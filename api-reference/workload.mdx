@@ -1,0 +1,1245 @@
+---
+title:  Workloads
+---
+
+## [Overview](#overview)
+
+Refer to the [Workload concepts](/concepts/workload) page.
+
+## [Create a Workload](#create)
+
+Refer to the [Create a Workload](/guides/create-workload) guide for additional details.
+
+## [Access Report](#access-report)
+
+Displays the permissions granted to principals for the workload.
+
+## [Autoscaling](#auto-scaling)
+
+### [Overview](#auto-scaling-overview)
+
+Workload auto-scaling is configured by setting a **strategy**, a **target value**, and in some cases as **metric percentile**. Together these values determine when the workload will
+scale up & down.
+
+As the system scales up, traffic will not be sent to the new replicas until they pass the readiness probe, if configured.
+If there is no probe configured or if it is a basic TCP port check, the requests will hit the new replicas before they are
+ready to respond. This could cause a delay or errors for end-user traffic.
+
+<Tip>
+You can configure autoscaling in the default options for a workload (`defaultOptions`) and in any of the location-specific options
+</Tip>
+
+### [Scaling Strategies](#scaling-strategies)
+
+The scaling strategy is set using `autoscaling.metric`.
+
+- Disabled (`disabled`)
+  - Scaling will be disabled.
+- Concurrent Requests Quantity (`concurrency`)
+  - The average number of requests executing at a given point in time across all the replicas.
+    `(requests * requestDuration)/(timePeriod * replicas)`.
+  - Example: A workload with 5 replicas received 1000 requests with an average response time of 50ms (05 seconds)
+    over a 1 second period. The concurrent requests metric for that period is `(1000 * .05)/(1 * 5) = 10`.
+- Requests Per Second (`rps`)
+  - The raw number of requests received by a workload each second divided by the number of replicas. Requests
+    are counted even if they have not yet been completed.
+- Percentage of CPU Utilization (`cpu`)
+  - The percentage of CPU consumed by system and user processes in the container(s) as specified in the container cpu field.
+- Request Latency (`latency`)
+  - The request response time (at a configurable percentile) in milliseconds, averaged across all replicas.
+
+<Warning>
+Caveats when choosing a workload type and a scaling strategy:
+
+- Serverless workloads cannot use the `latency` scaling strategy
+- Standard workloads cannot use the `concurrency` scaling strategy
+</Warning>
+
+<Warning>
+The scale to zero functionality is only available for Serverless workloads, and only when using the `rps` or `concurrency` scaling strategies
+</Warning>
+
+### [Autoscaling Standard Workloads](#autoscaling-standard-workloads)
+
+For standard workloads, Control Plane runs two asynchronous control loops:
+
+1. The Scaling Decision Loop
+2. The Metric Calculation Loop
+
+<Info>
+Because of this asynchronous structure, autoscaling decisions may be made based on a metric value that is as old as the metric's collection rate (usually 20 seconds).
+</Info>
+
+#### [The Scaling Decision Loop](#standard-scaling-decisions)
+
+A workload's scale is evaluated every 15 seconds, using the value most recently calculated by the [metric calculation loop][#standard-metric-calculations]. Each time an evaluation is made the chosen metric is averaged across all available replicas and compared against the scale target. When scaling up, Control Plane does not enforce a stabilization window; the number of pods will increase as soon as the [scaling algorithm](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#algorithm-details) dictates.
+When scaling down, a stabilization window of 5 minutes is used; the highest number of pods recommended by the scaling algorithm within the past 5 minutes will be applied to the running workload.
+
+#### [Termination Sequence](#termination-sequence)
+
+The termination sequence ensures a controlled and graceful process for removing workload replicas from the load balancer pool and handling container termination. The use of a preStop hook, either default or custom, can be leveraged to manage termination and connections as per the workload's requirements.
+
+Termination occurs most often when a workload is being scaled down or when an old version of the workload is taken offline after a successfull update to a new version. In rare cases, maintenance activities can cause workload replicas to be rescheduled and terminated.
+
+The steps below are performed for each replica of the workload.
+
+1. Load Balancer Update: At the initiation of workload termination, load balancers are sent a command to remove the workload replica from the pool.
+
+2. Workload Sidecar and Containers Termination: The workload sidecar (managed by Control Plane) and all other workload containers are sent a command to begin their termination process. This happens at nearly the same time as step 1.
+
+3. Load Balancer Routing: Once the load balancer is updated, any new incoming requests will be routed to the remaining healthy workload replicas for the workload.
+
+4. Sidecar Monitoring: The sidecar managed by Control Plane continues to monitor network activity. It will remain running until no more active requests exist and connections terminate, for a maximum duration of up to 90 seconds.
+
+5. Default PreStop Hook: If no customer-defined preStop hook is provided, a default preStop hook is applied to all workload containers. This default hook consists of the "sleep" command with a duration of 45 seconds. Once the sleep command completes the container is sent a SIGTERM signal and allowed to gracefully shutdown for an additional 45 seconds before receiving a SIGKILL signal.
+
+<Warning>
+If the "sleep" executable is not available in the customer's workload container, the container will be sent a graceful termination signal immediately. Requests might still reach it before the load balancer is fully updated.
+</Warning>
+
+6. Custom PreStop Hook (Optional): It is recommended to add a custom preStop hook only if specific custom logic is required, such as gracefully terminating connections that would not otherwise terminate. If a custom preStop hook is implemented, ensure it includes a delay or a check for existing requests before exiting. Once the preStop hook completes the container will receive a signal to terminate gracefully (SIGTERM) and will have up to 90 seconds from the start from the start of the shutdown process to complete.
+
+Please note that implementing a custom preStop hook is only advisable when additional logic is necessary for your specific workload termination needs.
+
+#### [The Metric Calculation Loop](#standard-metric-calculations)
+
+##### [Requests per Second](#standard-requests-per-second)
+
+Every 20 seconds, Control Plane calculates the average number of requests per second over the past 60 seconds.
+
+##### [Latency](#standard-latency)
+
+Every 20 seconds, Control Plane calculates latency, using the response time of the workload once requests are received, using an average over the past 60 seconds at the specified percentile (p50, p75, p99).
+
+##### [CPU](#standard-cpu)
+
+Every 15 seconds, Control Plane calculates the average CPU usage over the past 15 seconds.
+
+### [Autoscaling Serverless Workloads](#autoscaling-serverless-workloads)
+
+The current capacity is evaluated every 2 seconds and compared against the scale target. It averages requests
+completed over the previous 60 seconds to avoid rapid changes. If ever a scaling decision is made which results
+in a scale increase above 200% then it suspends scale down decisions and averages over 6 seconds for 60 seconds.
+This is to allow for rapid scaling when a burst of traffic is detected.
+
+<Tip>
+**Special considerations for the `latency` scaling strategy**
+
+Because request latency is represented as a distribution, when using the `latency` scaling strategy, you must choose a metric percentile by setting the `autoscaling.metricPercentile` property to one of the following values:
+
+- `p50`
+- `p75`
+- `p99`
+</Tip>
+
+### [Options](#autoscaling-options)
+
+- Minimum Scale (`autoscaling.minScale`)
+  - The minimum allowed number of replicas. A workload can scale down to 0 when there is no traffic and scale-up
+    immediately to fulfill new requests. (Must be between 0 and `Maximum Scale` inclusive).
+- Maximum Scale (`autoscaling.maxScale`)
+  - The maximum allowed number of replicas.
+- Scale to Zero Delay (`autoscaling.scaleToZeroDelay`)
+  - The amount of time (in seconds) when there are no requests received before a workload is scaled down to 0. (Must be between 30 and 3600 inclusive).
+- Maximum Concurrency (`autoscaling.maxConcurrency`)
+  - The maximum allowed number of requests to be actively running against a single replica. If there are no
+    replicas available that are processing less than the configured maximum number of concurrent requests, the system will
+    queue the request and wait for a replica to be available. It will not trigger a scale decision. The purpose of
+    this setting is to prevent a single replica from taking more traffic than it is designed to process.
+  - If, for example, Max Concurrency = 100, Scaling Strategy = ‘Concurrent Requests’, and Target = 100, the results would
+    not be desirable for most end-user traffic. When the system decides to scale up, it will queue the
+    requests until an existing request completes or the new replica becomes available.
+  - Must be between 0 and 1000 inclusive.
+- Metric Percentile (`autoscaling.metricPercentile`)
+  - The nth percentile is a value below which n percent of the values in a distribution lie.
+  - This may only be set while using the `latency` scaling strategy. The default value is `p50`.
+  - e.g. If the 50th percentile of a latency distribution is 200ms, 50% of requests took less than 200ms.
+  - Control plane supports p50, p75, and p99 metric percentiles.
+
+<Info>
+[Capacity AI](#capacity-ai) is not available if CPU Utilization is selected because dynamic allocation of CPU resources cannot be
+accomplished while scaling replicas based on the usage of its CPU.
+</Info>
+
+## [Capacity AI](#capacity-ai)
+
+Workloads can leverage intelligent allocation of its container's resources (CPU and Memory) by using Capacity AI.
+
+Capacity AI uses an analysis of historical usage to adjust these resources up to a configured maximum.
+
+This can significantly reduce cost, but may cause temporary performance issues with sudden spikes in usage.
+
+If capacity AI is disabled, the amount of resources configured will be fully allocated.
+
+Capacity AI must be disabled if the [autoscaling](#auto-scaling) strategy is set to `CPU Utilization`.
+
+<Note>
+Changes made to a workload will reset its historical usage and will restart the analysis process.
+</Note>
+
+### [Minimum Capacity AI](#minimum-capacity-ai)
+
+When resources are not being used, Capacity AI will downscale CPU usage to a minimum of 25 millicores. The minimum
+will increase depending on the memory size being recommended by Capacity AI using a 1:3 ratio of
+CPU millicores to memory MiB.
+
+## [Command Override](#command-override)
+
+The container entrypoint can be overridden by entering a custom command value.
+
+## [Command Line Arguments](#command-line-arguments)
+
+Custom command line arguments can be sent to the container during deployment.
+
+These arguments will be appended to the image `ENTRYPOINT`.
+
+The argument list is ordered and will be passed to the container in the same order.
+
+## [Connect](#connect)
+
+A specific replica of a workload can be connected to (similar to `exec`) from either the console or the CLI. This can be used for
+troubleshooting any issues with the replica.
+
+To connect using the console, click the `Connect` link from a workload. Select the location, container, replica, and command.
+Click `Connect` to execute the command. By default, the `bash` shell will be executed.
+
+To connect using the CLI, review the workload [connect](cli#workload-connect) subcommand.
+
+## [Containers](#containers)
+
+Workloads must have at least one container configured with the following:
+
+- [Image](#images)
+- [Resources](#resources) (CPU and Memory)
+- [Port(s)](#ports) that the container exposes
+- optional [Environment Variables](#environment-variables)
+- optional [Command Line Arguments](#command-line-arguments)
+- optional [Custom Metrics](#metrics)
+- optional [Readiness / Liveness Probes](#probes)
+- optional [Volumes](#volumes)
+
+<Tip>
+If a workload has more than one container, only one can serve traffic.
+</Tip>
+
+<Warning>
+The following rules apply to the name of a container:
+
+- Cannot be: 'istio-proxy', 'queue-proxy', 'istio-validation'.
+- Cannot start with: `cpln_`.
+</Warning>
+
+## [Inter-Container Communication](#inter-container-communication)
+
+Containers deployed within the same workload can communicate with each other using their names and assigned ports. This setup facilitates direct networking between containers.
+
+- **Container Identification** - Each container is uniquely identified by its name.
+- **Port Allocation** - Containers are assigned specific ports for network communication.
+
+### [Example Scenario](#inter-container-communication-example)
+
+- Imagine two containers within the same workload: `foo` and `bar`.
+- Container `foo` is running on port **4020**.
+- Container `bar` is running on port **4030**.
+
+`foo` can access `bar` using the URL **http://bar:4030**. This URL combines the name of the destination container `bar` and its assigned port **4030**, enabling direct communication between the two containers.
+
+This method ensures efficient and organized networking within a multi-container workload environment.
+```
+<!-- ## [Deployments](#deployments)
+
+Each location will be displayed, along with:
+
+- The image that the workload is serving
+- Health status
+- Resource usage
+  - CPU
+  - Memory
+- Versions
+- Replicas -->
+```
+## [Debug](#debug)
+
+In order to see detailed routing for the global georouted endpoint of a workload, debug values can be included within the response headers of a workload's endpoint request.
+
+The values will only be returned when:
+
+1. `debug` is active and the header `x-cpln-debug: true` is in the request.
+2. The global or canonical endpoint is being requested.
+
+Using the console, debug can be activated by:
+
+- Clicking `Options`.
+- Clicking the `Debug` switch to `on`.
+- Clicking `Save`.
+
+After the workload redeploys, the response from the workload's endpoint will contain the following headers if the
+header `x-cpln-debug: true` is in the request:
+
+- `x-cpln-location`: Location of the responding replica.
+- `x-cpln-replica`: Name of the responding replica.
+
+**Sample Request Headers:**
+
+```
+GET https://doc-test-v39red0.cpln.app/ HTTP/1.1
+Host: doc-test-v39red0.cpln.app
+Connection: keep-alive
+x-cpln-debug: true
+```
+
+**Sample Response Headers:**
+
+```
+HTTP/1.1 200 OK
+content-length: 2993
+content-type: text/plain
+date: Fri, 10 Sep 2021 21:34:27 GMT
+x-envoy-upstream-service-time: 2
+x-cpln-location: aws-us-west-2
+x-cpln-replica: doc-test-00083-deployment-75584b7d66-f8wtb
+```
+
+## [Endpoints](#endpoints)
+
+### [Canonical Endpoint (global)](#cononical)
+
+This URL is globally load-balanced and TLS terminated.
+This can be used for
+testing if there is an issue with the custom domain that is associated with the [GVC](/api-reference/gvc).
+
+### [Location Specific Endpoint](#location-specific)
+
+Within each deployment, a location specific URL is available that can be used for testing how your app is responding from a specific location of a [GVC](/api-reference/gvc).
+
+### [Custom Domain Endpoints](#endpoints-customdomainendpoints)
+
+Additional globally load-balanced endpoints will show in the workload status for each domain route that is configured to use this workload.
+
+## [Environment Variables](#environment-variables)
+
+Custom environment variables can be made available to the image running within a container.
+
+The value of the variable can be in plain text or a [secret value](#secret-env).
+
+<Warning>
+The length of an environment variable value cannot be greater than 4096 characters.
+</Warning>
+
+### [Built-in Variables](#built-in-env)
+
+Each workload has the following built-in environment variables:
+
+| Variable Name         | Description                                                                                                                                                 | Format                                            |
+| :-------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------ |
+| CPLN_GLOBAL_ENDPOINT  | The canonical Host header that the container will receive requests on                                                                                       | `${\workloadName}-${gvcAlias}.cpln.app`           |
+| CPLN_GVC              | The Global Virtual Cloud (/api-reference/gvc) the container is running under                                                                                               | string                                            |
+| CPLN_GVC_ALIAS        | The Global Virtual Cloud Alias                                                                                                                              | 13 digit alphanumeric value                       |
+| CPLN_LOCATION         | The [location](/api-reference/location) the container is serving the request from                                                                                          | aws-us-west-2, azure-eastus2, gcp-us-east1, etc.  |
+| CPLN_NAMESPACE        | The namespace of the container                                                                                                                              | Generated random string (e.g., aenhg2ec6pywt)     |
+| CPLN_PROVIDER         | The cloud provider the container is serving the request from                                                                                                | aws, azure, gcp, etc.                             |
+| CPLN_ORG              | The org the container is running under                                                                                                                      | string                                            |
+| CPLN_WORKLOAD         | The workload the container is running under                                                                                                                 | string                                            |
+| CPLN_WORKLOAD_VERSION | The Control Plane version of the Workload, only updated when needed to apply changes. For example, changing scaling settings will not cause this to change. | numeric                                           |
+| CPLN_TOKEN            | An token used to authenticate to the Control Plane CLI / API                                                                                                | Random authorization token                        |
+| CPLN_IMAGE            | The image as defined for this container in the Control Plane api                                                                                            | string                                            |
+
+<Note>
+Since a Workload Identity can be the target of a Policy, a running Workload can be authorized to exercise the
+Control Plane [CLI](/api-reference/cli) or [API](api) without any additional authentication.
+
+Examples:
+
+- Direct call to the Control Plane API:
+
+  - `curl ${CPLN_ENDPOINT}/org/${CPLN_ORG} -H "Authorization: ${CPLN_TOKEN}"`
+
+- If the Control Plane CLI installed:
+  - `cpln org get ${CPLN_ORG}`
+
+** The value of CPLN_TOKEN is valid only if the request originates from the Workload it is injected in. If it is used from
+another Workload or externally, a `403 Forbidden` response will be returned. **
+
+**TIP:** If a Workload is not assigned an Identity, it can still `GET` its parent Org.
+</Note>
+
+### [Secret Variables](#secret-env)
+
+Sensitive values can be used as an environment variable by using a [secret](/api-reference/secret).
+
+The [identity](#identity) of the workload must be member of a [policy](#policy) that has the `reveal` permissions on the [secret](/api-reference/secret).
+
+<Tip>
+When adding an environment variable using the UI, a list of available secrets can be accessed by pressing Control-S within the value textbox.
+If you do not have any secrets defined, the prefix `cpln://secret/` will be inserted.
+</Tip>
+
+### [Disallowed Variables](#disallowed-env)
+
+The following variable names are not allowed to be used as a custom environment variable:
+
+- `K_SERVICE`
+- `K_CONFIGURATION`
+- `K_REVISION`
+
+### [PORT Variable](#port)
+
+The `PORT` environment variable is provided at runtime and available to a container.
+
+It can be assigned as a custom environment variable in all cases except when the container is exposed and the value
+doesn't match that of the exposed port.
+
+For example:
+
+- If the container is exposed with a port of `3000`:
+  - the system will **accept** a PORT environment variable with the value `3000`.
+  - the system will **deny** a PORT environment variable with any value other than `3000`.
+- If the container is not exposed then any value is accepted for the PORT environment variable.
+
+### [Import Variables](#import-variables)
+
+A .env file can be uploaded using the console to import multiple environment variables. [Secret](#secret-env) values are supported.
+
+**Sample .env file:**
+
+```
+
+URL=http://test.example.com
+USERNAME=user001
+PASSWORD=cpln://secret/username_secret.password
+DATA=cpln://secret/opaque_secret.payload
+
+```
+
+### [Environment Variable Inheritance](#environment-variable-inheritance)
+
+Environment variables may be set at the [GVC](/api-reference/gvc) level. These variables are available to any container running in the GVC
+on an opt-in basis. To opt in, set the container's `inheritEnv` property to `true`. You can override the value of an
+inherited variable by adding a local variable with the same key.
+
+### [Use by Other Variables](#use-by-other-variables)
+
+Environment variables can contain the values of other environment variables by following the pattern `$(ENV_NAME)`.
+
+For example, the runtime value of the built-in variable `CPLN_GLOBAL_ENDPOINT` can be used in another environment variable by having the
+value `$(CPLN_GLOBAL_ENDPOINT)` added to the new variable.
+
+## [Firewall](#firewall)
+
+<Info>
+Inbound network access is only available for workloads of types `serverless` and `standard`. For other workload types, only outbound firewall settings are relevant.
+</Info>
+
+### [External](#external)
+
+The external firewall is used to control Internet traffic to/from a workload.
+
+**Inbound Requests:**
+
+- By default, all inbound requests are disabled.
+- Access is granted by explicitly adding one or more IPv4 / IPv6 / [CIDR](https://en.wikipedia.org/wiki/Classless_Inter-Domain_Routing) addresses or allowing all addresses.
+- Using the UI:
+  - Multiple address can entered within the textbox by delimiting each address with either a comma or space.
+  - An import file can be uploaded containing each address on its own line or delimited with either a comma or space.
+
+<Tip>
+The CIDR address `0.0.0.0/0` allows full inbound access from the public Internet.
+</Tip>
+
+**Outbound Requests:**
+
+- By default, all outbound requests are disabled.
+- Access is granted by explicitly adding one or more IPv4 / IPv6 / [CIDR](https://en.wikipedia.org/wiki/Classless_Inter-Domain_Routing) addresses or public hostnames or allowing all addresses / hostnames.
+  - **When using a hostname, only ports 80, 443, and 445 will be reachable. To allow all ports, enable all outbound requests.**
+  - When using a IP or CIDR, all ports will be reachable.
+- The IP/CIDR addresses takes precedence over hostnames.
+- Using the UI:
+  - Multiple address can entered within the textbox by delimiting each address with either a comma or space.
+  - An import file can be uploaded containing each address on its own line or delimited with either a comma or space.
+
+<Tip>
+The CIDR address `0.0.0.0/0` allows full outbound access to the public Internet.
+</Tip>
+
+### [Internal](#internal)
+
+The internal firewall is used to control access between other workloads within an [org](/api-reference/org).
+Only the ports listed in the workload containers array will be made accessible to other workloads.
+
+**Available Options:**
+
+- `None`: No access is allowed between workloads.
+- `Same GVC`: Workloads running in the same [GVC](/api-reference/gvc) are accessible.
+- `Same Org`: Workloads running in the same [org](/api-reference/org) are accessible.
+- `Specific Workloads`: Specific workloads are allowed access this workload.
+  - These workloads can be from the same or different GVCs.
+  - The user configuring this setting must have the `view` permission, set within a [policy](/api-reference/policy#permissions), on the workload being specified.
+- `Allow to Access Itself`: Enables replicas of this workload to access themselves.
+
+## [Identity](#identity)
+
+Refer to the [identities](/api-reference/identity) page for additional details.
+
+## [Images](#images)
+
+Each workload must be configured with at least one container, associated with an image.
+
+Images can be pulled from:
+
+- A public registry
+
+  - If the image does not require authentication, only the image name and optional tag are required.
+  - If authentication is required, a [pull secret](/api-reference/secret) must be configured on the [GVC](gvc#pull-secret) containing the [workload](workload).
+
+- Org's private registry
+  - If the image resides in your org's private registry, no [pull secret](/api-reference/secret) is required and you may use one of the following for the image name:
+    - Full Name: `/org/ORG_NAME/image/IMAGE_NAME:TAG`
+    - Short Name: `//image/IMAGE_NAME:TAG`
+
+Images must be formatted for linux/amd64 to run on the Control Plane Cloud Platform managed locations. When using a BYOK location additional runtime platforms are available.
+
+<Warning>
+The UserID 1337 is restricted.
+
+If used then inbound and outbound communication to the workload will be disabled.
+
+One known case where this UserID is configured by default is with [Laravel Sail](https://github.com/laravel/sail).
+
+If you need to use Laravel Sail on Control Plane then you must change the default UserID.
+
+Contact support for assistance.
+</Warning>
+
+<Note>
+Control Plane supports the use of dynamic tags. If an image is pushed and the tag is not updated (e.g., `latest`), the platform will redploy the new
+image within 5 minutes.
+
+To enable this feature:
+
+- Using the console
+  - Toggle the `Support Dynamic Tag` switch on the `Info` page of the selected workload.
+- Using [cpln apply](/guides/cpln-apply)
+  - Add the element `supportDynamicTags: true` within the selected workload.
+</Note>
+
+## [Inner Workload Communication](#inner-workload-communication)
+
+When executing multiple containers within a workload, utilize the hostname `localhost[:PORT]` for inter-container communication.
+
+## [Lifecycle](#lifecycle)
+
+Each Workload container can be configured to execute a subset of the [Kubernetes lifecycle hooks](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/). The supported hooks are:
+
+### [PostStart](#lifecycle-poststart)
+
+This hook is executed immediately after a container is created. However, there is no guarantee that the hook will execute
+before the container ENTRYPOINT. In the event of a failure, the relevant error message will be recorded in the corresponding deployment.
+
+### [PreStop](#lifecycle-prestart)
+
+This hook is executed immediately before a container is stopped. In the event of a failure, the relevant error message will be recorded in the workload's event log
+
+### [Setting lifecycle hooks](#lifecycle-hooks)
+
+These hooks can be configured using the console or [cpln apply](/guides/cpln-apply).
+
+- Using the console
+
+  - From the workload container, select the `Lifecycle` link from the top menu bar.
+  - Enter the command and optional arguments.
+  - Click `Save`.
+
+- Using [cpln apply](/guides/cpln-apply)
+
+  - Only the `exec` type is supported.
+  - Example:
+
+    **Add the `lifecycle` section to an existing workload container.**
+
+    ```yaml copy
+    spec:
+      containers:
+        - name: advanced-options-example
+          args: []
+          cpu: 50m
+          env: []
+          image: '//image/IMAGE:TAG'
+          memory: 128Mi
+          port: 8080
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - sh
+                  - '-c'
+                  - sleep 10
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - '-c'
+                  - sleep 10
+    ```
+
+## [Logs](#logs)
+
+Workload logs are consolidated from all the deployed locations and can be viewed using the UI or CLI.
+
+Using the UI, the logs page will be prefilled with the [LogQL](https://grafana.com/docs/loki/latest/logql/)
+query for the workload and [GVC](/api-reference/gvc) name.
+
+```logql title="Example LogQL Query"
+  {gvc="test-gvc, workload="test-workload"}
+```
+
+Logs can be further filtered by:
+
+- `Date`
+- `Location`
+- `Container`
+
+Grafana can be used to view the logs by clicking the `Explore on Grafana` link within the console.
+
+Refer to the [logs](/api-reference/logs) page for additional details.
+
+## [Map a Secret as a File](#map-a-secret-as-a-file)
+
+A [Secret](/secret) can be mapped as a read-only file by using a [Volume](#volumes).
+
+During the configuration of a [Volume](#volumes) using the console, the [Secret](/secret) reference (e.g., `cpln://secret/SECRET_NAME`) can be
+entered manually or `Control-S` can be pressed to view and select the available [Secrets](/secret).
+
+The Path must be a unique absolute path and, optionally, a file name (e.g., /secret/my-secret.txt) depending on the secret type. This path will be added to the container's
+file system and will be accessible by the running application.
+
+**NOTE:** A maximum of 15 volumes can be added.
+
+### [Secret Types](#secret-types)
+
+The secret type will dictate how the secret will be mounted to the file system.
+
+- [Opaque Secret](/secret#opaque)
+  :
+
+  - The `.payload` property is not required.
+  - If the payload is base-64 encoded, the secret can be decoded at runtime by selecting the
+    `Base64 decode at Runtime` checkbox when configuring the secret.
+  - The configured path must contain at least one subpath (e.g., /path/subpath). The last path (or file name) will be mounted as a
+    file and contain the payload. If a subpath is not given, the payload of the secret will be mounted as a file named `payload` (e.g., /path/payload).
+
+- [Azure](/secret#azure), [Docker](/secret#docker), and [GCP](/secret#gcp) Secrets:{' '}
+
+  - The secret will be mounted to the specified path as the file name `___cpln___.secret`.
+  - The configured path must contain at least one subpath (e.g., /path/subpath). The last path will be mounted as a
+    directory and contain the `___cpln___.secret` file.
+
+- All other [Secret Types](/secret#secret-types):
+
+  - If the root secret is selected, the specified path will be mounted as a directory. The contents of the directory will contain
+    files named as the key/property of the secret. The contents of each file will contain the value of the respective key.
+  - If a key/property of a secret is selected, the secret will be mounted to the specified path as a file. The contents will include
+    the value of the key/property.
+  - The directory will include a file named `___cpln___.secret`. The contents of this file will be the JSON formatted output of the secret.
+
+### [Identity Configuration](#secret-identity-configuration)
+
+A Workload that is configured with a [Volume](#volumes) that references a [Secret](/secret) must be configured with an [Identity](/secret#reveal-permission)
+bound to a [policy](/policy) having the [reveal](/secret#reveal-permission) permission.
+
+## [Metrics](#metrics)
+
+Control Plane can collect custom metrics from your workload by having your application emit
+a [Prometheus formatted list of metrics](https://prometheus.io/docs/practices/naming/) at a path and port of your choosing. The port can be different than the one serving traffic. Each container
+in a workload can be configured with metrics.
+
+<Tip>
+The convention is to use the path `/metrics`, but any path can be used.
+</Tip>
+
+Sample output from the metrics endpoint:
+
+```
+
+MY_COUNTER 788
+MY_COUNTER_2 123
+NUM_USERS 2
+NUM_ORDERS 91
+
+```
+
+The platform will scrape all the replicas in the workload every 30 seconds with a 5 second timeout. Metric names
+with the prefix `cpln_` will be ignored by the scrapping process.
+
+The collected metrics can be viewed by clicking the `Metrics` link on the workload page within the console. Clear any existing query and
+enter the name of the metric. Click `Run Query` to execute.
+
+The time-series displayed will include these labels:
+
+- `org`
+- `gvc`
+- `location`
+- `provider`
+- `region`
+- `cluster_id`
+- `replica`
+
+## [Permissions](#permissions)
+
+The permissions below are used to define [policies](/api-reference/policy) together with one or more of the four
+[principal types](/concepts/principal_types):
+```
+<!-- PERMISSIONS-START -->
+
+| Permission           | Description                                    | Implies                                                                 |
+| -------------------- | ---------------------------------------------- | ----------------------------------------------------------------------- |
+| connect              | Connect to replica (open an interactive shell) |                                                                         |
+| create               | Create new workloads                           |                                                                         |
+| delete               | Delete existing workloads                      |                                                                         |
+| edit                 | Modify existing workloads                      | view                                                                    |
+| exec                 | Execute commands                               | exec.runCronWorkload                                                    |
+| exec.runCronWorkload | Force a cron-workload to run                   |                                                                         |
+| manage               | Full access                                    | connect, create, delete, edit, exec, exec.runCronWorkload, manage, view |
+| view                 | Read-only access                               |                                                                         |
+
+<!-- PERMISSIONS-END -->
+```
+## [Ports](#ports)
+
+Workloads can expose ports to be accessed by other workloads internally, externally from the provided default endpoints and from Domains. Serverless workloads must expose one port. Cron workloads may not expose ports. Standard workloads can expose 0 or more ports. The default endpoints will route traffic to the first port exposed by the first container of a workload.
+
+```bash
+ports:
+- number: 8080
+  protocol: http
+```
+
+#### [Number](#number)
+
+The port to expose externally or internally to other Control Plane workloads. Access is controlled using the workload [firewall](#firewall).
+
+Ports which are not exposed or are only accessed from another container in the same workload do NOT need to be defined.
+
+<Warning>
+The ports listed below are blocked and are not allowed to be used.
+
+Containers which attempt to use these ports will not be able to bind.
+
+8012, 8022, 9090, 9091, 15000, 15001, 15006, 15020, 15021, 15090, 41000
+</Warning>
+
+#### [Protocol](#protocol)
+
+- grpc
+- http
+- http2
+- tcp
+
+If the protocol is not specified when using the `ports` then `http` is configured.
+
+If the deprecated `port` parameter is used then `http2` is configured.
+
+When the protocol is `tcp`...
+
+1. external access to the workload is only available externally when a gvc with dedicated load balancing enabled and a custom domain is used.
+1. internal access to the workload is only available from other workloads in the same [GVC](/api-reference/gvc).
+
+## [Probes](#probes)
+
+Probes are used to check the health of an application running inside a container.
+
+### [Readiness Probe](#readiness-probe)
+
+The readiness probe is used to determine if the workload replica is ready to receive traffic. For example, if the application is performing some actions during start-up and needs it to complete before
+serving requests, the readiness probe should fail until the actions have been completed.
+
+This check is used in two ways.
+
+1. Determines if replicas from a new version of the workload are ready, when the check passes the rollout continues, when the check fails the rollout is paused.
+
+2. Determines if the workload replica should receive new requests from end users. When the readiness probe is failing the replica is removed the pool of available replicas for this workload and all endpoints.
+
+It is recommended to use an HTTP or Command probes that perform an adequate check that the workload is healthy and able to respond to requests.
+
+### [Liveness Probe](#liveness-probe)
+
+The liveness probe defines when the container should be restarted.
+
+For example, if the application code hits a deadlock condition, the
+liveness probe can catch that the container is not healthy, and Control Plane will restart the failing workload replica. This will ensure that
+the application is available as much as possible until the defect causing the deadlock is fixed.
+
+### [Options](#probe-options)
+
+Health Check Type:
+
+- Run a Custom Command.
+- HTTP
+  - Scheme (either HTTP or HTTPS, default is HTTP).
+  - Path.
+  - Port (must be between 80 and 65535 inclusive).
+  - Optional HTTP headers.
+- TCP
+  - Socket port (must be between 80 and 65535 inclusive. Ports 8012, 8022, 9090, 9091, 15000, 15001, 15006, 15020, 15021, 15090, 41000 are invalid).
+- gRPC
+  - gRPC port.
+
+Configurable Limits:
+
+- Initial Delay Seconds
+  - The delay to wait after the container is started before performing the first probe (must be between 0 and 120 inclusive, default is 0).
+- Period Seconds
+  - How often to perform the probe (must be between 1 and 60 inclusive, default is 10).
+- Timeout Seconds
+  - Number of seconds after which the probe times out (must be between 1 and 60 inclusive, default is 1).
+- Success Threshold
+  - Minimum consecutive successes for the probe to be considered successful after having failed (must be between 1 and 20 inclusive, default is 1).
+- Failure Threshold
+  - When a probe fails, Kubernetes will try this amount of times before giving up. For a liveness probe, the container will be
+    restarted. For a readiness probe, the workload will be marked `Unready`. (must be between 1 and 20 inclusive, default is 3).
+
+Refer to the Kubernetes probe documentation [here](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+for additional details.
+
+## [Resources](#resources)
+
+Control Plane allows you to specify CPU and memory resources for each container.
+
+### [CPU](#cpu)
+
+CPU is specified in **millicores (m)** and **cores**.
+
+- **Millicore**: Since a whole core might be too much for many applications, the platform allows you to specify CPU resources in millicores. One core is equivalent to 1,000 millicores. Specifying `500` (in the console) or `500m` (in the YAML manifiest) would allocate half a core.
+- **Core**: A core is a CPU unit. Specifying `1` (in both the console and YAML manifest) as the CPU resource means allocating the equivalent of one full CPU core.
+
+### [Memory](#memory)
+
+Memory is specified in **Mebibytes (Mi)** and **Gibibytes (Gi)**.
+
+- **Mebibyte**: A unit of digital data that is equal to 1,048,576 bytes. Specifying `1` and selecting Mi (in the console) or `1Mi` (in the YAML manifiest) would allocate 1 Mebibyte.
+- **Gibibyte**: A unit of digital data that is equal to 1,073,741,824 bytes. Specifying `1` and selecting Gi (in the console) or `1Gi` (in the YAML manifiest) would allocate 1 Gibibyte.
+
+## [Rollout Options](#rollout-options)
+
+Settings to control the rollout process between versions.
+
+```yaml
+spec:
+  rolloutOptions:
+    minReadySeconds: 0
+    maxUnavailableReplicas: 1
+    maxSurgeReplicas: 100%
+    scalingPolicy: OrderedReady
+```
+
+#### [minReadySeconds](#rollout-options-minreadyseconds)
+
+The minimum number of seconds that a workload replica must be running before the rollout progresses.
+
+#### [maxUnavailableReplicas](#rollout-options-maxunavailablereplicas)
+
+The maximum number or percentage of replicas that can be unavailable during a rollout or during regular rescheduling of workloads.
+
+#### [maxSurgeReplicas](#rollout-options-maxsurgereplicas)
+
+The maximum number or percentage of new replicas that can added during a rollout for each batch.
+
+Example: If there are 4 running replicas and maxSurgeReplicas is set to 50%, then during each rollout 2 replicas will be added at the new version. Once they are healthy as determined by the [ReadinessProbe](#readiness-probe), the rollout will continue, -2 old replicas, +2 new replicas, -2 old replicas.
+
+In cases where a short rollout cutover is needed, a maxSurgeReplicas setting of `100%` is recommended.
+
+#### scalingPolicy
+
+The strategies used to update applications and services deployed. Valid values: `OrderedReady` (Updates workloads in a rolling fashion, taking down old ones and bringing up new ones incrementally, ensuring that the service remains available during the update.), `Parallel` (Causes all pods affected by a scaling operation to be created or destroyed simultaneously. This does not affect update operations.). Default: `OrderedReady`.
+
+## [Security Options](#security-options)
+
+Settings to control the security of the container at runtime.
+
+```yaml
+spec:
+  securityOptions:
+    filesystemGroupId: 777
+```
+
+#### [filesystemGroupId](#security-options-filesystemgroupid)
+
+Any mounted [Volumes](#volumes) for this container will be owned by the group id provided. When not specified `0` (root) is used.
+
+## [Storage](#storage)
+
+Each workload replica receives at least 1GB of local ephemeral solid state drive (SSD) storage. Workloads that request more than 1 core of CPU receive 1GB of storage for each core. For example, a workload that requests 1500 millicore of CPU can consume up to 1.5GB of ephemeral storage.
+
+If the replica uses more than its allotted ephemeral storage, it will be replaced with a new replica.
+
+## [Suspend](#suspend)
+
+Each workload can be suspended which immediately stops the workload from serving traffic. This is the same as
+setting the min/max scale to 0. When the workload is unsuspended, it will resume serving traffic.
+
+To temporarily deactivate a workload choose `Stop` from the Actions menu.
+
+```yaml
+spec:
+  defaultOptions:
+    suspend: true
+```
+
+The workload will stop running and will not serve any traffic.
+
+To reactivate the workload, choose `Start` from the actions menu.
+
+```yaml
+spec:
+  defaultOptions:
+    suspend: false
+```
+
+## [Timeout](#timeout)
+
+The maximum request duration in seconds before Control Plane will timeout. This timeout amount can be reached when
+Control Plane is waiting for the workload to respond or when waiting for a new workload to become available when using Autoscaling.
+
+The minimum value is **1 second** and the maximum value is **600 seconds**.
+
+## [Types](#types)
+```
+|                                                                  | Serverless | Standard / Stateful | Cron |
+| ---------------------------------------------------------------- | :--------: | :-----------------: | :--: |
+| Allow multiple containers                                        |     ✔      |          ✔          |  ✔   |
+| Scale to Zero                                                    |     ✔      |                     |      |
+| Must expose one HTTP port                                        |     ✔      |
+| Allow no exposed ports                                           |            |          ✔          |  ✔   |
+| Allow multiple exposed ports                                     |            |          ✔          |      |
+| Unable to expose any ports                                       |            |                     |  ✔   |
+| Custom Domain requests have the HOST header of the custom domain |            |          ✔          |      |
+| Fast switching update between versions                           |     ✔      |                     |      |
+| Rolling update between versions                                  |            |          ✔          |      |
+| Autoscale by CPU                                                 |     ✔      |          ✔          |      |
+| Autoscale by requests per second                                 |     ✔      |          ✔          |      |
+| Autoscale by concurrent requests                                 |     ✔      |                     |      |
+| Autoscale by request latency                                     |            |          ✔          |      |
+| Runs on a schedule and is expected to complete                   |            |                     |  ✔   |
+```
+### [Serverless](#serverless)
+
+Serverless workloads should be used for web applications that serve traffic on a single port, but may not need to run 100% of the time.
+
+Serverless workloads **may**:
+
+- Scale to zero.
+
+Serverless workloads **may not**:
+
+- Serve traffic on multiple ports.
+
+Serverless workloads **must**:
+
+- Expose a network endpoint.
+
+### [Standard](#standard)
+
+Standard workloads have greater flexibility in network exposure, but may not scale to zero.
+
+Standard workloads **may**:
+
+- Expose no network endpoint.
+- Serve traffic on multiple ports.
+
+Standard workloads **may not**:
+
+- Scale to zero.
+
+### [Cron](#cron)
+
+Cron workloads should be used when you need to perform a background task on a regular schedule.
+
+Cron workloads **may not**:
+
+- Serve traffic.
+- Scale to zero.
+- Include a container that runs indefinitely.
+
+Cron workloads **must**:
+
+- Exit upon completion of the task at hand. Control Plane will start a new replica of your workload at the next scheduled execution time.
+
+#### [Configuration](#cron-configuration)
+
+<Info>
+Cron workloads are always deployed to all locations within their GVC. Unlike workloads of other types, there is no way to provide location-specific configuration overrides.
+</Info>
+
+- `job.schedule`
+  - A string, which determines how often the cron workload should execute. This field uses the [Kubernetes cron schedule syntax](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/#cron-schedule-syntax)
+- `job.concurrencyPolicy`
+  - Either `Forbid` or `Replace`. This determines what Control Plane will do when a prior execution of your workload is still running when the next scheduled execution time arrives.
+    - `Forbid`: subsequent executions will be forgone until the running execution completes.
+    - `Replace`: the running execution will be stopped so that a new execution can begin.
+- `job.historyLimit`
+  - An integer between 1 and 10 representing the number of prior executions to be retained for reference.
+- `job.suspend`
+  - A boolean value indicating whether your workload should run. Setting this property to `true` will disable future executions.
+- `job.restartPolicy`
+  - Either `Never` or `OnFailure`. This determines whether your workload will be restarted when it fails on execution.
+- `job.activeDeadlineSeconds`
+  - **Optional**: By default there is no deadline. Job executions are allowed to run indefinitely.
+  - If this property is set, this is the maximum number of a seconds a job execution can run. If the job does not exit in the allotted time, Control Plane will remove it.
+
+#### [Run Now](#cron-run-now)
+
+<Tip>
+Cron workloads can be run on-demand even when they are suspended.
+</Tip>
+
+<Info>
+When running a cron workload on-demand the job.concurrencyPolicy field is ignored.
+</Info>
+
+Cron workloads can be run on-demand by submitting a `runCronWorkload` command via `POST https://api.cpln.io/org/my-org/gvc/my-gvc/workload/my-cron-workload/-command`
+
+```yaml copy title="runCronWorkload Command"
+type: runCronWorkload
+spec:
+  location: aws-us-west-2
+  containerOverrides:
+    - name: my-container
+      command: '/bin/sh'
+      args:
+        - '-c'
+        - sleep 10
+      env:
+        - name: MY_ENV_VAR
+          value: some-new-value
+```
+
+##### [runCronWorkload Spec](#cron-run-now-spec)
+
+- `location`
+  - The name of the location as shown in your GVC configuration.
+- `containerOverrides`
+  - **Optional**: A list of objects which override parts of a container's configuration
+- `containerOverrides[].name`
+  - The name of the container in the workload spec to override
+- `containerOverrides[].command`
+  - A new command for the container during this execution only. This field works just like `workload.containers[].command` in the workload spec.
+- `containerOverrides[].args`
+  - A new list of arguments for the container during this execution only. This field works just like `workload.containers[].args` in the workload spec.
+- `containerOverrides[].env`
+  - A new list of environment variables for the container during this execution only. This field works just like `workload.containers[].env` in the workload spec.
+
+##### [Run via the CLI](#cron-run-via-cli)
+
+Run a cron workload using the `cpln` CLI via `cpln workload cron start`. e.g.
+
+<Tip>
+If you do not specify a location using --location, the CLI will run the workload everywhere it has been deployed.
+</Tip>
+
+<Info>
+The --file parameter should contain a list of containerOverrides.
+</Info>
+
+```shell copy title="CLI Example"
+echo '[{"name":"my-container","command":"/bin/bash","args":["-c","sleep 10"],"env":[{"name":"MY_ENV_VAR","value":"some-new-value"}]}]' | cpln workload cron start cron --gvc my-gvc --org my-org --file -
+```
+
+#### [Job History](#cron-job-executions)
+
+A cron workload retains up to `job.historyLimit` job executions in its history. Each job execution will be in one of the following statuses:
+
+- Invalid
+- Active
+- Success
+- Failure
+- Removed
+
+##### [The Removed Status](#cron-job-executions-removed)
+
+The Removed status indicates that a job execution was deleted before it could finish execution. There are several reasons this can happen, but the most common are:
+
+- The `job.concurrencyPolicy` is `Replace` and while the job was still executing, `job.Schedule` dictated that the job should begin again.
+- The `job.activeDeadlineSeconds` limit was exceeded.
+
+### [Stateful](#stateful)
+
+#### [Overview](#stateful-overview)
+
+Stateful workloads are similar to [standard](#standard) and [serverless](#serverless) workloads in many ways. Much of the base functionality including
+Universal Cloud Identity, autoscaling, metrics, logs, audit trail, etc. remains the same.
+
+#### [Key Features](#key-features)
+
+##### [Stable Replica Identities](#stable-replica-identities)
+
+Each replica has a permanent identity. If a replica is rescheduled, restarted, or recreated for any reason, its identity will remain constant.
+Identities are of the form {`workloadName`}-{`replicaIndex`} e.g. for a workload called my-workload, the replica identities would be:
+
+- my-workload-0
+- my-workload-1
+- etc.
+
+##### [Stable Hostnames](#stable-hostnames)
+
+Each replica has a hostname corresponding to its identity. Hostnames are of the form `{replicaIdentity}.{\workloadName}`
+e.g. for a workload called my-workload, the replica hostnames would be:
+
+- my-workload-0.my-workload
+- my-workload-1.my-workload
+- etc.
+
+So to make an HTTP request to a specific replica, one might execute:
+
+`curl http://my-workload.my-workload-1:8080` from another workload running on Control Plane
+
+##### [Persistent Storage](#persistent-storage)
+
+Stateful workloads can mount a [volume set](volumeset) as a volume in one or more of its containers.
+To do this, simply add a volume to a container's list of volumes of the form:
+
+```yaml
+uri: cpln://volumeset/my-volume-set
+path: /some/mount/directory
+```
+
+##### [# Considerations When Using Persistent Storage](#persistent-storage-considerations)
+
+- Volume sets are GVC scoped.
+- A workload can only use volume sets in the same GVC.
+- A volume set can be used by at most one workload.
+- A workload may use any number of volume sets.
+- The volume set uri must begin with `cpln://volumeset/`.
+
+#### [Examples](#stateful-examples)
+
+##### [PostgreSQL](#stateful-examples-postgres)
+
+[This example](https://github.com/controlplane-com/examples/tree/main/examples/postgres) demonstrates how to run a simple postgresql instance on Control Plane.
+
+##### [NATS](#stateful-examples-nats)
+
+[This example](https://github.com/controlplane-com/examples/tree/main/examples/nats) demonstrates how to run [NATS](https://nats.io/) on Control Plane
+
+#### [Planned Features](#planned-features)
+
+- Access to a specific replica via the external endpoint. Currently, the external endpoint load-balances connections across all available replicas.
+
+## [Volumes](#volumes)
+
+Cloud Object and File storage, ephemeral scratch storage and [Secrets](/secret) can be mounted to directories of [containers](#containers) at runtime by adding one or more volumes.
+
+A volume consists of a `uri` and a mount `path`. The `uri` is prefixed with the provider scheme followed by the bucket/storage name
+(e.g., s3://my-s3-bucket). The mount `path` must be a unique absolute path (e.g., /s3-files). This path will be added to the
+container's file system and accessible by the running application.
+
+During the set up of a volume using the console, the `uri` name can be entered manually or an
+existing [Cloud Account](/api-reference/cloudaccount) can assist looking up the name.
+
+The [identity](#identity) of the workload is used to authenticate to the provider's cloud storage API, or used for authorization to access the Control Plane secret.
+A [Cloud Account](/api-reference/cloudaccount) for each cloud storage provider, with the necessary access/roles, must exist and be associated with
+the workload [identity](#identity).
+
+Volumes can be shared between containers of the same workload. For example if two containers in a workload are each configured with the volume `uri: 'scratch://volume1', path: '/my/shared/data'` then changes to files in `/my/shared/data` will be visible to both containers.
+
+**NOTE:** A maximum of 15 volumes can be added.
+
+### [Volume Providers](#volume-providers)
+
+| Volume Provider              | URI Scheme       | Mode                  | Example                                |
+| :--------------------------- | :--------------- | :-------------------- | :------------------------------------- |
+| CPLN Secret                  | cpln://secret    | read-only             | cpln://secret/secretname               |
+| [CPLN Volume Set](volumeset) | cpln://volumeset | read-write            | cpln://volumeset/my-volume-set         |
+| AWS S3                       | s3://            | read-only             | s3://my-s3-bucket                      |
+| Google Cloud Storage         | gs://            | read-only             | gs://my-google-bucket                  |
+| Azure Blob Storage           | azureblob://     | read-only             | azureblob://my-azure-account/container |
+| Azure Files                  | azurefs://       | read-write            | azurefs://my-azure-account/my-files    |
+| Scratch (emptyDir)           | scratch://       | read-write, ephemeral | scratch://volume1                      |
+
+### [Identity Configuration](#identity-configuration)
+
+To allow a workload [identity](#identity) the ability to authenticate to an object store, a
+[cloud access](identity#overview) rule must be created for each provider. A [Cloud Account](/api-reference/cloudaccount)
+for each provider must exists in order to create the [cloud access](identity#overview) rule.
+
+The following list contains the minimum roles/scopes that must be added to a [cloud access](identity#overview) rule:
+
+- S3 (using an AWS Cloud Account)
+
+  - Select `Create a new AWS role with existing policies` and choose `AmazonS3ReadOnlyAccess`.
+
+- Google Cloud Storage (using a Google Cloud Account)
+
+  - Select `Create a new GCP service account`.
+  - Resource: Storage -> Global -> Bucket -> `Select bucket name`.
+  - Role: `Storage Legacy Bucket Reader` and `Storage Legacy Object Reader`.
+  - Verify that the [Cloud Account for GCP](/cloudaccount#gcp-details) is configured correctly.
+    In particular, the Control Plane GCP service account requires the `Storage Admin` role.
+
+- Azure Blob Storage and Files (using an Azure Cloud Account)
+
+  - Scope: Storage -> Region -> Storage Accounts -> `Select storage account`.
+  - Role (for Azure Files) : [Reader and Data Access](https://docs.microsoft.com/en-us/azure/role-based-access-control/built-in-roles#reader-and-data-access).
+  - Role (for Azure Blobs) : `Storage Blob Data Reader`.
+
+### [Firewall Configuration](#volume-firewall-configuration)
+
+To allow a Workload access to the object stores, the outbound requests of its [external firewall](#external)
+must either be set to `All Outbound Requests Allowed` or the hostnames listed below for the corresponding object store must
+be added to the `Outbound Hostname Allow List`.
+
+```bash copy title="AWS"
+  *.amazonaws.com
+```
+
+```bash copy title="Azure Blob"
+  *.blob.core.windows.net
+  *.azure.com
+```
+
+```bash copy title="Azure File"
+  *.file.core.windows.net
+  *.azure.com
+```
+
+```bash copy title="GCP"
+  *.googleapis.com
+```
+
+### [Limitations](#limitations)
+
+- Volumes are read-only, except for Azure Files.
+- The following Path names are reserved:
+  - `/dev`
+  - `/dev/log`
+  - `/tmp`
+  - `/var`
+  - `/var/log`
+- Authentication to a provider is only facilitated through the workload [identity](#identity). The use of an AWS or Azure key to
+  mount a bucket/container within a container will not work.
+- Properties of a mounted object store, such as cache policies and timeouts, cannot be configured by the user. Control Plane has
+  optimized those values for each cloud provider.
+
+### [Metering and Billing](#metering-billing)
+
+The CPU, memory and egress used for mounted object stores are billed to the workload. To review the costs of mounting an object store,
+query the container named `cpln-mounter` for the workload within the metrics page.
+
+## [Working Directory Override](#working-directory)
+
+The container working directory can be overridden by entering a custom directory. The value must be an absolute path.
+
+## [Workload Health](#workload-health)
+
+- Possible values:
+  - `Loading`
+  - `Healthy`
+  - `Unhealthy`
+  - `Deleting`
+  - `Unknown`
+
+## [CLI](#cli)
+
+To view the CLI documentation for Workloads, [click here](cli#workload).
+
+## [Schema](#schema)
+
+To view the schema documentation for Workloads, [click here](schemas/workload).
