@@ -4,7 +4,7 @@ title: Autoscaling
 
 ## Overview
 
-Workload auto-scaling is configured by setting a **strategy**, a **target value**, and in some cases as **metric percentile**. Together these values determine when the workload will scale up & down.
+Workload auto-scaling is configured by setting a **strategy**, a **target** value, and in some cases as **metric percentile**. Together these values determine when the workload will scale up & down.
 
 As the system scales up, traffic will not be sent to the new replicas until they pass the readiness probe, if configured. If there is no probe configured or if it is a basic TCP port check, the requests will hit the new replicas before they are ready to respond. This could cause a delay or errors for end-user traffic.
 
@@ -37,7 +37,7 @@ The scaling strategy is set using `autoscaling.metric`.
 
 Caveats when choosing a workload type and a scaling strategy:
 
-- Serverless workloads cannot use the `latency` scaling strategy
+- Serverless workloads cannot use the `latency` scaling strategy or any of the Multi Metric scaling strategies.
 - Standard workloads cannot use the `concurrency` scaling strategy
 
 </Warning>
@@ -47,6 +47,10 @@ Caveats when choosing a workload type and a scaling strategy:
 The scale to zero functionality is only available for Serverless workloads, and only when using the `rps` or `concurrency` scaling strategies.
 
 </Warning>
+
+## Target
+
+The target is the value that the system will try to keep the metric near but below.
 
 ## Autoscaling Standard Workloads
 
@@ -65,7 +69,6 @@ Because of this asynchronous structure, autoscaling decisions may be made based 
 
 A workload's scale is evaluated every 15 seconds, using the value most recently calculated by the [metric calculation loop][#standard-metric-calculations]. Each time an evaluation is made the chosen metric is averaged across all available replicas and compared against the scale target. When scaling up, Control Plane does not enforce a stabilization window; the number of pods will increase as soon as the [scaling algorithm](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#algorithm-details) dictates. When scaling down, a stabilization window of 5 minutes is used; the highest number of pods recommended by the scaling algorithm within the past 5 minutes will be applied to the running workload.
 
-
 ### The Metric Calculation Loop
 
 #### Requests per Second
@@ -79,6 +82,10 @@ Every 20 seconds, Control Plane calculates latency, using the response time of t
 #### CPU
 
 Every 15 seconds, Control Plane calculates the average CPU usage over the past 15 seconds.
+
+#### Memory
+
+Every 15 seconds, Control Plane calculates the average memory usage over the past 15 seconds.
 
 ## Autoscaling Serverless Workloads
 
@@ -99,23 +106,119 @@ Because request latency is represented as a distribution, when using the `latenc
 ## Options
 
 - Minimum Scale (`autoscaling.minScale`)
-  - The minimum allowed number of replicas. A workload can scale down to 0 when there is no traffic and scale-up immediately to fulfill new requests. (Must be between 0 and `Maximum Scale` inclusive).
+  - The minimum allowed number of replicas.
+  - Control Plane can scale the workload down to 0 when there is no traffic and scale up immediately to fulfill new requests.
+  - Must be between 0 and `Maximum Scale` inclusive.
 - Maximum Scale (`autoscaling.maxScale`)
   - The maximum allowed number of replicas.
 - Scale to Zero Delay (`autoscaling.scaleToZeroDelay`)
-  - The amount of time (in seconds) when there are no requests received before a workload is scaled down to 0. (Must be between 30 and 3600 inclusive).
+  - The amount of time (in seconds) with no requests received before a workload is scaled down to 0.
+  - Must be between 30 and 3600 inclusive.
 - Maximum Concurrency (`autoscaling.maxConcurrency`)
-  - The maximum allowed number of requests to be actively running against a single replica. If there are no replicas available that are processing less than the configured maximum number of concurrent requests, the system will queue the request and wait for a replica to be available. It will not trigger a scale decision. The purpose of this setting is to prevent a single replica from taking more traffic than it is designed to process.
-  - If, for example, Max Concurrency = 100, Scaling Strategy = ‘Concurrent Requests’, and Target = 100, the results would not be desirable for most end-user traffic. When the system decides to scale up, it will queue the requests until an existing request completes or the new replica becomes available.
-  - Must be between 0 and 1000 inclusive.
+  A hard maximum for the number of concurrent requests allowed to a replica.
+  - If no replicas are available to fulfill the request, it will be queued until a replica with capacity is available and delivered as soon as one is available again.
+  - Capacity can be available from requests completing or when a new replica is available from scale out.
+  - A value of 0 allows all requests.
+  - Must be between 0 and 30000 inclusive.
+- Metric (`autoscaling.metric`)
+  - Controls the metric which will be used for scaling decisions. The goal is to maintain the target across all replicas of a deployment. Options include:
+    - `concurrency`: Uses the number of concurrent requests for the target.
+    - `cpu`: Uses % processor time for the target.
+    - `memory`: Uses memory in Mi for the target.
+    - `rps`: Uses requests per second for the target.
+    - `latency`: Uses the average request response time for the target. Not available for Serverless workloads.
+- Multi Metric (`autoscaling.multi`)
+  - Allows specifying multiple metrics for autoscaling decisions.
+  - Each metric must be unique and is defined with a target value.
+  - Not available for Serverless workloads.
 - Metric Percentile (`autoscaling.metricPercentile`)
-  - The nth percentile is a value below which n percent of the values in a distribution lie.
-  - This may only be set while using the `latency` scaling strategy. The default value is `p50`.
-  - e.g. If the 50th percentile of a latency distribution is 200ms, 50% of requests took less than 200ms.
-  - Control plane supports p50, p75, and p99 metric percentiles.
+  - The latency metric is represented as a distribution, so a percentile within the distribution must be chosen to be used with the target.
+  - The default value is `p50`.
+  - Control Plane supports p50, p75, and p99 metric percentiles.
+  - For example, if the percentile is p50 and the target is 100, when the 50th percentile of latency is greater than 100ms for the workload, a scale-up decision will be made.
 
 <Info>
 
-[Capacity AI](#capacity-ai) is not available if CPU Utilization is selected because dynamic allocation of CPU resources cannot be accomplished while scaling replicas based on the usage of its CPU.
+[Capacity AI](/objects/workload/capacity) is not available if CPU Utilization is selected because dynamic allocation of CPU resources cannot be accomplished while scaling replicas based on the usage of its CPU. Additionally, Capacity AI may not be enabled when multi metric is set.
 
 </Info>
+
+## Examples
+
+### Concurrency
+
+```yaml
+spec:
+  defaultOptions:
+    autoscaling:
+      metric: concurrency
+      maxConcurrency: 0
+      maxScale: 1
+      minScale: 5
+      scaleToZeroDelay: 300
+      target: 100
+```
+
+### CPU
+
+```yaml
+spec:
+  defaultOptions:
+    autoscaling:
+      metric: cpu
+      target: 80
+      minScale: 1
+      maxScale: 5
+```
+
+### Memory
+
+```yaml
+spec:
+  defaultOptions:
+    autoscaling:
+      metric: memory
+      target: 80
+      minScale: 1
+      maxScale: 5
+```
+
+### RPS
+
+```yaml
+spec:
+  defaultOptions:
+    autoscaling:
+      metric: rps
+      target: 100
+      minScale: 1
+      maxScale: 5
+```
+
+### Latency
+
+```yaml
+spec:
+  defaultOptions:
+    autoscaling:
+      metric: latency
+      target: 100
+      minScale: 1
+      maxScale: 5
+      metricPercentile: p50
+```
+
+### Multi Metric
+
+```yaml
+spec:
+  defaultOptions:
+    autoscaling:
+      minScale: 1
+      maxScale: 5
+      multi:
+        - metric: cpu
+          target: 80
+        - metric: memory
+          target: 80
+```
