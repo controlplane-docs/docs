@@ -6,20 +6,22 @@ title: Create Cloud SQL for PSC
 
 Follow the steps below to create a [Cloud SQL](https://cloud.google.com/sql/docs/introduction) instance with [Private Service Connect](https://cloud.google.com/vpc/docs/private-service-connect) (PSC) enabled within Google Cloud.
 
-## Prerequisites
+## Create using the GCP Console
+
+### Prerequisites
 
 - [Google Cloud Platform (GCP)](https://cloud.google.com/) account.
-- Install the latest [SDK](https://cloud.google.com/sdk/docs/install).
+- Install the latest Google Cloud [SDK](https://cloud.google.com/sdk/docs/install).
+- Existing GCP project
 - Enable the following APIs in your GCP project:
     - `SQL Admin`
     - `Compute Engine`
     - `Service Networking`
 
-## Create using the GCP Console
-
 ### Step 1 - Create a VPC
 1. Navigate to `VPC Networks` and select `Create VPC Network`.
 2. Name the VPC, enable the necessary firewall rules for your intended use and click `Create`.
+<Note>A subnet is not required for PSC with Cloud SQL. Cloud SQL lives in Google's managed data center and the VPC is only required for using a private ip, routing, and firewall rules.</Note>
 
 ### Step 2 - Create Cloud SQL
 1. Navigate to `SQL` and select `Create Instance`.
@@ -43,6 +45,9 @@ Private Service Connect enablement is not currently supported in the GCP console
 
 ### Step 3 - Enable Private Service Connect
 1. Use the `gcloud` CLI to edit the Cloud SQL instance. When patching the Cloud SQL instance, you must specify the allowed consumer project id(s) that will be used to consume the instance.
+<Note>
+To find the appropriate consumer project id, please contact support@controlplane.com.
+</Note>
 2. Use the following `gcloud` command:
 ```bash
 gcloud sql instances patch INSTANCE_NAME \
@@ -56,4 +61,352 @@ If you need to change the allowed consumer projects in the future, use the same 
 ### Next Steps
 
 - Once your Cloud SQL instance is created with PSC enabled, you can find your service attachment under `Connections` in your instance.
+- Contact <a href="mailto:support@mintlify.com">support@controlplane.com</a> with your service attachment and region.
+- Control Plane will use this service attachment to create the PSC endpoint on the consumer end in order for your workload to securely connect to the Cloud SQL.
+
+## Create using Terraform
+
+### Prerequisites
+
+- [Google Cloud Platform (GCP)](https://cloud.google.com/) account.
+- Install the [Terraform CLI](https://developer.hashicorp.com/terraform/install)
+- Existing GCP project
+- Ensure the user performing the tasks has one of the following permissions
+    - `Owner` (if you are the owner of the project)
+    - `Service Usage Admin`, `Cloudsql Admin`, and `Compute Network Admin` (minimum permissions required)
+
+### Step 1 - Create a Working Directory
+
+1. Create and navigate to a folder for your Terraform files:
+```bash
+mkdir cloudsql-setup
+cd cloudsql-setup
+```
+
+### Step 2 -  Define Terraform Configuration Files
+
+1. Create a file which will contain the following terraform to enable all necessary APIs.
+```hcl api-enablement.tf
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+resource "google_project_service" "cloud_resource_manager" {
+  project = var.project_id
+  service = "cloudresourcemanager.googleapis.com"
+}
+
+resource "google_project_service" "compute_engine" {
+  project = var.project_id
+  service = "compute.googleapis.com"
+  depends_on = [google_project_service.cloud_resource_manager]
+}
+
+resource "google_project_service" "sql_admin" {
+  project = var.project_id
+  service = "sqladmin.googleapis.com"
+  depends_on = [google_project_service.cloud_resource_manager]
+}
+
+resource "google_project_service" "service_networking" {
+  project = var.project_id
+  service = "servicenetworking.googleapis.com"
+  depends_on = [google_project_service.cloud_resource_manager]
+}
+```
+
+2. Create a file with the following terraform to create the necessary infrastructure around the cloud sql instance. Adjust the firewall rules as needed.
+
+<Note>A subnet is not required for PSC with Cloud SQL. Cloud SQL lives in Google's managed data center and the VPC is only required for using a private ip, routing, and firewall rules.</Note>
+
+
+```hcl infrastructure.tf
+resource "google_compute_network" "producer_vpc" {
+  name                    = "producer-vpc"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_firewall" "default_allow_internal" {
+  name    = "producer-allow-internal"
+  network = google_compute_network.producer_vpc.name
+
+  allow {
+    protocol = "tcp"
+  }
+  allow {
+    protocol = "udp"
+  }
+  allow {
+    protocol = "icmp"
+  }
+
+  source_ranges = var.internal_firewall_source_ranges
+}
+
+resource "google_compute_firewall" "default_allow_ssh" {
+  name    = "producer-allow-ssh"
+  network = google_compute_network.producer_vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+}
+
+resource "google_compute_global_address" "psc_ip_range" {
+  name          = var.psc_ip_range_name
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = var.psc_ip_range_prefix_length
+  network       = google_compute_network.producer_vpc.id
+}
+
+resource "google_service_networking_connection" "private_vpc_connection" {
+  network                 = google_compute_network.producer_vpc.id
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.psc_ip_range.name]
+}
+
+output "vpc_self_link" {
+  description = "The self link of the created VPC"
+  value       = google_compute_network.producer_vpc.self_link
+}
+```
+
+3. Create a file for the creation of the Cloud SQL instance. Adjust configuration settings as needed.
+
+<Warning>
+For Private Service Connect to be configured, it is required that:
+- ```ipv4_enabled``` is set to ```false```
+- ```psc_config``` is set up with ```psc_enabled``` as ```true```
+</Warning>
+
+``` hcl cloudsql.tf
+resource "google_sql_database_instance" "producer_sql" {
+  name             = var.instance_id
+  database_version = var.database_version
+  region           = var.region
+  project          = var.project_id
+
+  settings {
+    tier = var.tier
+    availability_type = "REGIONAL"
+
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = var.producer_vpc_self_link
+      ssl_mode     = "ALLOW_UNENCRYPTED_AND_ENCRYPTED"
+
+      psc_config {
+        psc_enabled                 = true
+        allowed_consumer_projects  = var.allowed_consumer_project_ids
+      }
+    }
+
+    backup_configuration {
+      enabled     = var.backup_enabled
+      start_time  = var.backup_start_time
+    }
+
+    maintenance_window {
+      day          = var.maintenance_day
+      hour         = var.maintenance_hour
+      update_track = var.maintenance_update_track
+    }
+
+    deletion_protection_enabled = var.deletion_protection
+  }
+
+  deletion_protection = var.deletion_protection
+}
+
+resource "google_sql_database" "database" {
+  name     = "mydb"
+  instance = google_sql_database_instance.producer_sql.name
+  project  = var.project_id
+}
+
+resource "google_sql_user" "users" {
+  name     = "postgres"
+  instance = google_sql_database_instance.producer_sql.name
+  password = var.db_password
+  project  = var.project_id
+}
+
+output "service_attachment_uri" {
+  description = "The service attachment URI for PSC"
+  value       = google_sql_database_instance.producer_sql.psc_service_attachment_link
+}
+```
+
+4. Create a file to specify each input variable.
+
+```hcl variables.tf
+variable "project_id" {
+  type        = string
+  description = "Your GCP project ID"
+}
+
+variable "region" {
+  type        = string
+  description = "Region to deploy resources"
+}
+
+variable "psc_ip_range_name" {
+  type        = string
+  default     = "psc-ip-range"
+}
+
+variable "psc_ip_range_prefix_length" {
+  type        = number
+  default     = 16
+}
+
+variable "internal_firewall_source_ranges" {
+  type        = list(string)
+  default     = ["10.0.0.0/8"]
+}
+
+variable "producer_vpc_self_link" {
+  type        = string
+  description = "The self-link of the VPC created (fill after infra apply)"
+}
+
+variable "allowed_consumer_project_ids" {
+  type = list(string)
+}
+
+variable "instance_id" {
+  type    = string
+  default = "producer-sql"
+}
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+  default   = "postgres"
+}
+
+variable "tier" {
+  type    = string
+  default = "db-f1-micro"
+}
+
+variable "database_version" {
+  type    = string
+  default = "POSTGRES_17"
+}
+
+variable "deletion_protection" {
+  type    = bool
+  default = false
+}
+
+variable "backup_enabled" {
+  type    = bool
+  default = true
+}
+
+variable "backup_start_time" {
+  type    = string
+  default = "02:00"
+}
+
+variable "maintenance_day" {
+  type    = number
+  default = 7
+}
+
+variable "maintenance_hour" {
+  type    = number
+  default = 2
+}
+
+variable "maintenance_update_track" {
+  type    = string
+  default = "stable"
+}
+```
+
+### Step 3 - Create a Terraform Variable File
+
+- This file will define your specific values for each variable. Replace each value with your own. The ```producer_vpc_self_link``` will be inserted after the ```infrastructure.tf``` file is applied.
+
+<Note>
+To find the appropriate consumer project id, please contact <a href="mailto:support@mintlify.com">support@controlplane.com</a>.
+</Note>
+
+<Warning>
+Ensure the region specified matches the region in your Control Plane workload. If the regions are not the same, the Private Service Connection will fail.
+</Warning>
+
+```hcl terraform.tfvars
+project_id                    = "your-gcp-project-id"
+region                        = "your-region"
+allowed_consumer_project_ids  = ["consumer-project-id"]
+db_password                   = "your-password"
+producer_vpc_self_link        = ""
+```
+
+### Step 4 - Initialize Terraform
+
+```bash
+terraform init
+```
+
+### Step 5 - Enable GCP APIs
+
+```bash
+terraform apply \
+  -target=google_project_service.cloud_resource_manager \
+  -target=google_project_service.compute_engine \
+  -target=google_project_service.sql_admin \
+  -target=google_project_service.service_networking \
+  -var-file=terraform.tfvars
+```
+
+### Step 6 - Create infrastructure
+
+```bash
+terraform apply \
+  -target=google_compute_network.producer_vpc \
+  -target=google_compute_firewall.default_allow_internal \
+  -target=google_compute_firewall.default_allow_ssh \
+  -target=google_compute_global_address.psc_ip_range \
+  -target=google_service_networking_connection.private_vpc_connection \
+  -var-file=terraform.tfvars
+```
+
+### Step 7 - Update ```terraform.tfvars```
+
+- Look for ```vpc_self_link``` output and copy/paste that value to your ```terraform.tfvars```
+```hcl terraform.tfvars
+producer_vpc_self_link = "paste-the-vpc-self-link-here"
+```
+
+### Step 8 - Deploy Cloud SQL
+```bash
+terraform apply \
+  -target=google_sql_database_instance.producer_sql \
+  -target=google_sql_database.database \
+  -target=google_sql_user.users \
+  -var-file=terraform.tfvars
+```
+
+### Next Steps
+
+- Once your Cloud SQL instance is created with PSC enabled, your service attachment will be returned in the terraform output.
+- Contact <a href="mailto:support@mintlify.com">support@controlplane.com</a> with your service attachment and region.
 - Control Plane will use this service attachment to create the PSC endpoint on the consumer end in order for your workload to securely connect to the Cloud SQL.
