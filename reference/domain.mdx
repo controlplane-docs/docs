@@ -10,6 +10,10 @@ Domains are scoped to an [Org](/reference/org) and are associated with **one** [
 
 Domains that are configured at Control Plane are automatically secured using TLS certificates, load balanced, and DNS geo-routed to the nearest healthy [location](/reference/location) assigned to the [GVC](/reference/gvc).
 
+### Domain Name Validation
+
+Domain names must be valid domain names with TLDs allowed. The domain name validation follows standard DNS domain name rules.
+
 ## Default Domain Names
 
 If a Domain is not mapped to a [GVC](/reference/gvc), the default domain names provided to [Workloads](/concepts/workload) are:
@@ -20,6 +24,63 @@ If a Domain is not mapped to a [GVC](/reference/gvc), the default domain names p
 ## Configure a Domain
 
 Refer to the [Configure a Domain](/guides/configure-domain) guide for additional details.
+
+## Domain Configuration Example
+
+Here's a comprehensive example of a domain configuration:
+
+```yaml
+kind: domain
+name: my-domain
+spec:
+  dnsMode: cname # or "ns"
+  certChallengeType: http01 # or "dns01"
+  gvcLink: //gvc/my-gvc
+  ports:
+    - number: 443
+      protocol: http2
+      tls:
+        minProtocolVersion: TLSV1_2
+        cipherSuites:
+          - ECDHE-ECDSA-AES256-GCM-SHA384
+          - ECDHE-RSA-AES256-GCM-SHA384
+        clientCertificate:
+          secretLink: //secret/client-ca-cert
+        serverCertificate:
+          secretLink: //secret/server-cert
+      cors:
+        allowCredentials: true
+        maxAge: 24h
+        allowOrigins:
+          - exact: https://example.com
+          - regex: "https://.*\\.example\\.com"
+        allowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+        allowHeaders:
+          - Authorization
+          - Content-Type
+        exposeHeaders:
+          - X-Custom-Header
+      routes:
+        - prefix: /api/
+          replacePrefix: /v2/api/
+          port: 443
+          workloadLink: //gvc/my-gvc/workload/api-service
+          headers:
+            request:
+              set:
+                X-Custom-Header: "value"
+                X-Client-IP: "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%"
+        - prefix: /web
+          port: 3000
+          workloadLink: //gvc/my-gvc/workload/web-service
+        - prefix: /
+          port: 8080
+          workloadLink: //gvc/my-gvc/workload/default-service
+```
 
 ## Domain Verification
 
@@ -34,11 +95,13 @@ If multiple [Orgs](/reference/org) are creating subdomains using the same apex d
 
 ## Hostname Behavior
 
-The hostname (`HOST`) environment variable that will be set on a running workload will be based on the type of Workload and which domain was used for the request.
+The `Host` header that will be sent in the request to the target workload will depend on the type of Workload and which domain was used for the request.
 
-For **serverless** workloads, even if the request was served using a custom domain, the hostname will be the canonical name.
+For **serverless** workloads, even if the request was served using a custom domain, the `Host` header will be the canonical endpoint of the workload.
 
-For **standard** or **stateful** workloads, the hostname will be set to the name of domain used for the request.
+For **standard** or **stateful** workloads, the `Host` header will be the name of domain used for the request.
+
+Whenever the `Host` header is manipulated, the `X-Forwarded-Host` header will be appended with the original `Host` from the request.
 
 ## Routing Modes
 
@@ -51,7 +114,7 @@ Control Plane provides two routing modes for directing requests to your domain:
 
 Path based routing allows requests to a specific path prefix be routed to a specific workload. Multiple paths can be defined, but there must be at least one path.
 
-This is accomplished by adding a **CNAME** record to DNS.
+This is accomplished by adding a **CNAME** record to DNS and configuring the domain with `dnsMode: cname`.
 
 Advantages of using Path Based routing:
 
@@ -64,11 +127,11 @@ Advantages of using Path Based routing:
   - **https://sub.example.com/workload_one**
   - **https://sub.example.com/workload_two**
 
-<Note>All path prefix values must be unique and there must be at least one path defined.</Note>
+<Note>All path prefix values must be unique and there must be at least one path defined. Routes are automatically sorted by prefix length (longest first), then by host prefix length, then by trailing slash preference.</Note>
 
 #### Path Prefix Replacement
 
-A path prefix can be configured to be replaced when forwarding the request to the [Workload](/concepts/workload).
+The `replacePrefix` property allows a path prefix to be replaced when forwarding the request to the [Workload](/concepts/workload).
 
 **For example:** A request to the URL `https://sub.example.com/users/` can have the path prefix `/users/` replaced with the path prefix `/v2/users/`
 when forwarding the request internally to the target [Workload](/concepts/workload).
@@ -92,11 +155,40 @@ ALL requests.
 
 #### Port Selection
 
-Each route can have a port assigned which will route requests to the respective port at the running workload.
+The `port` property allows each route to specify a port that will route requests to the respective port at the running workload.
 
 For **serverless** workloads, assigning the port is optional since only one port can serve traffic.
 
 For **standard** and **stateful** workloads that serve traffic on multiple ports, specific ports can be assigned on a route. If no port is assigned, external requests will be routed to the first port configured on the container.
+
+#### Replica Selection
+
+The `replica` property allows **stateful** workloads with replicaDirect enabled to specify a replica number to route traffic directly to a specific replica. The replica number must be an integer greater than or equal to 0.
+
+If no replica is specified, traffic will be routed to all replicas of the workload.
+
+#### Header Operations
+
+The `headers` property allows routes to be configured to manipulate HTTP headers for all requests to that route. Header operations allow you to set or override headers before forwarding requests to the workload.
+
+**Supported Operations:**
+- **`set`**: Sets or overrides headers to all HTTP requests for this route
+
+**Header Value Wildcards:**
+Header values support the following wildcards:
+- `%REQUESTED_SERVER_NAME%`: The server name requested by the client
+- `%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%`: The client IP address without port
+- `%START_TIME%`: The request start time
+
+**Example:**
+```yaml
+headers:
+  request:
+    set:
+      X-Custom-Header: "value"
+      X-Client-IP: "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%"
+      X-Server-Name: "%REQUESTED_SERVER_NAME%"
+```
 
 <Note>
 
@@ -111,13 +203,13 @@ Instead of specifying routes based on a path prefix, paths can be specified usin
 
 **For example:** A path regex can be specified as: `/user/.*/profile` to match routes like: `/user/bob/profile` or `/user/mary/profile`
 
-<Note>If at least one regex path is found, routes will not be sorted.</Note>
+<Note>If at least one regex path is found, routes will not be sorted. You must specify either a prefix OR regex for each route, but not both.</Note>
 
 ### Subdomain Based Routing
 
 Subdomain based routing allows a domain to be mapped to all workloads in a [GVC](/reference/gvc).
 
-The is accomplished by adding **NS** records to DNS which delegate DNS to Control Plane for this domain **only**.
+This is accomplished by adding **NS** records to DNS which delegate DNS to Control Plane for this domain **only** and configuring the domain with `dnsMode: ns`.
 
 Advantages of using Subdomain routing:
 
@@ -132,6 +224,29 @@ Advantages of using Subdomain routing:
   - **https://workload_one.sub.example.com**
   - **https://workload_two.sub.example.com**
 
+## DNS Modes
+
+Control Plane supports two DNS modes for domain configuration:
+
+### CNAME Mode (`dnsMode: cname`)
+
+In CNAME mode, Control Plane will configure workloads to accept traffic for the domain but will not manage DNS records for the domain. End users configure CNAME records in their own DNS pointed to the canonical workload endpoint.
+
+**Certificate Challenge Types:**
+- `certChallengeType: http01`: Uses HTTP-01 challenge for certificate validation
+- `certChallengeType: dns01`: Uses DNS-01 challenge for certificate validation
+
+<Note>When using CNAME mode with subdomain based routing (`gvcLink`), a custom server certificate must be configured for all ports that enable TLS.</Note>
+
+### NS Mode (`dnsMode: ns`)
+
+In NS mode, Control Plane will manage the subdomains and create all necessary DNS records. End users configure an NS record to forward DNS requests to the Control Plane managed DNS servers.
+
+**Certificate Challenge Types:**
+- `certChallengeType: dns01`: Uses DNS-01 challenge for certificate validation (only supported option)
+
+<Note>HTTP-01 challenge type is not supported for domains with NS mode.</Note>
+
 ## APEX Domain Considerations
 
 - An apex domain (e.g., **example.com**) can serve requests to Workloads using
@@ -140,6 +255,8 @@ Advantages of using Subdomain routing:
 - If subdomain based routing is desired, a [Custom Server Certificate](#custom-server-certificate) must be configured.
 
 - If your DNS provider does not allow apex domains to point to a CNAME record, a service such as [CloudFront](https://docs.aws.amazon.com/cloudfront/index.html) or [Cloudflare](https://cloudflare.com) must be used to proxy the apex domain to Control Plane.
+
+- Apex domains can only use CNAME mode (`dnsMode: cname`).
 
 <Tip>
 
@@ -156,27 +273,37 @@ Using the UI console, the port configuration section can be accessed when editin
 
 ### External Port
 
-Typically, TLS requests to a configured domain are served on the standard TLS port 443.
+The `number` property specifies the external port number. Typically, TLS requests to a configured domain are served on the standard TLS port 443.
+
+**Default Configuration:**
+- Port number: `443` (default)
+- Protocol: `http2` (default)
 
 Refer to the [dedicated load balancer](#dedicated-load-balancer-options) section on which external ports can be used if dedicated load balancing is enabled.
 
 ### Protocol
 
-The following protocols are supported:
+The `protocol` property specifies the protocol used for the port. The following protocols are supported:
 
-1. **HTTP2**
-1. **HTTP**
-1. **TCP** (when using a [dedicated load balancer](#dedicated-load-balancer-options))
+1. **`http2`** (default)
+1. **`http`**
+1. **`tcp`** (when using a [dedicated load balancer](#dedicated-load-balancer-options))
 
 ### TLS Settings
 
-The default TLS protocol version is **1.2**. The minimum TLS protocol version is **1.0**.
+The default TLS protocol version is **`minProtocolVersion: TLSV1_2`**. The minimum TLS protocol version is **`TLSV1_0`**.
 
-The minimum version should be set as high as possible, with a maximum supported value of **1.3**. All modern browsers support the default of **1.2**.
+The minimum version should be set as high as possible, with a maximum supported value of **`TLSV1_3`**. All modern browsers support the default of **`TLSV1_2`**.
+
+Supported TLS protocol versions:
+- **`TLSV1_3`** (TLS 1.3)
+- **`TLSV1_2`** (TLS 1.2) - Default
+- **`TLSV1_1`** (TLS 1.1)
+- **`TLSV1_0`** (TLS 1.0)
 
 #### Cipher Suites
 
-The following cipher suites are added by default and can be removed / re-added:
+The `cipherSuites` property configures the allowed cipher suites for TLS connections. The following cipher suites are added by default and can be removed / re-added:
 
 1. ECDHE-ECDSA-AES256-GCM-SHA384
 1. ECDHE-ECDSA-CHACHA20-POLY1305
@@ -205,11 +332,11 @@ If there is an attempt to disable the TLS settings on a domain, it will always r
 
 #### Client Certificate Forwarding
 
-Client certificates included in a request to a Domain can be configured to be forwarded to the destination [Workload](/concepts/workload).
+The `clientCertificate` property configures client certificate forwarding for TLS connections. Client certificates included in a request to a Domain can be configured to be forwarded to the destination [Workload](/concepts/workload).
 
 The `x-forwarded-client-cert` (XFCC) HTTP header will contain the client certificate details.
 
-The certificate authority PEM, stored as a [TLS Secret](/reference/secret#tls), can be associated with the Domain and used to verify the authority of the client certificate. The only verification performed checks that the CN of the PEM matches the Domain (i.e., **CN=\*.DOMAIN**).
+The certificate authority PEM, stored as a [Secret](/reference/secret) of type `keypair`, can be associated with the Domain via the `secretLink` property and used to verify the authority of the client certificate. The secret must contain a client certificate authority cert in PEM format used to verify requests which include client certificates. The key subject must match the domain and the key usage properties must be configured for client certificate authorization.
 
 If a certificate authority PEM is not associated with a Domain, no verification is performed.
 
@@ -229,13 +356,15 @@ Verify that the CA certificate includes the correct x509 key usage fields (criti
 
 #### Custom Server Certificate
 
-A Custom Server Certificate can be assigned to a Domain by selecting an existing [TLS secret](/reference/secret#tls).
+The `serverCertificate` property configures a custom server certificate for the domain. A Custom Server Certificate can be assigned to a Domain by selecting an existing [Secret](/reference/secret) of type `keypair` via the `secretLink` property.
 
 This certificate is used when configuring:
 
 1. An apex domain that is configured with [subdomain based routing](#subdomain-based-routing).
 2. A domain that is fronted by a proxy (such as CloudFlare).
 3. A domain that prefers not to use a certificate generated by Control Plane.
+
+The secret must contain PEM encoded content and be of type `keypair`. When the port number is 443 and this is not supplied, a certificate is provisioned automatically.
 
 <Tip>
 
@@ -257,21 +386,24 @@ The following are CORS properties that are configurable on the domain. Depending
 
 The following CORS properties can be configured:
 
-- **Allow Credentials**
+- **`allowCredentials`**
   - Determines whether the client-side code (typically running in a web browser) is allowed to include credentials (such as cookies, HTTP authentication, or client-side SSL certificates) in cross-origin requests.
-- **Max Age**
-  - Maximum amount of time, in seconds, that a preflight request result can be cached by the client browser. (Default: 24 hours)
-- **Allow Origins**
+- **`maxAge`**
+  - Maximum amount of time that a preflight request result can be cached by the client browser. Must match the regex pattern: `^[\d\.]+[wdhm]+$` (e.g., "24h", "1d", "3600s")
+- **`allowOrigins`**
   - Determines which origins are allowed to access a particular resource on a server from a web browser.
+    - Each origin can be specified as either:
+      - `exact`: A specific origin string (e.g., `https://example.com`)
+      - `regex`: A regex pattern to match origins
     - Examples:
       - Wildcard Origin: `*`
       - Specific Origin: `https://example.com`
-- **Allow Methods**
+- **`allowMethods`**
   - Specifies the HTTP methods (such as GET, POST, PUT, DELETE, etc.) that are allowed for a cross-origin request to a specific resource.
-- **Allow Headers**
-  - Specifies the custom HTTP headers that are allowed in a cross-origin request to a specific resource.
-- **Expose Headers**
-  - Specifies which response headers are exposed to the client-side code (typically running in a web browser) in a cross-origin request.
+- **`allowHeaders`**
+  - Specifies the custom HTTP headers that are allowed in a cross-origin request to a specific resource. Header names are automatically converted to lowercase.
+- **`exposeHeaders`**
+  - Specifies which response headers are exposed to the client-side code (typically running in a web browser) in a cross-origin request. Header names are automatically converted to lowercase.
 
 ## Dedicated Load Balancer Options
 
@@ -281,7 +413,7 @@ See the [GVC dedicated load balancer](/reference/gvc#dedicated-load-balancer) re
 
 ### NumTrustedProxies
 
-This gives control over the number of trusted proxies that are configured in front of Control Plane.
+The `numTrustedProxies` property gives control over the number of trusted proxies that are configured in front of Control Plane.
 
 Changing it, controls the source ip address used for request logging, firewall settings and for the X-Envoy-External-Address header passed to workloads.
 
@@ -293,19 +425,19 @@ When set to 2, any request where the XFF header does not have at least two addre
 
 ### Custom Ports
 
-The following external ports may be configured instead of only `443` and `80`.
+Any custom port number can be used with the exception of the following excluded ports:
 
-- 1443
-- 3000
-- 3001
-- 3002
-- 3003
-- 3004
-- 5912
-- 8443
-- 8444
-- 50051
-- 50052
+- 8012
+- 8022
+- 9090
+- 9091
+- 15000
+- 15001
+- 15006
+- 15020
+- 15021
+- 15090
+- 41000
 
 Please contact support on Slack or email [support@controlplane.com](mailto:support@controlplane.com) if you need to use a port that is not listed here.
 
@@ -313,18 +445,37 @@ Please contact support on Slack or email [support@controlplane.com](mailto:suppo
 
 When a dedicated load balancer is enabled on a GVC, the domains that are configured to serve workloads within that GVC will have the following options that can be configured:
 
-1. [Accept All Hosts](#accept-all-hosts)
-1. [Host Prefix](#host-prefix)
+1. [`acceptAllHosts`](#acceptallhosts)
+1. [`acceptAllSubdomains`](#acceptallsubdomains)
+1. [`hostPrefix`](#hostprefix)
+1. [`hostRegex`](#hostregex)
 
-#### Accept All Hosts
 
-`Accept All Hosts` configures the domain to allow all traffic (i.e. wildcard support) to the configured workloads, regardless of what the Host header or SNI is for the request.
+#### acceptAllHosts
 
-#### Host Prefix
+The `acceptAllHosts` property configures the domain to allow all traffic (i.e. wildcard support) to the configured workloads, regardless of what the Host header or SNI is for the request. There should only ever be at most one Domain configured with this setting for a single GVC. If there are multiple, then requests will only route for one of the two Domains.
 
-For domains using [Path Based Routing](#path-based-routing) the `Host Prefix` will be enabled and can be used for each path when the domain has the `Accept All Hosts` property enabled.
+#### acceptAllSubdomains
 
-This option allows forwarding traffic for different host headers to specific workloads.
+The `acceptAllSubdomains` property configures the domain to allow all traffic to `*.${Domain}` for the domain. No other Domains in the same GVC should be configured for any subdomains of this Domain since their routing rules will be ignored.
+
+#### hostPrefix
+
+For domains using [Path Based Routing](#path-based-routing) the `hostPrefix` property will be enabled and can be used for each path when the domain has the `acceptAllHosts` or `acceptAllSubdomains` property enabled.
+
+This option allows forwarding traffic for different host header prefixes to specific workloads.
+
+The host prefix must match the regex pattern: `^[0-9a-zA-Z-\._]*$`
+
+<Note>You cannot use both `hostPrefix` and `hostRegex` on the same route.</Note>
+
+#### hostRegex
+
+For domains using [Path Based Routing](#path-based-routing) the `hostRegex` property will be enabled and can be used for each path when the domain has the `acceptAllHosts` or `acceptAllSubdomains` property enabled.
+
+This option allows forwarding traffic for different host headers to specific workloads by regular expression.
+
+<Note>You cannot use both `hostPrefix` and `hostRegex` on the same route.</Note>
 
 ## Replica Direct Routing
 
@@ -335,7 +486,13 @@ These links will direct traffic directly to the specified replica of a workload.
 
 To configure a Domain for replica direct routing, you need to set the `workloadLink` property on the Domain to the link of the workload.
 The domain will also need to be configured as a `cname` domain with the `dns01` cert challenge type.
-The domain needs at least one port with at least one route to work.
+The domain needs at least one port with exactly one route per port.
+
+**Validation Rules:**
+- When `workloadLink` is configured, `certChallengeType` cannot be `http01`
+- Every port must have exactly one route
+- All routes must reference the same workload as the domain's `workloadLink`
+- The domain cannot have both `gvcLink` and `workloadLink` configured
 
 #### Example
 
@@ -395,6 +552,56 @@ The permissions below are used to define [policies](/reference/policy) together 
 
 Displays the permissions granted to principals for the domain.
 
+## Domain Status
+
+The domain status field indicates the current state of the domain configuration and deployment.
+
+**Supported Status Values:**
+- `initializing`: Domain is being set up
+- `ready`: Domain is fully configured
+- `pendingDnsConfig`: Waiting for DNS configuration to be verified, this may happen if DNS is updated but has not yet propagated
+- `pendingCertificate`: Waiting for certificate provisioning
+- `usedByGvc`: Domain is being used by a GVC with legacy configuration
+- `warning`: Domain has configuration warnings
+- `errored`: Domain configuration has errors
+
+**Status Fields:**
+- `endpoints`: Array of endpoint URLs and their associated workload links
+- `warning`: Warning message describing any issues
+- `locations`: Array of location-specific certificate status information
+- `fingerprint`: Unique identifier for the domain configuration
+- `dnsConfig`: Array of DNS configuration records required for the domain
+
+### DNS Configuration Records
+
+The `dnsConfig` field contains the DNS records that need to be configured for the domain to function properly.
+
+**DNS Record Structure:**
+- `type`: DNS record type (e.g., "CNAME", "NS", "TXT")
+- `ttl`: Time to live value (positive integer)
+- `host`: Hostname for the DNS record
+- `value`: DNS record value
+
+**Example DNS Configuration:**
+```json
+{
+  "dnsConfig": [
+    {
+      "type": "CNAME",
+      "ttl": 300,
+      "host": "sub.example.com",
+      "value": "cpln.app"
+    },
+    {
+      "type": "TXT",
+      "ttl": 300,
+      "host": "_acme-challenge.sub.example.com",
+      "value": "challenge-token-value"
+    }
+  ]
+}
+```
+
 ## CLI
 
 To view the CLI documentation for domains, [click here](/reference/cli#domain).
@@ -426,6 +633,35 @@ If you prefer to use a different certificate authority, you can configure a [cus
   disruptions.
 </Note>
 
+## Domain Validation Rules
+
+The following validation rules apply to domain configuration:
+
+### Route Limits
+- Maximum of 150 routes per domain
+- Routes must be unique (no duplicate prefix/regex and host combinations)
+- All routes must reference workloads within the same GVC
+
+### Port Configuration Limits
+- Maximum of 10 ports per domain
+- Each port can have a maximum of 150 routes
+
+### DNS Mode Constraints
+- Apex domains can only use CNAME mode (`dnsMode: cname`)
+- NS mode requires DNS-01 certificate challenge type
+- CNAME mode with subdomain routing requires custom server certificate
+
+### Workload Link Constraints
+- Cannot configure both `gvcLink` and `workloadLink` on the same domain
+- When `workloadLink` is configured:
+  - Cannot use HTTP-01 certificate challenge type
+  - Every port must have exactly one route
+  - All routes must reference the same workload
+
+### Wildcard Support Constraints
+- Cannot enable both `acceptAllHosts` and `acceptAllSubdomains` simultaneously
+- `hostPrefix` and `hostRegex` can only be used when `acceptAllHosts` or `acceptAllSubdomains` is enabled
+
 ## Domain Configuration Errors
 
 During the Domain configuration process, several errors might occur.
@@ -442,8 +678,6 @@ Below are some common issues and their implications:
   ```bash
   curl -v https://${domain}/.well-known/acme-challenge/
   ```
-
-````
 
 If the request is blocked, you will see an error message in the response, the request will hang, or the `location:` in the response will NOT be targeted to `http01-solver.cpln.io`.
 
