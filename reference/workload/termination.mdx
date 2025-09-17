@@ -2,28 +2,81 @@
 title: Termination Sequence
 ---
 
-The termination sequence ensures a controlled and graceful process for removing workload replicas from the load balancer pool and handling container termination. The use of a preStop hook, either default or custom, can be leveraged to manage termination and connections as per the workload's requirements.
+The termination sequence provides a controlled and graceful process for removing workload replicas from the load balancer pool and handling container termination. This process uses preStop hooks (either default or custom) to manage termination timing and ensure proper connection handling based on your workload's specific requirements.
 
-Termination occurs most often when a workload is being scaled down or when an old version of the workload is taken offline after a successful update to a new version. In rare cases, maintenance activities can cause workload replicas to be rescheduled and terminated.
+## When Termination Occurs
 
-The steps below are performed for each replica of the workload.
+Workload termination typically happens in these scenarios:
 
-1. Load Balancer Update: At the initiation of workload termination, load balancers are sent a command to remove the workload replica from the pool.
+- **Scaling down**: When reducing the number of workload replicas
+- **Version updates**: When replacing an old version with a new version after a successful deployment
+- **Capacity AI**: Regular rollouts similar to version updates when [Capacity AI](/reference/workload/capacity) is enabled
+- **Maintenance**: Rare cases where maintenance activities require workload replicas to be rescheduled
 
-2. Workload Sidecar and Containers Termination: The workload sidecar (managed by Control Plane) and all other workload containers are sent a command to begin their termination process. This happens at nearly the same time as step 1.
+## Termination Process Overview
 
-3. Load Balancer Routing: Once the load balancer is updated, any new incoming requests will be routed to the remaining healthy workload replicas for the workload.
+The following steps are performed for each workload replica. The shutdown process occurs simultaneously across all containers in a workload, with default configurations ensuring that in-flight requests complete and load balancers update before containers receive shutdown signals.
 
-4. Sidecar Monitoring: The sidecar managed by Control Plane continues to monitor network activity. It will remain running until no more active requests exist and connections terminate, for a maximum duration of up to 90 seconds.
+**Termination Grace Period**: By default, `spec.rolloutOptions.terminationGracePeriodSeconds` is set to `90` seconds. This controls the total time available for the workload replica to shutdown gracefully before all containers receive a SIGKILL signal.
 
-5. Default PreStop Hook: If no customer-defined preStop hook is provided, a default preStop hook is applied to all workload containers. This default hook consists of the "sleep" command with a duration of 45 seconds. Once the sleep command completes, the container is sent a SIGTERM signal and allowed to gracefully shutdown for an additional 45 seconds before receiving a SIGKILL signal.
+### 1. Load Balancer Update
+
+At the start of workload termination, load balancers receive a command to remove the workload replica from the pool. This update process typically takes a few seconds but can take up to 10 seconds. Once updated, new incoming requests are routed to the remaining healthy replicas.
+
+### 2. Workload Sidecar and Container Termination
+
+The workload sidecar (managed by Control Plane) and all other workload containers receive commands to begin their termination process. This occurs nearly simultaneously with the load balancer update.
+
+## Sidecar Termination Process
+
+The Control Plane-managed sidecar shutdown process consists of three sequential phases: **Hold** → **Monitoring** → **Drain**.
+
+### Phase 1: Sidecar Hold
+
+The sidecar continues running normally for 80 seconds by default. This is calculated as 10 seconds less than the termination grace period, which defaults to 90 seconds. The termination grace period can be adjusted in the workload rollout options. As an example, if the termination grace period is reduced the 10 seconds or less, the sidecar hold period would be 0 seconds.
+
+### Phase 2: Sidecar Monitoring
+
+The Control Plane-managed sidecar continues monitoring inbound and outbound network activity from workload containers. The sidecar remains running and waits to drain until no active requests exist. This phase can continue until the termination grace period expires or until no more connections are found.
+
+### Phase 3: Sidecar Drain
+
+In the drain phase, the sidecar stops accepting new connections and once again verifies that all existing connections are complete. Once all connections are completed, the sidecar shuts down.
+
+## Workload Container Termination Process
+
+### Default PreStop Hook
+
+If no custom preStop hook is defined for workload containers, a default preStop hook is applied that executes `sh -c "sleep 45"` to pause the shutdown process. The sleep duration is set to half of the `terminationGracePeriodSeconds` (default: 90 seconds = 45 seconds sleep). After the sleep completes, the container receives a SIGINT signal and has the remaining half of the termination grace period to shutdown gracefully before receiving a SIGKILL signal.
 
 <Warning>
 
-If the "sleep" executable is not available in the customer's workload container, the container will be sent a graceful termination signal immediately. Requests might still reach it before the load balancer is fully updated.
+**Missing sleep executable**: If the `sleep` executable is not available in any of your workload containers, ALL the containers for the replica being shutdown will receive a SIGKILL termination signal immediately. Requests may still attempt to reach the containers and fail before the load balancer is fully updated.
 
 </Warning>
 
-6. Custom PreStop Hook (Optional): It is recommended to add a custom preStop hook only if specific custom logic is required, such as gracefully terminating connections that would not otherwise terminate. If a custom preStop hook is implemented, ensure it includes a delay or a check for existing requests before exiting. Once the preStop hook completes the container will receive a signal to terminate gracefully (SIGTERM) and will have up to 90 seconds from the start of the shutdown process to complete.
+### Custom PreStop Hook (Optional)
 
-Please note that implementing a custom preStop hook is only advisable when additional logic is necessary for your specific workload termination needs.
+Consider implementing a custom preStop hook only if your workload requires specific termination logic, such as:
+
+- Ensuring connections are gracefully terminated
+- Managing shutdown delays when `sh` and `sleep` binaries are unavailable in the container
+- Implementing custom request handling during shutdown
+
+**Important**: If you implement a custom preStop hook, ensure it includes a delay or checks for ongoing requests before exiting. This allows external load balancers sufficient time to update. After the preStop hook completes, the container receives a SIGINT signal to terminate gracefully, with the full `terminationGracePeriodSeconds` (default: 90 seconds) allocated from the start of the shutdown process.
+
+<Warning>
+
+**PreStop hook errors**: If a custom preStop hook for any container throws an error, then ALL containers will immediately receive a SIGKILL signal.
+
+</Warning>
+
+<Note>
+
+**Serverless workloads**: For serverless workloads, the termination grace period is currently limited by the [timeoutSeconds](/reference/workload/general#timeout-seconds) in workload options. This restriction will be removed in a future update.
+
+</Note>
+
+## Summary
+
+Implementing a custom preStop hook is only recommended when additional logic is necessary for your specific workload termination requirements. The default preStop hook provides adequate termination handling for most use cases.
