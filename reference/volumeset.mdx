@@ -24,45 +24,151 @@ The shared filesystem does not support:
   - `deleteVolumeSnapshot`
   - `restoreVolume`
   - `deleteVolume`
+  - `shrinkVolume`
 
 ### Capacity and Billing
 
 - When a volume is created, it will have an initial capacity defined by the spec of your volume set.
 - Volume capacity can be increased by sending an `expandVolume` command.
-- Volume capacity cannot be decreased.
+- Volume capacity can be decreased using the `shrinkVolume` command, but this causes data loss (see [Volume Shrinkage](#volume-shrinkage) below).
 - The bill for a volume set is calculated by summing the reserved GB of all volumes.
-
 ## Autoscaling
 
 ### One Volume Per Replica
-<Note>The only applies to volume sets using traditional file systems (e.g. ext4, xfs)</Note>
+
+<Note>This only applies to volume sets using traditional file systems (e.g. ext4, xfs)</Note>
+
 - Like workloads, volume sets scale horizontally. Every replica in the linked workload is automatically assigned a volume.
 - When the linked workload scales down, the volumes are preserved. Volumes are only deleted when you send a `deleteVolume` command, or when the volume set itself is deleted.
 
-### Automatic Expansion
+### Automatic Expansion (Reactive)
 
-The `spec.autoscaling` object allows you to specify rules for automatically expanding volumes in the set. The available options are:
+The `spec.autoscaling` object allows you to specify rules for automatically expanding volumes in the set. When a volume's free space drops below a threshold, Control Plane expands it. The available options are:
 
-- `maxCapacity`: The largest allowable size for any volume in the set.
+- `maxCapacity`: The largest allowable size (in GB) for any volume in the set.
 - `minFreePercentage`: This must be a number between 1 and 100. When the free percentage on any volume drops below this threshold, Control Plane will issue an `expandVolume` command automatically.
-- `scalingFactor`: This must be a number {`>`} 1. When a volume must be expanded, the new capacity will be (the minimum size to ensure `minFreePercentage`) {`*`} `scalingFactor`. E.g. if a volume is using 8/10 GB, and the `minFreePercentage` is 50, the new capacity will be 16 {`*`} `scalingFactor`, assuming that product is {`<=`} `maxCapacity`.
+- `scalingFactor`: This must be a number {`>`} 1. Applied as a multiplier when calculating the new capacity, providing headroom beyond the minimum needed to restore `minFreePercentage`.
 
-For example:
+When a volume needs expansion, the new capacity is calculated as:
 
-```json Volume Set Autoscaling
+```
+newCapacity = usedGB / (1 - minFreePercentage/100) × scalingFactor
+```
+
+The result is capped at `maxCapacity`.
+
+**Example calculation:** Suppose a 10 GB volume has 8 GB used (2 GB free, 20%), and the configuration is `minFreePercentage: 20`, `scalingFactor: 2`.
+
+| Step | Calculation | Result |
+| :--- | :---------- | :----- |
+| Current state | 8 GB used, 2 GB free | 20% free — threshold met |
+| Minimum capacity for 20% free | 8 / (1 - 0.20) | 10 GB |
+| Apply `scalingFactor` | 10 {`*`} 2 | 20 GB |
+
+The volume expands to 20 GB (assuming this is {`<=`} `maxCapacity`).
+
+```json Volume Set with Reactive Autoscaling
 {
   ...
   "spec": {
     ...
     "autoscaling": {
        "maxCapacity": 100,
-       "minFreePercentage": 70,
+       "minFreePercentage": 20,
        "scalingFactor": 2
     }
   }
 }
 ```
 
+### Predictive Scaling
+
+Reactive scaling responds to low free space after it happens. In most cases this is sufficient, but workloads that experience rapid surges in storage consumption can outpace reactive scaling — the volume fills up faster than the expansion can complete.
+
+Predictive scaling addresses this by projecting future usage and expanding volumes _before_ they run low. It is a **supplement** to reactive scaling, not a replacement. On each evaluation cycle, Control Plane computes both a reactive target and a predictive target, then uses **whichever is larger** (capped at `maxCapacity`). This means reactive scaling always acts as a safety net.
+
+#### How It Works
+
+When predictive scaling is enabled, Control Plane:
+
+1. Queries volume usage over a configurable lookback window.
+2. Fits a linear regression to compute the average growth rate.
+3. Projects usage forward over a configurable projection window.
+4. Calculates a predictive target capacity using the same formula as reactive scaling, but substituting **projected** usage for current usage:
+
+```
+predictiveCapacity = projectedUsedGB / (1 - minFreePercentage/100) × predictiveScalingFactor
+```
+
+5. Compares the predictive and reactive targets, and uses the larger of the two.
+
+Predictive scaling is skipped (falling back to reactive only) when any of the following are true:
+
+- The volume's growth rate is below `minGrowthRateGBPerHour`.
+- Fewer than `minDataPoints` data points are available in the lookback window, meaning the projection is not yet considered reliable.
+
+#### Configuration
+
+Add a `predictive` object inside `autoscaling` to enable predictive scaling:
+
+| Field | Type | Default | Description |
+| :---- | :--- | :------ | :---------- |
+| `enabled` | boolean | `false` | Enable predictive scaling based on historical growth rates. |
+| `lookbackHours` | number | `24` | Hours of historical data to analyze for the growth rate calculation. Min: 1, Max: 168 (1 week). |
+| `projectionHours` | number | `6` | Hours into the future to project storage needs. Min: 1, Max: 72. |
+| `minDataPoints` | number | `10` | Minimum number of historical data points required before a projection is considered reliable. Prevents premature scaling decisions when insufficient data is available. Min: 2, Max: 100. |
+| `minGrowthRateGBPerHour` | number | `0.01` | Minimum growth rate (GB/hour) to trigger predictive expansion. Volumes growing slower than this rate will not trigger predictive scaling. |
+| `scalingFactor` | number | (inherited) | Scaling factor for predictive expansion. If not set, uses the parent `autoscaling.scalingFactor`. A lower value (e.g., 1.2) is recommended for gentler proactive scaling. Min: 1.1. |
+
+<Note>
+When `predictive.enabled` is `true`, the parent `autoscaling.minFreePercentage` and `autoscaling.scalingFactor` fields are required.
+</Note>
+
+#### Example
+
+```json Volume Set with Predictive Scaling
+{
+  ...
+  "spec": {
+    ...
+    "autoscaling": {
+       "maxCapacity": 100,
+       "minFreePercentage": 20,
+       "scalingFactor": 2,
+       "predictive": {
+         "enabled": true,
+         "lookbackHours": 48,
+         "projectionHours": 12,
+         "minDataPoints": 10,
+         "minGrowthRateGBPerHour": 0.1,
+         "scalingFactor": 1.2
+       }
+    }
+  }
+}
+```
+
+**Example calculation:** Suppose a 50 GB volume currently has 40 GB used (10 GB free), and its growth rate over the past 48 hours is 0.5 GB/hour.
+
+_Reactive target:_
+
+| Step | Calculation | Result |
+| :--- | :---------- | :----- |
+| Current state | 40 GB used, 10 GB free | 20% free — threshold met |
+| Minimum capacity for 20% free | 40 / (1 - 0.20) | 50 GB |
+| Apply `scalingFactor` (2.0) | 50 {`*`} 2.0 | **100 GB** |
+
+_Predictive target:_
+
+| Step | Calculation | Result |
+| :--- | :---------- | :----- |
+| Project usage 12 hours ahead | 40 + (0.5 {`*`} 12) | 46 GB |
+| Minimum capacity for 20% free | 46 / (1 - 0.20) | 57.5 GB |
+| Apply predictive `scalingFactor` (1.2) | 57.5 {`*`} 1.2 | **⌈69⌉ = 69 GB** |
+
+Control Plane compares the two targets: reactive (100 GB) vs. predictive (69 GB). Since reactive is larger, the volume expands to **100 GB** (which also equals `maxCapacity` in this configuration).
+
+In a different scenario — say the volume still has plenty of free space but is growing rapidly — the predictive target could exceed the reactive target. The key principle is: **whichever target is larger gets used**, ensuring the volume is sized for both current needs and anticipated growth.
 ## Snapshots
 
 Snapshots can be taken at any time and (optionally) on a regular schedule. To set up automatic snapshotting, you may use the `spec.snapshots` object. Options include:
@@ -133,7 +239,7 @@ Volume performance varies widely by cloud service provider.
 
 **Minimum Capacity**: 10Gb
 
-**Maximum Capacity**: 16384Gb
+**Maximum Capacity**: 65536Gb
 
 | Service Provider | Max Throughput | Max IOPS                   |
 | :--------------- | :------------- | :------------------------- |
@@ -148,7 +254,7 @@ Volume performance varies widely by cloud service provider.
 
 **Minimum Capacity**: 200Gb
 
-**Maximum Capacity**: 16384Gb
+**Maximum Capacity**: 65536Gb
 
 | Service Provider | Max Throughput | Max IOPS                    |
 | :--------------- | :------------- | :-------------------------- |
@@ -357,6 +463,51 @@ For example:
 }
 ```
 
+## Volume Shrinkage
+
+Volumes can be shrunk on-demand by issuing a `shrinkVolume` command. If the volume set is in-use by a workload, the corresponding workload replica will be restarted.
+
+<Warning>
+
+**CRITICAL: Shrinking a volume causes PERMANENT DATA LOSS.**
+
+The `shrinkVolume` command provisions a new volume at the smaller size. Existing data is not migrated - the old volume and all its data are permanently deleted.
+
+**Only use `shrinkVolume` for applications with built-in data redundancy:**
+- Apache Kafka (with proper replication factor)
+- Distributed databases with replication (Cassandra, CockroachDB, etc.)
+- Applications where data can be rebuilt from other replicas
+
+**Do not use `shrinkVolume` for:**
+- Single-replica stateful workloads
+- Databases without replication
+- Any application where data loss is unacceptable
+
+</Warning>
+
+<Info>The `shrinkVolume` command is only available for `ext4` and `xfs` filesystems. It is not supported for `shared` filesystems.</Info>
+
+### shrinkVolume
+
+Spec:
+
+- location
+- volumeIndex
+- newStorageCapacity
+
+For example:
+
+```json shrinkVolume Command
+{
+  "type": "shrinkVolume",
+  "spec": {
+    "location": "aws-sa-east-1",
+    "volumeIndex": 0,
+    "newStorageCapacity": 5
+  }
+}
+```
+
 ## Volume Deletion
 
 To delete a volume, issue a `deleteVolume` command.
@@ -500,13 +651,14 @@ The permissions below are used to define [policies](/reference/policy) together 
 | create                    | Create new volumesets                     |                                                                                                                                                          |
 | delete                    | Delete existing volumesets                |                                                                                                                                                          |
 | edit                      | Modify existing volumesets                | view                                                                                                                                                     |
-| exec                      | Execute commands                          | exec.restoreVolume, exec.createVolumeSnapshot, exec.expandVolume, exec.deleteVolume, exec.deleteVolumeSnapshot                                           |
+| exec                      | Execute commands                          | exec.restoreVolume, exec.createVolumeSnapshot, exec.expandVolume, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.shrinkVolume                        |
 | exec.createVolumeSnapshot | Create a snapshot of a volume             |                                                                                                                                                          |
 | exec.deleteVolume         | Delete a volume                           |                                                                                                                                                          |
 | exec.deleteVolumeSnapshot | Delete a volume snapshot                  |                                                                                                                                                          |
 | exec.expandVolume         | Increase the storage capacity of a volume |                                                                                                                                                          |
 | exec.restoreVolume        | Restore a volume to a snapshot            |                                                                                                                                                          |
-| manage                    | Full access                               | create, delete, edit, exec, exec.createVolumeSnapshot, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.expandVolume, exec.restoreVolume, manage, view |
+| exec.shrinkVolume         | Shrink a volume (causes data loss)        |                                                                                                                                                          |
+| manage                    | Full access                               | create, delete, edit, exec, exec.createVolumeSnapshot, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.expandVolume, exec.restoreVolume, exec.shrinkVolume, manage, view |
 | view                      | Read-only access                          |                                                                                                                                                          |
 
 ## Access Report
