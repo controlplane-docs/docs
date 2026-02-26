@@ -1,6 +1,6 @@
 ---
 title: Convert Kubernetes Manifests
-description: Migrate from Kubernetes to Control Plane by converting Deployments, StatefulSets, CronJobs, ConfigMaps, Secrets, and more.
+description: Migrate from Kubernetes to Control Plane by converting Deployments, StatefulSets, CronJobs, ConfigMaps, Secrets, Ingresses, and more.
 ---
 
 The `cpln convert` command transforms Kubernetes manifests into Control Plane resources, enabling seamless migration from Kubernetes environments.
@@ -78,6 +78,12 @@ The converter analyzes your Kubernetes spec to automatically select the appropri
 |-----------------|-------------------|-------|
 | PersistentVolumeClaim | [Volumeset](/reference/volumeset) | Persistent storage |
 
+### Domain conversions
+
+| Kubernetes Kind | Control Plane Kind | Notes |
+|-----------------|-------------------|-------|
+| Ingress | [Domain](/reference/domain) | Routes converted from Ingress rules |
+
 ### How secrets are converted
 
 Kubernetes Secrets are converted based on their `type` field:
@@ -113,6 +119,73 @@ If the StorageClass `parameters` contain any of these values, the volumeset uses
 - VMware: `thick`
 - Other: `fast`, `persistent_1`
 
+### How domains are converted
+
+Kubernetes Ingresses are converted to Control Plane [Domains](/reference/domain). The converter maps Ingress rules (host + paths) to domain routes, resolving backend Services to workloads.
+
+#### Field mapping
+
+| Kubernetes Ingress | Control Plane Domain | Notes |
+|-------------------|---------------------|-------|
+| `metadata.labels` | `tags` | Labels preserved as domain tags |
+| `spec.rules[].host` | `name` | Wildcard prefix (`*.`) stripped for domain name |
+| `spec.rules[].host` (wildcard) | `spec.acceptAllSubdomains` | Set to `true` when host starts with `*.` |
+| `spec.rules[].http.paths[].path` | Route `prefix` or `regex` | Depends on `pathType` |
+| `spec.rules[].http.paths[].backend.service` | Route `workloadLink` | Resolved via Service selector → workload pod labels |
+| Service `targetPort` | Route `port` | Container port resolved through the Service |
+
+#### Path type handling
+
+| Kubernetes `pathType` | Control Plane Route | Example |
+|----------------------|---------------------|---------|
+| `Prefix` | `prefix: "/api"` | Default behavior |
+| `Exact` | `regex: "^/api/v1/users$"` | Special characters escaped, anchored with `^` and `$` |
+| `ImplementationSpecific` | `prefix: "/legacy"` | Treated as Prefix |
+
+#### Service-to-workload resolution
+
+The converter resolves each Ingress backend to a Control Plane workload through the following steps:
+
+<Steps>
+<Step title="Find the Service">
+  The converter locates the Kubernetes Service referenced by the Ingress backend's `service.name`.
+</Step>
+
+<Step title="Match the workload">
+  The Service's `selector` labels are matched against workload pod template labels to find the target workload.
+</Step>
+
+<Step title="Resolve the port">
+  The Service port's `targetPort` is resolved to the actual container port:
+  - **Numeric targetPort** — used directly as the container port
+  - **Named targetPort** — resolved by matching the port name in the container spec
+  - **No targetPort** — falls back to the Service port number
+</Step>
+</Steps>
+
+#### Domain defaults
+
+All converted domains use these fixed settings:
+
+| Property | Value |
+|----------|-------|
+| **Port** | `443` |
+| **Protocol** | `http2` |
+| **DNS mode** | `cname` |
+| **Certificate challenge** | `http01` |
+
+#### Wildcard and apex domain merging
+
+When an Ingress contains rules for both `example.com` and `*.example.com`, the converter merges them into a single domain named `example.com` with `acceptAllSubdomains: true`. Routes from both rules are combined and deduplicated.
+
+<Warning>
+Domains with `acceptAllSubdomains` enabled require a [Dedicated Load Balancer](/reference/gvc#load-balancer) on the target GVC.
+</Warning>
+
+#### GVC context
+
+If a `--gvc` is provided, workload links use it directly (e.g., `//gvc/my-gvc/workload/api`). Otherwise, the converter inserts a `{{GVC}}` placeholder that you must replace before applying.
+
 ### Auto-generated resources
 
 When workloads reference secrets (via environment variables or volume mounts), the converter automatically creates:
@@ -143,8 +216,7 @@ These Kubernetes resources are not directly converted but inform the conversion:
 | Resource | How it's used |
 |----------|---------------|
 | **HorizontalPodAutoscaler** | Sets `minScale`, `maxScale`, `scaleToZeroDelay`, and CPU target |
-| **Service** | Protocol inference, public exposure detection |
-| **Ingress** | Public exposure detection |
+| **Service** | Protocol inference, public exposure detection, domain route resolution |
 | **ServiceAccount** | Image pull secrets extraction |
 | **EndpointSlice** | Service-to-Pod mapping for selectorless services |
 | **PersistentVolume** | Capacity and file system type for volumesets |
@@ -456,6 +528,110 @@ If no protocol can be inferred, the converter defaults to `tcp`.
 
   Converts to a **dictionary secret** containing the key-value pairs.
 </Tab>
+
+<Tab title="Domain (Ingress)">
+  An Ingress with a Deployment and Service becomes a domain with routes:
+
+  ```yaml k8s-ingress.yaml
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: api-server
+  spec:
+    replicas: 2
+    selector:
+      matchLabels:
+        app: api
+    template:
+      metadata:
+        labels:
+          app: api
+      spec:
+        containers:
+          - name: api
+            image: my-api:v1
+            ports:
+              - containerPort: 8080
+  ---
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: api-service
+  spec:
+    selector:
+      app: api
+    ports:
+      - port: 80
+        targetPort: 8080
+  ---
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: api-ingress
+    labels:
+      team: backend
+  spec:
+    rules:
+      - host: api.example.com
+        http:
+          paths:
+            - path: /api
+              pathType: Prefix
+              backend:
+                service:
+                  name: api-service
+                  port:
+                    number: 80
+  ```
+
+  Converts to a **workload** and a **domain** with routes pointing to the workload:
+
+  <Accordion title="View output">
+  ```yaml
+  kind: workload
+  name: api-server
+  spec:
+    type: serverless
+    containers:
+      - name: api
+        image: 'my-api:v1'
+        ports:
+          - number: 8080
+            protocol: http
+    defaultOptions:
+      capacityAI: false
+      autoscaling:
+        minScale: 2
+        maxScale: 2
+    firewallConfig:
+      external:
+        inboundAllowCIDR:
+          - 0.0.0.0/0
+        outboundAllowCIDR:
+          - 0.0.0.0/0
+  ---
+  kind: domain
+  name: api.example.com
+  description: 'Converted from K8s Ingress: api-ingress'
+  tags:
+    team: backend
+  spec:
+    dnsMode: cname
+    certChallengeType: http01
+    ports:
+      - number: 443
+        protocol: http2
+        routes:
+          - prefix: /api
+            workloadLink: '//gvc/{{GVC}}/workload/api-server'
+            port: 8080
+  ```
+  </Accordion>
+
+  <Tip>
+  Provide `--gvc` to replace the `{{GVC}}` placeholder with an actual GVC name in workload links.
+  </Tip>
+</Tab>
 </Tabs>
 
 ## Override protocol inference
@@ -509,6 +685,18 @@ cpln delete --file k8s.yaml --k8s true
 
 <Accordion title="PVC not creating volumeset">
   PersistentVolumeClaims are converted to volumesets. Ensure the PVC is referenced by a StatefulSet's volumeClaimTemplates for proper conversion.
+</Accordion>
+
+<Accordion title="Ingress not creating a domain">
+  Ingress conversion requires the referenced Services and their matching workloads (Deployments, StatefulSets, etc.) to be present in the same file. The converter uses the Service selector to find the target workload by matching pod template labels.
+</Accordion>
+
+<Accordion title="Service without selector error">
+  Ingress backend Services must have a `selector` defined so the converter can resolve which workload the Service targets. Services without selectors (e.g., ExternalName services) are not supported for domain conversion.
+</Accordion>
+
+<Accordion title="Workload link shows {{GVC}} placeholder">
+  When converting Ingresses without specifying `--gvc`, workload links contain a `{{GVC}}` placeholder. Provide `--gvc` during conversion or replace the placeholder before applying.
 </Accordion>
 </AccordionGroup>
 
