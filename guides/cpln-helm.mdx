@@ -48,12 +48,43 @@ A **release** is a deployed instance of a Helm chart. Each release:
 - Tracks revisions for rollback (10 by default, configurable with [`--history-limit`](#manage-revision-history))
 - Tags resources with `cpln/release` for tracking
 
+#### Release name constraints
+
+Release names must follow these rules:
+
+| Rule | Detail |
+|------|--------|
+| **Format** | DNS-1123 label — lowercase alphanumeric characters and hyphens only |
+| **Pattern** | Must match `^[a-z0-9]([-a-z0-9]*[a-z0-9])?$` |
+| **Max length** | 53 characters |
+| **Uniqueness** | Must be unique within the same organization |
+
+Alternatively, use `--generate-name` (or `-g`) to auto-generate a name in the format `<chart-name>-<unix-timestamp>`.
+
 ### Release state
 
 The release state tracks all resources deployed by the release, enabling:
 - Detection of added, modified, or removed resources
 - Automatic cleanup of deleted resources on upgrade
 - Rollback to any previous revision
+
+### Supported resource types
+
+Charts must contain **only Control Plane resource definitions**. Standard Kubernetes manifests (objects with `apiVersion` or `metadata` fields) are not supported and will cause the operation to fail.
+
+<Warning>
+If your chart contains any resource with an `apiVersion` or `metadata` field, or an unsupported `kind`, the install/upgrade will abort with:
+```
+ERROR: Some resources in the rendered template are not CPLN resources.
+```
+Remove any Kubernetes manifests and ensure every resource kind is a supported Control Plane kind.
+</Warning>
+
+### GVC-scoped resources
+
+The following resource kinds require a GVC context (via `--gvc` or your default profile context). The GVC must already exist or be created earlier in the same chart:
+
+`workload`, `identity`, `volumeset`
 
 ## Quick start
 
@@ -143,6 +174,14 @@ Install from different sources:
     --version <version>
   ```
 </Tab>
+
+<Tab title="Auto-generated name">
+  ```bash
+  cpln helm install --generate-name ./my-chart
+  ```
+
+  Creates a release named `<chart-name>-<unix-timestamp>` (e.g., `my-chart-1709913600`).
+</Tab>
 </Tabs>
 
 ### Wait for readiness
@@ -152,6 +191,16 @@ Wait for workloads to become ready:
 ```bash
 cpln helm install my-release ./my-chart --wait --timeout 600
 ```
+
+### Handle chart dependencies
+
+If your chart has dependencies defined in `Chart.yaml`, use `--dependency-update` to fetch them automatically:
+
+```bash
+cpln helm install my-release ./my-chart --dependency-update
+```
+
+Without this flag, missing dependencies will cause an error prompting you to re-run with the flag.
 
 ## Upgrade a release
 
@@ -164,11 +213,24 @@ cpln helm upgrade my-release ./my-chart
 The CLI:
 1. Renders the updated chart
 2. Applies new and modified resources
-3. Deletes resources removed from the chart
+3. Deletes resources removed from the chart (unless they have `helm.sh/resource-policy: keep`)
 4. Updates the release state
 
+### Install or upgrade
+
+Use `--install` to create the release if it does not exist, or upgrade it if it does:
+
+```bash
+cpln helm upgrade my-release ./my-chart --install
+```
+
+This is useful in CI/CD pipelines where you don't want to check whether the release already exists.
+
 <Warning>
-Use the same release name to ensure proper tracking of resources.
+Use the same release name **and chart name** to ensure proper tracking of resources. Upgrading with a different chart name than the original install will fail with:
+```
+ERROR: UPGRADE FAILED: cannot upgrade with different chart name
+```
 </Warning>
 
 ## Manage revision history
@@ -187,6 +249,10 @@ cpln helm upgrade my-release ./my-chart --history-limit 0
 The `--history-limit` flag must be provided on **every upgrade**. If omitted, it resets to the default of 10 revisions. For consistent behavior, always include `--history-limit` in your upgrade commands or CI/CD pipelines.
 </Warning>
 
+<Tip>
+You can also set the `HELM_MAX_HISTORY` environment variable as an alternative to the `--history-limit` flag. The CLI flag takes precedence over the environment variable.
+</Tip>
+
 | Value | Behavior |
 |-------|----------|
 | `10` (default) | Keeps the 10 most recent revisions |
@@ -196,6 +262,17 @@ The `--history-limit` flag must be provided on **every upgrade**. If omitted, it
 <Tip>
 Setting `--history-limit 0` is useful for audit compliance or when you need the ability to rollback to any previous state.
 </Tip>
+
+## Release description
+
+Use `--description` (or `--desc`) to attach a custom description to a release revision. It appears in `cpln helm history` output:
+
+```bash
+cpln helm install my-release ./my-chart --description "Initial deployment"
+cpln helm upgrade my-release ./my-chart --description "Added caching layer"
+```
+
+On rollback, if no description is provided, it auto-generates `"Rollback to <version>"`.
 
 ## Rollback a release
 
@@ -209,6 +286,14 @@ cpln helm rollback my-release
 cpln helm rollback my-release 2
 ```
 
+### Clean up on failure
+
+Use `--cleanup-on-fail` to automatically delete resources created during a failed rollback:
+
+```bash
+cpln helm rollback my-release --cleanup-on-fail
+```
+
 ## View release information
 
 <Tabs>
@@ -216,6 +301,8 @@ cpln helm rollback my-release 2
   ```bash
   cpln helm list
   ```
+
+  Lists all releases across all GVCs in the organization.
 
   ```
   +------------+--------+---------+---------------+---------+--------+
@@ -250,14 +337,39 @@ cpln helm rollback my-release 2
   Shows the rendered YAML for the current release.
 </Tab>
 
-<Tab title="Get values">
+<Tab title="Get all">
   ```bash
-  cpln helm get values my-release --all
+  cpln helm get all my-release
   ```
 
-  Shows merged chart and user values.
+  Shows combined release info, values, and manifest.
+</Tab>
+
+<Tab title="Get values">
+  ```bash
+  # User-provided values only
+  cpln helm get values my-release
+
+  # All values (chart defaults + user overrides)
+  cpln helm get values my-release --all
+  ```
+</Tab>
+
+<Tab title="Get notes">
+  ```bash
+  cpln helm get notes my-release
+  ```
+
+  Shows the chart notes (from `NOTES.txt`) for the current release.
 </Tab>
 </Tabs>
+
+All `helm get` subcommands accept `--revision <num>` to view data from a specific historical revision:
+
+```bash
+cpln helm get values my-release --revision 2
+cpln helm get manifest my-release --revision 2
+```
 
 ## Uninstall a release
 
@@ -281,12 +393,12 @@ cpln helm template my-release ./my-chart
 
 ## Injected values
 
-The CLI automatically injects these values into your chart:
+The CLI automatically injects these values into your chart, making them available in templates without requiring you to define them:
 
 | Key | Description |
 |-----|-------------|
 | `cpln.org` | Current organization name |
-| `cpln.gvc` | Current GVC name |
+| `cpln.gvc` | Current GVC name (when `--gvc` is provided) |
 
 Use in templates:
 
@@ -295,8 +407,68 @@ gvc: {{ .Values.cpln.gvc }}
 ```
 
 <Warning>
-Avoid defining a top-level `cpln` key in your `values.yaml` as it will be overwritten.
+Avoid defining a top-level `cpln` key in your `values.yaml` as it will be overwritten by the injected values.
 </Warning>
+
+<Note>
+`--set` and `--values` are **not carried over** between operations. Each upgrade generates a fresh config from the chart defaults plus whatever you pass in that command. CI/CD pipelines must pass the full set of values on every upgrade.
+</Note>
+
+## Tags and labels
+
+### Tagging resources
+
+Use `--tag` to attach custom tags to **all resources** deployed by the release:
+
+```bash
+cpln helm install my-release ./my-chart \
+  --tag environment=production \
+  --tag team=backend
+```
+
+Tags defined in your chart templates are also applied. The precedence order (highest wins):
+
+1. **Helm metadata tags** (`cpln/release`) — always applied, cannot be overridden
+2. **Template-level tags** — tags defined on individual resources in your chart YAML
+3. **Release-level tags** — tags from `--tag` and `--state-tag` flags
+
+This means tags set on a specific resource in your template override the same key passed via `--tag`.
+
+Use `--remove-tag` on upgrade to remove tags from resources:
+
+```bash
+cpln helm upgrade my-release ./my-chart --remove-tag environment
+```
+
+### Tagging the release secret
+
+Use `--state-tag` to attach tags to the **release state secret** itself (not the deployed resources):
+
+```bash
+cpln helm install my-release ./my-chart \
+  --state-tag managed-by=ci \
+  --state-tag pipeline-id=12345
+```
+
+Use `--remove-state-tag` on upgrade to remove state tags:
+
+```bash
+cpln helm upgrade my-release ./my-chart --remove-state-tag pipeline-id
+```
+
+### Tag behavior across revisions
+
+Unlike values, **tags carry over** between revisions. You don't need to re-specify `--tag` or `--state-tag` on every upgrade — previous tags are used as a base and new ones merge on top. Use `--remove-tag` or `--remove-state-tag` to explicitly drop a tag.
+
+## Secret change detection
+
+When a chart contains both secrets and workloads that reference those secrets, the CLI automatically tags workloads with a hash of each referenced secret's content:
+
+```
+cpln/secret:<secret-name> = <hash>
+```
+
+When you upgrade a release and a secret's content changes, the hash changes, triggering a workload redeployment. This ensures workloads always run with the latest secret values.
 
 ## Protect resources from deletion
 
@@ -309,7 +481,11 @@ tags:
   helm.sh/resource-policy: keep
 ```
 
-Resources with this tag are skipped during cleanup operations.
+Resources with this tag are skipped during cleanup operations. The CLI will print a message confirming the resource was preserved:
+
+```
+Skipped deletion of /org/{org}/gvc/{gvc}/volumeset/persistent-data because it has resource-policy=keep
+```
 
 ## Chart notes
 
@@ -341,18 +517,79 @@ cpln helm install prod-release ./my-chart -f values-prod.yaml
   ```bash
   cpln helm upgrade my-release ./my-chart
   ```
+
+  Or use `upgrade --install` to handle both cases:
+
+  ```bash
+  cpln helm upgrade my-release ./my-chart --install
+  ```
+</Accordion>
+
+<Accordion title="Release is stuck in pending state">
+  If a previous operation was interrupted, the release may be stuck in `pending-install`, `pending-upgrade`, or `pending-rollback` status. The CLI will show an error that includes the exact secret name and the command to delete it:
+
+  ```
+  ERROR: Release 'my-release' is 'pending-install', please wait for the install
+  or upgrade to finish. If this release revision is still pending or stuck, you
+  will need to manually delete the secret 'cpln-helm-release-my-release-abc12xyz-v1'.
+  Use the 'cpln secret delete cpln-helm-release-my-release-abc12xyz-v1' command to do so.
+  ```
+
+  Run the `cpln secret delete` command shown in the error message to unblock the release.
+</Accordion>
+
+<Accordion title="Non-CPLN resources in chart">
+  If your chart contains Kubernetes manifests (resources with `apiVersion` or `metadata` fields), you'll see:
+
+  ```
+  ERROR: Some resources in the rendered template are not CPLN resources.
+  ```
+
+  Remove any standard Kubernetes resources from your templates. Charts must contain only Control Plane resource definitions.
+</Accordion>
+
+<Accordion title="Cannot upgrade with different chart name">
+  When upgrading a release, the chart name must match the one used during install:
+
+  ```
+  ERROR: UPGRADE FAILED: cannot upgrade with different chart name
+  ```
+
+  If you need to switch charts, uninstall the release first, then install with the new chart.
 </Accordion>
 
 <Accordion title="Resources not deleted on upgrade">
-  Ensure you're using the same release name. Resources are only tracked within a single release.
+  Ensure you're using the same release name. Resources are only tracked within a single release. Also check if the resources have the `helm.sh/resource-policy: keep` tag, which prevents deletion.
 </Accordion>
 
 <Accordion title="Rollback fails">
-  Check available revisions with `cpln helm history`. By default, only 10 revisions are retained. See [Manage revision history](#manage-revision-history) to adjust this limit.
+  Check available revisions with `cpln helm history`. Rollback can only target revisions with `deployed` or `superseded` status. By default, only 10 revisions are retained. See [Manage revision history](#manage-revision-history) to adjust this limit.
+</Accordion>
+
+<Accordion title="Missing chart dependencies">
+  If your chart has dependencies in `Chart.yaml` that haven't been fetched:
+
+  ```
+  ERROR: Helm chart dependencies are missing.
+  ```
+
+  Re-run with the `--dependency-update` flag:
+
+  ```bash
+  cpln helm install my-release ./my-chart --dependency-update
+  ```
+</Accordion>
+
+<Accordion title="GVC does not exist">
+  GVC-scoped resources (workload, identity, volumeset) require the GVC to exist. Either create the GVC in a separate step before installing, or include the GVC as a resource in your chart so it's created first.
 </Accordion>
 
 <Accordion title="Permission denied on install">
   Ensure you have `reveal` permission on secrets to manage release state.
+</Accordion>
+
+<Accordion title="Release name invalid">
+  Release names must be DNS-1123 compliant: lowercase alphanumeric and hyphens only, max 53 characters, cannot start or end with a hyphen. Use `--generate-name` if you don't want to manage names manually.
 </Accordion>
 </AccordionGroup>
 
