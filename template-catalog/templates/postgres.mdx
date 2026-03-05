@@ -1,23 +1,22 @@
 ---
-title: PostgreSQL Highly Available
+title: PostgreSQL
 ---
 
 ## Overview
 
-PostgreSQL Highly Available deploys a production-ready PostgreSQL cluster using Patroni for automatic leader election and failover, with etcd providing distributed consensus. An optional HAProxy workload routes all write traffic to the current primary replica, providing a stable connection endpoint regardless of which replica holds the leader role.
+PostgreSQL is a powerful open-source relational database. This template deploys a single-replica PostgreSQL instance with persistent storage and optional scheduled backups to AWS S3 or GCS.
 
 <Note>
-For production use, maintain at least 3 PostgreSQL replicas and 3 etcd replicas. etcd requires an odd number of replicas (3, 5, 7) for quorum.
+PostgreSQL on Control Plane operates as a single-replica deployment. Do not scale up the replica count, as this would result in multiple isolated instances rather than a replicated cluster. For a highly available setup, use the [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) template instead.
 </Note>
 
 ### What Gets Created
 
-- **Stateful Workload** — A Patroni-managed PostgreSQL cluster with configurable replica count and resources. Each replica has its own volume.
-- **etcd Workload** — A dedicated etcd cluster (via dependency) providing distributed consensus for Patroni leader election.
-- **HAProxy Workload** *(optional, enabled by default)* — A leader-routing proxy that always directs write traffic to the current primary replica.
-- **Volume Set** — Persistent storage for PostgreSQL data, with optional autoscaling.
-- **Secrets** — A dictionary secret with database credentials; opaque secrets for the Patroni startup script, HAProxy startup script, and WAL-G backup script (created as needed).
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to all required secrets, and cloud storage access when backup is enabled.
+- **Stateful Workload** — A single-replica PostgreSQL container with configurable resources.
+- **Volume Set** — Persistent storage for database data, with optional autoscaling.
+- **Secret** — A dictionary secret storing the database username and password, injected into the container at startup.
+- **Identity & Policy** — An identity bound to the workload with `reveal` access to the database credentials secret, and cloud storage access when backup is enabled.
+- **Cron Workload** *(optional)* — A scheduled `pg_dump` backup job that writes compressed SQL dumps to AWS S3 or GCS.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
@@ -54,22 +53,18 @@ This template has no external prerequisites unless backup is enabled. To install
 The default `values.yaml` for this template:
 
 ```yaml
-replicas: 3
+image: postgres:18  # versions before postgres:17 do not support the backup feature
 
 resources:
-  minCpu: 500m
-  minMemory: 1Gi
-  maxCpu: 1
-  maxMemory: 2Gi
+  minCpu: 200m
+  minMemory: 128Mi
+  maxCpu: 500m
+  maxMemory: 256Mi
 
-image: controlplanecorporation/patroni-postgres:0.7
-
-postgres:
+config:
   username: username
   password: password
   database: test
-
-multiZone: false
 
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
@@ -79,143 +74,89 @@ volumeset:
     minFreePercentage: 10 # Trigger scaling when free space drops below this percentage
     scalingFactor: 1.2 # Multiply current capacity by this factor when scaling up
 
-internal_access:
-  type: same-gvc # options: same-gvc, same-org, workload-list
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
   workloads: # Note: can only be used if type is same-gvc or workload-list
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
-etcd:
-  replicas: 3
-  resources:
-    cpu: 500m
-    memory: 512Mi
-  multiZone: false
-  volumeset:
-    capacity: 10 # initial capacity in GiB (minimum is 10)
-  internal_access:
-    type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads:
-      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
-
-proxy: # HAProxy endpoint to write to leader replica
-  enabled: true
-  image: haproxy:2.9
-  resources:
-    cpu: 100m
-    memory: 128Mi
-  minReplicas: 2
-  maxReplicas: 2
-
-backup:
+backup: # compatible with Postgres 17+ only
   enabled: false
-  mode: logical  # logical or wal-g
+  image: controlplanecorporation/pg-backup:18.1.0 # 18.1.0 = Postgres 18, 17.1.0 = Postgres 17
+  schedule: "0 2 * * *" # cron schedule, default is daily at 2am UTC
+
   resources:
     cpu: 100m
     memory: 128Mi
-
-  logical:
-    image: controlplanecorporation/pg-backup:17.1.0
-    schedule: "0 2 * * *" # cron schedule, default is daily at 2am UTC
-
-  walg:
-    intervalSeconds: 21600 # interval in seconds between backups, default is every 6 hours
 
   provider: aws # Options: aws or gcp
 
   aws:
-    bucket: pg-ha-backup-bucket
+    bucket: my-backup-bucket
     region: us-east-1
-    cloudAccountName: my-s3-cloud-account
-    policyName: pg-ha-backup-policy
+    cloudAccountName: my-backup-cloudaccount
+    policyName: my-backup-policy
     prefix: postgres/backups
 
   gcp:
-    bucket: pg-ha-backup-bucket
-    cloudAccountName: my-gcs-cloud-account
+    bucket: my-backup-bucket
+    cloudAccountName: my-backup-cloudaccount
     prefix: postgres/backups
 ```
 
 ### Credentials
 
-- `postgres.username` — PostgreSQL superuser username. **Change before deploying to production.**
-- `postgres.password` — PostgreSQL superuser password. **Change before deploying to production.**
-- `postgres.database` — Name of the database created on first startup.
+- `config.username` — PostgreSQL username. **Change before deploying to production.**
+- `config.password` — PostgreSQL password. **Change before deploying to production.**
+- `config.database` — Name of the database created on startup.
 
 <Note>
 These values are only applied on first startup when the data directory is empty. Updating them after the initial deployment will have no effect on the running database. To change credentials or the database name on an existing instance, use PostgreSQL's native commands (e.g. `ALTER USER`, `ALTER DATABASE`).
 </Note>
 
-### PostgreSQL Cluster
+### Resources
 
-- `replicas` — Number of PostgreSQL replicas. Minimum 3 recommended for production.
-- `resources.minCpu` / `resources.minMemory` — Minimum CPU and memory guaranteed per replica.
-- `resources.maxCpu` / `resources.maxMemory` — Maximum CPU and memory per replica.
-- `multiZone` — Spread replicas across availability zones within the location.
+- `resources.minCpu` / `resources.minMemory` — Minimum CPU and memory guaranteed to the workload.
+- `resources.maxCpu` / `resources.maxMemory` — Maximum CPU and memory the workload can use.
 
 ### Storage
 
-- `volumeset.capacity` — Initial volume size in GiB (minimum 10). Each replica gets its own volume.
+- `volumeset.capacity` — Initial volume size in GiB (minimum 10).
 - `volumeset.autoscaling.enabled` — Automatically expand the volume as it fills. When enabled:
   - `maxCapacity` — Maximum volume size in GiB.
   - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
   - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
 
-### etcd Cluster
-
-- `etcd.replicas` — Number of etcd replicas. Must be an **odd number** (3, 5, 7) for quorum.
-- `etcd.resources.cpu` / `etcd.resources.memory` — CPU and memory per etcd replica.
-- `etcd.multiZone` — Spread etcd replicas across availability zones.
-- `etcd.volumeset.capacity` — Initial volume size for etcd data in GiB.
-- `etcd.internal_access.type` — Controls which workloads can reach the etcd cluster.
-
-### HAProxy (Strongly Recommended)
-
-In a Patroni cluster, only the leader replica accepts writes — other replicas are read-only. HAProxy automatically routes write traffic to the current leader, providing a stable connection endpoint even during failover.
-
-- `proxy.enabled` — Deploy the HAProxy leader-routing workload (default: `true`).
-- `proxy.resources.cpu` / `proxy.resources.memory` — CPU and memory per HAProxy replica.
-- `proxy.minReplicas` / `proxy.maxReplicas` — Replica count for the proxy workload.
-
-<Note>
-HAProxy must be enabled (`proxy.enabled: true`) for logical backups to function correctly. WAL-G backups do not require the proxy.
-</Note>
-
 ### Internal Access
 
-- `internal_access.type` — Controls which workloads can connect to PostgreSQL on port `5432`:
+- `internalAccess.type` — Controls which workloads can connect to PostgreSQL on port `5432`:
 
 | Type | Description |
 |------|-------------|
+| `none` | No internal access allowed |
 | `same-gvc` | Allow access from all workloads in the same GVC |
 | `same-org` | Allow access from all workloads in the same organization |
 | `workload-list` | Allow access only from specific workloads listed in `workloads` |
 
 ### Connecting to PostgreSQL
 
-Connect to PostgreSQL through the HAProxy workload, which always routes to the current leader:
+Once deployed, connect to the database from within the same GVC using:
 
 ```
-RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432
+RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432
 ```
 
 ### Backup
 
-Two backup modes are available. Set `backup.enabled: true`, choose a `mode`, and configure the storage provider.
+Backup is disabled by default. When enabled, a cron workload runs `pg_dump` on the configured schedule and uploads compressed SQL dumps to AWS S3 or GCS.
 
-| Mode | Description |
-|------|-------------|
-| `logical` | Scheduled SQL dumps via `pg_dump`. Portable and suitable for smaller databases. Requires HAProxy to be enabled. |
-| `wal-g` | Continuous WAL archiving with point-in-time recovery. Suitable for larger databases requiring minimal data loss. Runs as a sidecar container alongside PostgreSQL. |
+<Note>
+Backup requires PostgreSQL 17 or later. Set `backup.image` to match your PostgreSQL version: `controlplanecorporation/pg-backup:18.1.0` for Postgres 18, or `controlplanecorporation/pg-backup:17.1.0` for Postgres 17.
+</Note>
 
-- `backup.mode` — `logical` or `wal-g`.
+- `backup.enabled` — Enable scheduled backups.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
 - `backup.provider` — `aws` or `gcp`.
-- `backup.resources.cpu` / `backup.resources.memory` — Resources allocated to the backup container.
-
-**Logical backup settings:**
-- `backup.logical.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
-
-**WAL-G backup settings:**
-- `backup.walg.intervalSeconds` — Interval between base backups in seconds (default: `21600`, every 6 hours).
+- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
 
 ## Backup Prerequisites
 
@@ -223,7 +164,7 @@ Two backup modes are available. Set `backup.enabled: true`, choose a `mode`, and
 
 Before enabling backup with `provider: aws`, complete the following in your AWS account:
 
-1. Create an S3 bucket. Set `backup.aws.bucket` to the bucket name and `backup.aws.region` to its region.
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
 3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
 
@@ -257,16 +198,14 @@ Before enabling backup with `provider: aws`, complete the following in your AWS 
 
 Before enabling backup with `provider: gcp`, complete the following in your GCP account:
 
-1. Create a GCS bucket. Set `backup.gcp.bucket` to the bucket name.
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
 3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
 4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
 
 ## Restoring a Backup
 
-### Logical
-
-Run the following from a client with access to the backup bucket. Connect through the proxy workload so the restore targets the current leader.
+Run the following from a client with access to the backup bucket:
 
 **AWS S3:**
 
@@ -276,7 +215,7 @@ export PGPASSWORD="PASSWORD"
 aws s3 cp "s3://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
   | gunzip \
   | psql \
-      --host=RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local \
+      --host=RELEASE_NAME-postgres.GVC_NAME.cpln.local \
       --port=5432 \
       --username=USERNAME \
       --dbname=postgres
@@ -292,7 +231,7 @@ export PGPASSWORD="PASSWORD"
 gsutil cp "gs://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
   | gunzip \
   | psql \
-      --host=RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local \
+      --host=RELEASE_NAME-postgres.GVC_NAME.cpln.local \
       --port=5432 \
       --username=USERNAME \
       --dbname=postgres
@@ -300,35 +239,13 @@ gsutil cp "gs://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
 unset PGPASSWORD
 ```
 
-### WAL-G
-
-WAL-G point-in-time restore requires an empty data directory. Follow these steps:
-
-1. Run `wal-g backup-list` to identify the desired backup.
-2. Stop the PostgreSQL workload.
-3. Create a new Volume Set for the restored data.
-4. Run a one-off restore workload with the new Volume Set mounted at `/var/lib/postgresql/data` and run:
-
-```sh
-wal-g backup-fetch /var/lib/postgresql/data/pgdata <backup_name>
-```
-
-5. Re-point the PostgreSQL workload to the restored Volume Set and restart.
-6. After the restore, change `backup.walg.prefix` before re-enabling backups to avoid system identifier conflicts.
-
 ## External References
 
 <CardGroup cols={2}>
-    <Card title="Patroni Documentation" icon="book" href="https://patroni.readthedocs.io/">
-    Patroni automatic failover documentation
-    </Card>
     <Card title="PostgreSQL Documentation" icon="database" href="https://www.postgresql.org/docs/">
     Official PostgreSQL documentation
     </Card>
-    <Card title="etcd Documentation" icon="server" href="https://etcd.io/docs/v3.6/">
-    Official etcd documentation
-    </Card>
-    <Card title="PostgreSQL HA Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/postgres-highly-available">
+    <Card title="PostgreSQL Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/postgres">
     View the source files, default values, and chart definition
     </Card>
 </CardGroup>
