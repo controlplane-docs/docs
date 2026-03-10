@@ -11,12 +11,23 @@ Apache Airflow is an open-source platform for programmatically authoring, schedu
 - **GVC** — A dedicated GVC across the specified locations.
 - **Airflow Webserver** — The Airflow web UI for managing DAGs, monitoring task execution, and viewing logs.
 - **Celery Workers** — Distributed task execution workers that process DAG tasks.
-- **Redis** — A Redis broker for the Celery task queue.
+- **Redis** — A Redis broker for the Celery task queue, with persistent storage.
 - **PostgreSQL** — A PostgreSQL database for Airflow metadata storage.
-- **Volume Sets** — Persistent storage for Airflow DAG data and PostgreSQL.
+- **Volume Sets** — Persistent storage for Airflow DAG data, PostgreSQL, and Redis.
 - **KEDA ScaledObject** (optional) — Automatically scales Celery workers up or down based on Redis queue length.
-- **Secret** — A dictionary secret containing the PostgreSQL credentials and JWT signing key, shared across all Airflow workloads.
+- **Secret** — A dictionary secret containing the PostgreSQL credentials, JWT signing key, Fernet encryption key, and admin password, shared across all Airflow workloads.
 - **Identity & Policy** — An identity bound to the workloads with `reveal` access to the Airflow configuration secret.
+
+## Pre-Deployment Checklist
+
+Before deploying, generate and set the following required values in `values.yaml`:
+
+| Value | How to generate |
+|-------|----------------|
+| `airflow.auth.jwtSecret` | `openssl rand -base64 48` |
+| `airflow.auth.fernetKey` | `python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'` |
+| `airflow.admin.password` | Choose a strong password |
+| `postgres.config.password` | Choose a strong password |
 
 ## Installation
 
@@ -55,15 +66,20 @@ gvc:
   locations:
     - name: aws-eu-central-1
 
-# PostgreSQL database configuration
+# Postgres database configuration
 postgres:
   image: postgres:18
   resources:
-    cpu: 500m
-    memory: 1024Mi
+    minCpu: 250m
+    maxCpu: 500m
+    minMemory: 512Mi
+    maxMemory: 1024Mi
   config:
     username: username
     password: password
+    database: airflow
+  volumeset:
+    capacity: 10 # initial capacity in GiB (minimum is 10)
 
 # Redis cache configuration
 redis:
@@ -71,6 +87,8 @@ redis:
   resources:
     cpu: 250m
     memory: 512Mi
+  volumeset:
+    capacity: 10 # initial capacity in GiB (minimum is 10)
 
 # Apache Airflow configuration
 airflow:
@@ -87,9 +105,14 @@ airflow:
   webPort: 8080 # Port for accessing the Airflow web interface
 
   auth:
-    jwtSecret: 1234567890 # Secret key used to sign JWT tokens, generate with: openssl rand -base64 48
+    jwtSecret: CHANGE_ME # REQUIRED: generate with "openssl rand -base64 48"
     jwtExpirationDelta: 3600 # JWT token expiration time in seconds
     jwtRefreshThreshold: 300 # Threshold before token expires to allow refresh (seconds)
+    fernetKey: CHANGE_ME # REQUIRED: generate with "python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'"
+
+  admin:
+    username: admin
+    password: CHANGE_ME # REQUIRED: change before deploying to production
 
   scheduler:
     dagDirListInterval: 10 # How often to check DAG folder (seconds)
@@ -101,8 +124,21 @@ airflow:
 volumeset:
   airflow:
     capacity: 10 # initial capacity in GiB (minimum is 10)
-  postgres:
-    capacity: 10 # initial capacity in GiB (minimum is 10)
+
+# Firewall configuration
+firewallConfig:
+  inboundAllowCIDR:
+    - 0.0.0.0/0 # Restrict to specific IPs in production (e.g. - 203.0.113.0/24)
+
+# Git-sync configuration for DAG delivery
+gitSync:
+  enabled: false
+  repo: "" # Git repository URL (e.g. https://github.com/org/dags)
+  branch: main # Branch to sync
+  period: 60s # How often to sync
+  subPath: "" # Optional subfolder within the repo containing DAGs
+  auth:
+    token: "" # Personal access token for private repos (leave empty for public repos)
 
 # KEDA (Kubernetes Event-driven Autoscaling) configuration
 # NOT SUPPORTED in gcp/us-central1
@@ -125,13 +161,16 @@ keda:
 ### PostgreSQL
 
 - `postgres.image` — PostgreSQL Docker image.
-- `postgres.resources` — CPU and memory allocated to PostgreSQL.
-- `postgres.config.username` / `postgres.config.password` — Database credentials. Change the default password before deploying to production.
+- `postgres.resources` — CPU and memory bounds for the PostgreSQL workload (`minCpu`, `maxCpu`, `minMemory`, `maxMemory`).
+- `postgres.config.username` / `postgres.config.password` — Database credentials. **Change the default password before deploying to production.**
+- `postgres.config.database` — Name of the Airflow metadata database (default: `airflow`).
+- `postgres.volumeset.capacity` — Persistent storage for PostgreSQL data (GiB, minimum 10).
 
 ### Redis
 
 - `redis.image` — Redis Docker image.
 - `redis.resources` — CPU and memory allocated to Redis.
+- `redis.volumeset.capacity` — Persistent storage for Redis data (GiB, minimum 10).
 
 ### Airflow Webserver and Workers
 
@@ -141,14 +180,29 @@ keda:
 
 ### Authentication
 
-Airflow 3.x uses JWT-based authentication for API access. Configure the token behavior under `airflow.auth`:
+Airflow 3.x requires three security credentials, all of which **must be changed before deploying to production**:
 
-- `airflow.auth.jwtSecret` — Secret key used to sign JWT tokens. **Always replace the default value.** Generate a secure value with:
+- `airflow.auth.jwtSecret` — Secret key used to sign JWT tokens for API authentication. Generate a secure value with:
   ```bash
   openssl rand -base64 48
   ```
+- `airflow.auth.fernetKey` — Key used to encrypt stored connections and variables. Generate with:
+  ```bash
+  python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+  ```
 - `airflow.auth.jwtExpirationDelta` — Token lifetime in seconds (default `3600`).
 - `airflow.auth.jwtRefreshThreshold` — Seconds before expiry at which a token refresh is allowed (default `300`).
+
+### Admin Account
+
+- `airflow.admin.username` — Username for the initial Airflow admin account (default: `admin`).
+- `airflow.admin.password` — Password for the initial admin account. **Change before deploying to production.**
+
+The admin user is created on first startup using Airflow's `SimpleAuthManager`. Credentials are written to a password file on the shared volume and re-applied on every container restart, so the password always reflects the current value in `values.yaml`.
+
+<Note>
+`SimpleAuthManager` is the default auth manager in Airflow 3.x and is suitable for development and internal deployments. For production deployments requiring SSO or LDAP, consider integrating an external auth provider via OAuth/OIDC.
+</Note>
 
 ### Scheduler
 
@@ -161,8 +215,32 @@ Airflow 3.x uses JWT-based authentication for API access. Configure the token be
 
 ### Storage
 
-- `volumeset.airflow.capacity` — Persistent storage for Airflow DAG data (GiB, minimum 10).
-- `volumeset.postgres.capacity` — Persistent storage for PostgreSQL (GiB, minimum 10).
+- `volumeset.airflow.capacity` — Persistent storage for the Airflow home directory shared across workloads (GiB, minimum 10).
+
+PostgreSQL and Redis storage are configured under their respective sections (`postgres.volumeset.capacity` and `redis.volumeset.capacity`).
+
+<Note>
+The Airflow volume uses a shared (NFS-style) filesystem, allowing both the webserver and Celery workers to read DAGs and write logs to the same volume.
+</Note>
+
+### Firewall
+
+- `firewallConfig.inboundAllowCIDR` — List of CIDR ranges allowed to reach the Airflow webserver. Defaults to `0.0.0.0/0` (public). **Restrict to specific IP ranges in production.**
+
+### Git-Sync
+
+Git-sync runs as a sidecar container on the webserver and Celery worker workloads, continuously pulling DAGs from a Git repository into the shared Airflow volume. This is the recommended approach for managing DAGs in production.
+
+| Property | Description |
+|----------|-------------|
+| `gitSync.enabled` | Enable or disable the git-sync sidecar |
+| `gitSync.repo` | Git repository URL (e.g. `https://github.com/org/dags`) |
+| `gitSync.branch` | Branch to sync (default: `main`) |
+| `gitSync.period` | Sync interval (default: `60s`) |
+| `gitSync.subPath` | Optional subfolder within the repo containing DAG files |
+| `gitSync.auth.token` | Personal access token for private repositories (leave empty for public repos) |
+
+When git-sync is disabled, DAGs can be placed manually in the `/opt/airflow/dags` directory on the Airflow volume.
 
 ### KEDA Autoscaling
 
@@ -188,12 +266,38 @@ KEDA is not supported in `gcp/us-central1`.
 Once deployed, the Airflow web UI is available at the workload's canonical endpoint:
 
 ```
-https://<release-name>-airflow-webserver.<gvc-name>.cpln.app
+https://<gvc-name>-airflow-webserver.<gvc-name>.cpln.app
 ```
+
+Log in with the `airflow.admin.username` and `airflow.admin.password` set in `values.yaml`.
 
 <Note>
 This template creates a GVC with a default name defined in the values file. If you plan to deploy multiple instances, you **must assign a unique GVC name** for each deployment.
 </Note>
+
+### API Access
+
+Airflow 3.x uses JWT-based authentication for API access. To obtain a token:
+
+```bash
+curl -X POST https://<your-airflow-url>/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "your-password"}'
+```
+
+Use the returned token for subsequent API requests:
+
+```bash
+curl https://<your-airflow-url>/api/v2/dags \
+  -H "Authorization: Bearer <token>"
+```
+
+## Production Considerations
+
+- **Change all `CHANGE_ME` values** before deploying — `jwtSecret`, `fernetKey`, `admin.password`, and `postgres.config.password` are all required.
+- **Restrict `firewallConfig.inboundAllowCIDR`** to trusted IP ranges to limit access to the Airflow UI.
+- **Enable git-sync** for reliable, version-controlled DAG delivery.
+- **Auth**: `SimpleAuthManager` is not recommended for deployments requiring enterprise SSO. Evaluate an OAuth/OIDC integration for those use cases.
 
 ## External References
 
@@ -209,6 +313,9 @@ This template creates a GVC with a default name defined in the values file. If y
     </Card>
     <Card title="Redis Documentation" icon="database" href="https://redis.io/docs/latest/">
     Official Redis documentation
+    </Card>
+    <Card title="git-sync" icon="github" href="https://github.com/kubernetes/git-sync">
+    git-sync sidecar documentation
     </Card>
     <Card title="Airflow Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/airflow">
     View the source files, default values, and chart definition
