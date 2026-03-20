@@ -12,9 +12,10 @@ For production use, maintain at least 3 PostgreSQL replicas and 3 etcd replicas.
 
 ### What Gets Created
 
-- **Stateful Workload** — A Patroni-managed PostgreSQL cluster with configurable replica count and resources. Each replica has its own volume.
-- **etcd Workload** — A dedicated etcd cluster (via dependency) providing distributed consensus for Patroni leader election.
-- **HAProxy Workload** *(optional, enabled by default)* — A leader-routing proxy that always directs write traffic to the current primary replica.
+- **Stateful Patroni PostgreSQL Workload** — A Patroni-managed PostgreSQL cluster with configurable replica count and resources. Each replica has its own volume.
+- **etcd Workload** — A dedicated etcd cluster providing distributed consensus for Patroni leader election.
+- **HAProxy Leader-Routing Workload** *(optional, enabled by default)* — Routes write traffic to the current primary replica, providing a stable connection endpoint during failover.
+- **PgBouncer Workload** *(optional)* — A connection pooler deployed in front of HAProxy, multiplexing application connections into a smaller pool of real database connections.
 - **Volume Set** — Persistent storage for PostgreSQL data, with optional autoscaling.
 - **Secrets** — A dictionary secret with database credentials; opaque secrets for the Patroni startup script, HAProxy startup script, and WAL-G backup script (created as needed).
 - **Identity & Policy** — An identity bound to the workload with `reveal` access to all required secrets, and cloud storage access when backup is enabled.
@@ -97,7 +98,21 @@ etcd:
     workloads:
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
-proxy: # HAProxy endpoint to write to leader replica
+pgbouncer:
+  enabled: false
+  image: edoburu/pgbouncer:v1.25.1-p0
+  poolMode: transaction  # options: session, transaction, statement
+  defaultPoolSize: 25    # number of real Postgres connections PgBouncer maintains per pod
+  maxClientConn: 1000    # maximum number of client connections PgBouncer accepts per pod
+  maxDbConnections: 100  # hard cap on total Postgres connections regardless of how many PgBouncer pods are running
+  minReplicas: 2
+  maxReplicas: 4
+
+  resources:
+    cpu: 200m
+    memory: 128Mi
+
+proxy: # HAProxy endpoint to write to leader replica. Automatically enabled when pgbouncer is enabled.
   enabled: true
   image: haproxy:2.9
   resources:
@@ -190,13 +205,40 @@ HAProxy must be enabled (`proxy.enabled: true`) for logical backups to function 
 | `same-org` | Allow access from all workloads in the same organization |
 | `workload-list` | Allow access only from specific workloads listed in `workloads` |
 
+### PgBouncer Connection Pooling
+
+PgBouncer is an optional connection pooler that sits in front of HAProxy, multiplexing application connections into a smaller pool of real database connections. HAProxy handles leader routing and failover transparently — PgBouncer is unaware of which PostgreSQL replica is the primary.
+
+Enabling PgBouncer **automatically enables HAProxy**, as it is required for leader-aware routing in the HA cluster.
+
+When enabled, PgBouncer becomes the primary connection endpoint:
+
+```
+RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432
+```
+
+- `pgbouncer.poolMode` — Controls how connections are reused:
+
+| Mode | Description |
+|------|-------------|
+| `transaction` | Connection held only for the duration of a transaction, then returned to the pool. Best for most web and API workloads. Not compatible with session-level features (`SET` variables, temporary tables, advisory locks). |
+| `session` | Connection held for the entire client session. Compatible with all PostgreSQL features but provides less reuse. Increase `defaultPoolSize` to match your expected concurrent client count. |
+| `statement` | Connection returned after every statement. Transactions are not supported. Rarely used. |
+
+- `pgbouncer.defaultPoolSize` — Number of real PostgreSQL connections PgBouncer maintains per pod (default: `25`).
+- `pgbouncer.maxClientConn` — Maximum number of client connections PgBouncer accepts per pod (default: `1000`).
+- `pgbouncer.maxDbConnections` — Hard cap on total PostgreSQL connections across **all** PgBouncer pods. Prevents connection blowout when PgBouncer scales out — set this to a value the PostgreSQL primary can safely handle (default: `100`).
+- `pgbouncer.minReplicas` / `pgbouncer.maxReplicas` — PgBouncer autoscales on RPS between these bounds. Increase `maxReplicas` for high-throughput workloads.
+- `pgbouncer.resources.cpu` / `pgbouncer.resources.memory` — Resources allocated to each PgBouncer pod.
+
 ### Connecting to PostgreSQL
 
-Connect to PostgreSQL through the HAProxy workload, which always routes to the current leader:
+Connect using the appropriate endpoint depending on which optional components are enabled:
 
-```
-RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432
-```
+| Setup | Host |
+|-------|------|
+| PgBouncer enabled | `RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local` |
+| Proxy only | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local` |
 
 ### Backup
 
@@ -327,6 +369,9 @@ wal-g backup-fetch /var/lib/postgresql/data/pgdata <backup_name>
     </Card>
     <Card title="etcd Documentation" icon="server" href="https://etcd.io/docs/v3.6/">
     Official etcd documentation
+    </Card>
+    <Card title="PgBouncer Documentation" icon="database" href="https://www.pgbouncer.org/config.html">
+    PgBouncer configuration reference
     </Card>
     <Card title="PostgreSQL HA Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/postgres-highly-available">
     View the source files, default values, and chart definition
