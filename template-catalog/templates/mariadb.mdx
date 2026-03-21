@@ -12,11 +12,12 @@ MariaDB on Control Plane operates as a single-replica deployment. Do not scale u
 
 ### What Gets Created
 
-- **MariaDB Workload** — A single-replica MariaDB database container with configurable resources.
+- **Stateful MariaDB Workload** — A single-replica MariaDB database container with configurable resources.
 - **Volume Set** — Persistent storage for MariaDB data, with optional autoscaling.
 - **Secret** — An opaque secret storing the database name, root password, and user credentials, injected into the container at startup.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the database credentials secret.
-- **phpMyAdmin Workload** (optional) — A web-based database management interface. Enabled when `enablePhpMyAdmin: true`.
+- **Identity & Policy** — An identity bound to the workload with `reveal` access to the database credentials secret, and cloud storage access when backup is enabled.
+- **phpMyAdmin Workload** *(optional)* — A web-based database management interface. Enabled when `enablePhpMyAdmin: true`.
+- **Backup Cron Workload** *(optional)* — A scheduled `mysqldump` backup job that writes compressed dumps to AWS S3 or GCS.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
@@ -24,7 +25,7 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ## Installation
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -53,7 +54,7 @@ This template has no external prerequisites. To install, follow the instructions
 The default `values.yaml` for this template:
 
 ```yaml
-image: mariadb:10
+image: mariadb:11
 
 resources:
   minCpu: 100m
@@ -64,10 +65,10 @@ resources:
 timeoutSeconds: 15
 
 config:
-  db: db
-  rootPassword: root-pw
-  user: user
-  password: pw
+  user: username
+  password: password
+  rootPassword: root-password
+  db: test
 
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
@@ -83,6 +84,29 @@ internalAccess:
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
 enablePhpMyAdmin: true
+
+backup:
+  enabled: false
+  image: controlplanecorporation/mysql-backup:1.0 # compatible with all MariaDB versions
+  schedule: "0 2 * * *"   # daily at 2am UTC
+
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+  provider: aws # Options: aws or gcp
+
+  aws:
+    bucket: my-backup-bucket
+    region: us-east-1
+    cloudAccountName: my-backup-cloudaccount
+    policyName: my-backup-policy
+    prefix: mariadb/backups
+
+  gcp:
+    bucket: my-backup-bucket
+    cloudAccountName: my-backup-cloudaccount
+    prefix: mariadb/backups
 ```
 
 ### Credentials
@@ -131,6 +155,72 @@ Once deployed, connect to the database from within the same GVC using:
 
 ```
 RELEASE_NAME-maria.GVC_NAME.cpln.local:3306
+```
+
+## Backup
+
+Backup is disabled by default. When enabled, a cron workload runs `mysqldump` on the configured schedule and uploads compressed dumps to AWS S3 or GCS.
+
+- `backup.enabled` — Enable scheduled backups.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
+- `backup.provider` — `aws` or `gcp`.
+- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+
+### AWS S3
+
+Before enabling backup with `provider: aws`, complete the following in your AWS account:
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion"
+            ],
+            "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+            ]
+        }
+    ]
+}
+```
+
+4. Set `backup.aws.policyName` to the name of the policy created in step 3.
+5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+
+### GCS
+
+Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+
+## Restoring a Backup
+
+Run the following from a client with access to the backup bucket. For GCS, replace `aws s3 cp s3://...` with `gsutil cp gs://...`.
+
+```sh
+aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.gz - \
+  | gunzip \
+  | sed '/^SET @@GLOBAL.GTID_PURGED/d' \
+  | mariadb \
+      --host=RELEASE_NAME-maria.GVC_NAME.cpln.local \
+      --port=3306 \
+      --user=root
 ```
 
 ## External References
