@@ -20,6 +20,8 @@ This template creates a new GVC. At least 2 locations are required.
 - **Secret** — An opaque secret containing the Redis configuration (`redis.conf`), mounted into each Redis container.
 - **Secret** — An opaque secret containing the Sentinel configuration (`sentinel.conf`), mounted into each Sentinel container.
 - **Identity & Policy** — Separate identities and policies for the Redis and Sentinel workloads, each with `reveal` access to their respective secrets.
+- **Domain** *(optional)* — One domain per workload when public access is enabled, exposing Redis and Sentinel at the configured hostnames.
+- **Backup Cron Workload** *(optional)* — A scheduled backup job that writes Redis snapshots to AWS S3 or GCS.
 
 ## Installation
 
@@ -54,7 +56,7 @@ The default `values.yaml` for this template:
 ```yaml
 gvc:
   name: my-redis-gvc
-  locations: # Replica count applies to the Redis workload only; Sentinel always runs 1 per location
+  locations: # Replica count applies to Redis workload only; Sentinel always runs 1 per location
     - name: aws-eu-central-1
       replicas: 2
     - name: aws-us-west-2
@@ -70,6 +72,9 @@ redis:
   # serverCommand: redis-server  # Override for different Redis/Valkey image variants
   # extraArgs: "--maxclients 20000 --maxmemory 200mb --maxmemory-policy allkeys-lru"
   # password: your-redis-password
+  publicAccess:
+    enabled: false
+    address: redis.example-cpln.com  # Custom domain to expose Redis publicly
   volumeset:
     initialCapacity: 20 # GiB
     autoscaling:
@@ -86,12 +91,40 @@ sentinel:
   quorum: 2
   # extraArgs: "--sentinel down-after-milliseconds mymaster 5000 --sentinel failover-timeout mymaster 10000"
   # password: your-sentinel-password
+  publicAccess:
+    enabled: false
+    address: redis-sentinel.example-cpln.com  # Custom domain to expose Sentinel publicly
 
 # Applies to both Redis and Sentinel workloads
 firewall:
   internalAllowType: same-gvc # options: same-gvc, same-org, workload-list
+  # externalInboundAllowCIDR: "0.0.0.0/0"  # Required when publicAccess is enabled. Comma-separated list.
+  # externalOutboundAllowCIDR: "0.0.0.0/0"  # Comma-separated list.
   # workloads:
   #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+backup:
+  enabled: false
+  image: controlplanecorporation/redis-backup:1.0
+  schedule: "0 2 * * *"  # daily at 2am UTC
+
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+  provider: aws # Options: aws or gcp
+
+  aws:
+    bucket: my-backup-bucket
+    region: us-east-1
+    cloudAccountName: my-backup-cloudaccount
+    policyName: my-backup-policy
+    prefix: "redis/backups"
+
+  gcp:
+    bucket: my-backup-bucket
+    cloudAccountName: my-backup-cloudaccount
+    prefix: "redis/backups"
 ```
 
 ### Locations
@@ -134,11 +167,31 @@ Sentinel monitors the Redis primary and promotes a replica on failure. The quoru
 
 Sentinel state storage is always provisioned at 10 GiB with no autoscaling.
 
+### Public Access
+
+Both Redis and Sentinel can be exposed publicly via a custom domain. When enabled, a Control Plane domain resource is created for the workload and traffic is routed to it at the standard port.
+
+- `redis.publicAccess.enabled` — Expose Redis publicly (default: `false`).
+- `redis.publicAccess.address` — The custom domain hostname for Redis (e.g. `redis.example-cpln.com`).
+- `sentinel.publicAccess.enabled` — Expose Sentinel publicly (default: `false`).
+- `sentinel.publicAccess.address` — The custom domain hostname for Sentinel (e.g. `redis-sentinel.example-cpln.com`).
+
+<Note>
+`firewall.externalInboundAllowCIDR` must be set when public access is enabled. Without it, inbound external traffic will be blocked.
+</Note>
+
+When public access is enabled, connect using the configured domain address at the standard port:
+
+| Workload | Public endpoint |
+|----------|----------------|
+| Redis | `redis.publicAccess.address:6379` |
+| Sentinel | `sentinel.publicAccess.address:26379` |
+
 ### Firewall
 
 A single firewall configuration applies to both the Redis and Sentinel workloads.
 
-- `firewall.internalAllowType` — Controls which workloads can connect:
+- `firewall.internalAllowType` — Controls which workloads can connect internally:
 
 | Value | Description |
 |-------|-------------|
@@ -147,6 +200,8 @@ A single firewall configuration applies to both the Redis and Sentinel workloads
 | `workload-list` | Allow access only from specific workloads listed in `workloads` |
 
 - `firewall.workloads` — List of specific workload links, used when `internalAllowType` is `workload-list`.
+- `firewall.externalInboundAllowCIDR` — Comma-separated list of CIDRs allowed to reach the workloads externally. **Required when public access is enabled.** Use `0.0.0.0/0` to allow all, or restrict to specific IP ranges.
+- `firewall.externalOutboundAllowCIDR` — Comma-separated list of CIDRs the workloads are allowed to connect to externally.
 
 ### Connecting to Redis
 
@@ -170,6 +225,58 @@ The Sentinel master name is `mymaster`.
 |----------|------|----------|-------------|
 | Redis | `6379` | TCP | Redis data port |
 | Sentinel | `26379` | TCP | Sentinel discovery port |
+
+## Backup
+
+Backup is disabled by default. When enabled, a cron workload runs on the configured schedule and uploads Redis snapshots to AWS S3 or GCS.
+
+- `backup.enabled` — Enable scheduled backups.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
+- `backup.provider` — `aws` or `gcp`.
+- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+
+### AWS S3
+
+Before enabling backup with `provider: aws`, complete the following in your AWS account:
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion"
+            ],
+            "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+            ]
+        }
+    ]
+}
+```
+
+4. Set `backup.aws.policyName` to the name of the policy created in step 3.
+5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+
+### GCS
+
+Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
 
 ## External References
 
