@@ -12,10 +12,11 @@ PostGIS on Control Plane operates as a single-replica deployment. Do not scale u
 
 ### What Gets Created
 
-- **Stateful Workload** — A single-replica PostGIS database container with configurable resources.
+- **Stateful PostGIS Workload** — A single-replica PostGIS database container with configurable resources.
 - **Volume Set** — Persistent storage for database data, with optional autoscaling.
 - **Secret** — A dictionary secret storing the database username and password, injected into the container at startup.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the database credentials secret.
+- **Identity & Policy** — An identity bound to the workload with `reveal` access to the database credentials secret, and cloud storage access when backup is enabled.
+- **Backup Cron Workload** *(optional)* — A scheduled `pg_dump` backup job that writes compressed SQL dumps to AWS S3 or GCS.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
@@ -23,7 +24,7 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ## Installation
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -52,7 +53,7 @@ This template has no external prerequisites. To install, follow the instructions
 The default `values.yaml` for this template:
 
 ```yaml
-image: postgis/postgis:17-3.5
+image: postgis/postgis:18-3.6
 
 resources:
   minCpu: 200m
@@ -63,9 +64,7 @@ resources:
 config:
   username: username
   password: password
-
-postgres:
-  database: database
+  database: test
 
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
@@ -74,6 +73,29 @@ volumeset:
     maxCapacity: 100 # Maximum capacity in GiB
     minFreePercentage: 10 # Trigger scaling when free space drops below this percentage
     scalingFactor: 1.2 # Multiply current capacity by this factor when scaling up
+
+backup: # compatible with PostGIS 17+
+  enabled: false
+  image: controlplanecorporation/pg-backup:18.1.0 # tag 18.1.0 = Postgres 18, 17.1.0 = Postgres 17
+  schedule: "0 2 * * *"   # daily at 2am UTC
+
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+  provider: aws # Options: aws or gcp
+
+  aws:
+    bucket: my-backup-bucket
+    region: us-east-1
+    cloudAccountName: my-backup-cloudaccount
+    policyName: my-backup-policy
+    prefix: postgis/backups
+
+  gcp:
+    bucket: my-backup-bucket
+    cloudAccountName: my-backup-cloudaccount
+    prefix: postgis/backups
 
 internalAccess:
   type: same-gvc # options: none, same-gvc, same-org, workload-list
@@ -85,7 +107,7 @@ internalAccess:
 
 - `config.username` — PostgreSQL username. **Change before deploying to production.**
 - `config.password` — PostgreSQL password. **Change before deploying to production.**
-- `postgres.database` — Name of the database created on startup.
+- `config.database` — Name of the database created on startup.
 
 <Note>
 These values are only applied on first startup when the data directory is empty. Updating them after the initial deployment will have no effect on the running database. To change credentials or the database name on an existing instance, use PostgreSQL's native commands (e.g. `ALTER USER`, `ALTER DATABASE`).
@@ -121,6 +143,98 @@ Once deployed, connect to the database from within the same GVC using:
 
 ```
 RELEASE_NAME-postgis.GVC_NAME.cpln.local:5432
+```
+
+## Backup
+
+Backup is disabled by default. When enabled, a cron workload runs `pg_dump` on the configured schedule and uploads compressed SQL dumps to AWS S3 or GCS.
+
+<Note>
+Backup requires PostGIS 17 or later. Set `backup.image` to match your PostGIS version: `controlplanecorporation/pg-backup:18.1.0` for PostGIS 18, or `controlplanecorporation/pg-backup:17.1.0` for PostGIS 17.
+</Note>
+
+- `backup.enabled` — Enable scheduled backups.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
+- `backup.provider` — `aws` or `gcp`.
+- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+
+### AWS S3
+
+Before enabling backup with `provider: aws`, complete the following in your AWS account:
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion"
+            ],
+            "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+            ]
+        }
+    ]
+}
+```
+
+4. Set `backup.aws.policyName` to the name of the policy created in step 3.
+5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+
+### GCS
+
+Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+
+## Restoring a Backup
+
+Run the following from a client with access to the backup bucket:
+
+**AWS S3:**
+
+```sh
+export PGPASSWORD="PASSWORD"
+
+aws s3 cp "s3://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
+  | gunzip \
+  | psql \
+      --host=RELEASE_NAME-postgis.GVC_NAME.cpln.local \
+      --port=5432 \
+      --username=USERNAME \
+      --dbname=postgres
+
+unset PGPASSWORD
+```
+
+**GCS:**
+
+```sh
+export PGPASSWORD="PASSWORD"
+
+gsutil cp "gs://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
+  | gunzip \
+  | psql \
+      --host=RELEASE_NAME-postgis.GVC_NAME.cpln.local \
+      --port=5432 \
+      --username=USERNAME \
+      --dbname=postgres
+
+unset PGPASSWORD
 ```
 
 ## External References
