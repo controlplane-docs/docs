@@ -1,0 +1,633 @@
+# Control Plane Documentation
+
+> Last updated: 2026-04-27
+
+> Control Plane is a hybrid multi-cloud platform for deploying and managing
+> containerized workloads across AWS, GCP, Azure, and private clouds from
+> a single, unified interface. Certified PCI DSS Level 1, SOC 2 Type II,
+> and HIPAA-eligible.
+
+## Platform Overview
+
+Control Plane eliminates cloud vendor lock-in by providing a unified control plane that abstracts the differences between cloud providers. Workloads are deployed to Global Virtual Clouds (GVCs) that span multiple clouds and regions. Traffic is automatically geo-routed to the nearest healthy location. The platform handles TLS termination, autoscaling, logging, and identity-based cloud access transparently.
+
+Based on Kubernetes, Control Plane orchestrates hardened, security-isolated Kubernetes clusters across all regions of the major clouds. You can add additional Kubernetes clusters running anywhere as custom BYOK locations.
+
+Key entry points:
+- Console UI: https://console.cpln.io
+- CLI tool: `cpln` (install via npm `@controlplane/cli`, Homebrew `brew tap controlplane-com/cpln && brew install cpln`, or binary download)
+- REST API: https://api.cpln.io
+- MCP Server: https://mcp.cpln.io/mcp (80+ tools for AI agent integration)
+- AI Plugin: https://docs.controlplane.com/mcp/ai-plugin (skills, specialized agents, slash commands, and guardrail rules for AI coding assistants)
+- Terraform Provider: registry.terraform.io/providers/controlplane-com/cpln
+- OpenAPI Specs: https://api.cpln.io/openapi.json (Core), https://audit.cpln.io/openapi.json (Audit)
+- CLI Conventions (command structure, patterns, hallucination traps): https://docs.controlplane.com/cli-conventions.md
+
+## Resource Hierarchy
+
+```
+Org (Organization) — top-level isolation boundary, globally unique name, IMMUTABLE
+├── Principals: Users, Groups, Service Accounts                  (org-scoped)
+├── Governance: Policies, Quotas, Audit Contexts                 (org-scoped)
+├── Infrastructure: Cloud Accounts, Agents, Locations,           (org-scoped)
+│                   IP Sets, mk8s clusters
+├── Assets: Secrets (12 types), Images, Domains                  (org-scoped)
+└── GVC (Global Virtual Cloud) — deployment environment
+    ├── Workloads (1+ containers, four types)                    (GVC-scoped)
+    ├── Identities (cloud access, secrets, networks)             (GVC-scoped)
+    └── Volume Sets (persistent storage)                         (GVC-scoped)
+```
+
+Scoping rules:
+- **Org-scoped**: Secrets, Domains, Cloud Accounts, Agents, Policies, Images, Groups, Service Accounts, IP Sets, mk8s clusters, Audit Contexts, Quotas
+- **GVC-scoped**: Workloads, Identities, Volume Sets
+- A workload can reference secrets from its parent org but only volume sets and identities from its own GVC
+- Each domain is org-scoped but associated with exactly one GVC at a time
+- Pull secrets are configured at the **GVC level**, not per workload — only `docker`, `ecr`, and `gcp` secret types are valid pull secrets
+- Identities cannot be shared across GVCs — recreate the identity with the same spec in each GVC that needs it
+
+---
+
+## Essential Platform Knowledge for AI Agents
+
+### Workload Types
+
+Control Plane has four workload types. **Workload type is immutable** — changing it requires delete + recreate. Capture state with `cpln workload get NAME --gvc GVC -o yaml-slim > NAME.bak.yaml` first.
+
+| Feature | Serverless | Standard | Stateful | Cron |
+|:---|:---:|:---:|:---:|:---:|
+| Scale to zero | `rps` / `concurrency` | KEDA only | KEDA only | No |
+| Ports | Exactly 1 HTTP (required) | 0 or more | 0 or more | Must NOT expose any |
+| Capacity AI | Yes (default) | Yes (default) | **Always disabled** | N/A |
+| Persistent volumes | No | No | Yes (volume sets) | No |
+| `replicaDirect` LB | No | No | **Yes (only type)** | No |
+| `spec.job` (cron schedule) | Forbidden | Forbidden | Forbidden | Required |
+| Multi-metric autoscaling | No | Yes (cpu/memory/rps) | Yes (cpu/memory/rps) | N/A |
+| `maxConcurrency` | Used | Ignored | Ignored | N/A |
+| `timeoutSeconds` max | 600 | 3600 | 3600 | N/A |
+| Max containers per workload | 8 | 8 | 8 | 8 |
+
+Key distinctions:
+- **Serverless**: Must expose exactly one HTTP port. Can scale to zero with `rps` or `concurrency`. Cannot use `latency` or multi-metric autoscaling. `Host` header is the canonical endpoint, not the custom domain.
+- **Standard**: General-purpose workloads, multiple ports, non-HTTP supported. Cannot use `concurrency` autoscaling. Scale-to-zero only via KEDA.
+- **Stateful**: Like Standard but with stable replica identities, hostnames, and persistent volume support. Does **NOT** support Capacity AI. Required for `replicaDirect` LB and `workloadLink` domain routing.
+- **Cron**: Scheduled jobs that must exit on completion. Cannot serve traffic. Deploys to ALL GVC locations with no per-location overrides. Probes, autoscaling, `timeoutSeconds`, `capacityAI`, `debug` all ignored.
+
+Workload name max 49 chars; cannot end with `-headless`. Container names cannot start with `cpln-` or `debugger-`. Reserved container names: `istio-proxy`, `queue-proxy`, `istio-validation`, `cpln-envoy-assassin`, `cpln-writer-proxy`, `cpln-reader-proxy`, `cpln-dbaas-config`.
+
+### Workload Resource Validation
+
+| Constraint | Rule |
+|:---|:---|
+| CPU minimum | 25 millicores |
+| Memory minimum | 32 MiB |
+| Memory-to-CPU ratio | `memory(MiB) / cpu(millicores)` ≤ 8 (relax to 32 with tag `cpln/relaxMemoryToCpuRatio`) |
+| `port` vs `ports` | Mutually exclusive on the same container; port numbers unique across containers |
+| Volumes per workload | Max 15, unique paths, no path can be a parent of another |
+| `target` ceiling | ≤ 100 with cpu/memory metrics; not allowed with KEDA |
+| `metric` / `multi` / `target` | `metric` and `multi` are mutually exclusive; `target` is mutually exclusive with `multi` |
+| Health-check probe types | Exactly one of `exec`, `grpc`, `tcpSocket`, `httpGet` per probe (mutually exclusive) |
+
+**Defaults**: `type=serverless`, `cpu=50m`, `memory=128Mi`, `autoscaling.target=95`, `minScale=1`, `maxScale=5`, `scaleToZeroDelay=300s`, `terminationGracePeriodSeconds=90`, `firewallConfig.internal.inboundAllowType=none`. Readiness probes default to TCP-on-port for Serverless, **disabled** for Standard / Stateful / Cron.
+
+### Autoscaling Rules
+
+| Strategy | Serverless | Standard | Stateful | Cron |
+|:---|:---:|:---:|:---:|:---:|
+| Concurrency | Yes | No | No | No |
+| RPS | Yes | Yes | Yes | No |
+| CPU Utilization | Yes | Yes | Yes | No |
+| Memory Utilization | Yes | Yes | Yes | No |
+| Latency | No | Yes | Yes | No |
+| Multi-metric (cpu/memory/rps) | No | Yes | Yes | No |
+| KEDA (custom metrics) | No | Yes | Yes | No |
+| `disabled` (manual scaling) | Yes | Yes | Yes | N/A |
+
+**Scale to zero**:
+- Serverless workloads: `rps` or `concurrency` strategies.
+- Standard and Stateful workloads: KEDA only (e.g., scale on Redis queue length, Kafka topic lag, Prometheus queries).
+- Cron: Cannot scale to zero. All other types require `minScale >= 1`.
+
+KEDA (Kubernetes Event-Driven Autoscaling) must be enabled at the GVC level first. Available for Standard and Stateful workloads only.
+
+### Capacity AI
+
+Capacity AI dynamically adjusts container CPU and memory allocation based on historical usage to reduce costs. **Mutually exclusive with all of the following:**
+
+| Restriction | Reason |
+|:---|:---|
+| Stateful workloads | Stateful workloads need predictable resource allocation |
+| CPU Utilization autoscaling | Dynamic CPU allocation conflicts with CPU-based scaling |
+| Multi-metric autoscaling | Multi-metric requires stable resource baselines |
+| GPUs | GPU allocation is fixed, not dynamic |
+
+Capacity AI minimum: 25 millicores CPU, scaling up at a 1:3 ratio of CPU millicores to memory MiB. In-place resource resizing (no pod restart) is available for Standard and Cron workloads only. Changes to a workload reset historical usage and restart the analysis.
+
+### Secret Access Model
+
+Three steps are required for a workload to access a secret at runtime. **Missing any one step = silent runtime failure** (this is the #1 support issue).
+
+1. Create an **identity** and assign it to the workload: `cpln workload update WL --gvc GVC --set spec.identityLink=//identity/ID`
+2. Create a **policy** granting the identity `reveal` on the target secret, then bind: `cpln policy add-binding P --permission reveal --identity //gvc/GVC/identity/ID`
+3. Reference the secret in env vars / volumes using **the field-qualified form**: `cpln://secret/NAME.FIELD`
+
+**Field reference syntax (the field name is required)**:
+
+| Type | Form |
+|:---|:---|
+| `opaque` | `cpln://secret/NAME.payload` |
+| `dictionary` | `cpln://secret/NAME.KEY` (one env var per key, or volume-mount as a directory) |
+| `userpass` | `cpln://secret/NAME.username` / `.password` |
+| `tls` | `cpln://secret/NAME.cert` / `.key` |
+| `keypair` | `cpln://secret/NAME.publicKey` / `.privateKey` |
+| `aws` | `cpln://secret/NAME.accessKey` / `.secretKey` / `.roleArn` |
+| `gcp` | `cpln://secret/NAME` (typically a volume mount — JSON file) |
+
+Control Plane supports **12 secret types**: `opaque`, `dictionary`, `userpass`, `aws`, `gcp`, `azure-sdk`, `azure-connector`, `docker`, `ecr`, `tls`, `keypair`, `nats-account`. **`cpln secret create` does NOT exist** — use `create-opaque`, `create-aws`, `create-gcp`, etc. (12 type-specific variants).
+
+**Don't set `spec.identityLink` unless the workload actually needs secret access, credential-free cloud access, or private network access.** Empty identity assignments complicate debugging and audit traces.
+
+### Identity principal links in policies
+
+Policies must use the GVC-scoped form for identities: `//gvc/GVC_NAME/identity/NAME`. The bare `//identity/NAME` form is **silently ignored** — a common silent failure pattern.
+
+### Identity Constraints
+
+- Identities are **GVC-scoped** — they cannot be shared across GVCs (recreate per GVC with the same spec)
+- A workload can be assigned exactly **one** identity (`spec.identityLink=//identity/NAME`)
+- An identity can have only **one cloud account per provider** (e.g., one AWS + one GCP + one Azure, but not two AWS accounts)
+- An identity is only required when a workload needs secret access, credential-free cloud access, or private network access via agents — don't assign one for plain HTTP-serving workloads
+- Identities can be reused across multiple workloads within the same GVC
+- Provider sections each have XOR rules (e.g., AWS `roleName` ⊻ `policyRefs`; GCP `serviceAccount` ⊻ `bindings`). Network resources: `IPs` ⊻ `FQDN`. Native network resources: `awsPrivateLink` ⊻ `gcpServiceConnect`. Max 50 of each.
+
+### Networking Model
+
+**Internal DNS**: Workloads in the same GVC communicate at `WORKLOAD_NAME.GVC_NAME.cpln.local:PORT`. All internal traffic is automatically mTLS-encrypted — no configuration required. Every workload receives a `CPLN_TOKEN` env var (auto-rotated JWT, valid only from inside that workload).
+
+**Public canonical endpoint** depends on the GVC's `endpointNamingFormat`:
+- `org` (default for new GVCs): `{workload}-{gvcAlias}.{orgEndpointPrefix}.cpln.app`
+- `default`: `{workload}-{gvcAlias}.cpln.app`
+- `legacy`: legacy naming scheme
+
+`gvcAlias` is auto-generated and may differ from the GVC name. Look up the exact endpoint via `cpln workload get WL --gvc GVC -o json | jq -r '.status.endpoint'`. The container also receives a `CPLN_GLOBAL_ENDPOINT` env var. **Serverless workloads receive the canonical endpoint in the `Host` header** — original domain is in `X-Forwarded-Host`. Standard / Stateful receive the custom domain as `Host`.
+
+**Internal firewall** (workload-to-workload): Default is `none` (no access).
+- `none`: No inter-workload communication
+- `same-gvc`: All workloads in the same GVC can communicate
+- `same-org`: All workloads in the same org can communicate (cross-GVC)
+- `workload-list`: Only specified workloads can communicate (cross-GVC supported)
+
+**External firewall** (internet traffic): Both inbound and outbound are disabled by default.
+- Inbound: Enable by adding CIDR addresses (`0.0.0.0/0` for all internet traffic) or use `--public` on `cpln workload create`
+- Outbound: Enable by adding CIDRs or hostnames (`0.0.0.0/0` for all)
+- Hostname-based outbound rules only allow ports 80, 443, 445 by default (override with `outboundAllowPort`)
+- Hostname rules support wildcard prefix (`*.amazonaws.com`)
+- **CIDR rules take precedence over hostname rules** when both are set
+- **Blocked rules always take precedence over allowed rules**
+
+**Location ID format**: `aws-us-east-1`, `gcp-us-central1`, `azure-eastus`.
+
+### Domain Behavior
+
+Two DNS modes:
+- **CNAME mode** (`dnsMode: cname`): Path-based routing. You manage DNS, point CNAME to `cpln.app`.
+- **NS mode** (`dnsMode: ns`): Subdomain-based routing. Control Plane manages DNS via `ns1.cpln.cloud`, `ns2.cpln.cloud`, `ns1.cpln.live`, `ns2.cpln.live`.
+
+| Field | Rule |
+|:---|:---|
+| `dnsMode` | `cname` or `ns`. **Apex domains MUST use `cname`** — NS does not support apex |
+| `certChallengeType` | `http01` or `dns01`. **NS mode requires `dns01`** (`http01` rejected) |
+| `gvcLink` ⊻ `workloadLink` ⊻ `ports.routes` | Mutually exclusive. `workloadLink` (replica-direct) is **Stateful only** |
+| `acceptAllHosts` ⊻ `acceptAllSubdomains` | Mutually exclusive; both require dedicated LB |
+| `ports[].protocol` | `http`, `http2` (default), `tcp` (`tcp` requires dedicated LB) |
+| Route scope | All routes in a domain must target workloads in the **same GVC** |
+
+**Auto-provisioned TLS certificates** (Let's Encrypt) are valid 90 days, auto-renewed every 60. Custom certificates use the `keypair` secret type with PEM content.
+
+**`Host` header behavior** differs by workload type:
+- **Serverless**: `Host` is always the canonical endpoint (e.g., `workload-gvcalias.cpln.app`), NOT the custom domain. Original is in `X-Forwarded-Host`.
+- **Standard/Stateful**: `Host` IS the custom domain used in the request.
+
+### Storage (Volume Sets)
+
+Volume sets provide persistent storage within a GVC. Mount via `cpln://volumeset/NAME` with `recoveryPolicy: retain` (default) or `recycle`. **Stateful only** for `ext4`/`xfs`; `shared` works with any workload type.
+
+| Filesystem | Access | Binding | Snapshots / shrink / delete / restore |
+|:---|:---|:---|:---:|
+| `ext4` | RWO | 1 stateful workload | Yes |
+| `xfs` | RWO | 1 stateful workload | Yes |
+| `shared` | RWX | Any number of workloads, any type | **No** |
+
+| Performance class | Min capacity | Max capacity |
+|:---|:---|:---|
+| `general-purpose-ssd` | 10 GB | 65,536 GB |
+| `high-throughput-ssd` | **200 GB** | 65,536 GB |
+| `shared` (auto-set when `fileSystemType: shared`) | 10 GB | 65,536 GB |
+
+- **Both `fileSystemType` AND `performanceClass` are immutable** after creation. Changing either = delete + recreate (data loss).
+- Custom encryption (AWS KMS) is supported on `ext4`/`xfs` only.
+- Volumes can only be **expanded once every 6 hours**.
+- `shrinkVolume` provisions a NEW smaller volume and **permanently deletes the old volume and all its data** — only safe for distributed systems with replication (Kafka, CockroachDB). Never use for single-replica stateful workloads or databases without replication.
+- `createFinalSnapshot: true` (default) auto-snapshots before any volume deletion — leave on.
+- Volume sets are GVC-scoped. A workload can only use volume sets in the same GVC. Autoscaling (reactive and predictive) is available for automatic expansion.
+
+### Access Control
+
+Two independent systems:
+- **Billing account roles**: `billing_admin`, `billing_viewer`, `org_creator` — manage billing and org creation. These are independent from org permissions; a `billing_admin` has NO implicit org-level permissions.
+- **Org-level policies**: Bind principals (users, groups, service accounts, identities) to permissions on target resources. Fine-grained authorization following least-privilege principles.
+
+**Four principal types**: Users (`//user/EMAIL`), Groups (`//group/NAME`), Service Accounts (`//serviceaccount/NAME`), Identities (`//gvc/GVC/identity/NAME` — NEVER `//identity/NAME`).
+
+**Policy rules**:
+- `targetKind` is **singular and lowercase**. Valid: `account`, `agent`, `auditctx`, `cloudaccount`, `domain`, `group`, `gvc`, `identity`, `image`, `location`, `org`, `policy`, `quota`, `secret`, `serviceaccount`, `task`, `user`, `volumeset`, `workload`.
+- **NOT valid policy targets** (controlled via parent): `ipset`, `mk8s`, `workloadreplica`.
+- Target scope — pick exactly one: `target: all` | `targetLinks: [...]` | `targetQuery: {spec: {match, terms}}`.
+- Max 50 bindings per policy, 200 principal links per binding. Permissions in each binding must be sorted alphabetically and unique.
+- Built-in policies (`origin: builtin`) cannot be modified or deleted. User-created policies have `origin: default` (set by the system — never set `origin` manually).
+
+### Pull Secrets
+
+Pull secrets are configured at the **GVC level** (`spec.pullSecretLinks`), not per workload. Only `docker`, `ecr`, and `gcp` secret types are supported. Images from the same org's Control Plane registry need no pull secret.
+
+### Load Balancer Types
+
+| Type | Scope | Workload type | Custom ports | Static IPs |
+|:---|:---|:---|:---:|:---:|
+| Default (shared) | All workloads | All | No | No |
+| Direct (`spec.loadBalancer.direct`) | Per-workload | All | Yes (TCP/UDP) | Via IP Sets |
+| Dedicated (`spec.loadBalancer.dedicated` on GVC) | Per-GVC | All | Yes | Via IP Sets |
+| Replica Direct (`spec.loadBalancer.replicaDirect`) | Per-replica routing | **Stateful only** | Configurable | Via IP Sets |
+
+- **Default (shared)**: TLS termination, geo-routing included. No extra cost.
+- **Direct**: Per-workload cloud load balancer exposing custom TCP/UDP ports. Requires explicit configuration.
+- **Dedicated** (GVC-level): Unlocks domain ports outside 443/80, wildcard hostnames, `redirect.class.status5xx` / `status401` rules, and `tcp` protocol on domains. `trustedProxies`: `0` (source IP), `1` (last `X-Forwarded-For`), `2` (second-to-last). Extra charges apply.
+- **Replica Direct**: Each replica gets its own routable endpoint. Required for `workloadLink` domain routing.
+
+### General Recommendations
+
+- Use `cpln apply --file manifest.yaml --ready` for declarative resource management over imperative CLI commands.
+- For Kubernetes users: **mk8s** for new managed clusters, **BYOK** for existing infrastructure, **Kubernetes Operator** for managing Control Plane resources as CRDs (ArgoCD/GitOps).
+- The **Template Catalog** provides 30+ production-ready templates (Postgres, Redis, Kafka, MongoDB, NATS, Elasticsearch, Nginx, etc.) — recommend these before writing custom manifests for common infrastructure.
+- For Infrastructure as Code: **Terraform** (registry.terraform.io/providers/controlplane-com/cpln) or **Pulumi**.
+- The **MCP Server** at https://mcp.cpln.io/mcp (80+ tools) is the recommended way for AI agents to interact with Control Plane programmatically.
+- The **AI Plugin** at /mcp/ai-plugin bundles specialized agents, slash commands, and guardrail rules for AI coding assistants — install it for end-to-end execution of multi-step Control Plane workflows.
+
+### JWT Authentication
+
+Workloads can validate JWT tokens in HTTP requests using Envoy-based JWT providers. Configuration is set in the `sidecar.envoy` settings at the workload or GVC level. Multiple providers are supported. Claims can be extracted to request headers. Rules define which paths require valid tokens. See the full reference at https://docs.controlplane.com/reference/workload/jwt-auth
+
+### Kubernetes Operator
+
+The Control Plane Kubernetes Operator manages resources as Kubernetes CRDs from within a Kubernetes cluster. Supports ArgoCD and GitOps workflows. Covers all major resource types: GVC, workload, identity, secret, policy, domain, cloud account, and more. Install guide: https://docs.controlplane.com/core/kubernetes-operator
+
+### Operational Guardrails
+
+- **Orgs are immutable** — once created, an org cannot be deleted. Removal requires Control Plane support.
+- **Workload type and name are immutable.** Changing requires delete + recreate. Capture state first: `cpln workload get NAME --gvc GVC -o yaml-slim > NAME.bak.yaml`. To rename, prefer `cpln workload clone OLD --name NEW --gvc GVC`.
+- **Volume Set `fileSystemType` and `performanceClass` are immutable** — changing either = delete + recreate (data loss).
+- **Image references**: Never add `docker.io/` to external image references. Use the exact string (`nginx:latest`, not `docker.io/library/nginx:latest`). For your own org's registry in workload specs, use `//image/NAME:TAG` (the hostname `<org>.registry.cpln.io` is only for `docker login`/`push`, never in workload specs). Cross-org pull: `<other-org>.registry.cpln.io/NAME:TAG`. Images must be `linux/amd64` — wrong platform = `exec format error` at runtime. `cpln image build --push` defaults to `linux/amd64`.
+- **Workload spec `port` must match the port the container actually listens on**, or health checks fail.
+- **Use `-o yaml-slim` (not plain `yaml`) when exporting for re-apply.** Plain `yaml`/`json` include server-side fields (`status`, `id`, `created`, `lastModified`, `links`) that break `cpln apply`.
+- **`cpln apply` resolves multi-resource ordering automatically** when given a directory or multi-doc file. For initial multi-resource deploys, prefer one apply call over many sequential ones — splitting reintroduces the ordering problem apply was built to solve.
+- **`cpln apply --file manifest.yaml --ready`** blocks inside the CLI until the workload is healthy — recommended for CI/CD. **Caveat**: `--ready` does NOT fail-fast on terminal container errors (non-zero exit, image pull error, crashloop). On a misconfigured first-deploy, `--ready` sits through its full timeout while the container is dead. For first-deploys, newly-built images, workload type migrations, or re-applies after a recent failure, use the patience-windowed safety net pattern at [/guides/cpln-apply](https://docs.controlplane.com/guides/cpln-apply).
+- **Don't poll long-running operations from the AI layer** — each poll re-reads conversation context, burning tokens. Use `--ready` (CLI-side blocking) or shell loops (`timeout 600 bash -c 'until cpln workload get N --gvc G -o json | jq -e ".status.healthCheck.status == true"; do sleep 10; done'`).
+- **Service account keys for CI/CD** (generate with `cpln serviceaccount add-key`), never user tokens. Authenticate via `CPLN_TOKEN` env var, never `--token` (leaks into logs).
+- **Apple Silicon**: `cpln image build --name <image>:<tag> --push` defaults to `linux/amd64`. Verify with `cpln image get <image>:<tag>` after building.
+- **For state-mutating commands without explicit context**: stop and confirm the target org / profile / GVC. Never silently fall back to the active CLI profile. For destructive operations (`delete`, `volumeset shrink`, `gvc remove-location`, `policy remove-binding`), present blast radius and wait for explicit confirmation even when permissions auto-approve.
+
+### CLI Hallucination Traps — commands that DON'T exist
+
+| Wrong | Correct |
+|:---|:---|
+| `cpln secret create` | `cpln secret create-opaque`, `create-aws`, etc. (12 type-specific variants) |
+| `cpln <resource> list` | `cpln <resource> get` (no args = list all) |
+| `cpln mk8s create` | `cpln apply --file mk8s-manifest.yaml` |
+| `cpln logs --follow` | `cpln logs --tail` (or `-t` or `-f`) |
+| `cpln workload log` | `cpln logs '{gvc="GVC", workload="WORKLOAD"}'` |
+| `cpln cloudaccount create` | `cpln cloudaccount create-aws`, `create-azure`, `create-gcp`, `create-ngs` |
+| `cpln apply` (no `--file`) | `cpln apply --file manifest.yaml` |
+| `cpln workload update --identity X` | `cpln workload update REF --set spec.identityLink=//identity/X` |
+| `cpln secret update --data '{}'` | `cpln secret edit REF` or `cpln apply --file ...` |
+| `cpln gvc update --location LOC` | `cpln gvc update REF --set 'spec.staticPlacement.locationLinks+=//location/LOC'` |
+| `cpln image push` / `cpln image pull` | `cpln image build --push` (build+push), or `docker push` after `cpln image docker-login` |
+| `cpln image tag` for Docker version tags | `cpln image tag` exists but manages **metadata** key=value tags only. For Docker version tags use `cpln image build --name NAME:TAG` or `docker tag` |
+| `cpln workload create --type stateful/cron` | `cpln apply --file workload.yaml` — CLI flags only support `serverless` and `standard` create |
+
+**Verification rule**: Never write a `cpln` command from memory. Verify with `cpln <command> --help`, the MCP `cpln_suggest` tool, or [CLI Conventions](https://docs.controlplane.com/cli-conventions.md).
+
+### Logs (LogQL)
+
+```
+cpln logs '{gvc="GVC", workload="WL"}' --org ORG --tail
+```
+
+- **LogQL labels**: `gvc`, `workload`, `container`, `location`, `provider`, `replica`, `stream`. Special: `container="_accesslog"` for HTTP access logs.
+- **Filters inside the query** (NOT shell pipes): `|= "error"` (contains), `!= "debug"` (excludes), `|~ "timeout|crash"` (regex).
+- **`--gvc` is NOT a flag here** — GVC goes inside the LogQL query.
+- Range flags: `--since "1h"`, `--from`, `--to` (ISO 8601, duration, or `now-<duration>`); `--limit N` (default 30, `0` = unlimited).
+- **Cron logs**: each run is a separate replica. Enumerate runs via `cpln workload get-deployments NAME --gvc GVC -o json` → `status.jobExecutions[]`, then scope logs by the `replica` label and run's time window.
+
+---
+
+## Getting Started
+- [Introduction](https://docs.controlplane.com/introduction): Platform overview, navigation, and links to quickstart guides
+- [What is Control Plane?](https://docs.controlplane.com/whatis): Architecture, Universal Cloud Identity, global load balancing, and key differentiators
+- [Releases](https://docs.controlplane.com/releases): Platform release notes and changelog
+- [Compliance](https://docs.controlplane.com/compliance): SOC 2 Type II, HIPAA, and other certifications
+
+## Quickstart
+- [Deploy a Workload](https://docs.controlplane.com/quickstart/quick-start-1-deploy-workload): First deployment tutorial
+- [Deploy an Application](https://docs.controlplane.com/quickstart/quick-start-2-deploy-application): Build and deploy from source code
+- [Custom Domain](https://docs.controlplane.com/quickstart/quick-start-3-custom-domain): Configure a custom domain for your workload
+- [Service-to-Service](https://docs.controlplane.com/quickstart/quick-start-4-service-to-service): Internal workload communication
+
+## Concepts
+- [Billing](https://docs.controlplane.com/concepts/billing): Billing accounts, invoices, payment methods, and spending alerts
+- [Organizations](https://docs.controlplane.com/concepts/org): Top-level resource boundary for isolation, billing, and multi-tenancy
+- [Global Virtual Clouds (GVCs)](https://docs.controlplane.com/concepts/gvc): Multi-cloud deployment environments spanning providers and regions
+- [Workloads](https://docs.controlplane.com/concepts/workload): Container deployment units with autoscaling, logging, and Capacity AI
+- [Access Control](https://docs.controlplane.com/concepts/access-control): Two-part access control combining billing account roles with org-level policies
+
+## Core Platform
+- [Accessing Cloud Resources](https://docs.controlplane.com/core/accessing-cloud-resources): Credential-free access to AWS, GCP, and Azure services via identities
+- [Audit Trail](https://docs.controlplane.com/core/audittrail): Tamper-proof activity tracking for compliance and debugging
+- [Authentication](https://docs.controlplane.com/core/authentication): SSO login (Google, GitHub, Microsoft, SAML) and CLI service account authentication
+- [Kubernetes Operator](https://docs.controlplane.com/core/kubernetes-operator): Manage Control Plane resources as Kubernetes CRDs with GitOps support
+- [Logs](https://docs.controlplane.com/core/logs): LogQL-based log aggregation, live streaming, and Grafana integration
+- [Miscellaneous](https://docs.controlplane.com/core/misc): Tags, environment variables, and additional platform configuration
+- [Query](https://docs.controlplane.com/core/query): Filter and select resources using tags, properties, and relations
+- [Security](https://docs.controlplane.com/core/security): Platform security model including TLS, ciphers, and 12-factor app principles
+- [Terms](https://docs.controlplane.com/core/terms): Glossary of platform terminology and definitions
+
+## Reference
+- [Reference Overview](https://docs.controlplane.com/reference/overview): Resource hierarchy and reference section navigation
+- [Agent](https://docs.controlplane.com/reference/agent): Wormhole agents for secure connectivity to private networks, VPCs, and on-prem resources
+- [Audit Context](https://docs.controlplane.com/reference/auditctx): Audit context configuration for scoping audit trail queries
+- [Cloud Account](https://docs.controlplane.com/reference/cloudaccount): Cloud provider account mappings that work with identities to enable credential-free cloud resource access via Universal Cloud Identity
+- [Domain](https://docs.controlplane.com/reference/domain): Custom domain configuration with TLS, geo-routing, path-based and subdomain-based DNS modes
+- [Group](https://docs.controlplane.com/reference/group): User and service account membership collections for access control
+- [GVC](https://docs.controlplane.com/reference/gvc): GVC configuration including locations, pull secrets, environment variables, tracing, and load balancing
+- [Identity](https://docs.controlplane.com/reference/identity): GVC-scoped workload identities for credential-free cloud provider access via Universal Cloud Identity
+- [Image](https://docs.controlplane.com/reference/image): Container image registry, formats, and private/public image references
+- [IP Set](https://docs.controlplane.com/reference/ipset): Reserve static public IP addresses per GVC location for workloads (via direct load balancer) and GVC dedicated load balancers
+- [Location](https://docs.controlplane.com/reference/location): Geographical deployment locations across AWS, GCP, and Azure, plus custom BYOK locations from your own Kubernetes clusters
+- [Organization](https://docs.controlplane.com/reference/org): Organization resource properties, tags, and management
+- [Policy](https://docs.controlplane.com/reference/policy): Fine-grained permission policies for all resource types
+- [Quota](https://docs.controlplane.com/reference/quota): Resource quotas and usage limits per organization
+- [Secret](https://docs.controlplane.com/reference/secret): Encrypted secret storage with 12 types (AWS, Azure SDK, Azure Connector, Docker, Dictionary, ECR, GCP, Keypair, Opaque, NATS Account, TLS, Username & Password)
+- [Service Account](https://docs.controlplane.com/reference/serviceaccount): Non-human principals for API access with token and key management
+- [User](https://docs.controlplane.com/reference/user): Org member management, invitations, and multi-org membership
+- [Volume Set](https://docs.controlplane.com/reference/volumeset): Persistent storage with three filesystem types — ext4/xfs (single stateful workload, one volume per replica) and shared (any number of workloads, single volume per location). Supports autoscaling and snapshots
+
+### External Logging
+- [Logging Overview](https://docs.controlplane.com/external-logging/overview): Configure log shipping to external providers
+- [S3](https://docs.controlplane.com/external-logging/s3): Ship logs to Amazon S3
+- [CloudWatch](https://docs.controlplane.com/external-logging/cloudwatch): Ship logs to AWS CloudWatch
+- [Coralogix](https://docs.controlplane.com/external-logging/coralogix): Ship logs to Coralogix
+- [Datadog](https://docs.controlplane.com/external-logging/datadog): Ship logs to Datadog
+- [Logz.io](https://docs.controlplane.com/external-logging/logz-io): Ship logs to Logz.io
+- [Stackdriver](https://docs.controlplane.com/external-logging/stackdriver): Ship logs to Google Cloud Stackdriver
+
+### Workload Reference
+- [Workload General](https://docs.controlplane.com/reference/workload/general): Overview of workload resources, identities, connect, and debug
+- [Autoscaling](https://docs.controlplane.com/reference/workload/autoscaling): Scaling strategies (concurrency, RPS, CPU, latency, memory, KEDA)
+- [Capacity AI](https://docs.controlplane.com/reference/workload/capacity): Intelligent resource optimization using historical usage analysis
+- [Containers](https://docs.controlplane.com/reference/workload/containers): Container configuration (images, resources, ports, probes, volumes)
+- [Custom Metrics](https://docs.controlplane.com/reference/workload/custom-metrics): Prometheus-based custom metrics for workload autoscaling
+- [Firewall](https://docs.controlplane.com/reference/workload/firewall): External and internal firewall rules for inbound/outbound traffic, CIDRs, and HTTP header filtering
+- [JWT Authentication](https://docs.controlplane.com/reference/workload/jwt-auth): JWT-based authentication and authorization for workload endpoints
+- [Load Balancing](https://docs.controlplane.com/reference/workload/load-balancing): Direct load balancers exposing workload ports through cloud LBs with geo DNS routing
+- [Security](https://docs.controlplane.com/reference/workload/security): Workload-level security settings and configurations
+- [Termination](https://docs.controlplane.com/reference/workload/termination): Graceful shutdown, termination grace period, and lifecycle hooks
+- [Types](https://docs.controlplane.com/reference/workload/types): Standard, Stateful, Cron, and Serverless workload comparison with capabilities matrix
+- [Volumes](https://docs.controlplane.com/reference/workload/volumes): Cloud storage, volume sets, ephemeral scratch, and secret volume mounts
+
+## How-to Guides
+- [Guides Overview](https://docs.controlplane.com/guides/overview): Step-by-step guides for common tasks on Control Plane
+
+### CLI Configuration
+- [Browser-less CLI Login](https://docs.controlplane.com/guides/browser-less-cli-login): Authenticate with the CLI using service account tokens for headless environments
+
+### Integrations
+- [Kubernetes Operator](https://docs.controlplane.com/guides/cli/cpln-operator): Deploy and manage resources using Kubernetes CRDs
+
+### Configure Resources
+- [Configure CDN](https://docs.controlplane.com/guides/configure-cdn): Set up Cloudflare or CloudFront CDN for workload endpoints
+- [Configure a Domain](https://docs.controlplane.com/guides/configure-domain): Custom domain routing with DNS verification
+- [Configure an Agent](https://docs.controlplane.com/guides/setup-agent): Agent setup for AWS, Azure, GCP, and private networks
+- [Invite Users](https://docs.controlplane.com/guides/invite-users): Invite users to your organization
+- [Rate Limiting](https://docs.controlplane.com/guides/rate-limiting): Configure Envoy-based request rate limiting
+- [Resource Protection](https://docs.controlplane.com/guides/resource-protection): Protect resources from accidental deletion
+- [Service-to-Service Calls](https://docs.controlplane.com/guides/service-to-service): Internal workload communication with firewall rules
+
+### Create Resources
+- [Create an Agent](https://docs.controlplane.com/guides/agent): Define an agent and generate a bootstrap config for private network connectivity
+- [Create an Audit Context](https://docs.controlplane.com/guides/create-audit-context): Scope audit trail queries with audit contexts
+- [Create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account): Connect AWS, Azure, or GCP cloud provider accounts
+- [Create a Group](https://docs.controlplane.com/guides/create-group): Organize users and service accounts into groups
+- [Create a GVC](https://docs.controlplane.com/guides/create-gvc): Set up Global Virtual Clouds via Console UI and CLI
+- [Create an Identity](https://docs.controlplane.com/guides/create-identity): Set up identities for credential-free cloud resource access
+- [Create an Organization](https://docs.controlplane.com/guides/create-org): Create a new organization for resource isolation
+- [Create a Policy](https://docs.controlplane.com/guides/policy): Define access permissions for resources via Console UI and CLI
+- [Create a Secret (Overview)](https://docs.controlplane.com/guides/create-secret/overview): Secure secret storage and injection for workloads
+- [Create AWS Secret](https://docs.controlplane.com/guides/create-secret/aws): Create an AWS access key secret
+- [Create Azure Connector Secret](https://docs.controlplane.com/guides/create-secret/azure-connector): Create an Azure Function App connector secret
+- [Create Azure SDK Secret](https://docs.controlplane.com/guides/create-secret/azure-sdk): Create an Azure SDK credentials secret
+- [Create Dictionary Secret](https://docs.controlplane.com/guides/create-secret/dictionary): Create a key/value pair dictionary secret
+- [Create Docker Secret](https://docs.controlplane.com/guides/create-secret/docker): Create a Docker registry authentication secret
+- [Create ECR Secret](https://docs.controlplane.com/guides/create-secret/ecr): Create an AWS ECR pull secret
+- [Create GCP Secret](https://docs.controlplane.com/guides/create-secret/gcp): Create a GCP service account secret
+- [Create Keypair Secret](https://docs.controlplane.com/guides/create-secret/keypair): Create a public/private keypair secret
+- [Create NATS Account Secret](https://docs.controlplane.com/guides/create-secret/nats-account): Create a NATS Account credentials secret
+- [Create Opaque Secret](https://docs.controlplane.com/guides/create-secret/opaque): Create an opaque text secret
+- [Create TLS Secret](https://docs.controlplane.com/guides/create-secret/tls): Create a TLS key and certificate secret
+- [Create Username & Password Secret](https://docs.controlplane.com/guides/create-secret/userpass): Create a username and password secret
+- [Create a Service Account](https://docs.controlplane.com/guides/create-service-account): Programmatic API access with service accounts and keys
+- [Create a Workload](https://docs.controlplane.com/guides/create-workload): Deploy containerized applications with step-by-step walkthrough
+
+### Deployment
+- [Apply YAML Manifests](https://docs.controlplane.com/guides/cpln-apply): Declarative resource management with cpln apply
+- [Convert Kubernetes Manifests](https://docs.controlplane.com/guides/cli/cpln-convert): Migrate from Kubernetes to Control Plane by converting Deployments, StatefulSets, CronJobs, and more
+- [Delete Resources from Manifests](https://docs.controlplane.com/guides/cpln-delete): Remove resources using the same YAML/JSON files used to create them
+- [Deploy Docker Compose Projects](https://docs.controlplane.com/guides/compose-deploy): Convert and deploy Docker Compose projects with cpln stack
+- [Manage Helm Releases](https://docs.controlplane.com/guides/cpln-helm): Deploy and manage resources using Helm charts with cpln helm
+
+### GitOps
+- [CI/CD and GitOps](https://docs.controlplane.com/guides/gitops): GitHub, GitLab, Bitbucket, and CircleCI integration examples
+- [Environment Promotion](https://docs.controlplane.com/guides/environment-promotion): Promote workloads across dev, staging, and production environments
+
+### Images
+- [Push Images](https://docs.controlplane.com/guides/push-image): Build and push container images to Control Plane's private registry
+- [Pull Images](https://docs.controlplane.com/guides/pull-image): Configure workloads to pull container images from public and private registries
+- [Copy Images](https://docs.controlplane.com/guides/copy-image): Copy container images between organizations using the CLI
+- [Build with Buildpacks](https://docs.controlplane.com/guides/buildpacks): Build container images without Dockerfiles using Cloud Native Buildpacks
+
+### Native Networking
+- [Native Networking Setup](https://docs.controlplane.com/guides/native-networking/native-networking-setup): Configure AWS PrivateLink or GCP Private Service Connect
+- [AWS PrivateLink with RDS](https://docs.controlplane.com/guides/native-networking/aws-privatelink/privatelink-rds-terraform): Connect to RDS via PrivateLink using Terraform
+- [GCP Private Service Connect with Cloud SQL](https://docs.controlplane.com/guides/native-networking/private-service-connect/cloud-sql): Connect to Cloud SQL via Private Service Connect
+
+### Observability
+- [Centralized Metrics](https://docs.controlplane.com/guides/centralized-metrics-management): Multi-org metrics aggregation with Grafana
+- [Default Metrics](https://docs.controlplane.com/guides/default-metrics): Built-in workload metrics reference
+- [Export Metrics](https://docs.controlplane.com/guides/export-metrics): Export metrics via Prometheus /federate endpoint
+
+### Workload Access
+- [Connect to Workloads](https://docs.controlplane.com/guides/cli/workload/connect): Open an interactive shell session inside a running container
+- [Copy Files](https://docs.controlplane.com/guides/cli/cpln-cp): Transfer files between your local machine and running containers
+- [Execute Commands](https://docs.controlplane.com/guides/cli/workload/exec): Execute commands in running workload containers
+- [Port Forward](https://docs.controlplane.com/guides/cli/cpln-port-forward): Access workload ports locally through a secure tunnel
+- [Run One-off Workloads](https://docs.controlplane.com/guides/cli/workload/run): Create temporary workloads for commands, scripts, or debugging
+- [Run Cron Commands](https://docs.controlplane.com/guides/cli/workload/cron-run): Execute commands with persistent cron workload runners
+
+## CLI Reference
+- [CLI Overview](https://docs.controlplane.com/cli-reference/overview): Getting started with the Control Plane CLI
+- [Installation](https://docs.controlplane.com/cli-reference/installation): Install on macOS, Linux, or Windows
+- [CLI Release Notes](https://docs.controlplane.com/cli-reference/release-notes): CLI version history and changelog
+
+### Get Started
+- [Quickstart](https://docs.controlplane.com/cli-reference/get-started/quickstart): Get started with the CLI in minutes
+- [Authentication](https://docs.controlplane.com/cli-reference/get-started/authentication): Interactive login and token-based authentication flows
+- [Profiles](https://docs.controlplane.com/cli-reference/get-started/profiles): Manage authentication context across multiple orgs and environments
+- [Images](https://docs.controlplane.com/cli-reference/get-started/images): Build, push, pull, and manage container images
+
+### Using the CLI
+- [Getting Help](https://docs.controlplane.com/cli-reference/using-cli/help): Built-in help system for commands, flags, and options
+- [Common Options](https://docs.controlplane.com/cli-reference/using-cli/common-options): Shared flags available across all CLI commands
+- [Output Formats](https://docs.controlplane.com/cli-reference/using-cli/output): JSON, YAML, text, Terraform, and CRD output formats
+- [Shell Completion](https://docs.controlplane.com/cli-reference/using-cli/shell-completion): Enable tab completion in your terminal
+- [Troubleshooting](https://docs.controlplane.com/cli-reference/using-cli/troubleshooting): Solutions to common CLI issues
+
+### CI/CD & Development
+- [CI/CD Usage](https://docs.controlplane.com/cli-reference/ci-cd-development/ci-cd): Automate deployments in CI/CD pipelines
+- [CLI in Containers](https://docs.controlplane.com/cli-reference/ci-cd-development/container-image): Run the CLI inside Docker images for automation
+
+### Commands
+- [account](https://docs.controlplane.com/cli-reference/commands/account): Manage billing accounts
+- [agent](https://docs.controlplane.com/cli-reference/commands/agent): Manage agents for private network connectivity
+- [apply](https://docs.controlplane.com/cli-reference/commands/apply): Create or update resources from JSON/YAML files
+- [auditctx](https://docs.controlplane.com/cli-reference/commands/auditctx): Manage audit contexts
+- [cloudaccount](https://docs.controlplane.com/cli-reference/commands/cloudaccount): Manage cloud provider account integrations
+- [convert](https://docs.controlplane.com/cli-reference/commands/convert): Convert Kubernetes manifests to Control Plane format
+- [cp](https://docs.controlplane.com/cli-reference/commands/cp): Copy files to/from workload containers
+- [delete](https://docs.controlplane.com/cli-reference/commands/delete): Delete resources from JSON/YAML files
+- [domain](https://docs.controlplane.com/cli-reference/commands/domain): Manage custom domains and routing
+- [group](https://docs.controlplane.com/cli-reference/commands/group): Manage user and service account groups
+- [gvc](https://docs.controlplane.com/cli-reference/commands/gvc): Manage Global Virtual Clouds
+- [helm](https://docs.controlplane.com/cli-reference/commands/helm): Deploy resources using Helm charts
+- [identity](https://docs.controlplane.com/cli-reference/commands/identity): Manage workload identities for cloud access
+- [image](https://docs.controlplane.com/cli-reference/commands/image): Manage container images in the registry
+- [ipset](https://docs.controlplane.com/cli-reference/commands/ipset): Reserve and manage static public IP addresses for workloads and GVC load balancers
+- [location](https://docs.controlplane.com/cli-reference/commands/location): Manage cloud provider regions and custom BYOK locations
+- [login](https://docs.controlplane.com/cli-reference/commands/login): Authenticate with Control Plane
+- [logs](https://docs.controlplane.com/cli-reference/commands/logs): View and stream workload logs
+- [misc](https://docs.controlplane.com/cli-reference/commands/misc): Miscellaneous utility commands
+- [mk8s](https://docs.controlplane.com/cli-reference/commands/mk8s): Manage Managed Kubernetes clusters
+- [operator](https://docs.controlplane.com/cli-reference/commands/operator): Manage the Kubernetes operator
+- [org](https://docs.controlplane.com/cli-reference/commands/org): Manage organizations
+- [policy](https://docs.controlplane.com/cli-reference/commands/policy): Manage access control policies
+- [port-forward](https://docs.controlplane.com/cli-reference/commands/port-forward): Forward local ports to workload containers
+- [profile](https://docs.controlplane.com/cli-reference/commands/profile): Manage CLI authentication profiles
+- [quota](https://docs.controlplane.com/cli-reference/commands/quota): View resource quotas and usage
+- [rest](https://docs.controlplane.com/cli-reference/commands/rest): Make raw REST API calls
+- [secret](https://docs.controlplane.com/cli-reference/commands/secret): Manage encrypted secrets
+- [serviceaccount](https://docs.controlplane.com/cli-reference/commands/serviceaccount): Manage service accounts and keys
+- [stack](https://docs.controlplane.com/cli-reference/commands/stack): Deploy Docker Compose projects
+- [task](https://docs.controlplane.com/cli-reference/commands/task): Manage asynchronous tasks
+- [user](https://docs.controlplane.com/cli-reference/commands/user): Manage org users and invitations
+- [volumeset](https://docs.controlplane.com/cli-reference/commands/volumeset): Manage persistent volume sets (ext4, xfs, shared filesystems)
+- [workload](https://docs.controlplane.com/cli-reference/commands/workload): Manage workloads (create, deploy, scale, connect)
+
+## API Reference
+- [API Overview](https://docs.controlplane.com/api-reference/api): REST API documentation for all Control Plane resources
+- [OpenAPI Spec (Core)](https://api.cpln.io/openapi.json): Machine-readable API definition for all resources
+- [OpenAPI Spec (Audit)](https://audit.cpln.io/openapi.json): Audit API definition for event tracking
+
+## Infrastructure as Code
+- [IaC Overview](https://docs.controlplane.com/iac/overview): Manage Control Plane resources as code with Terraform and Pulumi
+- [Terraform Provider](https://docs.controlplane.com/iac/terraform): Infrastructure as Code with Terraform
+- [Pulumi Provider](https://docs.controlplane.com/iac/pulumi): Infrastructure as Code with Pulumi
+
+## MCP Server (AI Integration)
+- [MCP Overview](https://docs.controlplane.com/mcp/overview): AI assistant integration via Model Context Protocol at https://mcp.cpln.io/mcp (80+ tools)
+- [AI Plugin](https://docs.controlplane.com/mcp/ai-plugin): Install the Control Plane AI plugin — bundles platform knowledge, specialized agents (Workload Troubleshooter, Secret Setup Wizard, Domain Configurator, K8s Migrator, etc.), slash commands, and guardrail rules for AI coding assistants
+- [MCP Examples](https://docs.controlplane.com/mcp/examples): Practical MCP usage examples for AI agents
+
+### Tool Setup
+- [Google Antigravity](https://docs.controlplane.com/mcp/antigravity): Configure MCP Server for Google Antigravity IDE
+- [Claude Code](https://docs.controlplane.com/mcp/claude): Configure MCP Server for Claude Code
+- [OpenAI Codex](https://docs.controlplane.com/mcp/codex): Configure MCP Server for OpenAI Codex
+- [Cursor IDE](https://docs.controlplane.com/mcp/cursor): Configure MCP Server for Cursor IDE
+- [Gemini CLI](https://docs.controlplane.com/mcp/geminicli): Configure MCP Server for Google Gemini CLI
+- [Visual Studio Code](https://docs.controlplane.com/mcp/vscode): Configure MCP Server for VS Code with GitHub Copilot
+
+## Managed Kubernetes (mk8s)
+- [mk8s Overview](https://docs.controlplane.com/mk8s/overview): Provision Kubernetes clusters across cloud providers
+
+### Providers
+- [Generic Provider](https://docs.controlplane.com/mk8s/generic): mk8s clusters on any infrastructure
+- [AWS Provider](https://docs.controlplane.com/mk8s/aws): mk8s clusters on AWS
+- [GCP Provider](https://docs.controlplane.com/mk8s/gcp): mk8s clusters on Google Cloud Platform
+- [Hetzner Provider](https://docs.controlplane.com/mk8s/hetzner): mk8s clusters on Hetzner Cloud
+
+### Add-ons
+- [Dashboard](https://docs.controlplane.com/mk8s/add-ons/dashboard): Kubernetes Dashboard UI
+- [Headlamp](https://docs.controlplane.com/mk8s/add-ons/headlamp): Headlamp Kubernetes UI
+- [AWS Workload Identity](https://docs.controlplane.com/mk8s/add-ons/aws_workload_identity): IAM roles for service accounts
+- [Azure Workload Identity](https://docs.controlplane.com/mk8s/add-ons/azure_workload_identity): Azure AD workload identity federation
+- [AWS ECR](https://docs.controlplane.com/mk8s/add-ons/aws_ecr): Pull images from Amazon ECR
+- [AWS EFS](https://docs.controlplane.com/mk8s/add-ons/aws_efs): Mount Amazon EFS volumes
+- [AWS ELB](https://docs.controlplane.com/mk8s/add-ons/aws_elb): AWS Elastic Load Balancer integration
+- [Azure ACR](https://docs.controlplane.com/mk8s/add-ons/azure_acr): Pull images from Azure Container Registry
+- [BYOK](https://docs.controlplane.com/mk8s/add-ons/byok): Bring Your Own Kubernetes cluster integration
+- [Local Path Storage](https://docs.controlplane.com/mk8s/add-ons/local_path_storage): Local path provisioner for persistent volumes
+- [Metrics](https://docs.controlplane.com/mk8s/add-ons/metrics): Metrics collection for mk8s clusters
+- [Registry Mirror](https://docs.controlplane.com/mk8s/add-ons/registry_mirror): Container registry mirror for faster pulls
+- [Sysbox](https://docs.controlplane.com/mk8s/add-ons/sysbox): Sysbox runtime for enhanced container isolation
+- [Logs](https://docs.controlplane.com/mk8s/add-ons/logs): Centralized logging for mk8s clusters
+
+## CPLN Platform (BYOK)
+- [BYOK Overview](https://docs.controlplane.com/byok/overview): Connect existing Kubernetes clusters to Control Plane
+- [Actuator Settings](https://docs.controlplane.com/byok/settings/actuator): Configure the BYOK actuator for Kubernetes deployment management
+- [Agent Settings](https://docs.controlplane.com/byok/settings/agent): Configure BYOK agent connectivity settings
+- [Volume Set Settings](https://docs.controlplane.com/byok/settings/volumeset): Configure volume set storage class suffixes for custom CSI solutions
+- [Workload Settings](https://docs.controlplane.com/byok/settings/workload): BYOK workload settings including internal firewall and Kubernetes options
+
+## Template Catalog
+- [Template Overview](https://docs.controlplane.com/template-catalog/overview): 30+ production-ready templates for common infrastructure
+- [Install via UI](https://docs.controlplane.com/template-catalog/install-manage/ui): Install and manage templates using the Console UI
+- [Install via CLI](https://docs.controlplane.com/template-catalog/install-manage/cli): Install and manage templates using cpln CLI
+- [Install via Terraform](https://docs.controlplane.com/template-catalog/install-manage/terraform): Install templates with Terraform
+- [Install via Pulumi](https://docs.controlplane.com/template-catalog/install-manage/pulumi): Install templates with Pulumi
+
+### Templates
+- [Airflow](https://docs.controlplane.com/template-catalog/templates/airflow): Apache Airflow workflow orchestration
+- [ClickHouse](https://docs.controlplane.com/template-catalog/templates/clickhouse): ClickHouse column-oriented analytics database
+- [CockroachDB](https://docs.controlplane.com/template-catalog/templates/cockroachdb): CockroachDB distributed SQL database
+- [Coraza](https://docs.controlplane.com/template-catalog/templates/coraza): Coraza Web Application Firewall (WAF)
+- [Task Runner](https://docs.controlplane.com/template-catalog/templates/cpln-task-runner): Control Plane task runner for batch jobs
+- [DBeaver](https://docs.controlplane.com/template-catalog/templates/dbeaver): DBeaver database management tool
+- [etcd](https://docs.controlplane.com/template-catalog/templates/etcd): etcd distributed key-value store
+- [External Secret Syncer](https://docs.controlplane.com/template-catalog/templates/external-secret-syncer): Sync secrets from external providers
+- [FusionAuth](https://docs.controlplane.com/template-catalog/templates/fusionauth): FusionAuth identity and access management
+- [Kafka](https://docs.controlplane.com/template-catalog/templates/kafka): Apache Kafka event streaming platform
+- [Manticore](https://docs.controlplane.com/template-catalog/templates/manticore): Manticore Search full-text search engine
+- [MariaDB](https://docs.controlplane.com/template-catalog/templates/mariadb): MariaDB relational database
+- [MinIO](https://docs.controlplane.com/template-catalog/templates/minio): MinIO S3-compatible object storage
+- [MongoDB](https://docs.controlplane.com/template-catalog/templates/mongodb): MongoDB document database
+- [MySQL](https://docs.controlplane.com/template-catalog/templates/mysql): MySQL relational database
+- [NATS](https://docs.controlplane.com/template-catalog/templates/nats): NATS messaging system
+- [Nginx](https://docs.controlplane.com/template-catalog/templates/nginx): Nginx reverse proxy and web server
+- [Ollama](https://docs.controlplane.com/template-catalog/templates/ollama): Ollama local LLM inference server
+- [OpenSearch](https://docs.controlplane.com/template-catalog/templates/opensearch): OpenSearch search and analytics engine
+- [PostGIS](https://docs.controlplane.com/template-catalog/templates/postgis): PostGIS geospatial database extension
+- [PostgreSQL](https://docs.controlplane.com/template-catalog/templates/postgres): PostgreSQL relational database
+- [PostgreSQL HA](https://docs.controlplane.com/template-catalog/templates/postgres-highly-available): Highly available PostgreSQL with Patroni
+- [RabbitMQ](https://docs.controlplane.com/template-catalog/templates/rabbitmq): RabbitMQ message broker
+- [Redis](https://docs.controlplane.com/template-catalog/templates/redis): Redis in-memory data store
+- [Redis Cluster](https://docs.controlplane.com/template-catalog/templates/redis-cluster): Redis Cluster for distributed caching
+- [Redis Multi-Location](https://docs.controlplane.com/template-catalog/templates/redis-multi-location): Redis deployed across multiple locations
+- [Tailscale](https://docs.controlplane.com/template-catalog/templates/tailscale): Tailscale mesh VPN connectivity
+- [TiDB](https://docs.controlplane.com/template-catalog/templates/tidb): TiDB distributed SQL database
+- [Tyk](https://docs.controlplane.com/template-catalog/templates/tyk): Tyk API gateway
