@@ -11,10 +11,11 @@ Each location runs a configurable number of replicas that discover and join one 
 ### What Gets Created
 
 - **GVC** — A dedicated GVC across the specified locations.
-- **Stateful Workload** — CockroachDB (`v25.4.0`) with per-location replica scaling and replica-direct load balancing.
+- **Stateful CockroachDB Workload** — CockroachDB (`v25.4.0`) with per-location replica scaling and replica-direct load balancing.
 - **Volume Set** — Persistent ext4 storage (general-purpose-ssd) with final snapshot creation and 7-day retention.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the startup and user secrets.
+- **Identity & Policy** — An identity bound to the workload with `reveal` access to the startup and user secrets, and cloud storage access when backup is enabled.
 - **Secrets** — A startup script for cluster join/initialization and an opaque secret for the database user credential.
+- **Backup Cron Workload** *(optional)* — A scheduled job that triggers a CockroachDB `BACKUP` SQL command to stream data directly to AWS S3 or GCS.
 
 ### Architecture
 
@@ -24,7 +25,7 @@ With 3 or more regions and the `SURVIVE REGION FAILURE` survival goal, the clust
 
 ## Installation
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -56,16 +57,18 @@ The default `values.yaml` for this template:
 gvc:
   name: cockroach-gvc
   locations:
+    - name: aws-us-west-2
+      replicas: 3
     - name: aws-us-east-2
       replicas: 3
     - name: aws-eu-central-1
       replicas: 3
-    - name: aws-us-west-2
-      replicas: 3
+
+image: cockroachdb/cockroach:v25.4.0
 
 resources:
-  cpu: 2000m
-  memory: 4096Mi
+  cpu: 2
+  memory: 4Gi
 
 database:
   name: mydb
@@ -73,15 +76,37 @@ database:
 
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
-
-cockroach_defaults:
-  sql_port: 26257
-  http_port: 8080
+  autoscaling:
+    enabled: false # Set to true to enable autoscaling
+    maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
+    minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
+    scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
 
 internal_access:
   type: same-gvc # options: same-gvc, same-org, workload-list
   workloads: # Note: can only be used if type is same-gvc or workload-list
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+backup:
+  enabled: false
+  image: controlplanecorporation/cockroach-backup:1.0
+  schedule: "0 2 * * *"
+  activeDeadlineSeconds: 14400   # hard kill after 4 hours if backup hangs
+  location: aws-us-east-2        # run the backup job in the same region as your storage bucket
+  resources:
+    cpu: 500m
+    memory: 512Mi
+  provider: aws  # options: aws, gcp
+  aws:
+    bucket: my-backup-bucket
+    region: us-east-1
+    cloudAccountName: my-backup-cloudaccount
+    policyName: my-backup-policy
+    prefix: cockroach/backups
+  gcp:
+    bucket: my-backup-bucket
+    cloudAccountName: my-backup-cloudaccount
+    prefix: cockroach/backups
 ```
 
 ### Locations and Replicas
@@ -114,6 +139,10 @@ These values are only applied on the first initialization. If the cluster has al
 
 - `resources.cpu` and `resources.memory` set the CPU and memory allocated to each CockroachDB replica.
 - `volumeset.capacity` sets the initial persistent volume size in GiB (minimum 10).
+- `volumeset.autoscaling.enabled` — Enable automatic volume expansion as data grows.
+- `volumeset.autoscaling.maxCapacity` — Maximum volume size in GiB.
+- `volumeset.autoscaling.minFreePercentage` — Triggers a scale-up when free space falls below this percentage.
+- `volumeset.autoscaling.scalingFactor` — Multiplier applied to the current capacity on each scale-up.
 
 ### Internal Access
 
@@ -136,21 +165,95 @@ internal_access:
 
 ### Connecting to CockroachDB
 
-Once deployed, the SQL interface is available on port 26257 (default). You can connect from a workload within the same GVC using:
+Once deployed, the SQL interface is available on port 26257. Connect from a workload within the same GVC using:
 
 ```bash
-cockroach sql --insecure
+cockroach sql --insecure --host=RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257
 ```
-
-The DB Console (HTTP UI) is available on port 8080 for monitoring cluster health, query performance, and node status.
 
 <Note>
 This template deploys CockroachDB in insecure mode (no TLS). It is intended for internal workloads that connect through Control Plane's internal network.
 </Note>
 
+The DB Console (HTTP UI) runs on port 8080 for monitoring cluster health, query performance, and node status. It is not exposed externally — access it via port forward and open `http://localhost:8080` in your browser.
+
 <Note>
 This template creates a GVC with a default name defined in the values file. If you plan to deploy multiple instances, you **must assign a unique GVC name** for each deployment.
 </Note>
+
+## Backup
+
+Backup is disabled by default. When enabled, a cron workload triggers a CockroachDB `BACKUP` SQL command on the configured schedule. CockroachDB nodes stream backup data directly to cloud storage using their own workload identity — the backup job only issues the SQL command and does not transfer data itself.
+
+- `backup.enabled` — Enable scheduled backups.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
+- `backup.provider` — `aws` or `gcp`.
+- `backup.location` — The Control Plane location where the backup cron job runs. **Set this to the region closest to your storage bucket** to minimize cross-region transfer latency.
+- `backup.activeDeadlineSeconds` — Hard timeout for the backup job in seconds (default: `14400` / 4 hours). The job is killed if it exceeds this limit.
+- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+
+### AWS S3
+
+Before enabling backup with `provider: aws`, complete the following in your AWS account:
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion"
+            ],
+            "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+            ]
+        }
+    ]
+}
+```
+
+4. Set `backup.aws.policyName` to the name of the policy created in step 3.
+5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+
+### GCS
+
+Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+
+## Restoring a Backup
+
+Backups are stored at `BUCKET/PREFIX/`. Run `cockroach sql` from a machine with network access to the cluster.
+
+**AWS S3**
+
+```sh
+cockroach sql --insecure \
+  --host="RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257" \
+  --execute="RESTORE FROM LATEST IN 's3://BUCKET_NAME/PREFIX?AUTH=implicit&AWS_REGION=BUCKET_REGION';"
+```
+
+**GCS**
+
+```sh
+cockroach sql --insecure \
+  --host="RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257" \
+  --execute="RESTORE FROM LATEST IN 'gs://BUCKET_NAME/PREFIX?AUTH=implicit';"
+```
 
 ## External References
 
@@ -163,6 +266,9 @@ This template creates a GVC with a default name defined in the values file. If y
     </Card>
     <Card title="Survive Region Failure" icon="shield" href="https://www.cockroachlabs.com/docs/stable/alter-database#survive-region-failure">
     Configure region failure survival goals
+    </Card>
+    <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/cockroach-backup">
+    Source code for the CockroachDB backup container image
     </Card>
     <Card title="CockroachDB Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/cockroach">
     View the source files, default values, and chart definition
