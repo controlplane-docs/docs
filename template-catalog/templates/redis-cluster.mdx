@@ -12,16 +12,17 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ### What Gets Created
 
-- **Stateful Workload** — A multi-replica Redis Cluster workload (`RELEASE_NAME-redis-cluster`). All replicas are managed together. Replica 0 initializes the cluster once all nodes are healthy.
+- **Stateful Redis Cluster Workload** — (`RELEASE_NAME-redis-cluster`): all replicas managed together. Replica 0 initializes the cluster once all nodes are healthy.
 - **Volume Set** — Persistent storage for each Redis node's data directory.
 - **Secret** — An opaque secret containing the Redis cluster configuration (`redis.conf`), mounted into each container.
 - **Secret** — An opaque secret containing the cluster initialization script, mounted and executed at startup.
 - **Secret** *(optional)* — A dictionary secret holding the Redis password, created when `redis.password` is set.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the config, startup script, and auth secrets.
+- **Identity & Policy** — An identity bound to the workload with `reveal` access to the config, startup script, and auth secrets, and cloud storage access when backup is enabled.
+- **Backup Cron Workload** *(optional)* — A scheduled backup job that writes one snapshot per primary shard to AWS S3 or GCS.
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -72,6 +73,29 @@ volumeset:
 # Configure Redis authentication by uncommenting and setting the password field
 redis: {}
   # password: your-secure-password
+
+backup:
+  enabled: false
+  image: controlplanecorporation/redis-backup:1.0 # compatible with all Redis versions
+  schedule: "0 2 * * *"  # daily at 2am UTC
+
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+  provider: aws # Options: aws or gcp
+
+  aws:
+    bucket: my-backup-bucket
+    region: us-east-1
+    cloudAccountName: my-backup-cloudaccount
+    policyName: my-backup-policy
+    prefix: redis-cluster/backups
+
+  gcp:
+    bucket: my-backup-bucket
+    cloudAccountName: my-backup-cloudaccount
+    prefix: redis-cluster/backups
 ```
 
 ### Authentication
@@ -143,11 +167,77 @@ RELEASE_NAME-redis-cluster-N.RELEASE_NAME-redis-cluster.GVC_NAME.cpln.local:6379
 | `6379` | TCP | Redis data port |
 | `16379` | TCP | Redis cluster bus (internal node-to-node communication) |
 
+## Backup
+
+Backup is disabled by default. When enabled, a cron workload runs on the configured schedule and produces one compressed `.rdb.gz` file per primary shard, uploaded to AWS S3 or GCS. The backup image is compatible with all Redis versions.
+
+- `backup.enabled` — Enable scheduled backups.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
+- `backup.provider` — `aws` or `gcp`.
+- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+
+### AWS S3
+
+Before enabling backup with `provider: aws`, complete the following in your AWS account:
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion"
+            ],
+            "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+            ]
+        }
+    ]
+}
+```
+
+4. Set `backup.aws.policyName` to the name of the policy created in step 3.
+5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+
+### GCS
+
+Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+
+## Restoring a Backup
+
+Each primary shard produces its own backup file (e.g. `redis-<timestamp>-node-0.rdb.gz`). Download and decompress the file for the shard you want to restore, then copy it to `/data/dump.rdb` on the corresponding replica and restart that replica.
+
+For GCS, replace `aws s3 cp s3://...` with `gsutil cp gs://...`.
+
+```sh
+aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.rdb.gz - \
+  | gunzip > /tmp/dump.rdb
+```
+
 ## External References
 
 <CardGroup cols={2}>
     <Card title="Redis Cluster Documentation" icon="book" href="https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/">
     Official Redis Cluster setup and client configuration guide
+    </Card>
+    <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/redis-backup">
+    Source code for the Redis backup container image
     </Card>
     <Card title="Redis Cluster Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/redis-cluster">
     View the source files, default values, and chart definition

@@ -11,18 +11,19 @@ This template deploys a production-ready TiDB cluster across multiple Control Pl
 ### What Gets Created
 
 - **GVC** — A new GVC spanning the configured locations.
-- **Stateful Workload** — PD (`RELEASE_NAME-pd`): placement driver cluster distributed across locations according to `pdReplicas`. Uses `replicaDirect` addressing so each PD node is individually reachable.
-- **Stateful Workload** — TiKV (`RELEASE_NAME-tikv`): distributed storage nodes. Replica count per location is controlled by `gvc.locations[].replicas`.
-- **Standard Workload** — TiDB Server (`RELEASE_NAME-server`): MySQL-compatible SQL layer on port `4000`. Per-location replica count follows `gvc.locations[].replicas`.
-- **Standard Workload** *(optional)* — DB Init (`RELEASE_NAME-tidb-db-init`): a one-time initialization job that sets the root password and creates the application database and user. Disable after first deployment.
+- **Stateful PD Workload** — (`RELEASE_NAME-pd`): placement driver cluster distributed across locations according to `pdReplicas`. Uses `replicaDirect` addressing so each PD node is individually reachable.
+- **Stateful TiKV Workload** — (`RELEASE_NAME-tikv`): distributed storage nodes. Replica count per location is controlled by `gvc.locations[].replicas`.
+- **Standard TiDB Server Workload** — (`RELEASE_NAME-server`): MySQL-compatible SQL layer on port `4000`. Per-location replica count follows `gvc.locations[].replicas`.
+- **DB Init Workload** *(optional)* — (`RELEASE_NAME-tidb-db-init`): a one-time initialization job that sets the root password and creates the application database and user. Disable after first deployment.
+- **Backup Cron Workload** *(optional)* — A scheduled backup job that uses TiDB's `br` tool to write a full cluster snapshot to AWS S3 or GCS.
 - **Volume Set** — PD storage (`RELEASE_NAME-tidb-pd-vs`): 10 GiB fixed, ext4, general-purpose-ssd, with 7-day snapshot retention.
 - **Volume Set** — TiKV storage (`RELEASE_NAME-tidb-tikv-vs`): configurable capacity with optional autoscaling, ext4, general-purpose-ssd, with 7-day snapshot retention.
 - **Secrets** — Opaque secrets containing startup scripts for PD, TiKV, and TiDB Server, plus an optional dictionary secret with database credentials.
-- **Identity & Policy** — A shared identity bound to all workloads with `reveal` access to all secrets.
+- **Identity & Policy** — A shared identity bound to all workloads with `reveal` access to all secrets, and cloud storage access when backup is enabled.
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -78,10 +79,10 @@ resources:
     cpu: 2
     memory: 4Gi
 
-autoCreateDatabase:
+autoCreateDatabase: # Enable to automatically create the database on initialization
   enabled: true
-  deployInitWorkload: true # Set to false after initialization to remove the init workload
-  database:
+  deployInitWorkload: true # Set to false after the DB has been initialized to remove the init workload and save resources
+  database: # Set database values
     rootPassword: myrootpw
     user: myuser
     password: mypw
@@ -91,33 +92,58 @@ volumeset:
   tikv:
     capacity: 10 # initial capacity in GiB (minimum is 10)
     autoscaling:
-      enabled: false
+      enabled: false # Set to true to enable autoscaling
       maxCapacity: 100 # Maximum capacity in GiB
-      minFreePercentage: 10
-      scalingFactor: 1.2
+      minFreePercentage: 10 # Minimum free percentage before scaling triggers
+      scalingFactor: 1.2 # Multiplier applied to current capacity when scaling
   pd:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 
-exposeServer: false # Set to true to expose the TiDB MySQL port publicly
+exposeServer: true # Set to true to expose TiDB server publicly
 
-external_access:
+external_access: # Set if client is outside the GVC or in another location
   server_outboundAllowCIDR: []
-  tikv_outboundAllowCIDR: []
+  tikv_outboundAllowCIDR: [] # Note: when backup.enabled is true, the template automatically allows outbound access (0.0.0.0/0) regardless of this value.
   pd_outboundAllowCIDR: []
 
 internal_access:
   server:
     type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads:
+    workloads:  # Note: can only be used if type is same-gvc or workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
   tikv:
-    type: same-gvc
-    workloads:
+    type: same-gvc # options: same-gvc, same-org, workload-list
+    workloads:  # Note: can only be used if type is same-gvc or workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
   pd:
-    type: same-gvc
-    workloads:
+    type: same-gvc # options: same-gvc, same-org, workload-list
+    workloads:  # Note: can only be used if type is same-gvc or workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+backup:
+  enabled: false
+  image: controlplanecorporation/tidb-backup:v8.5.3
+  schedule: "0 2 * * *"  # daily at 2am UTC
+  activeDeadlineSeconds: 14400  # 4 hours max per backup job
+  location: aws-us-east-1  # Run backup in the location closest to your storage bucket/region
+
+  resources:
+    cpu: 1
+    memory: 1Gi
+
+  provider: aws # Options: aws or gcp
+
+  aws:
+    bucket: my-backup-bucket
+    region: us-east-1
+    cloudAccountName: my-backup-cloudaccount
+    policyName: my-backup-policy
+    prefix: tidb/backups
+
+  gcp:
+    bucket: my-backup-bucket
+    cloudAccountName: my-backup-cloudaccount
+    prefix: tidb/backups
 ```
 
 ### Locations
@@ -182,7 +208,7 @@ Both volume sets retain snapshots for 7 days and create a final snapshot on dele
 **External access:**
 
 - `exposeServer` — Set to `true` to allow external connections to the TiDB MySQL port (`4000`) from any IP (`0.0.0.0/0`).
-- `external_access.server_outboundAllowCIDR` / `tikv_outboundAllowCIDR` / `pd_outboundAllowCIDR` — Outbound CIDR allowlists for each component, for reaching external services.
+- `external_access.server_outboundAllowCIDR` / `tikv_outboundAllowCIDR` / `pd_outboundAllowCIDR` — Outbound CIDR allowlists for each component, for reaching external services. When `backup.enabled` is `true`, TiKV outbound access is automatically set to `0.0.0.0/0` so nodes can upload directly to cloud storage, regardless of `tikv_outboundAllowCIDR`.
 
 ### Connecting to TiDB
 
@@ -205,11 +231,100 @@ Use the `user` / `password` credentials from `autoCreateDatabase.database`, or c
 | TiKV | `20160` | TCP | TiKV data port |
 | TiKV | `20180` | TCP | TiKV status port |
 
+## Backup
+
+Backup is disabled by default. When enabled, a cron workload uses TiDB's `br` tool to take a full cluster snapshot on the configured schedule and upload it to AWS S3 or GCS.
+
+- `backup.enabled` — Enable scheduled backups.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
+- `backup.provider` — `aws` or `gcp`.
+- `backup.location` — The Control Plane location where the backup job runs. Set to the location **closest to your storage bucket** to minimize cross-region transfer latency and costs.
+- `backup.activeDeadlineSeconds` — Maximum time allowed per backup job in seconds (default: `14400` / 4 hours).
+- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+
+<Note>
+When `backup.enabled` is `true`, the template automatically grants TiKV outbound access to `0.0.0.0/0` so nodes can upload data directly to cloud storage. This overrides `external_access.tikv_outboundAllowCIDR`.
+</Note>
+
+### AWS S3
+
+Before enabling backup with `provider: aws`, complete the following in your AWS account:
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion"
+            ],
+            "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+            ]
+        }
+    ]
+}
+```
+
+4. Set `backup.aws.policyName` to the name of the policy created in step 3.
+5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+
+### GCS
+
+Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+
+## Restoring a Backup
+
+Backups are stored at `BUCKET/PREFIX/tidb-TIMESTAMP/`. To restore, run `br restore full` from a machine with network access to the PD endpoint.
+
+**AWS S3:**
+
+```sh
+br restore full \
+  --pd="RELEASE_NAME-pd.GVC_NAME.cpln.local:2379" \
+  --storage="s3://BUCKET_NAME/PREFIX/tidb-TIMESTAMP" \
+  --s3.region="BUCKET_REGION"
+```
+
+**GCS:**
+
+```sh
+br restore full \
+  --pd="RELEASE_NAME-pd.GVC_NAME.cpln.local:2379" \
+  --storage="gcs://BUCKET_NAME/PREFIX/tidb-TIMESTAMP"
+```
+
+<Note>
+The `br` binary version must match your TiDB cluster version. Download it from the [TiDB Community Toolkit](https://docs.pingcap.com/tidb/stable/download-ecosystem-tools).
+</Note>
+
 ## External References
 
 <CardGroup cols={2}>
     <Card title="TiDB Documentation" icon="book" href="https://docs.pingcap.com/tidb/stable">
     Official TiDB documentation
+    </Card>
+    <Card title="TiDB Community Toolkit" icon="book" href="https://docs.pingcap.com/tidb/stable/download-ecosystem-tools">
+    Download `br` and other TiDB ecosystem tools
+    </Card>
+    <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/tidb-backup">
+    Source code for the TiDB backup container image
     </Card>
     <Card title="TiDB Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/tidb">
     View the source files, default values, and chart definition
