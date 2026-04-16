@@ -4,23 +4,33 @@ title: ClickHouse
 
 ## Overview
 
-ClickHouse is a high-performance, column-oriented analytical database designed for real-time querying and data warehousing at scale. This template deploys a ClickHouse cluster with ClickHouse Keeper for distributed coordination, backed by object storage (AWS S3 or GCS) for long-term scalable storage and a local volume for fast read caching.
+ClickHouse is a high-performance, column-oriented analytical database designed for real-time querying and data warehousing at scale. This template deploys ClickHouse in either **single-node** or **cluster** mode depending on how locations are configured, backed by object storage (AWS S3 or GCS) for long-term scalable storage and a local volume for fast read caching.
+
+### Deployment Modes
+
+| Mode | Configuration | Keeper |
+|---|---|---|
+| **Single-node** | 1 location, `replicas: 1` | Not deployed |
+| **Single-shard cluster** | 1 location, `replicas` > 1 | Deployed |
+| **Multi-shard cluster** | 3+ locations | Deployed across first 3 locations |
+
+2 locations is not supported — use 1 (single-node or single-shard) or 3+.
 
 ### What Gets Created
 
-- **GVC** — A dedicated GVC across the specified locations (minimum 3 required).
-- **ClickHouse Server** — The main analytical database workload with configurable replicas per location.
-- **ClickHouse Keeper** — The coordination service workload (1 replica per location, always 3 total).
-- **Volume Sets** — Persistent storage for both the server (metadata, state, and system files) and Keeper.
+- **GVC** — A dedicated GVC across the specified locations.
+- **Stateful ClickHouse Server Workload** — The main analytical database workload with configurable replicas per location.
+- **Stateful ClickHouse Keeper Workload** *(cluster mode only)* — The coordination service workload (1 replica per location, always 3 total).
+- **Volume Sets** — Persistent storage for the server (metadata, state, and system files), and for Keeper in cluster mode.
 - **Secrets** — A database config secret with credentials and cluster name, startup script secrets for ClickHouse Server and Keeper, and a storage configuration secret for the selected cloud provider (AWS S3 or GCS).
 - **Identity & Policy** — An identity bound to the workloads with `reveal` access to the template secrets, and cloud access for reading and writing to object storage.
 
 ### Architecture
 
-Each location maps to one ClickHouse Keeper replica, forming a 3-node quorum for distributed coordination. ClickHouse Server replicas communicate with Keeper using Control Plane's internal DNS. Primary data is stored in the configured object storage bucket; a local scratch volume serves as a fast read cache.
+In cluster mode, each location maps to one ClickHouse Keeper replica, forming a 3-node quorum for distributed coordination. ClickHouse Server replicas communicate with Keeper using Control Plane's internal DNS. In single-node mode, no Keeper is deployed. Primary data is stored in the configured object storage bucket in all modes; a local scratch volume serves as a fast read cache.
 
 <Note>
-To minimize network egress costs, deploy all locations in the same cloud provider and keep your object storage bucket in the same region(s). Using 1 replica per location for the ClickHouse server workload is sufficient.
+To minimize network egress costs, deploy all locations in the same cloud provider and keep your object storage bucket in the same region(s). Using 1 replica per location for the ClickHouse server workload is sufficient for most cluster deployments.
 </Note>
 
 ## Prerequisites
@@ -121,12 +131,14 @@ The default `values.yaml` for this template:
 ```yaml
 gvc:
   name: clickhouse-gvc
-  # Replica count will only affect the server workload
-  # Keeper will always have 3 total replicas (1 per location)
-  locations: # Minimum of 3 locations are required
-    - name: aws-us-west-2
-      replicas: 1
+  # Single-node mode: exactly 1 location with replicas: 1 — no Keeper, uses S3/GCS for storage
+  # Single-shard cluster: 1 location with replicas > 1 — Keeper required
+  # Multi-shard cluster: 3 or more locations — Keeper required
+  # Note: 2 locations is not supported
+  locations:
     - name: aws-us-east-2
+      replicas: 1
+    - name: aws-us-west-2
       replicas: 1
     - name: aws-us-east-1
       replicas: 1
@@ -137,14 +149,14 @@ aws: # If enabled, all fields below are required - See prerequisites for guidanc
   bucket: clickhouse-s3-bucket # Name of your S3 bucket
   region: us-east-1 # Region of your S3 bucket
   cloudAccountName: clickhouse-s3-cloudaccount # Name of your Cloud Account
-  policyName: clickhouse-s3-policy # Name of your pre-created policy
+  policyName: clickhouse-s3-policy # Name of your pre-created policy to allow access to the S3 bucket
 
 gcp: # If enabled, all fields below are required - See prerequisites for guidance
   bucket: clickhouse-gcs-bucket # Name of your GCS bucket
-  accessKeyId: gcs-access-key-id # HMAC access key ID
-  secretAccessKey: gcs-secret-access-key # HMAC secret access key
+  accessKeyId: gcs-access-key-id # Access key ID for your GCS service account
+  secretAccessKey: gcs-secret-access-key # Secret access key for your GCS service account
 
-clusterName: my_cluster # Name of ClickHouse cluster
+clusterName: my_cluster # Used in cluster mode only
 
 database: # Automatically create a database on initialization using the default user
   name: mydatabase
@@ -154,30 +166,28 @@ volumeset:
   server:
     capacity: 10 # initial capacity in GiB (minimum is 10)
   keeper:
-    capacity: 10 # initial capacity in GiB (minimum is 10)
+    capacity: 10 # initial capacity in GiB (minimum is 10) - cluster mode only
 
 server:
+  image: clickhouse/clickhouse-server:25.10
   resources:
     cpu: 2
     memory: 2Gi
   internal_access:
     type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads: # Note: can only be used if type is same-gvc or workload-list
+    workloads:  # Note: can only be used if type is same-gvc or workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
-keeper:
+keeper: # cluster mode only
+  image: clickhouse/clickhouse-keeper:25.10
   resources:
     cpu: 2
     memory: 2Gi
   internal_access:
     type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads: # Note: can only be used if type is same-gvc or workload-list
+    workloads:  # Note: can only be used if type is same-gvc or workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
-
-### Locations and Replicas
-
-Configure `gvc.locations` with at least 3 locations. The `replicas` value controls how many ClickHouse Server replicas run in each location — 1 per location is sufficient. ClickHouse Keeper always runs exactly 1 replica per location (3 total) regardless of this setting.
 
 <Note>
 This template creates a GVC with a default name defined in the values file. If you plan to deploy multiple instances, you **must assign a unique GVC name** for each deployment.
@@ -206,7 +216,7 @@ Set `provider` to either `aws` or `gcp`, then fill in the corresponding section.
 
 ### Cluster and Database
 
-- `clusterName` — The name used for distributed DDL queries across the ClickHouse cluster.
+- `clusterName` — The name used for distributed DDL queries. Only relevant in cluster mode.
 - `database.name` — Database created automatically on first initialization.
 - `database.password` — Password for the default ClickHouse user. **Change before deploying to production.**
 
@@ -214,10 +224,16 @@ Set `provider` to either `aws` or `gcp`, then fill in the corresponding section.
 These values are only applied on first initialization when the data directory is empty. Updating them after the initial deployment will have no effect on the running cluster. To change credentials or the database name on an existing instance, use ClickHouse's native commands (e.g. `ALTER USER`, `RENAME DATABASE`).
 </Note>
 
+### Images
+
+- `server.image` — ClickHouse Server container image.
+- `keeper.image` — ClickHouse Keeper container image. Only used in cluster mode.
+
 ### Resources and Storage
 
 - `server.resources` / `keeper.resources` — CPU and memory allocated to each workload.
-- `volumeset.server.capacity` / `volumeset.keeper.capacity` — Persistent volume size in GiB for server and Keeper state (minimum 10 each).
+- `volumeset.server.capacity` — Persistent volume size in GiB for server state (minimum 10).
+- `volumeset.keeper.capacity` — Persistent volume size in GiB for Keeper state (minimum 10). Only used in cluster mode.
 
 ### Internal Access
 
