@@ -179,7 +179,7 @@ Run both before considering work done.
 1. **Every `.mdx` file MUST have a `description` frontmatter field** (max 300 characters). This powers SEO and LLM context.
 2. **Never use "click here"** as link text. Use descriptive text: `[workload reference](/reference/workload/general)` not `[click here](/reference/workload/general)`.
 3. **Sections should be self-contained.** A reader (human or AI) should understand a section without having read prior sections.
-4. **Define terms on first use per page.** Write "Global Virtual Cloud (GVC)" before using "GVC" alone.
+4. **Use short forms with reference links — do not spell out acronyms parenthetically.** Write `[GVC](/reference/gvc)`, `[org](/reference/org)`, `BYOK`, `mk8s` rather than `Global Virtual Cloud (GVC)` or `organization (org)`. The reference page is the canonical place to learn the full term — link readers there. Definition pages (`concepts/gvc`, `concepts/org`) are the exception where introducing both forms is appropriate.
 5. **All code blocks must have language identifiers** (` ```yaml `, ` ```bash `, ` ```json `).
 6. **Headings should include feature context.** Use "GVC Overview" rather than just "Overview" when the heading appears in search results.
 
