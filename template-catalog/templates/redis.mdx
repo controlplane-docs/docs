@@ -64,7 +64,7 @@ redis:
     memory: 256Mi
     minCpu: 80m
     minMemory: 128Mi
-  replicas: 2
+  replicas: 3
   timeoutSeconds: 15
   multiZone: false
   replicaDirect: false
@@ -88,6 +88,32 @@ redis:
     #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
     # external_outboundAllowCIDR: 0.0.0.0/0
   env: []
+  tags: {}
+  requestRetryPolicy: {}
+  replication:
+    backlogSize: 1gb
+    timeout: 300
+    slaveOutputBufferLimit: "2gb 512mb 300"
+  probes:
+    readiness:
+      failureThreshold: 10
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 4
+    liveness:
+      failureThreshold: 5
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+  exporter:
+    enabled: false  # adds a redis_exporter sidecar that exposes metrics at :9121/metrics
+    image: oliver006/redis_exporter:v1.67.0-alpine
+    resources:
+      cpu: 50m
+      memory: 64Mi
+      minCpu: 25m
+      minMemory: 32Mi
+    dropMetrics: []  # e.g., ["redis_command_.*", "redis_keyspace_.*"]
   dataDir: /data
   persistence:
     enabled: false
@@ -103,6 +129,10 @@ redis:
           maxCapacity: 100 # In GiB
           minFreePercentage: 20
           scalingFactor: 1.2
+        # customEncryption:
+        #   enabled: true
+        #   region: aws-us-east-1
+        #   keyId: arn:aws:kms:us-east-1:1234567890:key/YOUR_KEY_ID
 
 sentinel:
   image: redis:7.4
@@ -135,6 +165,8 @@ sentinel:
     #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
     # external_outboundAllowCIDR: 0.0.0.0/0
   env: []
+  tags: {}
+  requestRetryPolicy: {}
   persistence:
     enabled: false
     volumes:
@@ -149,6 +181,10 @@ sentinel:
           maxCapacity: 50 # In GiB
           minFreePercentage: 20
           scalingFactor: 1.2
+        # customEncryption:
+        #   enabled: true
+        #   region: aws-us-east-1
+        #   keyId: arn:aws:kms:us-east-1:1234567890:key/YOUR_KEY_ID
 
 backup:
   enabled: false
@@ -203,7 +239,7 @@ Sentinel can be configured with a separate password for Sentinel-to-Sentinel com
 
 ### Redis Cluster
 
-- `redis.replicas` — Number of Redis replicas. Replica 0 is always the initial primary.
+- `redis.replicas` — Number of Redis replicas. Defaults to `3`. Replica 0 is always the initial primary.
 - `redis.resources.cpu` / `redis.resources.memory` — Maximum CPU and memory per replica.
 - `redis.resources.minCpu` / `redis.resources.minMemory` — Minimum CPU and memory guaranteed per replica.
 - `redis.multiZone` — Spread replicas across availability zones within the location.
@@ -219,6 +255,63 @@ Sentinel monitors the Redis cluster and automatically promotes a replica when th
 - `sentinel.resources.cpu` / `sentinel.resources.memory` — Maximum CPU and memory per Sentinel replica.
 - `sentinel.resources.minCpu` / `sentinel.resources.minMemory` — Minimum CPU and memory guaranteed per Sentinel replica.
 - `sentinel.multiZone` — Spread Sentinel replicas across availability zones.
+
+### Replication Tuning
+
+The `redis.replication` block controls low-level replication behavior. The defaults are sized for production workloads and typically do not need adjustment.
+
+- `replication.backlogSize` — Replication backlog size. The default `1gb` covers ~5 minutes of disconnect at ~3 MB/s of writes. The Redis default of `1mb` will trigger a full RDB resync on any brief disconnect.
+- `replication.timeout` — Timeout in seconds for full-resync transfers. The default `300s` covers datasets up to ~30 GB. The Redis default of `60s` is too low for large datasets.
+- `replication.slaveOutputBufferLimit` — Format: `<hard> <soft> <seconds>`. The default `"2gb 512mb 300"` sustains full resyncs of large datasets at high write rates. The Redis default `"256mb 64mb 60"` can cause the master to kill a replica mid-stream.
+
+### Health Checks
+
+Probe settings for the Redis workload are configurable under `redis.probes`. This is most useful when persistence is enabled and large datasets require additional time to load before the replica is ready.
+
+The startup probe window is derived from the readiness probe settings:
+
+```
+startup window = initialDelaySeconds + (30 × periodSeconds)
+```
+
+The default (`10 + 30×5 = 160s`) is sufficient for small datasets. If AOF load takes longer, increase `periodSeconds`:
+
+```yaml
+redis:
+  probes:
+    readiness:
+      initialDelaySeconds: 35   # clears the AOF load window
+      periodSeconds: 20          # startup window = 35 + (30×20) = 635s
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `readiness.initialDelaySeconds` | `10` | Seconds to wait before first readiness check |
+| `readiness.periodSeconds` | `5` | How often to run the readiness check; also controls the startup window |
+| `readiness.failureThreshold` | `10` | Number of failures before the replica is marked not ready |
+| `readiness.timeoutSeconds` | `4` | Timeout per probe attempt |
+| `liveness.initialDelaySeconds` | `30` | Seconds before the first liveness check |
+| `liveness.periodSeconds` | `10` | How often to run the liveness check |
+| `liveness.failureThreshold` | `5` | Number of failures before the container is restarted |
+| `liveness.timeoutSeconds` | `5` | Timeout per probe attempt |
+
+### Metrics
+
+A `redis_exporter` sidecar can be enabled to expose Prometheus metrics. When enabled, Control Plane scrapes `:9121/metrics` automatically every 30 seconds and makes the metrics available in the console.
+
+- `redis.exporter.enabled` — Set to `true` to add the exporter sidecar to each Redis replica.
+- `redis.exporter.image` — Exporter image (default: `oliver006/redis_exporter:v1.67.0-alpine`).
+- `redis.exporter.resources` — CPU and memory limits/requests for the sidecar container.
+- `redis.exporter.dropMetrics` — List of regex patterns matched against metric names. Use to filter high-cardinality series before they are stored.
+
+```yaml
+redis:
+  exporter:
+    enabled: true
+    dropMetrics:
+      - "redis_commands_latencies_usec_bucket"
+      - "redis_latency_percentiles_usec"
+```
 
 ### Storage
 
