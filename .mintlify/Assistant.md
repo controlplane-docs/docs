@@ -291,7 +291,7 @@ A workload references secrets from its parent org but only volume sets and ident
 | Custom domains | [Domain reference](/reference/domain) — choose CNAME (single GVC) or NS (multi-GVC, geo-routing) |
 | Credential-free cloud access (AWS/GCP/Azure/NGS) | [Identity reference](/reference/identity) — cloud account + identity + grants |
 | Connecting to private VPCs / on-prem | [Agents (wormholes)](/guides/agent) |
-| Authoring AI agents that work with Control Plane | [AI Plugin](/mcp/ai-plugin) and [MCP Server](/mcp/overview) |
+| Authoring AI agents that work with Control Plane | [AI Tools Overview](/mcp/overview), [AI Plugin](/mcp/ai-plugin), and [MCP Server](/mcp/mcp-server) |
 | Org access control / RBAC | [Policy reference](/reference/policy), [Group reference](/reference/group) |
 | External logging | [External logging guide](/external-logging/overview) |
 | Audit and compliance | [Audit Trail](/core/audittrail), [Audit Context](/reference/auditctx) |
