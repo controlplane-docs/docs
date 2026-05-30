@@ -597,7 +597,7 @@ Before submitting:
 
 - [/guides/cpln-apply](https://docs.controlplane.com/guides/cpln-apply) — GitOps, multi-resource apply, the patience-windowed safety-net pattern
 - [/cli-reference/overview](https://docs.controlplane.com/cli-reference/overview) — all CLI commands and flags
-- [/mcp/overview](https://docs.controlplane.com/mcp/overview), [/mcp/mcp-server](https://docs.controlplane.com/mcp/mcp-server), [/mcp/ai-plugin](https://docs.controlplane.com/mcp/ai-plugin) — AI Tools overview (choose-your-path), MCP Server (80+ tools, OAuth + per-org consent), and full AI plugin (skills + agents + commands + guardrails)
+- [/ai/overview](https://docs.controlplane.com/ai/overview), [/ai/mcp-server](https://docs.controlplane.com/ai/mcp-server), [/ai/ai-plugin](https://docs.controlplane.com/ai/ai-plugin) — AI Tools overview (choose-your-path), MCP Server (80+ tools, OAuth + per-org consent), and full AI plugin (skills + agents + commands + guardrails)
 - [/template-catalog/overview](https://docs.controlplane.com/template-catalog/overview) — 30+ production-ready templates
 - [/mk8s/overview](https://docs.controlplane.com/mk8s/overview), [/byok/overview](https://docs.controlplane.com/byok/overview), [/core/kubernetes-operator](https://docs.controlplane.com/core/kubernetes-operator)
 - Terraform: [registry.terraform.io/providers/controlplane-com/cpln](https://registry.terraform.io/providers/controlplane-com/cpln/latest/docs)
