@@ -1,0 +1,225 @@
+---
+title: Publishing & Converting VM Images
+description: Package a disk image as an OCI containerDisk and push it to your registry, boot from an HTTP(S) image, and convert VMDK/qcow2/VHD images for use with VM workloads.
+keywords: ['vm image', 'containerdisk', 'qcow2', 'vmdk', 'vhd convert', 'qemu-img', 'kubevirt image', 'boot disk image', 'cdi import', 'windows vm image']
+---
+
+A [VM workload](/reference/workload/vm) boots from a disk image. There are two ways to provide one:
+
+- An **OCI containerDisk** — a disk image packaged as a normal OCI image and pushed to a registry. Best for reproducibility and reuse.
+- An **HTTP(S) disk image** — a disk file (qcow2, raw, VMDK, VHD, …) hosted at a URL and imported into a persistent disk on first boot. Best for large images or a one‑time "lift and shift."
+
+This guide covers building and publishing both, and converting images that start in another format.
+
+## Choosing an approach
+
+<CardGroup cols={2}>
+  <Card title="OCI containerDisk" icon="box">
+    Reproducible, versioned, and pulled like any other image. Recommended for images you reuse or roll out across many VMs.
+  </Card>
+  <Card title="HTTP(S) import" icon="download">
+    No image build step. Point at a URL; Control Plane imports and converts it into a persistent disk. Good for large or one-off images.
+  </Card>
+</CardGroup>
+
+## Supported source formats
+
+The HTTP(S) importer accepts and auto‑converts these disk formats:
+
+| Format | Extensions | Notes |
+| :----- | :--------- | :---- |
+| QEMU copy‑on‑write | `.qcow2` | Recommended; compact and sparse. |
+| Raw | `.img`, `.raw` | Uncompressed full‑size disk. |
+| VMware | `.vmdk` | VMware exports. |
+| Hyper‑V | `.vhd`, `.vhdx` | Windows/Hyper‑V exports. |
+| VirtualBox | `.vdi` | VirtualBox exports. |
+| Optical | `.iso` | CD/DVD media. |
+
+Compressed variants (`.gz`, `.xz`) are also accepted and decompressed on import. **Both** the OCI containerDisk and HTTP(S) paths run the same conversion — CDI converts the source to the boot disk's native format on import — so you can ship a `.vmdk` (or `.vhd`, `.vdi`, …) directly without converting it first. Converting to `qcow2` at build time (see [Converting images](#converting-images)) is an optional optimization that moves the one-time conversion cost out of the import.
+
+## Option A — Publish an OCI containerDisk
+
+A containerDisk is an OCI image whose only contents are a single disk file placed in `/disk/`. KubeVirt loads that disk as the VM's boot device.
+
+<Steps>
+<Step title="Obtain a disk image">
+  Use any [supported format](#supported-source-formats) — `qcow2`, `raw`, `vmdk`, `vhd`/`vhdx`, or `vdi`. CDI converts it to the boot disk's native format on import, so no pre-conversion is needed. (Converting to `qcow2` first is optional — see [Converting images](#converting-images).)
+</Step>
+
+<Step title="Write a Dockerfile">
+  The image is built `FROM scratch` with the disk added to `/disk/`. The disk file must be readable by UID `107` (the `qemu` user that runs the VM), so set ownership with `--chown=107:107`:
+
+  ```dockerfile Dockerfile
+  FROM scratch
+  ADD --chown=107:107 my-disk.vmdk /disk/
+  ```
+
+  <Note>
+  Nothing else belongs in a containerDisk — no base OS, no entrypoint. The disk file alone is the payload (any supported format). Omitting `--chown=107:107` causes a permission error when KubeVirt tries to open the disk.
+  </Note>
+</Step>
+
+<Step title="Build and push to your registry">
+  Build for `linux/amd64` and push to your org's registry. Using the CLI:
+
+  ```bash
+  cpln image build --name my-vm-disk:v1 --push
+  ```
+
+  Or with Docker directly (registry path `ORG.registry.cpln.io/IMAGE:TAG`):
+
+  ```bash
+  cpln image docker-login
+  docker buildx build --platform=linux/amd64 \
+    -t my-org.registry.cpln.io/my-vm-disk:v1 .
+  docker push my-org.registry.cpln.io/my-vm-disk:v1
+  ```
+
+  See [Push Images to Registry](/guides/push-image) for authentication and CI/CD details.
+</Step>
+
+<Step title="Reference it in the VM workload">
+  Use the Control Plane image link format — `//image/<name>:<tag>` or `/org/<org>/image/<name>:<tag>`:
+
+  ```yaml YAML
+  spec:
+    type: vm
+    vm:
+      bootDisk:
+        source:
+          oci:
+            image: //image/my-vm-disk:v1
+  ```
+
+  Public containerDisks work too, e.g. `quay.io/containerdisks/ubuntu:22.04`.
+</Step>
+</Steps>
+
+<Tip>
+A VM's boot disk is always backed by a volume set, so `bootDisk.persist.volumeSet` is required alongside the source. See [Persistence](/reference/workload/vm#persistence-with-volume-sets).
+</Tip>
+
+## Option B — Boot from an HTTP(S) image
+
+Host the disk image at an HTTP(S) URL and let Control Plane import it. The import lands in a per‑replica persistent disk, so a boot volume set is **required**.
+
+<Steps>
+<Step title="Host the image">
+  Place the disk file (any [supported format](#supported-source-formats)) behind an `http(s)` URL the cluster can reach — an object store signed URL, a release asset, or a simple web server.
+</Step>
+
+<Step title="(Recommended) Compute a checksum">
+  ```bash
+  sha256sum my-disk.qcow2
+  ```
+</Step>
+
+<Step title="Reference it with a boot volume set">
+  ```yaml YAML
+  spec:
+    type: vm
+    vm:
+      bootDisk:
+        source:
+          http:
+            url: https://example.com/images/my-disk.qcow2
+            checksum: 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'
+        persist:
+          volumeSet: cpln://volumeset/my-vm-root
+  ```
+
+  On first boot the image is downloaded, verified against the checksum, converted to the disk's native format, and written to the replica's persistent disk. Subsequent boots reuse the imported disk.
+</Step>
+</Steps>
+
+<Info>
+Object‑store schemes (`s3://`, `gs://`) are not yet accepted directly — use a signed `http(s)` URL instead.
+</Info>
+
+## Converting images
+
+CDI converts disk formats for you on import, so this step is **optional** — reach for it only to shrink an image or to pay the conversion cost once at build time instead of on every import. `qemu-img` (from the `qemu-utils` package) converts between formats:
+
+<CodeGroup>
+
+```bash VMDK → qcow2
+qemu-img convert -p -O qcow2 disk.vmdk disk.qcow2
+```
+
+```bash VHD/VHDX → qcow2
+qemu-img convert -p -O qcow2 disk.vhdx disk.qcow2
+```
+
+```bash VDI → qcow2
+qemu-img convert -p -O qcow2 disk.vdi disk.qcow2
+```
+
+```bash raw → qcow2
+qemu-img convert -p -O qcow2 disk.img disk.qcow2
+```
+
+</CodeGroup>
+
+Inspect an image to confirm its format and virtual size:
+
+```bash
+qemu-img info disk.qcow2
+```
+
+<Tip>
+To shrink a sparse disk after conversion, run `virt-sparsify --in-place disk.qcow2` (from `libguestfs-tools`). Smaller images push and import faster.
+</Tip>
+
+### Building a containerDisk from a converted image
+
+Once converted, package and push it as in [Option A](#option-a--publish-an-oci-containerdisk):
+
+```dockerfile Dockerfile
+FROM scratch
+ADD --chown=107:107 disk.qcow2 /disk/
+```
+
+```bash
+cpln image build --name my-vm-disk:v1 --push
+```
+
+## Windows images
+
+Windows guests work the same way, with a few practicalities:
+
+- Set `spec.vm.guestOS: windows` so the correct DNS bootstrap is injected. See [Cloud-init & platform injection](/reference/workload/vm#cloud-init--platform-injection).
+- Windows disk images can be large; the [HTTP import](#option-b--boot-from-an-https-image) path avoids building a multi‑GB OCI image.
+- A generation‑1 (MBR) VHD boots with `firmware.bootloader: bios`; a UEFI image uses the default `efi`.
+- Ensure VirtIO drivers are present in the image so the guest sees its disk and network. Microsoft's evaluation VHDs typically need the VirtIO drivers slipstreamed in before upload.
+
+```yaml YAML
+spec:
+  type: vm
+  vm:
+    guestOS: windows
+    bootDisk:
+      source:
+        http:
+          url: https://example.com/images/windows-server-2022.vhd
+      persist:
+        volumeSet: cpln://volumeset/win-root
+    firmware:
+      bootloader: bios
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="VM Workloads" href="/reference/workload/vm" icon="server">
+    Configure and run the VM
+  </Card>
+  <Card title="Volume Sets" href="/reference/volumeset" icon="database">
+    Persist boot and data disks
+  </Card>
+  <Card title="Push Images" href="/guides/push-image" icon="upload">
+    Registry authentication and CI/CD
+  </Card>
+  <Card title="Create a Workload" href="/guides/create-workload" icon="cube">
+    Deploy from a manifest
+  </Card>
+</CardGroup>
