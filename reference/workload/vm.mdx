@@ -1,0 +1,404 @@
+---
+title: Virtual Machines
+description: Run full virtual machines as a workload type on Control Plane — inside the same service mesh, identity, networking, and observability as containers. Boot disks, persistence, cloud-init, and SSH.
+keywords: ['vm workload', 'virtual machine', 'kubevirt', 'windows vm', 'linux vm', 'containerdisk', 'boot disk', 'cloud-init', 'vm ssh', 'qemu', 'vmdk']
+---
+
+## Overview
+
+A **VM workload** (`spec.type: vm`) runs a full virtual machine — its own kernel, init system, and guest operating system — as a first‑class Control Plane workload. A VM is scheduled, networked, secured, and observed exactly like a [standard](/reference/workload/types#standard) container workload: it joins the [service mesh](/reference/workload/security), receives a [Universal Cloud Identity](/reference/identity), is governed by the same [firewall](/reference/workload/firewall) rules, and streams metrics and logs into the same observability stack.
+
+Use a VM workload when you need something a container cannot give you:
+
+- A "lift and shift" of an existing virtual machine image (VMDK, qcow2, VHD) without re‑platforming it into a container.
+- A specific guest OS or kernel (Windows, a custom Linux distribution, an appliance image).
+- Software that must run against real hardware abstractions (custom kernel modules, nested virtualization‑style tooling, legacy applications).
+
+<Note>
+VM workloads are backed by [KubeVirt](https://kubevirt.io/). You do not interact with KubeVirt directly — Control Plane translates your workload spec into the underlying VM definition, disk imports, networking, and mesh configuration.
+</Note>
+
+### A VM is just another workload
+
+Everything you already know about workloads applies to VMs:
+
+| Capability | Behavior for VMs |
+| :--------- | :--------------- |
+| **Service mesh / mTLS** | VM traffic flows through the Istio sidecar; workload‑to‑workload traffic is mutually authenticated with the workload's identity. |
+| **Service discovery** | Other workloads reach the VM at `<workload>.<gvc>.cpln.local`. The VM resolves in‑cluster names through a platform DNS forwarder (see [Cloud-init & platform injection](#cloud-init--platform-injection)). |
+| **Identity & cloud access** | The VM runs as the workload [identity](/reference/identity); cloud‑provider credentials are available to the guest via the same metadata endpoint used by containers. |
+| **Firewall** | The VM's inbound/outbound access is governed by [`firewallConfig`](/reference/workload/firewall), identical to other workloads. |
+| **Domains** | A [domain](/reference/domain) can route public traffic to a VM that exposes ports. |
+| **Metrics & logs** | Prometheus scraping, the serial console log, and the audit trail all work without extra configuration. |
+| **Autoscaling** | Manual replica counts via `minScale`/`maxScale`. (See [Scaling & lifecycle](#scaling--lifecycle).) |
+
+Because of this, most of the rest of the workload documentation — [firewall](/reference/workload/firewall), [identity](/reference/identity), [domains](/reference/domain), [custom metrics](/reference/workload/custom-metrics) — applies to VMs unchanged. This page covers what is **specific** to the VM type.
+
+## Lifecycle & disruption
+
+<Warning>
+**VMs can currently be disrupted.** A VM replica runs similar to a container workload on our platform. When we need to scale down, the VM can on occasion be **stopped and restarted elsewhere**. Control Plane does **not** offer live migration yet — there is no seamless, in‑memory hand‑off between nodes. A restart is a cold boot: in‑memory state is lost and the guest boots again from its disk. Data can be lost if the root disk is not configured with a volumeset.
+</Warning>
+
+Design your VM workloads to tolerate restarts:
+
+- **Persist anything you need to keep** on a [volume set](#persistence-with-volume-sets) — both the boot disk and any data disks. State written only to an ephemeral root disk does not survive rescheduling.
+- **Expect cold reboots** during node scale‑down, node upgrades, and cluster maintenance. When running with your own [Mk8s](/mk8s/overview) location you can control this in your nodepool settings.
+- **Make boot idempotent.** Your [cloud-init](#cloud-init--platform-injection) and guest services should converge to a working state on every boot, not just the first.
+
+This is the same operational model as a [stateful](/reference/workload/types#stateful) container workload: durable storage is explicit, and identity/storage are stable across restarts, but the running process itself is not pinned to a node.
+
+## Minimal example
+
+A single Ubuntu VM that installs and serves nginx on port 80, with a persisted boot disk:
+
+```yaml YAML
+kind: workload
+name: my-vm
+spec:
+  type: vm
+  containers:
+    - name: vm
+      cpu: 1000m
+      memory: 2Gi
+      ports:
+        - number: 80
+          protocol: http
+  vm:
+    bootDisk:
+      source:
+        oci:
+          image: quay.io/containerdisks/ubuntu:22.04
+      persist:
+        volumeSet: cpln://volumeset/my-vm-root
+    runStrategy: Always
+    cloudInit:
+      userData: |
+        #cloud-config
+        packages:
+          - nginx
+        runcmd:
+          - systemctl enable nginx
+          - systemctl start nginx
+  firewallConfig:
+    external:
+      inboundAllowCIDR: ['0.0.0.0/0']
+      outboundAllowCIDR: ['0.0.0.0/0']
+    internal:
+      inboundAllowType: same-gvc
+  defaultOptions:
+    autoscaling:
+      minScale: 1
+      maxScale: 1
+```
+
+<Note>
+A VM workload has exactly **one** container entry. It describes the VM's resources (`cpu`, `memory`), exposed `ports`, `metrics`, and attached `volumes`. The guest image comes from `spec.vm.bootDisk`, **not** from `containers[0].image` — setting a container image on a VM workload is rejected.
+</Note>
+
+## The container entry
+
+A VM workload reuses the [container](/reference/workload/containers) object for the VM's resource and networking surface, with VM‑specific rules:
+
+- **Exactly one container.** Multiple containers are rejected.
+- **`cpu` must be a whole number of cores** — a multiple of `1000m`, and at least `1000m`. The guest is presented this many vCPU cores. (`500m`, `1500m`, etc. are rejected.)
+- **`memory`** is the RAM presented to the guest (e.g. `2Gi`).
+- **`ports`** advertise the services the guest listens on, for service discovery and mesh routing. Use the `ports` array (`{ number, protocol }`); the singular `port` field is not valid for VMs.
+- **`metrics`** enables Prometheus scraping of a guest endpoint (see [Custom metrics](/reference/workload/custom-metrics)).
+- **`readinessProbe` / `livenessProbe`** support `tcpSocket` and `httpGet` only (`exec` and `grpc` are rejected).
+- **`volumes`** attach data disks to the VM (see [Persistence](#persistence-with-volume-sets)).
+- **Not valid for VMs:** `image`, `command`, `args`, `workingDir`, `lifecycle`, and the singular `port`. The guest OS owns process lifecycle.
+
+CPU topology (how those cores are presented) can optionally be shaped with `spec.vm.cpu.sockets` (1–32) and `spec.vm.cpu.threads` (1–8). By default the core count is derived from `containers[0].cpu`.
+
+## Boot disk
+
+`spec.vm.bootDisk` defines where the VM boots from. Exactly one **source** is required.
+
+### OCI containerDisk source
+
+The simplest path: package a disk image as an OCI image (a "containerDisk") and reference it. This is the recommended, most reproducible option.
+
+```yaml YAML
+bootDisk:
+  source:
+    oci:
+      image: quay.io/containerdisks/ubuntu:22.04
+```
+
+- The image may be a public containerDisk (e.g. `quay.io/containerdisks/ubuntu:22.04`), or one you publish to your org's [registry](/reference/image) and reference as `//image/<name>:<tag>` or `/org/<org>/image/<name>:<tag>`.
+- Cross‑org image links are rejected; the image must belong to the calling org or be a public registry reference.
+- `persist.volumeSet` is **required**. The boot disk is always a per‑replica PVC backed by a [volume set](#persistence-with-volume-sets); the image seeds it on first boot.
+
+See [Publishing & converting VM images](/guides/vm-images) for how to build and push a containerDisk and convert images from other formats.
+
+### HTTP(S) source
+
+Boot from a disk image hosted over HTTP(S). Control Plane imports it into a persistent disk on first boot, so `persist.volumeSet` is **required**.
+
+```yaml YAML
+bootDisk:
+  source:
+    http:
+      url: https://example.com/images/my-disk.qcow2
+      checksum: 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'
+    persist:
+      volumeSet: cpln://volumeset/my-vm-root
+```
+
+- The importer accepts common disk formats — **qcow2, raw, VMDK, VHD/VHDX, VDI, ISO** — and gzip/xz‑compressed variants, converting them to the disk's native format on import.
+- `checksum` is optional but recommended: `sha256:<hex>` or `sha512:<hex>`. The import is verified against it.
+- Import runs once per replica's persistent disk; subsequent boots reuse the imported disk.
+
+### Boot disk options
+
+| Field | Default | Notes |
+| :---- | :------ | :---- |
+| `bootDisk.source.oci.image` | — | OCI containerDisk reference. Mutually exclusive with `http`. |
+| `bootDisk.source.http.url` | — | HTTP(S) disk image URL. Requires `persist.volumeSet`. |
+| `bootDisk.source.http.checksum` | — | `sha256:<hex>` or `sha512:<hex>`. |
+| `bootDisk.persist.volumeSet` | — | **Required.** `cpln://volumeset/<name>`. The boot disk is always a per‑replica PVC. |
+| `bootDisk.bus` | `virtio` | Disk bus: `virtio`, `sata`, or `scsi`. |
+| `bootDisk.bootOrder` | `1` | Boot priority (1–16) when multiple bootable disks exist. |
+
+<Info>
+Object‑store sources (`s3://`, `gs://`) and snapshot restores are not yet exposed. To boot from an object store, use a signed `http(s)` URL. To boot from an existing volume set snapshot, use the volume set [`restoreVolume`](/reference/volumeset) command.
+</Info>
+
+## Persistence with volume sets
+
+VM storage is durable only when it is backed by a [volume set](/reference/volumeset). A volume set provisions one PVC per replica and keeps its contents across reschedules. There are two distinct uses.
+
+### Persisting the boot disk
+
+Set `bootDisk.persist.volumeSet` to make the root disk durable. The image source seeds the disk the first time; after that, the guest's changes to the root filesystem survive restarts and node moves.
+
+```yaml YAML
+vm:
+  bootDisk:
+    source:
+      oci:
+        image: quay.io/containerdisks/ubuntu:22.04
+    persist:
+      volumeSet: cpln://volumeset/my-vm-root
+```
+
+The disk size comes from the volume set's `initialCapacity` (defaulting to `20Gi` if the boot volume set is omitted entirely), and the storage class comes from the volume set's performance class.
+
+### Attaching additional data disks
+
+Additional volumes are attached to the VM as **block devices** through the container's `volumes` list. Each entry needs a `uri` and a `name`; the `name` identifies the device inside the guest.
+
+```yaml YAML
+containers:
+  - name: vm
+    cpu: 1000m
+    memory: 2Gi
+    volumes:
+      - uri: cpln://volumeset/my-vm-data
+        name: data
+        bus: virtio
+        serial: DATA001
+```
+
+<Warning>
+For VMs, a data volume is presented to the guest as a **raw block device** (e.g. `/dev/vdb`), **not** auto‑mounted at a path. This is different from container workloads, where a volume's `path` mounts it into the filesystem. The guest is responsible for partitioning, formatting, and mounting the device — typically once, then persisted on the device itself. Use the `serial` field to find the device reliably at `/dev/disk/by-id/...` and mount it from cloud-init.
+</Warning>
+
+Data‑disk volume fields:
+
+| Field | Default | Notes |
+| :---- | :------ | :---- |
+| `uri` | — | `cpln://volumeset/<name>` for a data disk, or `cpln://secret/<name>` to surface a [secret](/reference/secret) as a disk. |
+| `name` | — | Required. Device name inside the guest. |
+| `bus` | `virtio` | `virtio`, `sata`, or `scsi`. |
+| `serial` | — | Disk serial, surfaced to the guest for stable `by-id` lookup. |
+| `cdrom` | `false` | Attach as a read‑only CD‑ROM (useful for ISO/secret payloads). |
+| `bootOrder` | — | Optional boot priority if the disk is bootable. |
+
+Example: format and mount a data disk on first boot, idempotently, from cloud-init:
+
+```yaml YAML
+cloudInit:
+  userData: |
+    #cloud-config
+    runcmd:
+      - |
+        DEV=/dev/disk/by-id/*DATA001*
+        if ! blkid $DEV; then mkfs.ext4 -L data $DEV; fi
+        mkdir -p /mnt/data
+        echo 'LABEL=data /mnt/data ext4 defaults,nofail 0 2' >> /etc/fstab
+        mount -a
+```
+
+Volume set [considerations](/reference/workload/types#considerations-when-using-persistent-storage) apply: they are GVC‑scoped, a volume set is used by at most one workload (unless [shared](/reference/volumeset#shared-file-system)), and the URI must begin with `cpln://volumeset/`.
+
+## Networking & ports
+
+A VM is subject to the same [firewall](/reference/workload/firewall) and service‑mesh policy as any other workload.
+
+- **Exposed ports** come from `containers[0].ports`. These are the ports other workloads, domains, and probes can reach, and they flow through the service mesh.
+- **Port 22 (SSH)** is always reachable internally by Control Plane — SSH authenticates with its own certificate trust (see [SSH access](#ssh-access)).
+- **A single network interface** is supported (`spec.vm.networks` accepts one entry, default name `default`).
+- **Service discovery:** other workloads reach the VM at `<workload>.<gvc>.cpln.local` on its exposed ports, exactly like a container workload.
+
+<Tip>
+Inside the guest, Control Plane's internal service names (`*.cpln.local`) resolve through the platform DNS forwarder. On some Linux guests, large `cpln.local` answers resolve more reliably over TCP — adding `options use-vc` to `/etc/resolv.conf` from cloud-init forces TCP and avoids truncation issues.
+</Tip>
+
+## Connecting with RDP (Windows)
+
+A Windows VM has no public RDP endpoint by default. Use the [`cpln port-forward`](/guides/cli/cpln-port-forward) command to open a secure tunnel from your machine to the VM's RDP port (3389), then point any RDP client at `localhost`. This requires `connect` permission on the workload and never exposes RDP publicly.
+
+<Steps>
+<Step title="Enable RDP in the guest">
+  Ensure the Windows image has Remote Desktop enabled, the firewall allows it, and you have a user to log in as. You can do this in the image, or from [cloud-init](#cloud-init--platform-injection):
+
+  ```yaml YAML
+  vm:
+    guestOS: windows
+    cloudInit:
+      userData: |
+        #ps1_sysnative
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+        Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+        net user admin 'YourStrongPassword!' /add
+        net localgroup administrators admin /add
+  ```
+</Step>
+
+<Step title="Start the tunnel">
+  Forward a local port to 3389 on a VM replica. The port does **not** need to be listed in the workload's `ports` — `cpln port-forward` reaches the guest directly:
+
+  ```bash
+  cpln port-forward my-windows-vm 3389:3389 --gvc my-gvc --location aws-us-west-2
+  ```
+
+  Use a different local port (e.g. `13389:3389`) if 3389 is busy on your machine, and `--replica` to target a specific VM.
+</Step>
+
+<Step title="Connect your RDP client">
+  Point any RDP client at the local end of the tunnel and log in with the guest credentials:
+
+  ```text
+  localhost:3389
+  ```
+
+  On macOS use the **Windows App** (formerly Microsoft Remote Desktop); on Windows use **mstsc**; on Linux use a client such as **Remmina** or **xfreerdp**:
+
+  ```bash
+  xfreerdp /v:localhost:3389 /u:admin
+  ```
+</Step>
+</Steps>
+
+<Note>
+The same pattern works for any TCP service the guest listens on — `cpln port-forward` to the port and connect locally. The port does not need to be listed in the workload's `ports`; that list only governs in‑cluster service‑mesh traffic.
+</Note>
+
+## Cloud-init & platform injection
+
+`spec.vm.cloudInit` provides the guest's [cloud-init](https://cloudinit.readthedocs.io/) user‑data. Control Plane **merges** your content with a small amount of platform configuration so the VM works inside the mesh — your cloud-init is preserved and runs alongside the injected pieces.
+
+### Providing your own cloud-init
+
+Supply exactly one of:
+
+| Field | Use when |
+| :---- | :------- |
+| `cloudInit.userData` | Inline cloud-init (max 16 KiB). Convenient for non‑sensitive config. Not encrypted at rest in the data‑service. |
+| `cloudInit.userDataBase64` | Same as `userData`, base64‑encoded (max ~22 KB). |
+| `cloudInit.userDataSecret` | A [secret](/reference/secret) holding the user‑data (key `userdata` or `user-data`). Use this for sensitive payloads. |
+
+```yaml YAML
+cloudInit:
+  userDataSecret: //secret/my-vm-cloudinit
+```
+
+### What the platform injects
+
+On top of your user‑data, Control Plane adds (and keeps under its control):
+
+- **Network configuration.** A name‑based interface match with DNS pointed at the in‑cluster forwarder. This is platform‑managed and not user‑overridable: KubeVirt re‑randomizes the VM's MAC on every restart, and a MAC‑pinned network config would stall the guest after a reschedule.
+- **In‑cluster DNS.** So the guest can resolve `*.cpln.local` and other cluster service names, and so cross‑location ([wormhole](/reference/workload/general)) peers are reachable.
+- **Service‑mesh interception.** The VM's pod joins the Istio mesh; traffic on the exposed ports is mutually authenticated with the workload identity.
+- **SSH trust.** A platform SSH certificate authority is trusted by the guest and a platform user is provisioned, enabling certificate‑based SSH (see below). This is re‑applied on every boot so it survives image and platform updates.
+- **(Windows only)** A DNS bootstrap script that points the guest's adapters at the in‑cluster resolver and sets the cluster search suffixes.
+
+Set `spec.vm.guestOS` to `linux` (default) or `windows` so the correct per‑OS injection is applied.
+
+### SSH access
+
+There are two ways to get your SSH keys into the guest, in addition to the platform's certificate trust:
+
+- **`cloudInit.sshPublicKeySecrets`** — a list (max 8) of [secrets](/reference/secret) holding public keys, injected for the default user.
+- **`spec.vm.accessCredentials`** — per‑user key delivery. Each entry maps a key secret to one or more guest `users`, delivered via `qemuGuestAgent` (default) or `configDrive`.
+
+```yaml YAML
+vm:
+  accessCredentials:
+    - sshPublicKeySecret: //secret/team-ssh-keys
+      users: [ubuntu, ops]
+      deliveryMethod: qemuGuestAgent
+```
+
+<Note>
+`cpln workload connect` and `cpln workload exec` log into the guest as the platform `cpln` user using a CA‑signed certificate — both the user and the trusted CA come from the platform's cloud‑init injection. They therefore require a **cloud‑init‑capable guest** (standard Linux cloud images, or Windows with cloudbase‑init). Minimal images that don't process cloud‑init (e.g. CirrOS) won't accept these connections; reach those over the serial console instead.
+</Note>
+
+## Scaling & lifecycle
+
+- **Replicas** are controlled by `defaultOptions.autoscaling.minScale` / `maxScale`. Each replica is an independent VM with its own persistent disk(s).
+- **`runStrategy`** controls the power state:
+  - `Always` (default) — keep the VM running; restart it if it stops.
+  - `RerunOnFailure` — restart only on non‑zero exit.
+  - `Manual` — start/stop is driven explicitly.
+  - `Halted` — defined but powered off. Requires `minScale: 0`.
+- **`clock.timezone`** sets the guest clock (default `UTC`).
+- **`hostname`** / **`subdomain`** set the guest's hostname and DNS subdomain.
+- **`firmware`** selects the bootloader (`efi` default, or `bios`) and optional SMBIOS identifiers (`uuid`, `serial`, `smbios.*`).
+
+<Info>
+**Secure Boot is not yet available.** `firmware.secureBoot` is rejected by validation. It requires persistent EFI NVRAM, which is not yet provisioned; without it a Secure Boot guest would lose its boot state on reboot.
+</Info>
+
+## Settings reference
+
+All fields below live under `spec.vm`. In the **Req.** column, **✓** means required, **—** optional, and **Cond.** conditionally required (see Notes). A VM must have a boot source — exactly one of `bootDisk.source.oci.image` or `bootDisk.source.http.url`.
+
+| Field | Req. | Type | Default | Notes |
+| :---- | :--: | :--- | :------ | :---- |
+| `bootDisk.source.oci.image` | Cond. | string | — | OCI containerDisk reference. Exactly one boot source; XOR with `http`. |
+| `bootDisk.source.http.url` | Cond. | string | — | HTTP(S) disk URL. Requires `persist.volumeSet`. |
+| `bootDisk.source.http.checksum` | — | string | — | `sha256:<hex>` / `sha512:<hex>`. |
+| `bootDisk.persist.volumeSet` | ✓ | string | — | `cpln://volumeset/<name>`. The boot disk is always a per‑replica PVC. |
+| `bootDisk.bus` | — | enum | `virtio` | `virtio` / `sata` / `scsi`. |
+| `bootDisk.bootOrder` | — | int | `1` | 1–16. |
+| `cpu.sockets` | — | int | — | 1–32. Cores derive from container `cpu`. |
+| `cpu.threads` | — | int | — | 1–8. |
+| `firmware.bootloader` | — | enum | `efi` | `efi` / `bios`. |
+| `firmware.uuid` | — | string | generated | Fixed SMBIOS UUID (v4). |
+| `firmware.serial` | — | string | — | SMBIOS serial. |
+| `firmware.smbios.*` | — | string | — | `manufacturer`, `product`, `version`, `sku`, `family`. |
+| `guestOS` | — | enum | `linux` | `linux` / `windows`. |
+| `networks[0].name` | — | string | `default` | Single interface; masquerade only. |
+| `cloudInit.userData` | — | string | — | Inline cloud-init (≤16 KiB). XOR with the other `userData*`. |
+| `cloudInit.userDataBase64` | — | string | — | Base64 cloud-init. |
+| `cloudInit.userDataSecret` | — | secret link | — | Secret with `userdata` / `user-data`. |
+| `cloudInit.sshPublicKeySecrets` | — | secret link[] | — | Up to 8. |
+| `accessCredentials[].sshPublicKeySecret` | Cond. | secret link | — | Required when an `accessCredentials` entry is present. |
+| `accessCredentials[].users` | Cond. | string[] | — | Required per entry. 1–16 guest users. |
+| `accessCredentials[].deliveryMethod` | — | enum | `qemuGuestAgent` | `qemuGuestAgent` / `configDrive`. |
+| `runStrategy` | — | enum | `Always` | `Always` / `RerunOnFailure` / `Manual` / `Halted`. |
+| `clock.timezone` | — | string | `UTC` | e.g. `America/New_York`. |
+| `hostname` | — | string | — | `[a-z0-9-]`, ≤63. |
+| `subdomain` | — | string | — | `[a-z0-9-]`, ≤63. |
+
+## Related
+
+- [Publishing & converting VM images](/guides/vm-images)
+- [Run VM workloads on your own mk8s cluster](/mk8s/add-ons/kubevirt)
+- [Volume sets](/reference/volumeset)
+- [Workload firewall](/reference/workload/firewall)
+- [Workload identity](/reference/identity)
+- [Custom metrics](/reference/workload/custom-metrics)
