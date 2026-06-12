@@ -6,7 +6,7 @@ keywords: ['redis geo', 'multi-region cache', 'global cache', 'redis active pass
 
 ## Overview
 
-Redis Multi-Location deploys a master-replica Redis cluster with Redis Sentinel across multiple Control Plane locations, providing geographic distribution and automatic failover. Unlike the standard [Redis](/template-catalog/templates/redis) template, this template creates its own GVC spanning the configured locations.
+Redis Multi-Location deploys a single Redis Sentinel cluster spanning multiple Control Plane locations within one GVC. All Redis replicas across all locations belong to the same cluster — replica 0 in the first location starts as the primary, and Sentinel automatically elects a new primary from any location on failure.
 
 <Note>
 This template creates a new GVC. At least 2 locations are required.
@@ -15,15 +15,13 @@ This template creates a new GVC. At least 2 locations are required.
 ### What Gets Created
 
 - **GVC** — A new GVC spanning the configured locations.
-- **Stateful Redis Workload** — (`RELEASE_NAME-redis`): replica 0 starts as the primary; all others replicate from it. The per-location replica count is independently configurable.
-- **Stateful Sentinel Workload** — (`RELEASE_NAME-sentinel`): 1 replica per location monitors the Redis cluster and orchestrates automatic failover.
-- **Volume Set** — Persistent storage for Redis data (configurable capacity).
-- **Volume Set** — Persistent storage for Sentinel state (10 GiB, fixed).
-- **Secret** — An opaque secret containing the Redis configuration (`redis.conf`), mounted into each Redis container.
-- **Secret** — An opaque secret containing the Sentinel configuration (`sentinel.conf`), mounted into each Sentinel container.
+- **Stateful Redis Workload** — A single cross-location Redis cluster. Replica 0 in the first location starts as the primary; all others replicate from it. Each replica gets its own persistent volume.
+- **Stateful Sentinel Workload** — 1 Sentinel replica per location (not configurable). Monitors the cluster and orchestrates automatic failover across locations.
+- **Volume Set** — Persistent storage for Redis data (configurable capacity and autoscaling).
+- **Secrets** — Opaque secrets for the Redis and Sentinel configurations, mounted into each container.
 - **Identity & Policy** — Separate identities and policies for the Redis and Sentinel workloads, each with `reveal` access to their respective secrets.
-- **Domain** *(optional)* — One domain per workload when public access is enabled, exposing Redis and Sentinel at the configured hostnames.
-- **Backup Cron Workload** *(optional)* — A scheduled backup job that writes Redis snapshots to AWS S3 or GCS.
+- **Domain** *(optional)* — One domain per workload when public access is enabled, exposing Redis and Sentinel at the configured addresses.
+- **Backup Cron Workload** *(optional)* — A scheduled backup job that writes Redis snapshots to AWS S3 or GCS. Runs in the first configured location only.
 
 ## Installation
 
@@ -67,16 +65,16 @@ gvc:
       replicas: 2
 
 redis:
-  image: redis:7.2
+  image: redis:7.4
   resources:
     cpu: 200m
     memory: 256Mi
-  # serverCommand: redis-server  # Override for different Redis/Valkey image variants
-  # extraArgs: "--maxclients 20000 --maxmemory 200mb --maxmemory-policy allkeys-lru"
+  serverCommand: redis-server  # Can be overridden based on the version of redis/valkey image
+  # extraArgs: "--maxmemory 200mb --maxmemory-policy allkeys-lru"
   # password: your-redis-password
   publicAccess:
     enabled: false
-    address: redis.example-cpln.com  # Custom domain to expose Redis publicly
+    address: redis.example-cpln.com
   volumeset:
     initialCapacity: 20 # GiB
     autoscaling:
@@ -86,16 +84,15 @@ redis:
       scalingFactor: 1.2
 
 sentinel:
-  image: redis:7.2
+  image: redis:7.4
   resources:
     cpu: 200m
     memory: 256Mi
-  quorum: 2
   # extraArgs: "--sentinel down-after-milliseconds mymaster 5000 --sentinel failover-timeout mymaster 10000"
   # password: your-sentinel-password
   publicAccess:
     enabled: false
-    address: redis-sentinel.example-cpln.com  # Custom domain to expose Sentinel publicly
+    address: redis-sentinel.example-cpln.com
 
 # Applies to both Redis and Sentinel workloads
 firewall:
@@ -152,11 +149,10 @@ Authentication is disabled by default. Redis and Sentinel can be configured with
 
 ### Sentinel
 
-Sentinel monitors the Redis primary and promotes a replica on failure. The quorum must be set to a value that can form a majority across all running Sentinel instances.
+Sentinel monitors the Redis primary across all locations and promotes a replica on failure. One Sentinel replica is deployed per location — this is fixed and not configurable. Quorum is calculated automatically based on the number of locations.
 
 - `sentinel.image` — Redis (or Valkey) image to use for Sentinel.
 - `sentinel.resources.cpu` / `sentinel.resources.memory` — CPU and memory allocated per Sentinel replica.
-- `sentinel.quorum` — Number of Sentinel instances that must agree before a failover is initiated. For 3 locations (3 Sentinel replicas), a quorum of `2` is recommended.
 - `sentinel.extraArgs` — Additional Sentinel arguments (e.g. custom `down-after-milliseconds` or `failover-timeout`).
 
 ### Storage
@@ -167,27 +163,42 @@ Sentinel monitors the Redis primary and promotes a replica on failure. The quoru
   - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
   - `scalingFactor` — Multiply current capacity by this factor when scaling up.
 
-Sentinel state storage is always provisioned at 10 GiB with no autoscaling.
-
 ### Public Access
 
-Both Redis and Sentinel can be exposed publicly via a custom domain. When enabled, a Control Plane domain resource is created for the workload and traffic is routed to it at the standard port.
-
-- `redis.publicAccess.enabled` — Expose Redis publicly (default: `false`).
-- `redis.publicAccess.address` — The custom domain hostname for Redis (e.g. `redis.example-cpln.com`).
-- `sentinel.publicAccess.enabled` — Expose Sentinel publicly (default: `false`).
-- `sentinel.publicAccess.address` — The custom domain hostname for Sentinel (e.g. `redis-sentinel.example-cpln.com`).
+Redis and Sentinel can be exposed over the internet via TCP using Control Plane's domain resource with per-replica port routing.
 
 <Note>
-`firewall.externalInboundAllowCIDR` must be set when public access is enabled. Without it, inbound external traffic will be blocked.
+When `publicAccess` is enabled, a Dedicated Load Balancer is automatically enabled on the GVC. This is required for TCP port routing and is a paid Control Plane feature.
 </Note>
 
-When public access is enabled, connect using the configured domain address at the standard port:
+- `redis.publicAccess.enabled` — Expose Redis publicly (default: `false`).
+- `redis.publicAccess.address` — A domain you control to expose Redis (e.g. `redis.your-domain.com`).
+- `sentinel.publicAccess.enabled` — Expose Sentinel publicly (default: `false`).
+- `sentinel.publicAccess.address` — A domain you control to expose Sentinel (e.g. `redis-sentinel.your-domain.com`).
 
-| Workload | Public endpoint |
-|----------|----------------|
-| Redis | `redis.publicAccess.address:6379` |
-| Sentinel | `sentinel.publicAccess.address:26379` |
+DNS records must be added before deploying. If ownership has not been proven, the first deploy will fail and the error message will list the exact TXT and CNAME records required. Add those records in your DNS provider, then upgrade the release to complete the deployment. **Disable DNS proxying** (e.g. Cloudflare's orange cloud) — TCP traffic must pass through directly.
+
+When enabled, a Control Plane domain resource is created for each address. Port mapping is one port per replica:
+
+| Workload | Ports |
+|----------|-------|
+| Redis | `6380`, `6381`, ... (one per replica across all locations) |
+| Sentinel | `26380`, `26381`, ... (one per location) |
+
+`firewall.externalInboundAllowCIDR` must be set when public access is enabled. Without it, inbound external traffic will be blocked.
+
+**Connecting externally:**
+
+```bash
+# Redis replica 0
+redis-cli -h redis.your-domain.com -p 6380 ping
+
+# Redis replica 1
+redis-cli -h redis.your-domain.com -p 6381 ping
+
+# Sentinel replica 0 (location 0)
+redis-cli -h redis-sentinel.your-domain.com -p 26380 ping
+```
 
 ### Firewall
 
@@ -207,13 +218,31 @@ A single firewall configuration applies to both the Redis and Sentinel workloads
 
 ### Connecting to Redis
 
-Connect to Redis from within the same GVC using:
+All replicas across all locations belong to a single cluster and are accessible within the GVC. Replica 0 in the first configured location starts as the primary.
+
+**Option 1 — Load-balanced endpoint (any replica):**
 
 ```text
 RELEASE_NAME-redis.GVC_NAME.cpln.local:6379
 ```
 
-For Sentinel-aware clients, connect through Sentinel to always route to the current primary:
+**Option 2 — Direct to a specific replica:**
+
+```text
+replica-0.RELEASE_NAME-redis.LOCATION.GVC_NAME.cpln.local:6379
+replica-1.RELEASE_NAME-redis.LOCATION.GVC_NAME.cpln.local:6379
+```
+
+**Option 3 — Via Sentinel to always write to the current primary:**
+
+```bash
+MASTER_INFO=$(redis-cli -h RELEASE_NAME-sentinel.GVC_NAME.cpln.local -p 26379 SENTINEL get-master-addr-by-name mymaster)
+MASTER_HOST=$(echo $MASTER_INFO | cut -d' ' -f1)
+MASTER_PORT=$(echo $MASTER_INFO | cut -d' ' -f2)
+redis-cli -h $MASTER_HOST -p $MASTER_PORT SET my-key "Hello world"
+```
+
+For Sentinel-aware clients, connect through:
 
 ```text
 RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379
@@ -225,8 +254,10 @@ The Sentinel master name is `mymaster`.
 
 | Workload | Port | Protocol | Description |
 |----------|------|----------|-------------|
-| Redis | `6379` | TCP | Redis data port |
-| Sentinel | `26379` | TCP | Sentinel discovery port |
+| Redis | `6379` | TCP | Redis data port (internal) |
+| Sentinel | `26379` | TCP | Sentinel discovery port (internal) |
+| Redis (public) | `6380`, `6381`, ... | TCP | One port per replica across all locations |
+| Sentinel (public) | `26380`, `26381`, ... | TCP | One port per location |
 
 ## Backup
 
