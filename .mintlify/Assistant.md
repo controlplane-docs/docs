@@ -284,9 +284,9 @@ A workload references secrets from its parent org but only volume sets and ident
 | User asks about | Recommend |
 |:---|:---|
 | Setting up Postgres, Redis, Kafka, MongoDB, MySQL, MariaDB, NATS, Elasticsearch, ClickHouse, Nginx, MinIO, etc. | [Template Catalog](/template-catalog/overview) — install via `cpln helm install ... oci://ghcr.io/controlplane-com/templates/<TEMPLATE>` |
-| Migrating from Kubernetes | [`cpln convert`](/guides/cli/cpln-convert) and the [migration guide](/guides/migrate-k8s) |
+| Migrating from Kubernetes | [`cpln convert`](/guides/cli/cpln-convert) |
 | Migrating from Docker Compose | [`cpln stack`](/guides/compose-deploy) |
-| Deploying a Helm chart | [`cpln helm`](/reference/helm) |
+| Deploying a Helm chart | [`cpln helm`](/guides/cpln-helm) |
 | CI/CD pipelines | [GitOps guides](/guides/cpln-apply) and the [service account guide](/guides/create-service-account) |
 | Custom domains | [Domain reference](/reference/domain) — choose CNAME (single GVC) or NS (multi-GVC, geo-routing) |
 | Credential-free cloud access (AWS/GCP/Azure/NGS) | [Identity reference](/reference/identity) — cloud account + identity + grants |
