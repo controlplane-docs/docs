@@ -104,6 +104,115 @@ After the add-on reconciles and a VM node is ready:
 - The cluster's [location](/reference/location) reports `vm` under its workload-type capabilities.
 - A [VM workload](/reference/workload/vm) targeting this location schedules, imports its boot disk (watch `Importing boot disk: NN%` in the deployment status), and boots.
 
+## Console access
+
+For day-to-day access, use the platform paths documented on the [VM workload](/reference/workload/vm) page — they work the same on your own cluster and require no `kubectl`:
+
+- **SSH (Linux):** `cpln workload connect` / `cpln workload exec`.
+- **RDP (Windows) or any TCP service:** [`cpln port-forward`](/guides/cli/cpln-port-forward) to the guest port, then connect to `localhost`.
+
+When a guest will not boot far enough to accept SSH or RDP — a kernel panic, a UEFI failure, or a stalled first boot — you need the raw graphical console. On a cluster you operate (mk8s or [BYOK](/mk8s/generic)) you have direct access, so use KubeVirt's [`virtctl`](https://kubevirt.io/user-guide/user_workloads/virtctl_client_tool/) against the cluster:
+
+<Steps>
+<Step title="Find the VM instance and its namespace">
+  VM instances are labelled with their workload name and run in the [GVC](/reference/gvc) namespace:
+
+  ```bash
+  kubectl get vmi -A -l cpln/workload=<workload-name>
+  ```
+</Step>
+
+<Step title="Open the VNC console">
+  Point `virtctl` at the instance (use the `NAME` and `NAMESPACE` from the previous step). `virtctl` launches your local VNC viewer:
+
+  ```bash
+  virtctl vnc <vmi-name> -n <gvc-namespace> --kubeconfig <cluster-kubeconfig>
+  ```
+
+  If you have no local VNC client, run with `--proxy-only`; `virtctl` prints a local `127.0.0.1:<port>` address you can point any VNC client at.
+</Step>
+</Steps>
+
+<Note>
+`virtctl` must match the cluster's KubeVirt version, and your kubeconfig user needs access to the `virtualmachineinstances/vnc` subresource. The serial console (boot log, login banner) is also available as `virtctl console <vmi-name> -n <gvc-namespace>`.
+</Note>
+
+## Troubleshooting
+
+<AccordionGroup>
+<Accordion title="A VM workload never starts and no instance appears">
+  **Symptom:** The workload deploys but stays not-ready, and `kubectl get vmi -A -l cpln/workload=<workload-name>` returns nothing — or the VM instance is stuck `Pending`/`Scheduling`. The [location](/reference/location) may not report `vm` in its capabilities.
+
+  **Cause:** No VM-capable node, or KubeVirt's components have nowhere to run. VMs and the KubeVirt control plane are scoped to nodes labelled `cpln.io/nodeType: vm`.
+
+  **Fix:** Confirm at least one ready, labelled node exists:
+
+  ```bash
+  kubectl get nodes -l cpln.io/nodeType=vm
+  ```
+
+  If the list is empty, add the label (and the matching taint) to a node pool on KVM-capable instances as shown in [How to enable](#how-to-enable), and verify the `kubevirt` add-on has reconciled.
+</Accordion>
+
+<Accordion title="Boot disk import is stuck">
+  **Symptom:** The deployment status sits at `Importing boot disk: NN%` and never reaches running.
+
+  **Cause:** CDI imports the boot disk into a PVC before the VM can boot. Imports stall when there is no working default `StorageClass`, or when the default StorageClass is **block-mode** and CDI has no filesystem-mode scratch space.
+
+  **Fix:** Ensure a default `StorageClass` exists. If it is block-mode, set `scratchSpaceStorageClass` to a filesystem-mode class:
+
+  ```yaml YAML
+  addOns:
+    kubevirt:
+      scratchSpaceStorageClass: my-filesystem-sc
+  ```
+
+  Inspect the importer pod for the underlying error:
+
+  ```bash
+  kubectl logs -n <gvc-namespace> -l app=containerized-data-importer
+  ```
+</Accordion>
+
+<Accordion title="Windows VM fails to boot (UEFI)">
+  **Symptom:** The VM never reaches the OS; the VNC/serial console shows a UEFI error such as `failed to load Boot0001 ... from PciRoot(0x0)`.
+
+  **Cause:** Control Plane runs these VMs with non-persistent EFI NVRAM, so the firmware boots with an empty variable store. The image must place the Windows boot manager at the UEFI fallback path (`\EFI\BOOT\BOOTX64.EFI`); without it the firmware has nothing to boot. Enabling Secure Boot causes the same class of failure because it requires persistent NVRAM.
+
+  **Fix:** Rebuild the Windows image with the fallback bootloader (see [Publishing & converting VM images](/guides/vm-images)). Do **not** set `firmware.secureBoot` — it is [not yet available](/reference/workload/vm#scaling--lifecycle) for this reason.
+</Accordion>
+
+<Accordion title="Raw TCP to another workload over the mesh resets (HTTP works)">
+  **Symptom:** A VM (often Windows) reaches another workload's internal endpoint fine over HTTP, but a plain TCP protocol (SQL, RDP, custom TCP) connects only intermittently and otherwise resets.
+
+  **Cause:** Istio's DNS proxy auto-allocates a virtual IP per ServiceEntry that can resolve to a non-serving endpoint; HTTP re-routes by `Host` header, raw TCP does not.
+
+  **Fix:** Enable the [`MESH_DISABLE_IP_AUTOALLOCATE`](/byok/settings/actuator#mesh_disable_ip_autoallocate) actuator setting for that location, then reconcile the workload and re-establish the connection.
+</Accordion>
+
+<Accordion title="Can't connect to the VM from my machine">
+  **Symptom:** SSH or RDP to the VM times out from outside the cluster.
+
+  **Cause:** A VM has no public endpoint by default; its `ports` only govern in-cluster service-mesh traffic.
+
+  **Fix:** Reach the guest with [`cpln port-forward`](/guides/cli/cpln-port-forward) — it tunnels directly to a replica and the target port does **not** need to be listed in the workload's `ports`:
+
+  ```bash
+  cpln port-forward <workload-name> 13389:3389 --gvc <gvc> --location <location>
+  ```
+
+  Then connect your client to `localhost:13389`. For public HTTP access, attach a [domain](/reference/domain) instead.
+</Accordion>
+
+<Accordion title="VM can't resolve cpln.local or reach other workloads">
+  **Symptom:** Inside the guest, `*.cpln.local` names or cross-location peers fail to resolve.
+
+  **Cause:** VM guests resolve in-cluster names through a platform DNS forwarder; large answers can be truncated over UDP on some guests.
+
+  **Fix:** Enable the [`nodeLocalDns`](/mk8s/add-ons) add-on (recommended alongside KubeVirt). On Linux guests you can also force TCP DNS by adding `options use-vc` to `/etc/resolv.conf` from [cloud-init](/reference/workload/vm#cloud-init--platform-injection).
+</Accordion>
+</AccordionGroup>
+
 ## Next steps
 
 <CardGroup cols={2}>
