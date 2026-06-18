@@ -22,7 +22,7 @@ concepts/           — Core concepts: org, GVC, workload, billing, access contr
 reference/          — Detailed resource configuration and behavior
 guides/             — Step-by-step how-to guides for creating and configuring resources
 core/               — Platform fundamentals: auth, security, logs, audit trail, query
-mcp/                — MCP Server docs and AI tool setup guides
+ai/                 — AI Agents docs: AI Plugin, MCP Server, and AI tool setup guides
 cli-reference/      — CLI installation, usage guides, troubleshooting (commands/ is GENERATED — do NOT edit manually)
 iac/                — Infrastructure as Code (Terraform, Pulumi)
 template-catalog/   — 30+ production-ready templates (Postgres, Redis, Kafka, etc.)
@@ -150,7 +150,7 @@ Documentation, How-to Guides, Template Catalog, Managed Kubernetes, CPLN Platfor
 | Step-by-step instructions            | `guides/`                                     | Create a workload, configure a domain               |
 | CLI command documentation            | `cli-reference/commands/` (GENERATED)         | `cpln workload`, `cpln secret` — do NOT edit here   |
 | CLI usage guides and troubleshooting | `cli-reference/` (non-commands pages)         | Profiles, output formats, shell completion          |
-| AI tool integration                  | `mcp/`                                        | MCP server setup, usage examples                    |
+| AI tool integration                  | `ai/`                                         | AI Plugin, MCP server setup, usage examples         |
 | Terraform/Pulumi usage               | `iac/`                                        | Provider installation and configuration             |
 | Platform features spanning resources | `core/`                                       | Authentication, logging, audit trail                |
 | Error resolution                     | `reference/error-messages.mdx`                | Deployment errors, secret access failures           |
