@@ -1,0 +1,499 @@
+---
+title: "Blue/Green Deployments"
+description: "Deploy new application versions with zero downtime using parallel workloads and instant traffic switching."
+keywords: ["blue green deployment", "zero downtime deployment", "traffic switching", "workload promotion", "canary", "rollback", "domain routing", "cpln apply", "GVC", "workload"]
+---
+
+## Overview
+
+Blue/green deployment is a release strategy that reduces downtime and risk by running two identical production environments: one active (blue) and one idle (green). When a new version is ready, you deploy it to the idle environment, validate it, and then switch all traffic over instantly. If something goes wrong, you roll back by switching traffic back to the original environment.
+
+On Control Plane, blue/green deployments are implemented using two separate Workloads within the same GVC, combined with Domain path-based or subdomain-based routing to control which workload receives live traffic.
+
+<Tip>
+  This guide assumes you already have a GVC, a working workload, and a domain configured for your application. See the [Create a GVC](/guides/create-gvc), [Create a Workload](/guides/create-workload), and [Configure a Domain](/guides/configure-domain) guides if you need to set those up first.
+</Tip>
+
+---
+
+## How It Works
+
+Control Plane's Domain resource supports path-based and subdomain-based routing, allowing requests to be directed to any workload within a GVC. A blue/green deployment takes advantage of this by maintaining two workloads simultaneously and updating the Domain route to point to whichever is currently active.
+
+### The Two Environments
+
+The `blue` workload runs the current production version of your application. The `green` workload runs the new version you want to deploy. Only one workload receives external traffic at any given time, but both remain running until the switch is confirmed.
+
+| Blue Environment (Current) | Green Environment (New) |
+|---|---|
+| Serves all live production traffic | Receives no external traffic until cutover |
+| Validated, stable release | New version under test and validation |
+| Scaled to handle full production load | Can be pre-scaled before traffic switch |
+| Active target in Domain routing rules | Inactive; endpoint accessible for testing |
+| Deleted or kept on standby after cutover | Becomes the new blue after promotion |
+
+### Traffic Routing
+
+Traffic is controlled by a Control Plane `Domain` resource. By updating the `workloadLink` field in a domain route, you redirect all incoming traffic from the blue workload to the green workload. This switch takes effect globally across all locations in your GVC within seconds, without downtime.
+
+Control Plane domains support two routing modes for blue/green deployments:
+
+- **Path-based routing** (`dnsMode: cname`) - Routes requests to different workloads based on URL path prefix. Recommended for most blue/green setups because you maintain full DNS control and it is CDN/WAF compatible.
+- **Subdomain-based routing** (`dnsMode: ns`) - Assigns a unique subdomain to each workload automatically. Use this if your architecture requires distinct DNS names per workload.
+
+### The Deployment Lifecycle
+
+1. Deploy the green workload with the new image version.
+2. Validate the green workload using its internal Control Plane endpoint or a staging domain.
+3. Update the Domain routing rule to point to the green workload.
+4. Monitor the green workload in production.
+5. Decommission the blue workload, or keep it on standby for rapid rollback.
+
+<Note>
+  Because the switch is a single Domain configuration change, rollback is equally instant: update the route back to the blue workload link.
+</Note>
+
+---
+
+## Prerequisites
+
+- A Control Plane account with an active Org.
+- The Control Plane CLI (`cpln`) installed and authenticated. See the [CLI Reference](/cli-reference/overview) for setup instructions.
+- An existing GVC with at least one location configured.
+- A `blue` workload already deployed and serving production traffic.
+- A Domain configured and associated with your GVC.
+- The new application image built and pushed to your org's private registry. See the [Push an Image](/guides/push-image) guide.
+
+<Note>
+  Replace all placeholder values in the examples below (`ORG_NAME`, `GVC_NAME`, `DOMAIN_NAME`, and image tags) with values specific to your environment.
+</Note>
+
+<Note>
+  The CLI commands and YAML manifests in this guide are generic examples intended to illustrate structure. For a real deployment, export the configuration of your existing blue workload and use that as the basis for the green workload definition. This ensures your green workload inherits all of your current container settings, environment variables, resource limits, probes, and firewall rules exactly.
+
+  Export your current workload using the CLI:
+
+  ```bash
+  cpln workload get my-app-blue --gvc my-gvc --org ORG_NAME -o yaml-slim > green-workload.yaml
+  ```
+
+  Then update the `name` field to `my-app-green` and change the container `image` to the new version before applying. You can also export from the Console by navigating to your workload, clicking **Actions**, and selecting **Export**.
+</Note>
+
+---
+
+## Step-by-Step Guide
+
+All steps in this guide can be completed using either the Control Plane CLI or the [Console UI](https://console.cpln.io). CLI commands are shown throughout for reproducibility and automation. Where the Console UI approach differs meaningfully, instructions are included inline.
+
+### Step 1: Deploy the Green Workload
+
+Create a new workload running the new image version. Choose its name carefully before creating it — workload names cannot be changed after creation. A clear, consistent naming scheme (such as `my-app-blue` and `my-app-green`, or `my-app-v1` and `my-app-v2`) makes it easy to identify which workload is active at a glance.
+
+The most reliable starting point is to export the configuration of your existing blue workload and modify it, rather than writing a manifest from scratch. This guarantees the green workload matches your current production settings exactly.
+
+Export and prepare the green workload manifest:
+
+```bash
+# Export the blue workload's current configuration
+cpln workload get my-app-blue --gvc my-gvc --org ORG_NAME -o yaml-slim > green-workload.yaml
+
+# Update the name and image in the exported file, then apply
+```
+
+In the exported file, change `name` to `my-app-green` and update the container `image` to the new version tag, then apply it:
+
+```bash
+cpln apply --file green-workload.yaml --org ORG_NAME
+```
+
+Alternatively, you can create the workload directly with the CLI or apply a manifest written from scratch. The CLI command and YAML below are simplified generic examples for reference only; your actual workload will have more configuration inherited from the export.
+
+<Tabs>
+  <Tab title="CLI">
+    ```bash
+    cpln workload create \
+      --name my-app-green \
+      --image //image/my-app:2.0.0 \
+      --gvc my-gvc \
+      --port 8080 \
+      --public
+    ```
+  </Tab>
+  <Tab title="YAML (generic example)">
+    The following is a simplified example for reference. In practice, export your blue workload's configuration as described above and edit the `name` and `image` fields.
+
+    ```yaml
+    kind: workload
+    name: my-app-green
+    gvc: my-gvc
+    spec:
+      type: serverless
+      containers:
+        - name: my-app-green
+          image: //image/my-app:2.0.0
+          ports:
+            - number: 8080
+              protocol: http
+      defaultOptions:
+        autoscaling:
+          minScale: 1
+          maxScale: 5
+          metric: rps
+          target: 100
+    ```
+
+    Then apply it:
+
+    ```bash
+    cpln apply --file green-workload.yaml --org ORG_NAME
+    ```
+  </Tab>
+  <Tab title="Console UI">
+    1. Navigate to your GVC in the [Console](https://console.cpln.io) and click **Workloads** in the left menu.
+    2. Click **New** and enter the name for your green workload (e.g. `my-app-green`).
+    3. To base it on your existing blue workload, open `my-app-blue`, click **Actions**, and select **Clone**. Update the name and image tag on the clone form before saving.
+    4. Update the container image to the new version tag and confirm all other settings match your blue workload.
+    5. Click **Create**. The workload will begin deploying across all configured locations.
+  </Tab>
+</Tabs>
+
+<Tip>
+  The green workload gets its own internal Control Plane endpoint (the canonical endpoint) immediately. You can use this to validate the new version before it receives any production traffic.
+</Tip>
+
+### Step 2: Validate the Green Workload
+
+Before switching traffic, verify that the green workload is healthy and behaving as expected. Use the workload's canonical endpoint, which is accessible without modifying any domain routing.
+
+Check the workload deployment status:
+
+```bash
+cpln workload get my-app-green --gvc my-gvc --org ORG_NAME
+```
+
+Retrieve the canonical endpoint:
+
+```bash
+cpln workload get my-app-green --gvc my-gvc --org ORG_NAME -o json | jq '.status.endpoint'
+```
+
+In the Console, navigate to your workload and check the **Health** indicator on the Info page. The canonical endpoint URL is listed under **Endpoints** and can be opened directly from there.
+
+Run smoke tests, integration tests, or manual checks against the canonical endpoint to confirm the new version is production-ready. The green workload is completely isolated from your production domain at this stage.
+
+<Tip>
+  You can also temporarily add a second domain or a staging path prefix routed to the green workload for more realistic pre-production validation.
+</Tip>
+
+### Step 3: Switch Traffic to Green
+
+Once validation passes, update your Domain resource to route production traffic to `my-app-green` instead of `my-app-blue`. This is the cutover step.
+
+As with the workload, you can export your current domain configuration as a starting point:
+
+```bash
+cpln domain get DOMAIN_NAME --org ORG_NAME -o yaml-slim > domain.yaml
+```
+
+Then update the `workloadLink` in the relevant route to point to `my-app-green` and apply. The YAML shown in the tabs below is a generic example illustrating which field to change.
+
+<Tabs>
+  <Tab title="Path-Based Routing (Recommended)">
+    If your domain uses `dnsMode: cname`, update the `workloadLink` in the relevant route:
+
+    ```yaml
+    kind: domain
+    name: DOMAIN_NAME
+    spec:
+      dnsMode: cname
+      gvcLink: //gvc/my-gvc
+      ports:
+        - number: 443
+          protocol: http2
+          routes:
+            - prefix: /
+              port: 8080
+              workloadLink: //gvc/my-gvc/workload/my-app-green  # <-- Updated
+    ```
+
+    Apply the change:
+
+    ```bash
+    cpln apply --file domain.yaml --org ORG_NAME
+    ```
+  </Tab>
+  <Tab title="Subdomain-Based Routing">
+    If your domain uses `dnsMode: ns`, traffic is automatically routed to workloads by name. Switching traffic means directing users to the new workload's subdomain (`my-app-green.your-domain.com`) or updating your application's DNS CNAME to point to the green workload endpoint.
+  </Tab>
+  <Tab title="CLI Patch (Quick Cutover)">
+    For a fast cutover without editing YAML files, patch the domain directly via the CLI:
+
+    ```bash
+    cpln rest patch /org/ORG_NAME/domain/DOMAIN_NAME \
+      --patch '{"spec":{"ports":[{"number":443,"routes":[{"prefix":"/",
+        "workloadLink":"//gvc/my-gvc/workload/my-app-green","port":8080}]}]}}' \
+      --org ORG_NAME
+    ```
+  </Tab>
+  <Tab title="Console UI">
+    1. In the [Console](https://console.cpln.io), navigate to your Org and click **Domains** in the left menu.
+    2. Select your domain and click **Edit**.
+    3. Under **Ports**, expand the relevant port and locate the route with the `prefix` you want to switch.
+    4. Update the **Workload** field from `my-app-blue` to `my-app-green`.
+    5. Click **Update**. The change propagates to all GVC locations within seconds.
+  </Tab>
+</Tabs>
+
+<Note>
+  The domain update propagates to all locations in the GVC within seconds. There is no staged rollout of the routing change itself; it is atomic and global.
+</Note>
+
+### Step 4: Monitor the Green Workload
+
+After the traffic switch, monitor the green workload to confirm it is handling production load correctly. Keep the blue workload running during this observation period to enable rapid rollback.
+
+View workload logs in real time:
+
+```bash
+cpln logs --workload my-app-green --gvc my-gvc --org ORG_NAME --tail
+```
+
+Check replica health and scaling:
+
+```bash
+cpln workload get my-app-green --gvc my-gvc --org ORG_NAME
+```
+
+Use the Control Plane Console Metrics view (powered by Grafana) to inspect error rates, latency, and request throughput for the green workload.
+
+<Tip>
+  Set up Grafana alerts on the green workload before the cutover. Alert on error rate, p99 latency, and 5xx responses so you are notified immediately if the new version degrades.
+</Tip>
+
+### Step 5: Decommission or Keep the Blue Workload
+
+Once you are confident the green workload is stable, you have two options for the blue workload:
+
+<AccordionGroup>
+  <Accordion title="Option A: Delete the Blue Workload">
+    If you do not need a rapid rollback standby, delete the blue workload to free up resources:
+
+    ```bash
+    cpln workload delete my-app-blue --gvc my-gvc --org ORG_NAME
+    ```
+
+    In the Console, navigate to the `my-app-blue` workload, click **Actions**, and select **Delete**.
+  </Accordion>
+  <Accordion title="Option B: Scale Down and Keep on Standby">
+    Scale the blue workload to its minimum replica count (or to zero if using KEDA autoscaling) to reduce cost while keeping it available for rollback:
+
+    ```bash
+    cpln workload update my-app-blue \
+      --set spec.defaultOptions.autoscaling.minScale=0 \
+      --gvc my-gvc \
+      --org ORG_NAME
+    ```
+
+    In the Console, navigate to the `my-app-blue` workload, click **Scaling** in the left menu, and set the **Min Scale** value to `0`.
+
+    <Tip>
+      Serverless workloads can scale to zero automatically when traffic stops. If your blue workload is of type `serverless` and receives no traffic, it scales down on its own without any intervention.
+    </Tip>
+  </Accordion>
+</AccordionGroup>
+
+After a suitable observation period, delete the old blue workload. For the next release cycle, your current green workload becomes the new production baseline. Deploy the next version as a new workload using whatever name fits your convention (for example, swapping back to `my-app-blue`), update the Domain route, and repeat the process.
+
+---
+
+## Rolling Back
+
+If you detect a problem with the green workload, rolling back is the reverse of the cutover: update the Domain route to point back to the blue workload.
+
+<Tabs>
+  <Tab title="Console UI">
+    1. In the [Console](https://console.cpln.io), navigate to your Org and click **Domains** in the left menu.
+    2. Select your domain and click **Edit**.
+    3. Under **Ports**, expand the relevant port and locate the route pointing to `my-app-green`.
+    4. Update the **Workload** field back to `my-app-blue`.
+    5. Click **Update**. Traffic returns to the blue workload within seconds.
+  </Tab>
+  <Tab title="cpln apply">
+    Update your domain manifest to revert the `workloadLink` and apply it:
+
+    ```yaml
+    kind: domain
+    name: DOMAIN_NAME
+    spec:
+      dnsMode: cname
+      gvcLink: //gvc/my-gvc
+      ports:
+        - number: 443
+          protocol: http2
+          routes:
+            - prefix: /
+              port: 8080
+              workloadLink: //gvc/my-gvc/workload/my-app-blue  # <-- Reverted
+    ```
+
+    ```bash
+    cpln apply --file domain.yaml --org ORG_NAME
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  Because the blue workload was never stopped, rollback is instant. Traffic returns to the previous version within seconds of the domain update propagating.
+</Note>
+
+---
+
+## Automating with CI/CD
+
+Blue/green deployments integrate naturally into CI/CD pipelines using the Control Plane CLI or Terraform. The pipeline automates the image build, green workload creation, health check, and traffic switch steps.
+
+### GitHub Actions Example
+
+The following workflow builds the new image, deploys it to a green workload, runs a health check, and performs the traffic cutover if the check passes.
+
+```yaml
+name: Blue/Green Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CPLN_ORG: ${{ secrets.CPLN_ORG }}
+      CPLN_GVC: my-gvc
+      CPLN_TOKEN: ${{ secrets.CPLN_TOKEN }}
+      IMAGE_TAG: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Control Plane CLI
+        run: npm install -g @controlplane/cli
+
+      - name: Authenticate
+        run: cpln profile update default --token $CPLN_TOKEN
+
+      - name: Build and push image
+        run: cpln image build --name my-app:$IMAGE_TAG --push --org $CPLN_ORG
+
+      - name: Deploy green workload
+        run: |
+          sed 's|IMAGE_TAG|'"$IMAGE_TAG"'|g' green-workload.yaml | \
+            cpln apply --file - --org $CPLN_ORG
+
+      - name: Wait for green workload to be ready
+        run: cpln workload get my-app-green --gvc $CPLN_GVC --org $CPLN_ORG --wait-ready
+
+      - name: Run smoke tests
+        run: ./scripts/smoke-test.sh $(cpln workload get my-app-green \
+               --gvc $CPLN_GVC --org $CPLN_ORG -o json | jq -r '.status.endpoint')
+
+      - name: Switch traffic to green
+        run: cpln apply --file domain-green.yaml --org $CPLN_ORG
+
+      - name: Delete old blue workload
+        run: cpln workload delete my-app-blue --gvc $CPLN_GVC --org $CPLN_ORG
+```
+
+<Warning>
+  Store your `CPLN_ORG` and `CPLN_TOKEN` values as GitHub Actions secrets. Never hardcode credentials in pipeline files.
+</Warning>
+
+For more CI/CD examples using GitLab, Bitbucket, and CircleCI, see the [CI/CD Examples](/guides/gitops) guide.
+
+---
+
+## Advanced Patterns
+
+### Mirror Traffic for Pre-Production Validation
+
+Control Plane domains support a `mirror` routing property that sends a copy of live traffic to a secondary workload. This allows you to validate the green workload under real production load before committing to the cutover, without exposing users to any green responses.
+
+```yaml
+routes:
+  - prefix: /
+    port: 8080
+    workloadLink: //gvc/my-gvc/workload/my-app-blue
+    mirror:
+      - workloadLink: //gvc/my-gvc/workload/my-app-green
+        percent: 100
+```
+
+With mirroring enabled, the blue workload still serves all production responses. The green workload receives an identical copy of each request but its responses are discarded. You can inspect green workload logs and metrics to confirm correctness before the switch.
+
+<Note>
+  Mirror traffic is fire-and-forget: the mirrored workload's response is not returned to the client, so errors on the green workload are invisible to users.
+</Note>
+
+### Multi-Location Considerations
+
+Control Plane workloads and domains are global by default. When you update a Domain route, the change propagates to every location in the GVC. There is no built-in mechanism to switch one location at a time.
+
+If you need location-specific traffic control, use separate GVCs for each region and route at the DNS layer, or use the GVC [location routing options](/reference/gvc#location-routing-options) to adjust traffic distribution by latency or priority. Contact [Control Plane support](mailto:support@controlplane.com) at support@controlplane.com for guidance on complex multi-region deployment patterns.
+
+### Environment Naming Conventions
+
+The `blue`/`green` names are conventions. Some teams prefer `my-app-stable` and `my-app-canary`, or versioned names like `my-app-v1` and `my-app-v2`. Because workload names cannot be changed after creation, choose your naming scheme before creating workloads and apply it consistently. Only one workload should be the target of the production Domain route at any time.
+
+You may also use Control Plane tags to annotate which workload is currently active, making it easy to identify the production workload programmatically:
+
+```bash
+cpln workload update my-app-green \
+  --set tags.deployment-role=active \
+  --gvc my-gvc --org ORG_NAME
+
+cpln workload update my-app-blue \
+  --set tags.deployment-role=standby \
+  --gvc my-gvc --org ORG_NAME
+```
+
+---
+
+## Quick Reference
+
+| Action | Command |
+|---|---|
+| Create green workload | `cpln workload create --name my-app-green --image //image/my-app:2.0 --gvc GVC` |
+| Check workload status | `cpln workload get my-app-green --gvc GVC --org ORG` |
+| View workload logs | `cpln logs --workload my-app-green --gvc GVC --org ORG --tail` |
+| Update workload image | `cpln workload update my-app-green --set spec.containers.main.image=//image/my-app:2.1 --gvc GVC` |
+| Switch domain to green | `cpln apply --file domain-green.yaml --org ORG` |
+| Roll back to blue | `cpln apply --file domain-blue.yaml --org ORG` |
+| Scale blue to zero | `cpln workload update my-app-blue --set spec.defaultOptions.autoscaling.minScale=0 --gvc GVC` |
+| Delete blue workload | `cpln workload delete my-app-blue --gvc GVC --org ORG` |
+| Export workload as YAML | `cpln workload get my-app-blue --gvc GVC -o yaml-slim > workload.yaml` |
+| Add deployment tag | `cpln workload update my-app-green --set tags.deployment-role=active --gvc GVC` |
+
+---
+
+## Related Resources
+
+<CardGroup cols={2}>
+  <Card title="Workload Reference" href="/reference/workload" icon="server">
+    Full workload configuration options including autoscaling, probes, and container settings.
+  </Card>
+  <Card title="Domain Reference" href="/reference/domain" icon="link">
+    Domain routing modes, path-based routing, mirror routing, and TLS configuration.
+  </Card>
+  <Card title="Apply YAML Manifests" href="/guides/cpln-apply" icon="file-code">
+    Using cpln apply for declarative, repeatable resource management.
+  </Card>
+  <Card title="CI/CD Examples" href="/guides/gitops" icon="code-branch">
+    Pipeline examples for GitHub Actions, GitLab CI, Bitbucket, and CircleCI.
+  </Card>
+  <Card title="Push an Image" href="/guides/push-image" icon="docker">
+    Build and push container images to your org's private Control Plane registry.
+  </Card>
+  <Card title="GVC (Global Virtual Cloud)" href="/concepts/gvc" icon="globe">
+    How GVCs define location placement, pull secrets, and DNS geo-routing.
+  </Card>
+</CardGroup>
