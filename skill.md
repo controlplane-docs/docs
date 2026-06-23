@@ -2,7 +2,7 @@
 name: cpln
 description: Use when deploying and managing containerized workloads across multiple clouds (AWS, GCP, Azure, private), configuring multi-cloud infrastructure, managing secrets and access control, setting up identities for credential-free cloud access, automating deployments with GitOps, or connecting AI tools to Control Plane via the AI Plugin or MCP Server.
 license: Apache-2.0
-compatibility: Requires cpln CLI (npm @controlplane/cli, Homebrew, or binary), AI Plugin (Claude Code, Codex, Gemini CLI — bundles the MCP Server), or MCP Server (https://mcp.cpln.io/mcp). Works with any CI/CD platform, Terraform, Pulumi, and Kubernetes.
+compatibility: Requires cpln CLI (npm @controlplane/cli, Homebrew, or binary), AI Plugin (Claude Code, Codex, Antigravity CLI — bundles the MCP Server), or MCP Server (https://mcp.cpln.io/mcp). Works with any CI/CD platform, Terraform, Pulumi, and Kubernetes.
 allowed-tools: cpln
 metadata:
   mintlify-proj: controlplanecorporation
@@ -21,14 +21,14 @@ Control Plane is a hybrid platform for deploying and managing containerized work
 - CLI: `cpln` — install via npm `@controlplane/cli`, Homebrew (`brew tap controlplane-com/cpln && brew install cpln`), or binary
 - Console: https://console.cpln.io
 - API: https://api.cpln.io
-- AI Plugin: `controlplane-com/ai-plugin` (recommended for Claude Code, Codex, Gemini CLI — bundles MCP Server with skills, agents, slash commands, and guardrails)
+- AI Plugin: `controlplane-com/ai-plugin` (recommended for Claude Code, Codex, Antigravity CLI — bundles MCP Server with skills, agents, slash commands, and guardrails)
 - MCP Server: `https://mcp.cpln.io/mcp` (80+ tools for any MCP-compatible AI client; OAuth + per-org consent)
 - Docs: https://docs.controlplane.com (page index for AI agents: https://docs.controlplane.com/llms.txt)
 - Full CLI conventions and hallucination traps: https://docs.controlplane.com/cli-conventions.md
 
 ## When to use this skill
 
-Deploying workloads across multi-cloud GVCs, configuring infrastructure (locations, networking, firewall, domains), managing secrets + identity + policy access chains, automating with `cpln apply` / CI/CD, debugging via `cpln logs` / `exec` / `connect` / `port-forward`, building and pushing images, migrating from Kubernetes / Docker Compose / Helm, working with mk8s / BYOK / Kubernetes Operator, or connecting AI tools via the AI Plugin (Claude Code, Codex, Gemini CLI) or MCP Server (any MCP-compatible client).
+Deploying workloads across multi-cloud GVCs, configuring infrastructure (locations, networking, firewall, domains), managing secrets + identity + policy access chains, automating with `cpln apply` / CI/CD, debugging via `cpln logs` / `exec` / `connect` / `port-forward`, building and pushing images, migrating from Kubernetes / Docker Compose / Helm, working with mk8s / BYOK / Kubernetes Operator, or connecting AI tools via the AI Plugin (Claude Code, Codex, Antigravity CLI) or MCP Server (any MCP-compatible client).
 
 ## Resource model
 
@@ -66,7 +66,7 @@ Org (Organization) — top-level isolation boundary, globally unique name
 | **Agents** | Secure tunnels to private networks (VPCs, on-prem, data centers) | Workloads need to reach private TCP endpoints behind firewalls |
 | **External Logging** | Ship logs to S3, CloudWatch, Coralogix, Datadog, Logz.io, Stackdriver | Compliance, long-term retention, or external log analysis |
 | **Domains** | Custom domain routing with auto-TLS, geo-routing, path-based routing | Expose workloads on your own domain with CNAME or NS delegation |
-| **AI Plugin** | Plugin for Claude Code, Codex, and Gemini CLI — bundles the MCP Server plus skills, agents, slash commands, and guardrails | Recommended path for AI-assisted infrastructure management when your tool supports plugins |
+| **AI Plugin** | Plugin for Claude Code, Codex, and Antigravity CLI — bundles the MCP Server plus skills, agents, slash commands, and guardrails | Recommended path for AI-assisted infrastructure management when your tool supports plugins |
 | **MCP Server** | 80+ tools for AI agents to manage infrastructure programmatically; OAuth + per-org consent | Any MCP-compatible AI client (Cursor, Claude Web, Claude Desktop, VS Code, Antigravity, Amp, OpenCode) |
 
 ## Guardrails — read these first
