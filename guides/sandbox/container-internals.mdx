@@ -1,0 +1,102 @@
+---
+title: "Container Internals"
+description: "How the sandbox container boots, exposes the browser IDE and terminal, and routes traffic through the gateway proxy."
+keywords: ['sandbox container', 'boot sequence', 'gateway proxy', 'port discovery', 'code-server', 'ttyd', 'SSH']
+---
+
+## Boot Sequence
+
+The container entrypoint starts the sandbox services in this order:
+
+1. Seed `/root` from defaults on first boot
+2. Create `/root/workspace` and symlink `/workspace`
+3. Raise inotify limits
+4. Start the gateway proxy (port 8888)
+5. Start `sshd`
+6. Run deferred install script (if present)
+7. Start code-server (port 8443)
+8. Start ttyd browser terminal (port 7681)
+9. Start port/resource monitor
+10. Snapshot installed packages for fork detection
+11. Mark the sandbox ready
+
+## Gateway Proxy
+
+Each sandbox runs a gateway proxy that routes browser IDE, terminal, and application traffic through a single public endpoint.
+
+| Path | Backend | Auth | Purpose |
+| :--- | :------ | :--- | :------ |
+| `/_ide/` | code-server (8443) | Password | VS Code in browser |
+| `/_term/` | ttyd (7681) | Password | Browser terminal |
+| `/_port/<N>/` | Any process (N) | Password | Proxy to detected local port |
+| `/_callback/<N>/` | Any process (N) | None | OAuth/webhook callbacks |
+| `/_status` | Gateway | None | JSON runtime status |
+| `/_ports` | Gateway | None | JSON discovered ports |
+| `/healthz` | Gateway | None | Readiness probe |
+| `/` | App process (APP_PORT) | None | Public application URL |
+
+The `/_ide/`, `/_term/`, and `/_port/` routes are password-protected via cookie session. The password is displayed in the connect panel.
+
+## Ports
+
+| Port | Visibility | Purpose |
+| :--- | :--------- | :------ |
+| 8888 | Public | Gateway endpoint |
+| APP_PORT (default 8080) | Local | User application |
+| 8443 | Local | code-server |
+| 7681 | Local | ttyd |
+| 22 | Private (port-forward only) | SSH |
+
+Reserved ports (22, 7681, 8443, 8888) cannot be used as the app port.
+
+## Port Discovery
+
+A background scanner checks for non-reserved TCP listeners every 10 seconds. Detected ports are available at `/_ports` and in the connect panel with auto-inferred labels (Vite, Next.js, Django, etc.).
+
+The primary app port is served at the root URL (`/`). Additional detected ports use prefix routing (`/_port/<N>/`).
+
+## IDE Backends
+
+### code-server
+
+Starts on `127.0.0.1:8443` with code-server auth disabled. The gateway handles browser authentication.
+
+### Browser Terminal
+
+ttyd starts on port 7681 with tmux for session persistence. See [Terminal & tmux](/guides/sandbox/terminal-tmux).
+
+### SSH Server
+
+`sshd` starts for desktop IDE connectivity. Interactive SSH sessions auto-attach to a persistent tmux session. The `cpln sandbox connect` command automates SSH access by injecting your public key, setting up port-forwarding, and launching your desktop IDE.
+
+## Persistent Workspace
+
+`/root` is mounted from a persistent [volumeset](/reference/volumeset). Everything under `/root` survives container restarts and suspend/resume:
+
+- `~/workspace/` — repositories and working files
+- `~/.bashrc`, `~/.gitconfig` — shell and tool config
+- `~/.config/` — code-server settings, extensions
+- `~/.npm-global/` — globally installed npm packages
+- `~/.local/` — pip user installs
+
+Deleting the sandbox deletes the volumeset and everything under `/root`.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="App port shows 'waiting' in sandbox status">
+    No process is listening on `APP_PORT`. Start your app from the IDE terminal. The gateway shows a waiting page until a process binds to the port.
+  </Accordion>
+  <Accordion title="IDE or terminal not starting">
+    Check the service logs inside the container:
+
+    ```bash theme={null}
+    cat /tmp/code-server.log
+    cat /tmp/ttyd.log
+    cat /tmp/ide-gateway.log
+    ```
+  </Accordion>
+  <Accordion title="Port detected but returns 502">
+    The service is detected but the gateway can't reach it. Verify the service binds to `0.0.0.0` or `127.0.0.1`, not a specific interface.
+  </Accordion>
+</AccordionGroup>
