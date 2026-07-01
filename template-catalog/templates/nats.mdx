@@ -1,18 +1,19 @@
 ---
 title: NATS
-description: Deploy NATS on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and multi-region super cluster with WebSocket support and gateway routing.
+description: Deploy NATS on Control Plane using the Template Catalog. Covers configuration, multi-region super cluster, WebSocket support, gateway routing, and optional JetStream persistent storage.
 keywords: ['pubsub', 'event bus', 'lightweight broker', 'rabbitmq alternative', 'kafka alternative', 'jetstream', 'streaming', 'request reply', 'cncf', 'message broker', 'nats template']
 ---
 
 ## Overview
 
-NATS is an open-source, high-performance, lightweight messaging system optimized for cloud-native architectures. It supports pub/sub, queueing, and request/reply patterns. This template deploys a NATS super cluster across multiple regions, with each location running independent replicas. By default it exposes a WebSocket interface on port 443 via Control Plane's TLS termination.
+NATS is an open-source, high-performance, lightweight messaging system optimized for cloud-native architectures. It supports pub/sub, queueing, and request/reply patterns. This template deploys a NATS super cluster using the official NATS image across multiple regions, with each location running independent replicas. JetStream can be enabled for persistent streams, durable consumers, K-V store, and object store — each replica gets its own dedicated volume. By default it exposes a WebSocket interface on port 443 via Control Plane's TLS termination.
 
 ### What Gets Created
 
 - **GVC** — A dedicated GVC spanning the configured locations.
-- **Stateful Workload** — A NATS cluster with per-location replica counts, exposing the client port (4222), cluster port (6222), gateway port (7222), and optionally the WebSocket port (8080).
-- **Secrets** — An opaque configuration secret containing the full NATS values, and an opaque extra data secret used for the `nats_extra_config` block.
+- **Stateful NATS Workload** — A NATS super cluster using the official `nats` image, with per-location replica counts, exposing the client port (4222), cluster port (6222), gateway port (7222), and optionally the WebSocket port (8080).
+- **Volume Set** *(optional, when JetStream is enabled)* — Persistent storage for JetStream data. Each replica gets its own volume, with optional autoscaling.
+- **Secrets** — An opaque configuration secret containing the full NATS server config, and an opaque extra data secret used for the `nats_extra_config` block.
 - **Identity & Policy** — An identity bound to the workload with `reveal` access to both secrets.
 
 <Note>
@@ -54,20 +55,20 @@ gvc:
   name: nats-gvc
   locations:
     - name: aws-us-east-1
-      replicas: 3
+      replicas: 2
     - name: aws-us-west-2
       replicas: 2
     - name: aws-eu-central-1
-      replicas: 4
+      replicas: 2
 
 resources:
   cpu: 100m
   memory: 256Mi
 
+image: nats:2.11.6-alpine # official NATS image tag — bump to upgrade NATS version
+
 nats_defaults:
-  image: controlplanecorporation/mynats:0.1
   port: 4222
-  allowNonTls: true
   cluster:
     listen: "0.0.0.0:6222"
     port: 6222
@@ -75,24 +76,42 @@ nats_defaults:
   gateway:
     listen: "0.0.0.0:7222"
     port: 7222
+
   websocket:
     enabled: true
     port: 8080
     compression: false
     noTls: true # Control Plane handles TLS termination
+    # allowedOrigins: []  # Uncomment and add origins if needed
+    # advertise: "ws://example.com:8080"  # Uncomment if different from default
 
 allowCIDR:
-  - 0.0.0.0/0 # Restricts inbound access to the WebSocket port only
+  - 0.0.0.0/0 # Allow all traffic. Change to specific CIDRs to limit exposure.
+              # Only applicable to the WebSocket port. Control Plane exposes it on port 443.
 
-# You can add any valid NATS configuration under nats_extra_config
-nats_extra_config: |
-  jetstream: false
+jetstream:
+  enabled: false # set to true to enable persistent JetStream streaming and storage
 
-internalAccess:
+volumeset:
+  capacity: 10 # initial capacity in GiB per replica (minimum is 10)
+  autoscaling:
+    enabled: false
+    maxCapacity: 100
+    minFreePercentage: 10
+    scalingFactor: 1.2
+
+# Add any additional valid NATS configuration here — appended to the server config at startup
+nats_extra_config: ""
+
+internalAccess: # Sets the internal firewall scope
   type: same-gvc # options: none, same-gvc, same-org, workload-list
   workloads: # Note: can only be used if type is same-gvc or workload-list
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
+
+### Image
+
+- `image` — The NATS container image to use. Defaults to the official `nats:2.11.6-alpine` image. Bump the tag to upgrade the NATS version.
 
 ### GVC and Locations
 
@@ -104,6 +123,26 @@ internalAccess:
 ### Resources
 
 - `resources.cpu` / `resources.memory` — CPU and memory allocated to each NATS replica.
+
+### JetStream
+
+- `jetstream.enabled` — When `true`, enables NATS's built-in persistence layer, adding durable streams, consumers, K-V store, and object store on top of the core pub/sub model. Without it, NATS is purely in-memory.
+
+When JetStream is enabled, each replica gets its own dedicated persistent volume (configured via `volumeset`).
+
+<Note>
+Streams default to `num_replicas: 1`, meaning stream data lives on a single server. For streams that must survive a location outage, set `num_replicas` to 2 or higher in your application — this is configured per-stream, not in this template.
+</Note>
+
+### Volume Set
+
+The `volumeset` block applies only when `jetstream.enabled: true`.
+
+- `volumeset.capacity` — Initial volume size in GiB per replica (minimum 10).
+- `volumeset.autoscaling.enabled` — Automatically expand the volume as it fills. When enabled:
+  - `maxCapacity` — Maximum volume size in GiB.
+  - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
+  - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
 
 ### WebSocket
 
@@ -135,11 +174,10 @@ Do not set `internalAccess.type` to `none`. NATS replicas must be able to commun
 
 ### Extra NATS Configuration
 
-- `nats_extra_config` — Any valid NATS server configuration to merge at runtime. Use this to enable JetStream, set `max_payload`, configure accounts, or add other NATS server options:
+- `nats_extra_config` — Any additional valid NATS server configuration appended to the server config at startup. Use this to set `max_payload`, configure accounts, or add other NATS server options:
 
 ```yaml
 nats_extra_config: |
-  jetstream: true
   max_payload: 8MB
 ```
 
