@@ -20,14 +20,14 @@ After each scan, the daemon writes two tags to the image:
 | `cpln/trivy-scan` | URL to the HTML vulnerability report |
 | `cpln/trivy-scan-time` | Timestamp of the scan |
 
-Only images without an existing `cpln/trivy-scan` tag are scanned. To re-scan an image, remove that tag first.
+Each run scans images that do not yet have a `cpln/trivy-scan` tag. When `rescanAfter` is set (default `7d`), images whose last scan is older than that window are scanned again and their report is refreshed in place at the same URL. Setting `rescanAfter` to `""` disables rescanning — then re-scanning an image requires removing its `cpln/trivy-scan` tag first.
 
 ### What Gets Created
 
 - **Cron Daemon Workload** — Trivy daemon with trivy-api sidecar, runs on a cron schedule.
 - **Serverless Web-Server Workload** — Report storage and serving, autoscales from 1–3 replicas.
-- **Identity & Policy** — Identity bound to each workload with access to the configured storage cloud account and the service account secret.
-- **Secret** — CPLN secret storing the service account key *(created automatically when using `trivyAuth.type: inline`; skipped when referencing an existing secret)*.
+- **Identity & Policy** — Identity bound to each workload with access to the configured storage cloud account, plus `reveal` access to the referenced credentials secret.
+- **Secret** — CPLN secret storing the shared bearer token between the daemon and web-server. The service account key itself lives in an opaque secret you create beforehand (see Prerequisites).
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
@@ -37,32 +37,25 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ### Service Account
 
-Trivy authenticates against the Control Plane image registry using a service account key. Set `serviceAccountName` to the name of your service account, then choose one of the two auth methods below.
+Trivy authenticates against the Control Plane image registry using a service account key stored in an **opaque** secret.
 
 <Steps>
   <Step title="Create or select a service account">
-    Create a Control Plane service account (or use an existing one) that has read access to images in your org. Set `serviceAccountName` in `values.yaml` to its name.
+    Create a Control Plane service account (or use an existing one). Set `serviceAccountName` in `values.yaml` to its name — the template grants it image `pull` and `view` permissions automatically.
   </Step>
   <Step title="Generate a key">
-    Generate a key for the service account and copy the key value.
+    Generate a key for the service account and copy the key value. It cannot be retrieved later.
   </Step>
-  <Step title="Configure auth in values.yaml">
-    Choose how to provide the key:
-
-    **Inline** (`trivyAuth.type: inline`) — Paste the key directly. The template creates a CPLN secret automatically:
-    ```yaml
-    trivyAuth:
-      type: inline
-      serviceAccountKey: "your-service-account-key"
+  <Step title="Store the key in an opaque secret">
+    ```bash
+    echo -n "your-service-account-key" | cpln secret create-opaque --name trivy-credentials --encoding plain -f -
     ```
-
-    **Existing Secret** (`trivyAuth.type: existingSecret`) — Reference a pre-existing CPLN **dictionary** secret by name and key. The template grants the workload identity `reveal` access automatically:
+  </Step>
+  <Step title="Reference the secret in values.yaml">
+    The template grants the workload identity `reveal` access automatically:
     ```yaml
     trivyAuth:
-      type: existingSecret
-      existingSecret:
-        name: my-registry-credentials  # CPLN dictionary secret name
-        key: SERVICE_ACCOUNT_KEY       # Key within the dictionary secret
+      secretName: trivy-credentials
     ```
   </Step>
 </Steps>
@@ -171,15 +164,9 @@ storage:
 postToken: changeme
 
 # Authentication for Trivy to pull images from the Control Plane image registry.
-# type: "inline"         — paste the key here; template creates the CPLN secret automatically
-# type: "existingSecret" — reference a pre-existing CPLN dictionary secret
+# Name of a pre-existing CPLN opaque secret whose payload is the service account key (see Prerequisites).
 trivyAuth:
-  type: inline
-  serviceAccountKey: my-service-account-key
-
-  existingSecret:
-    name: trivy-credentials  # CPLN dictionary secret name
-    key: serviceAccountKey   # Key within the dictionary secret
+  secretName: trivy-credentials
 
 # Control Plane service account that Trivy uses to pull images
 serviceAccountName: trivy-service-account
@@ -187,8 +174,11 @@ serviceAccountName: trivy-service-account
 # Cron schedule for the scanning daemon
 schedule: "*/59 * * * *"
 
+# Rescan images whose last scan is older than this (e.g. "7d", "24h"). Empty = scan once only.
+rescanAfter: 7d
+
 daemon:
-  image: ghcr.io/controlplane-com/cpln-trivy-daemon:1.0.0
+  image: ghcr.io/controlplane-com/cpln-trivy-daemon:1.2.0
   resources:
     cpu: 1
     memory: 1Gi
@@ -197,13 +187,13 @@ daemon:
       - 0.0.0.0/0
 
 trivyApi:
-  image: ghcr.io/controlplane-com/cpln-trivy-trivy-api:1.0.0
+  image: ghcr.io/controlplane-com/cpln-trivy-trivy-api:1.2.0
   resources:
     cpu: 2
     memory: 4Gi
 
 webServer:
-  image: ghcr.io/controlplane-com/cpln-trivy-web-server:1.0.0
+  image: ghcr.io/controlplane-com/cpln-trivy-web-server:1.2.0
   resources:
     cpu: 150m
     memory: 128Mi
@@ -231,12 +221,10 @@ webServer:
 | `storage.azureFileshare.fileShare` | — | Azure file share name |
 | `storage.azureFileshare.scope` | — | Full Azure resource scope for role assignment |
 | `postToken` | `changeme` | Shared bearer token between daemon and web-server |
-| `trivyAuth.type` | `inline` | Auth method: `inline` or `existingSecret` |
-| `trivyAuth.serviceAccountKey` | — | Service account key value *(required when type is `inline`)* |
-| `trivyAuth.existingSecret.name` | — | CPLN dictionary secret name *(required when type is `existingSecret`)* |
-| `trivyAuth.existingSecret.key` | — | Key within the dictionary secret *(required when type is `existingSecret`)* |
-| `serviceAccountName` | `cpln-trivy-service-account` | Service account Trivy uses to pull images |
+| `trivyAuth.secretName` | `trivy-credentials` | Name of an existing opaque secret whose payload is the service account key |
+| `serviceAccountName` | `trivy-service-account` | Service account Trivy uses to pull images |
 | `schedule` | `*/59 * * * *` | Cron schedule for the scanning daemon |
+| `rescanAfter` | `7d` | Rescan images whose last scan is older than this (`<N>d` or `<N>h`). Empty string disables rescanning |
 | `daemon.resources.cpu` | `1` | CPU for the daemon container |
 | `daemon.resources.memory` | `1Gi` | Memory for the daemon container |
 | `trivyApi.resources.cpu` | `2` | CPU for the trivy-api sidecar |
@@ -248,6 +236,10 @@ webServer:
 Change `postToken` from its default `changeme` value before any production deployment. This token authenticates report submissions from the daemon to the web-server.
 </Warning>
 
+<Note>
+Report URLs are publicly accessible by default — they contain an unguessable SHA-256 hash, but no authentication. Restrict `webServer.firewall.inboundAllowCIDR` if reports must stay private.
+</Note>
+
 ## Viewing Reports
 
 Once the daemon has run, navigate to any scanned image in the Control Plane console. The `cpln/trivy-scan` tag on the image contains a direct URL to the HTML vulnerability report. Opening that URL serves the report from the web-server.
@@ -255,29 +247,31 @@ Once the daemon has run, navigate to any scanned image in the Control Plane cons
 To list all scanned images via CLI:
 
 ```bash
-cpln image query --tag cpln/trivy-scan -o json | jq '.items[].name'
+cpln image query --tag cpln/trivy-scan --max -1 -o json | jq '.items[].name'
 ```
 
 ## Maintenance
 
-### Force a Full Re-Scan
+### Periodic Re-Scans
 
-To reset all scan tags and trigger a full re-scan on the next daemon run:
+With `rescanAfter` set (default `7d`), re-scans happen automatically: any image whose last scan is older than the window is scanned again on the next daemon run, and its report is refreshed at the same URL. Adjust the window (e.g. `24h` for daily) or set it to `""` to scan each image only once.
 
-```bash
-cpln image query --tag cpln/trivy-scan -o json | jq -r '.items[].name' | \
-  xargs -I{} cpln image tag {} --remove cpln/trivy-scan --remove cpln/trivy-scan-time
-```
+### Force an Immediate Re-Scan
 
-### Re-Scan a Single Image
-
-To re-scan one image, remove its scan tags:
+To re-scan an image before its `rescanAfter` window elapses, remove its scan tags:
 
 ```bash
 cpln image tag my-image:latest --remove cpln/trivy-scan --remove cpln/trivy-scan-time
 ```
 
-The daemon will pick it up on its next scheduled run.
+To reset all scan tags and trigger a full re-scan on the next daemon run:
+
+```bash
+cpln image query --tag cpln/trivy-scan --max -1 -o json | jq -r '.items[].name' | \
+  xargs -I{} cpln image tag {} --remove cpln/trivy-scan --remove cpln/trivy-scan-time
+```
+
+The daemon will pick the images up on its next scheduled run.
 
 ## External References
 
