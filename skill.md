@@ -264,7 +264,7 @@ Reference syntax in env vars / volumes:
 ### Setup
 
 ```bash
-cpln login                                                  # interactive browser login
+cpln login                                                  # interactive login: prints a URL + confirmation code
 cpln profile update default --org my-org --gvc my-gvc       # set default org/GVC
 ```
 
