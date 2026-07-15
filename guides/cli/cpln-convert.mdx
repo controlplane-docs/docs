@@ -42,14 +42,28 @@ The `cpln convert` command transforms Kubernetes manifests into Control Plane re
 The converter analyzes your Kubernetes spec to automatically select the appropriate Control Plane workload type:
 
 <AccordionGroup>
+<Accordion title="Pinned via annotation (highest priority)">
+  Set the `cpln.io/workload-type` annotation on the Deployment, StatefulSet, DaemonSet, ReplicaSet, or its pod template to pin the type explicitly:
+
+  ```yaml
+  metadata:
+    annotations:
+      cpln.io/workload-type: serverless  # serverless | standard | stateful
+  ```
+
+  The pin overrides the automatic inference below. A workload that mounts a **dedicated** volumeset can only be pinned to `stateful`, and pinning `serverless` on a workload whose shape conflicts with serverless requirements (e.g., multiple ports) emits a warning and is validated by the API. Jobs and CronJobs always convert to `cron` and ignore the annotation.
+</Accordion>
+
 <Accordion title="Cron">
   **Job** and **CronJob** resources always become `cron` workloads.
   - CronJobs preserve their schedule from `spec.schedule`
   - Jobs use a default schedule of `* * * * *` (every minute)
 </Accordion>
 
-<Accordion title="Stateful (highest priority)">
-  The workload becomes `stateful` if any container mounts a **volumeset** (from PersistentVolumeClaim or volumeClaimTemplates).
+<Accordion title="Stateful">
+  The workload becomes `stateful` if any container mounts a **dedicated volumeset** (from a PersistentVolumeClaim or volumeClaimTemplates with single-node access modes such as `ReadWriteOnce`).
+
+  Claims with multi-node access modes (`ReadWriteMany`, `ReadOnlyMany`) convert to [shared volumesets](#how-volumesets-are-configured), which any workload type can mount — they do not force the stateful type.
 
   Stateful takes precedence over standard when both conditions are met.
 </Accordion>
@@ -61,6 +75,69 @@ The converter analyzes your Kubernetes spec to automatically select the appropri
   - The workload has **rollout options** (from K8s `strategy`, `updateStrategy`, `minReadySeconds`, or `podManagementPolicy`)
 </Accordion>
 </AccordionGroup>
+
+<Warning>
+The workload type is **immutable** after creation. When a converted workload already exists with a different type, `cpln apply --k8s` fails with `Workload type may not be changed` (405). Pin the type with the `cpln.io/workload-type` annotation to keep conversions stable across CLI versions. CLI versions before 3.9.0 inferred `serverless` for some Deployments; from 3.9.0 on, the default is `standard`.
+</Warning>
+
+### Conversion annotations
+
+The converter honors these annotations on the workload object metadata (Deployment, StatefulSet, DaemonSet, ReplicaSet, ReplicationController, Job, CronJob) or on its pod template metadata. Object-level annotations take precedence over template-level ones.
+
+| Annotation | Values | Effect |
+|------------|--------|--------|
+| `cpln.io/workload-type` | `serverless`, `standard`, `stateful` | Pins the converted workload type, overriding automatic inference |
+| `cpln.io/inherit-env` | `true`, `false` | Sets `inheritEnv` on every converted container, so [GVC-level environment variables](/reference/gvc#env) flow into the workload |
+| `cpln.io/internal-inbound-allow-type` | `none`, `same-gvc`, `same-org` | Overrides the [internal firewall inference](#firewall-and-public-exposure) for the converted workload |
+
+<Note>
+`cron` and `vm` cannot be pinned. Cron workloads carry a job schedule that only Jobs and CronJobs provide (they always convert to `cron`). [VM workloads](/reference/workload/types) boot from a disk image instead of running containers, so no container-based Kubernetes kind can convert to one.
+</Note>
+
+```yaml Example
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  annotations:
+    cpln.io/workload-type: serverless
+    cpln.io/inherit-env: 'true'
+    cpln.io/internal-inbound-allow-type: same-gvc
+```
+
+<Tip>
+With kustomize, apply annotations across a whole stack using `commonAnnotations`, or per-resource with a patch.
+</Tip>
+
+### Environment variables
+
+Container environment variables convert as follows:
+
+| Kubernetes source | Control Plane result |
+|-------------------|---------------------|
+| `env` with `value` | Inline value, preserved as-is |
+| `env` with `valueFrom.configMapKeyRef` | `cpln://secret/<configmap-name>.<key>` reference |
+| `env` with `valueFrom.secretKeyRef` | `cpln://secret/<secret-name>.<key>` reference |
+| `env` with `valueFrom.fieldRef` | `cpln://reference/<fieldPath>` reference |
+| `envFrom` with `configMapRef` | One variable per ConfigMap `data` key, referencing the converted secret |
+| `envFrom` with `secretRef` | One variable per Secret `data`/`stringData` key, referencing the converted secret |
+
+`envFrom` expansion follows Kubernetes semantics:
+
+- An explicit `env` entry **overrides** an `envFrom` variable with the same name.
+- A key present in multiple `envFrom` sources takes the value of the **last** source.
+- A `prefix` on the source is prepended to every expanded variable name.
+- ConfigMap `binaryData` keys are not expanded (Kubernetes does not expose them as environment variables either).
+
+<Warning>
+The converter needs the referenced ConfigMap or Secret **in the conversion input** to know its keys:
+
+- A missing non-optional `configMapRef` fails the conversion (the pod could not start on Kubernetes either).
+- A missing `optional: true` `configMapRef` is skipped with a warning.
+- A missing `secretRef` (e.g., a Secret that already exists on Control Plane) produces a **warning** because its keys cannot be enumerated — include the Secret manifest in the input or add the variables to `env` manually.
+- A `secretRef` to a Secret that converts to a non-dictionary type (a `payload` key becomes opaque, basic-auth becomes userpass) is skipped with a warning, since its keys are not individually addressable.
+- Expanded variable names starting with `CPLN_` are skipped with a warning; that prefix is reserved.
+</Warning>
 
 ### Secret and config conversions
 
@@ -105,7 +182,11 @@ PersistentVolumeClaims are converted to volumesets with these settings:
 |----------|---------------------------|---------|
 | **Capacity** | PersistentVolume `spec.capacity.storage` → PVC `spec.resources.requests.storage` | 10 GB |
 | **Performance class** | StorageClass parameters (see below) | `general-purpose-ssd` |
-| **File system type** | PV volume source `fsType` → StorageClass `parameters.fsType` | `ext4` |
+| **File system type** | PVC `accessModes` (see below) → PV volume source `fsType` → StorageClass `parameters.fsType` | `ext4` |
+
+**Shared volumesets from multi-node access modes:**
+
+A PVC whose `accessModes` include `ReadWriteMany` or `ReadOnlyMany` converts to a **shared** volumeset (`fileSystemType: shared`, `performanceClass: shared`). Shared volumesets can be mounted by workloads of any type and by multiple workloads at once — matching how RWX claims behave on Kubernetes. All other claims convert to dedicated block-storage volumesets, which only `stateful` (or `vm`) workloads can mount, one workload at a time.
 
 **High-performance SSD detection:**
 
@@ -194,17 +275,25 @@ This ensures workloads can access their secrets without manual policy configurat
 
 ### Firewall and public exposure
 
-The converter analyzes your Kubernetes Services and Ingresses to determine if a workload should be publicly accessible:
+The converter analyzes your Kubernetes Services and Ingresses to determine how each workload should be reachable:
 
 | Kubernetes Configuration | Control Plane Firewall |
 |-------------------------|------------------------|
 | Service type `LoadBalancer` matching pod labels | External inbound allowed (`0.0.0.0/0`) |
 | Ingress routing to a Service matching pod labels | External inbound allowed (`0.0.0.0/0`) |
 | No public exposure detected | External inbound blocked (default) |
+| Any Service selecting the pod (ClusterIP, NodePort, LoadBalancer, headless) | Internal inbound allowed from the same GVC (`same-gvc`) |
+| No Service selecting the pod | Internal inbound blocked (`none`, default) |
+
+On Kubernetes, any pod can reach a Service inside the cluster. The converter preserves that reachability: a workload backed by a Service converts with `firewallConfig.internal.inboundAllowType: same-gvc`, so dependent workloads (databases, message brokers, internal APIs) keep talking to each other after migration. Use the `cpln.io/internal-inbound-allow-type` [annotation](#conversion-annotations) to override the inference per workload — for example, `none` to lock a workload down even though a Service selects it.
 
 <Info>
 All workloads have external **outbound** traffic allowed by default (`0.0.0.0/0`).
 </Info>
+
+<Warning>
+When a workload's internal firewall is `none`, calls from other workloads in the GVC fail in ways that look like application errors on the caller side (e.g., `connection reset by peer`); the target workload's access log shows `rbac_access_denied_matched_policy[none]`. If intra-GVC calls fail after a conversion done with an older CLI, set `same-gvc` on the target: `cpln workload update <name> --set spec.firewallConfig.internal.inboundAllowType=same-gvc`.
+</Warning>
 
 ### Informational resources
 
@@ -213,7 +302,7 @@ These Kubernetes resources are not directly converted but inform the conversion:
 | Resource | How it's used |
 |----------|---------------|
 | **HorizontalPodAutoscaler** | Sets `minScale`, `maxScale`, `scaleToZeroDelay`, and CPU target |
-| **Service** | Protocol inference, public exposure detection, domain route resolution |
+| **Service** | Protocol inference, internal firewall inference, public exposure detection, domain route resolution |
 | **ServiceAccount** | Image pull secrets extraction |
 | **EndpointSlice** | Service-to-Pod mapping for selectorless services |
 | **PersistentVolume** | Capacity and file system type for volumesets |
@@ -606,6 +695,9 @@ If no protocol can be inferred, the converter defaults to `tcp`.
           - 0.0.0.0/0
         outboundAllowCIDR:
           - 0.0.0.0/0
+      internal:
+        inboundAllowType: same-gvc
+        inboundAllowWorkload: []
   ---
   kind: domain
   name: api.example.com
@@ -664,6 +756,30 @@ cpln delete --file k8s.yaml --k8s true
 ## Troubleshooting
 
 <AccordionGroup>
+<Accordion title="Workload type may not be changed (405)">
+  The workload type is immutable. This error means the type inferred by the current conversion differs from the type of the already-existing workload — commonly after upgrading across CLI v3.9.0, which changed the inferred default from a serverless/standard mix to `standard`.
+
+  Pin the type in the K8s manifest so it stays stable across CLI versions:
+
+  ```yaml
+  metadata:
+    annotations:
+      cpln.io/workload-type: serverless
+  ```
+
+  To intentionally change a workload's type, create a new workload with the target type and migrate traffic to it — the type cannot be changed in place.
+</Accordion>
+
+<Accordion title="Workloads cannot reach each other after conversion">
+  Workloads not selected by any Kubernetes Service convert with the internal firewall closed (`inboundAllowType: none`). Callers see errors like `connection reset by peer` while the target's access log shows `rbac_access_denied_matched_policy[none]`.
+
+  Include the Services in the conversion input so the converter infers `same-gvc`, set the `cpln.io/internal-inbound-allow-type` annotation, or open the firewall after the fact with `cpln workload update <name> --set spec.firewallConfig.internal.inboundAllowType=same-gvc`.
+</Accordion>
+
+<Accordion title="envFrom variables are missing">
+  `envFrom` sources expand only when the referenced ConfigMap or Secret is part of the conversion input, because the converter needs the keys. Check the conversion warnings on stderr: a Secret that lives only on Control Plane cannot be expanded — include its manifest in the input or add the variables to `env` manually.
+</Accordion>
+
 <Accordion title="Resource type not supported">
   Some Kubernetes resources don't have direct Control Plane equivalents. Use `--verbose` to see which properties are ignored during conversion.
 </Accordion>
