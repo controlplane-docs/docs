@@ -258,6 +258,7 @@ A workload references secrets from its parent org but only volume sets and ident
 | Connect to container | `cpln workload connect WL --gvc GVC` |
 | Port forward | `cpln port-forward WL 8080:8080 --gvc GVC` |
 | Build & push image | `cpln image build --name IMAGE:TAG --push` |
+| Build & push without local Docker | `cpln image build --name IMAGE:TAG --remote` |
 | Convert K8s manifests | `cpln convert --file k8s-manifest.yaml` |
 | Export resource for re-apply | `cpln workload get WL --gvc GVC -o yaml-slim > wl.yaml` |
 | Rename a resource | `cpln workload clone OLD --name NEW --gvc GVC` |

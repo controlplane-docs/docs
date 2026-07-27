@@ -98,7 +98,7 @@ Missing any one = silent runtime failure. The #1 support issue.
 - **NEVER** prefix external images with `docker.io/`. Use `nginx:latest`, not `docker.io/library/nginx:latest`.
 - **Own org's registry** in workload specs: `//image/NAME:TAG`. The hostname `<own-org>.registry.cpln.io` is only for `docker login`/`push`, never in workload specs.
 - **Cross-org pull**: `<other-org>.registry.cpln.io/NAME:TAG`.
-- Images must be `linux/amd64`. `cpln image build --push` defaults to this. Wrong platform = `exec format error` at runtime.
+- Images must be `linux/amd64`. `cpln image build --push` defaults to this, and `--remote` always builds it. Wrong platform = `exec format error` at runtime.
 - The workload spec `port` must match the port the container actually listens on, or health checks fail.
 
 ### 4. Firewall defaults — everything is denied
@@ -276,6 +276,7 @@ For CI/CD, set environment variables through your platform's secrets management 
 | `CPLN_ORG` | Default organization |
 | `CPLN_GVC` | Default GVC |
 | `CPLN_PROFILE` | Profile override |
+| `CPLN_SKIP_UPDATE_CHECK` | Any non-empty value skips the daily new-version check and its notice |
 
 Override per command: `--org`, `--gvc`, `--profile`.
 
@@ -362,6 +363,7 @@ The resource command map + Standard CRUD verbs cover most cases. These are the s
 | Export for re-apply | `cpln workload get WL --gvc GVC -o yaml-slim > wl.yaml` |
 | Rename (preferred over get/edit/apply) | `cpln workload clone OLD --name NEW --gvc GVC` |
 | Build & push image | `cpln image build --name IMAGE:TAG --push` |
+| Build & push without local Docker | `cpln image build --name IMAGE:TAG --remote` (add `--repo <https-url>` to build a GitHub/GitLab repo) |
 | Convert K8s manifests | `cpln convert --file k8s-manifest.yaml` |
 
 ## Manifest patterns
