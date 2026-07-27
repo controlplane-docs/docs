@@ -30,6 +30,7 @@ cpln image build --name my-app:v1.0 --push
 - `--push` pushes to your org's private registry. Without it, the image is only built locally.
 - Override builder: `--builder`/`-B`. Override buildpack: `--buildpack`/`-b`.
 - Build context directory: `--dir` (default: `.`). Skip cache: `--no-cache`.
+- No Docker available: `--remote` builds remotely and pushes the result (no `--push`, and the local build flags `--dockerfile`/`--builder`/`--buildpack`/`--env`/`--platform` are rejected). Build a repository instead of a folder with `--remote --repo <https-url> [--branch B]`; return without waiting with `--detach`.
 - Buildx fallback: single-platform builds fall back to legacy `docker build` when Buildx is unavailable; multi-platform builds require Buildx. See the **cpln-image** skill (Common Gotchas) for version history and details.
 
 **Image reference rules in workload specs:**
@@ -54,7 +55,7 @@ Available on nearly every command. Never list these per-command — they're alwa
 
 **`--org`** is on ~90% of commands. **`--gvc`** is on all subcommands of GVC-scoped resources (workload, identity, volumeset) plus helm, stack, apply, convert, cp, delete, and port-forward. It is NOT a flag on `cpln logs` — the GVC is specified inside the LogQL query.
 
-Environment overrides: `CPLN_TOKEN`, `CPLN_ORG`, `CPLN_GVC`, `CPLN_PROFILE`.
+Environment overrides: `CPLN_TOKEN`, `CPLN_ORG`, `CPLN_GVC`, `CPLN_PROFILE`. Set `CPLN_SKIP_UPDATE_CHECK` to any non-empty value to suppress the daily new-version check and its notice.
 
 ## Standard CRUD Operations
 
