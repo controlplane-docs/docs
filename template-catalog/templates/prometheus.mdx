@@ -1,0 +1,314 @@
+---
+title: Prometheus
+description: Deploy Prometheus on Control Plane using the Template Catalog. A self-hosted metrics database with remote-write ingest, durable TSDB storage, and an optional Thanos sidecar for Store API federation and object-storage block upload.
+keywords: ['metrics storage', 'time series database', 'promql', 'monitoring', 'remote_write receiver', 'scrape configs', 'thanos store api', 'grafana datasource', 'observability', 'mimir alternative', 'ha prometheus', 'prometheus template']
+---
+
+## Overview
+
+Prometheus is the standard open-source metrics database. This template deploys a single Prometheus server with the remote-write receiver enabled and a durable TSDB volume: your own senders push metrics in via Prometheus `remote_write` (or Prometheus scrapes targets you configure), and anything that speaks PromQL — your own Grafana, dashboards, scripts — queries them back. An optional co-located Thanos sidecar (on by default) exposes the Store API for a Thanos Query tier and can upload TSDB blocks to your object bucket for long-term durability.
+
+<Note>
+This is a **self-hosted metrics store for your own metrics from your own sources**. It is separate from — and not a replacement for — Control Plane's built-in observability, which continues to collect and dashboard your workloads' metrics natively.
+</Note>
+
+### Architecture
+
+- **Prometheus** — A single-replica stateful workload. Scrape and remote-write ingest plus PromQL query, all on port `9095` — Prometheus's usual port `9090` is reserved by the platform, so this template runs it on `9095` instead. High availability is achieved by installing the template twice (see [High Availability](#high-availability)).
+- **Thanos sidecar** *(optional, default on)* — A second container in the same workload. Serves the Thanos Store API (gRPC) on `10901` and HTTP health/metrics on `10902`, and uploads TSDB blocks to object storage when enabled.
+- **Object storage** *(optional)* — The sidecar ships completed TSDB blocks to your S3, GCS, or S3-compatible bucket; history beyond local retention lives in the bucket.
+
+### What Gets Created
+
+- **Stateful Prometheus Workload** — Serves remote-write ingest and PromQL query on port `9095`; includes the Thanos sidecar container when enabled.
+- **Volume Set** — 20 GiB at `/prometheus` for the TSDB, shared read-only with the sidecar.
+- **Secrets** — An opaque secret holding the rendered `prometheus.yml`, mounted as a file; a second secret holds the Thanos bucket configuration when object storage is enabled.
+- **Identity & Policy** — An identity bound to the workload with `reveal` access to exactly the template's secrets (plus any remote-write password secrets you name), and cloud access scoped to exactly your bucket (AWS and GCP backends) when object storage is enabled.
+
+<Note>
+This template does not create a GVC. You must deploy it into an existing GVC.
+</Note>
+
+## Prerequisites
+
+None for a default install. Two optional features have prerequisites:
+
+- **Remote write with basic auth** — an opaque secret per endpoint holding the password (set `remoteWrite[].basicAuth.passwordSecretName` to its name). The secret must exist **before** install — the template references it by name only and never stores the password in values.
+- **Object storage** (`thanos.objectStorage`) — an existing bucket and access setup for it. Complete the steps for your chosen backend below.
+
+<Tabs>
+  <Tab title="AWS S3">
+    AWS S3 uses a Control Plane cloud identity — no credentials are stored; the workload's identity vends temporary credentials at runtime.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create an S3 bucket. Set `thanos.objectStorage.aws.bucket` and `thanos.objectStorage.aws.region` to match.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `thanos.objectStorage.aws.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        Create an AWS IAM policy granting `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on the bucket and its objects (the template's README includes the full policy JSON). Set `thanos.objectStorage.aws.policyName` to the policy's name (bare name, not ARN).
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    Google Cloud Storage uses a Control Plane cloud identity — no credentials are stored.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create a GCS bucket. Set `thanos.objectStorage.gcp.bucket` to its name.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your GCP project. Set `thanos.objectStorage.gcp.cloudAccountName` to its name.
+      </Step>
+      <Step title="Confirm bucket access">
+        No policy to author — the template grants the workload identity `roles/storage.objectAdmin` scoped to the bucket automatically.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="S3-compatible (MinIO, R2, Wasabi)">
+    Any S3-compatible server uses static access credentials, since these cannot federate with a cloud account.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create your bucket on the server and credentials that can read and write it. Set `thanos.objectStorage.minio.bucket`, `thanos.objectStorage.minio.accessKey`, and `thanos.objectStorage.minio.accessSecret` to match.
+      </Step>
+      <Step title="Set the endpoint">
+        Set `thanos.objectStorage.minio.endpoint` to the S3 API address as `host:port` with **no scheme** (e.g. `my-minio:9000`), and `thanos.objectStorage.minio.insecure: true` when the endpoint is plain HTTP.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+Install the template using your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+image: prom/prometheus:v3.13.1
+
+resources: # Prometheus server; memory scales with active series
+  cpu: 1000m
+  memory: 2Gi
+  minCpu: 500m
+  minMemory: 1Gi
+
+retention:
+  time: 15d # how long samples are kept on the local volume
+  size: "" # optional local size cap, e.g. 15GB — empty means no cap
+
+volumeset:
+  capacity: 20 # GiB — TSDB volume mounted at /prometheus
+
+scrapeInterval: 30s # global scrape interval (self-scrape and extraScrapeConfigs)
+externalLabels: {} # identity labels on all uploaded/forwarded series, e.g. region: us-east-1, replica: a
+extraScrapeConfigs: "" # raw YAML list of additional scrape_configs entries
+
+remoteWrite: [] # entries: url (required) + optional basicAuth
+# - url: http://my-mimir.my-gvc.cpln.local:8080/api/v1/push
+#   basicAuth:
+#     username: my-user
+#     passwordSecretName: my-remote-write-password # opaque secret, must exist BEFORE install
+
+thanos:
+  sidecar:
+    enabled: true # co-located sidecar exposing the Store API (gRPC :10901) for a Thanos Query tier
+    image: quay.io/thanos/thanos:v0.42.2
+    resources:
+      cpu: 250m
+      memory: 512Mi
+      minCpu: 100m
+      minMemory: 128Mi
+  objectStorage:
+    enabled: false # sidecar uploads TSDB blocks to your bucket; requires thanos.sidecar.enabled
+    type: aws # options: aws, gcp, minio
+    blockDuration: 2h # advanced: TSDB block interval (min=max disables local compaction)
+
+    aws: # AWS S3 — keyless via Control Plane cloud identity
+      bucket: my-prometheus-bucket # bucket must already exist
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account # Control Plane AWS cloud account
+      policyName: my-prometheus-s3-policy # custom bucket-scoped IAM policy (bare name)
+
+    gcp: # Google Cloud Storage — keyless via Control Plane cloud identity
+      bucket: my-prometheus-bucket # bucket must already exist
+      cloudAccountName: my-gcs-cloud-account # Control Plane GCP cloud account
+
+    minio: # Any S3-compatible server (MinIO, R2, Wasabi, …) — static keys + endpoint
+      endpoint: my-minio:9000 # host:port, NO scheme
+      insecure: true # true when the endpoint is plain HTTP
+      bucket: my-prometheus-bucket # bucket must already exist
+      region: us-east-1
+      accessKey: my-minio-username
+      accessSecret: my-minio-password
+
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # with workload-list, e.g. //gvc/GVC/workload/NAME — cross-GVC callers allowed
+```
+
+### Resources
+
+- `image` — The Prometheus container image.
+- `resources` — CPU and memory for the Prometheus container. Memory scales with the number of active series.
+
+### TSDB and Retention
+
+- `retention.time` — How long samples are kept on the local volume (e.g. `15d`, `30d`, `1y`).
+- `retention.size` — Optional local size cap (e.g. `15GB`); empty means no cap.
+- `volumeset.capacity` — Volume size in GiB for the TSDB at `/prometheus`.
+
+With object storage enabled, local retention is only the near-term window — history beyond it lives in your bucket and is served by your Thanos query tier.
+
+### Metrics
+
+- `scrapeInterval` — Global scrape interval, applied to the self-scrape and any `extraScrapeConfigs` jobs.
+- `externalLabels` — Identity labels attached to all uploaded and forwarded series. The template always injects a baseline `prometheus: <workload-name>` label; your keys merge over it (overriding `prometheus` is allowed — required for the [HA pair recipe](#high-availability)).
+- `extraScrapeConfigs` — A raw YAML list of additional Prometheus `scrape_configs` entries, for example:
+
+```yaml
+extraScrapeConfigs: |
+  - job_name: my-app
+    static_configs:
+      - targets: ["my-app.my-gvc.cpln.local:8080"]
+```
+
+### Remote Write
+
+`remoteWrite` pushes this server's metrics to any Prometheus-remote-write-compatible store — for example this catalog's Grafana Mimir template — and is the recommended shape when the Thanos sidecar is disabled:
+
+```yaml
+thanos:
+  sidecar:
+    enabled: false
+remoteWrite:
+  - url: http://my-mimir.my-gvc.cpln.local:8080/api/v1/push
+    basicAuth: # optional
+      username: my-user
+      passwordSecretName: my-remote-write-password # opaque secret, must exist BEFORE install
+```
+
+The password is never stored in values — `passwordSecretName` names an opaque secret you create before install; the template mounts it as a `password_file` and grants the workload identity `reveal` on exactly that secret.
+
+### Thanos Sidecar and Object Storage
+
+- `thanos.sidecar.enabled` — Runs the Thanos sidecar next to Prometheus, exposing the Store API (gRPC `10901`) so a Thanos Query tier can fan out queries to this server. Disable it when you forward metrics with `remoteWrite` instead.
+- `thanos.objectStorage.enabled` — The sidecar uploads completed TSDB blocks to your bucket (recommended for production durability). Requires `thanos.sidecar.enabled`.
+- `thanos.objectStorage.blockDuration` — Advanced: the TSDB block interval; the template pins min and max block duration to this value, which disables local compaction so blocks ship cleanly.
+
+Set `thanos.objectStorage.type` to `aws`, `gcp`, or `minio`, and configure that block. AWS and GCP use a Control Plane cloud identity — no credentials are stored. See [Prerequisites](#prerequisites) for the per-backend setup steps.
+
+| Field | Backends | Description |
+|---|---|---|
+| `bucket` | all | Target bucket. Must already exist. |
+| `region` | `aws`, `minio` | Bucket region. |
+| `cloudAccountName` | `aws`, `gcp` | Control Plane cloud account granting bucket access. |
+| `policyName` | `aws` | Bare name of the custom bucket-scoped IAM policy. |
+| `endpoint` | `minio` | S3 API address as `host:port` — no scheme. |
+| `insecure` | `minio` | `true` when the endpoint is plain HTTP. |
+| `accessKey` / `accessSecret` | `minio` | Static credentials with access to the bucket. |
+
+### Internal Access
+
+Prometheus is **internal-only by design** — it has no built-in authentication, so this template never exposes a public endpoint. `internalAccess.type` controls which workloads can reach it:
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access allowed |
+| `same-gvc` | Allow access from all workloads in the same GVC |
+| `same-org` | Allow access from all workloads in the same organization |
+| `workload-list` | Allow access only from specific workloads listed in `workloads` |
+
+`workloads` entries take the form `//gvc/GVC_NAME/workload/WORKLOAD_NAME` and may name workloads in **other GVCs** — use this (or `same-org`) to allow a Thanos Query tier in another GVC to reach the Store API.
+
+To serve clients outside Control Plane, front Prometheus with your own authenticating proxy behind a custom domain — that proxy is yours to build and operate; the template does not provide one.
+
+## Connecting
+
+Prometheus serves everything on port `9095` — its usual port `9090` is reserved by the platform, so point senders and datasources at `9095`:
+
+| What | Value |
+|---|---|
+| Remote-write ingest (from your senders) | `http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095/api/v1/write` |
+| PromQL / Grafana datasource | `http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095` |
+| Thanos Store API (same GVC) | `RELEASE_NAME-prometheus:10901` |
+| Thanos Store API (cross-GVC) | `replica-0.RELEASE_NAME-prometheus.LOCATION.GVC_NAME.cpln.local:10901` |
+
+To push metrics here from another Prometheus:
+
+```yaml
+remote_write:
+  - url: http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095/api/v1/write
+```
+
+A Thanos Query tier — such as this catalog's Thanos template — adds this server as a store endpoint. From another GVC, use the cross-GVC `replica-0.…` address and allow the caller via `internalAccess` (`same-org`, or `workload-list` naming the query workload). Cross-location internal traffic incurs egress charges — co-locate the query tier with its stores where practical.
+
+## High Availability
+
+Prometheus has no cluster mode, so this template deliberately has no replicas knob — a second replica of the same install would just double-count. The upstream HA pattern is two independent, identically-configured instances deduplicated at query time. Install the template twice (e.g. releases `prom-a` and `prom-b`) with identical values except `externalLabels`:
+
+```yaml
+# prom-a                  # prom-b
+externalLabels:           externalLabels:
+  prometheus: my-prom       prometheus: my-prom
+  replica: a                replica: b
+```
+
+Senders dual-write to both endpoints; a Thanos Query tier dedups via `--query.replica-label=replica`. Overriding `prometheus` to a shared value is required so the two label sets differ only in `replica`.
+
+## Important Notes
+
+- **Prometheus has no built-in authentication, so this template never exposes a public endpoint.** To serve clients outside Control Plane, front it with your own authenticating proxy behind a custom domain.
+- **Remote-write password secrets must exist before install** — a missing `passwordSecretName` secret wedges the deployment waiting on it.
+- **Config changes ship via `helm upgrade`** (workload redeploy) — there is no hot reload.
+- **With object storage enabled, keep `retention.time` at least 3× `blockDuration`** (the default `15d`/`2h` satisfies this) — the sidecar needs blocks on the local volume long enough to upload them.
+- **The TSDB survives reinstall** — the volume is retained with a final snapshot, and local data resumes when a new install binds it.
+- **After a restart, readiness can take minutes on a large TSDB** — WAL replay holds the readiness endpoint at 503; this is normal recovery, not a failure.
+
+## External References
+
+<CardGroup cols={2}>
+    <Card title="Prometheus Documentation" icon="book" href="https://prometheus.io/docs/introduction/overview/">
+    Official Prometheus documentation
+    </Card>
+    <Card title="Prometheus Configuration" icon="gear" href="https://prometheus.io/docs/prometheus/latest/configuration/configuration/">
+    Configuration reference, including scrape_configs
+    </Card>
+    <Card title="Prometheus remote_write" icon="chart-line" href="https://prometheus.io/docs/practices/remote_write/">
+    Remote-write tuning and best practices
+    </Card>
+    <Card title="Thanos Sidecar" icon="server" href="https://thanos.io/tip/components/sidecar.md/">
+    Store API and block-upload sidecar reference
+    </Card>
+    <Card title="Prometheus (GitHub)" icon="github" href="https://github.com/prometheus/prometheus">
+    Source code and releases
+    </Card>
+    <Card title="Prometheus Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/prometheus">
+    View the source files, default values, and chart definition
+    </Card>
+</CardGroup>
