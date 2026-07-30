@@ -1,0 +1,307 @@
+---
+title: Thanos
+description: Deploy Thanos on Control Plane using the Template Catalog. A global PromQL query layer that fans out over your Prometheus servers with HA deduplication, plus an optional Store Gateway and Compactor for object-storage-backed long-term retention.
+keywords: ['thanos query', 'global query view', 'metrics federation', 'promql', 'prometheus dedup', 'store gateway', 'compactor', 'downsampling', 'grafana datasource', 'long-term metrics', 'observability', 'cortex alternative', 'mimir alternative', 'thanos template']
+---
+
+## Overview
+
+Thanos turns many independent Prometheus servers into one queryable metrics system. This template deploys Thanos Query — a stateless global PromQL layer that fans each query out over the gRPC Store API endpoints you list (typically the Thanos sidecar of each [Prometheus template](/template-catalog/templates/prometheus) install, across GVCs and regions) and deduplicates HA pairs — plus an optional object-storage tier (Store Gateway + Compactor) that serves and manages long-term metric history from your bucket.
+
+<Note>
+This is a **self-hosted query layer for your own metrics from your own Prometheus servers**. It is separate from — and not a replacement for — Control Plane's built-in observability, which continues to collect and dashboard your workloads' metrics natively.
+</Note>
+
+### Architecture
+
+- **Thanos Query** — A stateless standard workload. UI and PromQL API on port `10902`, gRPC Store API on `10901`. Single replica by default — set `replicas: 2` or more for an HA query tier; queries keep succeeding through rolling restarts and replica loss.
+- **Store Gateway** *(optional, default off)* — A stateful workload that serves historical blocks from your object bucket to Query, with a local index/meta cache volume (safe to lose — it rebuilds on start). Query picks it up automatically when enabled.
+- **Compactor** *(optional, default off)* — A stateful **singleton** that compacts, downsamples, and applies retention to the blocks in your bucket.
+- **Object storage** *(optional)* — The bucket your Prometheus Thanos sidecars upload blocks to; the Store Gateway and Compactor share one rendered `objstore.yml` configuration for it.
+
+### What Gets Created
+
+- **Standard Thanos Query Workload** — Serves the UI and PromQL API on port `10902` and its own Store API on `10901`.
+- **Stateful Store Gateway Workload** *(optional)* — Serves historical bucket blocks to Query.
+- **Stateful Compactor Workload** *(optional)* — Compacts, downsamples, and applies retention to bucket blocks.
+- **Volume Sets** *(optional)* — A 10 GiB cache volume for the Store Gateway and a 20 GiB workspace volume for the Compactor.
+- **Secret** *(optional)* — An opaque secret holding the rendered `objstore.yml` bucket configuration, mounted as a file; created only when the storage tier is enabled.
+- **Identity & Policy** — A shared identity bound to all workloads; when the storage tier is enabled, a policy grants it `reveal` on the objstore secret, and cloud access is scoped to exactly your bucket (AWS and GCP backends).
+
+<Note>
+This template does not create a GVC. You must deploy it into an existing GVC.
+</Note>
+
+## Prerequisites
+
+None for a default install — Query boots with an empty store list and you point it at your store endpoints via `stores`.
+
+The optional storage tier (`storeGateway` / `compactor`) requires an existing bucket in one of the supported backends — the **same bucket** your Prometheus template's Thanos sidecar uploads blocks to. Complete the steps for your chosen backend below.
+
+<Tabs>
+  <Tab title="AWS S3">
+    AWS S3 uses a Control Plane cloud identity — no credentials are stored; the workload's identity vends temporary credentials at runtime.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create an S3 bucket. Set `storage.aws.bucket` and `storage.aws.region` to match.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `storage.aws.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        Create an AWS IAM policy with the JSON below (replace `YOUR_BUCKET`), then set `storage.aws.policyName` to the policy's name (bare name, not ARN):
+
+        ```json
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+              "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET",
+                "arn:aws:s3:::YOUR_BUCKET/*"
+              ]
+            }
+          ]
+        }
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    Google Cloud Storage uses a Control Plane cloud identity — no credentials are stored.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create a GCS bucket. Set `storage.gcp.bucket` to its name.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your GCP project. Set `storage.gcp.cloudAccountName` to its name.
+      </Step>
+      <Step title="Confirm bucket access">
+        No policy to author — the template grants the workload identity `roles/storage.objectAdmin` scoped to the bucket automatically.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="S3-compatible (MinIO, R2, Wasabi)">
+    Any S3-compatible server uses static access credentials, since these cannot federate with a cloud account.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create your bucket on the server and credentials that can read and write it. Set `storage.minio.bucket`, `storage.minio.accessKey`, and `storage.minio.accessSecret` to match.
+      </Step>
+      <Step title="Set the endpoint">
+        Set `storage.minio.endpoint` to the S3 API address as `host:port` with **no scheme** (e.g. `my-minio:9000`), and `storage.minio.insecure: true` when the endpoint is plain HTTP.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+Install the template using your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+image: quay.io/thanos/thanos:v0.42.2
+
+resources: # Thanos Query
+  cpu: 500m
+  memory: 1Gi
+  minCpu: 250m
+  minMemory: 512Mi
+
+replicas: 1 # Query is stateless — set 2+ for an HA query tier
+
+stores: [] # gRPC Store API endpoints Query fans out over, host:port with NO scheme
+# stores:
+#   - my-prometheus-prometheus.metrics-east.cpln.local:10901
+#   - my-prometheus-b-prometheus.metrics-west.cpln.local:10901
+
+queryReplicaLabels: # external label(s) marking HA duplicates to deduplicate
+  - replica
+
+publicAccess:
+  enabled: false # true = Query UI/API at a *.cpln.app URL — it has NO built-in auth
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # used with workload-list, e.g. //gvc/GVC/workload/NAME
+
+storeGateway:
+  enabled: false # serves historical bucket blocks to Query
+  resources:
+    cpu: 500m
+    memory: 1Gi
+    minCpu: 250m
+    minMemory: 512Mi
+  volumeset:
+    capacity: 10 # GiB — local index/meta cache; safe to lose (rebuilds on start)
+
+compactor:
+  enabled: false # MUST be the ONLY compactor on the bucket, across all installs
+  resources:
+    cpu: 500m
+    memory: 1Gi # size up for large buckets — compaction is memory-hungry
+    minCpu: 250m
+    minMemory: 512Mi
+  volumeset:
+    capacity: 20 # GiB — compaction workspace; size ~2x two weeks of raw blocks
+  retention: # per-resolution bucket retention; "0d" keeps forever
+    raw: "0d"
+    fiveMinutes: "0d"
+    oneHour: "0d"
+
+storage: # used only when storeGateway or compactor is enabled
+  type: aws # options: aws, gcp, minio
+
+  aws: # AWS S3 — keyless via Control Plane cloud identity
+    bucket: my-thanos-bucket # bucket must already exist
+    region: us-east-1
+    cloudAccountName: my-s3-cloud-account # Control Plane AWS cloud account
+    policyName: my-thanos-s3-policy # custom bucket-scoped IAM policy (bare name)
+
+  gcp: # Google Cloud Storage — keyless via Control Plane cloud identity
+    bucket: my-thanos-bucket # bucket must already exist
+    cloudAccountName: my-gcs-cloud-account # Control Plane GCP cloud account
+
+  minio: # Any S3-compatible server (MinIO, R2, Wasabi, …) — static keys + endpoint
+    endpoint: my-minio:9000 # host:port, NO scheme
+    insecure: true # true when the endpoint is plain HTTP
+    bucket: my-thanos-bucket # bucket must already exist
+    region: us-east-1
+    accessKey: my-minio-username
+    accessSecret: my-minio-password
+```
+
+### Query
+
+- `image` — The Thanos container image, shared by all components.
+- `resources` — CPU and memory for the Query container (the Store Gateway and Compactor have their own `resources` blocks under their keys).
+- `replicas` — Query is stateless, so replicas need no coordination. Set `2` or more for an HA query tier that serves queries without interruption through rolling restarts and replica loss.
+
+### Store Endpoints
+
+Each `stores` entry is a gRPC Store API endpoint — typically the Thanos sidecar of a [Prometheus template](/template-catalog/templates/prometheus) install — as `host:port` with **no scheme**:
+
+| Source | Endpoint form |
+|---|---|
+| Same GVC | `WORKLOAD.GVC.cpln.local:10901` |
+| Cross-GVC / cross-region | `WORKLOAD.GVC.cpln.local:10901` (service-level DNS — the Prometheus template is single-replica, so this reaches the one replica directly and is the most reliable form) |
+
+Two things to know for cross-GVC endpoints, both **on the Prometheus side**:
+
+1. The target workload's internal firewall must allow inbound from this Query workload — set its `internalAccess.type` to `same-org`, or `workload-list` including `//gvc/GVC/workload/RELEASE-thanos`. A store showing as "down" in the Query UI is almost always this firewall.
+2. Cross-location internal traffic (Query in one region querying sidecars in another) incurs egress charges — co-locate the query tier with its stores where practical.
+
+`queryReplicaLabels` names the external label(s) that mark HA duplicates: series identical except for this label are collapsed into one at query time. The default `replica` matches the Prometheus template's [HA pair recipe](/template-catalog/templates/prometheus#high-availability) — the label name must exactly match what your HA pair sets.
+
+Changing `stores` takes effect via `helm upgrade` — endpoints are workload arguments, so an upgrade safely redeploys Query with the new list, and Query keeps answering queries even while some listed endpoints are down.
+
+### Access
+
+- `publicAccess.enabled` — Exposes the Query UI and PromQL API at a `*.cpln.app` canonical endpoint. **Query has no built-in authentication**, so anyone with the URL can run queries against everything it federates — keep this off (the default) or front Query with your own authenticating proxy.
+- `internalAccess.type` — Controls which workloads can reach Query internally:
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access allowed |
+| `same-gvc` | Allow access from all workloads in the same GVC |
+| `same-org` | Allow access from all workloads in the same organization |
+| `workload-list` | Allow access only from specific workloads listed in `workloads` |
+
+`workloads` entries take the form `//gvc/GVC_NAME/workload/WORKLOAD_NAME`.
+
+### Long-Term Storage Tier
+
+Off by default, the storage tier serves metric history from the object bucket your Prometheus sidecars upload blocks to — configure the same bucket under `storage`:
+
+- `storeGateway.enabled` — Runs the Store Gateway, which serves historical bucket blocks to Query. Query picks up its endpoint automatically — no `stores` entry needed. Its volume is only a local index/meta cache and is safe to lose.
+- `compactor.enabled` — Runs the Compactor, which compacts and downsamples bucket blocks and applies `compactor.retention` per resolution (`raw`, `fiveMinutes`, `oneHour`; `"0d"` keeps forever).
+
+<Warning>
+Run **exactly one Compactor per bucket, across all installs and regions** — a second Compactor on the same bucket corrupts the block layout and requires manual repair. Multi-region users enable `compactor` in one install only.
+</Warning>
+
+Long-term reads need both halves on the same bucket: a Prometheus sidecar uploading blocks to it, and `storeGateway.enabled: true` here to serve them.
+
+### Object Storage
+
+Set `storage.type` to `aws`, `gcp`, or `minio`, and configure that block. AWS and GCP use a Control Plane cloud identity — no credentials are stored. See [Prerequisites](#prerequisites) for the per-backend setup steps.
+
+| Field | Backends | Description |
+|---|---|---|
+| `bucket` | all | Target bucket. Must already exist. |
+| `region` | `aws`, `minio` | Bucket region. |
+| `cloudAccountName` | `aws`, `gcp` | Control Plane cloud account granting bucket access. |
+| `policyName` | `aws` | Bare name of the custom bucket-scoped IAM policy. |
+| `endpoint` | `minio` | S3 API address as `host:port` — no scheme. |
+| `insecure` | `minio` | `true` when the endpoint is plain HTTP. |
+| `accessKey` / `accessSecret` | `minio` | Static credentials with access to the bucket. |
+
+## Connecting
+
+| What | Value |
+|---|---|
+| Query UI / PromQL API (in-GVC) | `http://RELEASE_NAME-thanos.GVC_NAME.cpln.local:10902` |
+| Grafana Prometheus datasource | The same URL — Query speaks the Prometheus HTTP API |
+| Query UI / API (public, when `publicAccess.enabled`) | The `*.cpln.app` canonical endpoint (`cpln workload get RELEASE_NAME-thanos -o yaml` → `status.canonicalEndpoint`) |
+| Query's own Store API (for a higher Thanos tier) | `RELEASE_NAME-thanos.GVC_NAME.cpln.local:10901` (gRPC) |
+
+Point your Grafana at Query instead of individual Prometheus servers to get one deduplicated global view. The Query UI's **Stores** page shows every configured endpoint with its health and labels — the first place to look when a source is missing from results.
+
+## Important Notes
+
+- **Query has no built-in authentication** — with `publicAccess.enabled: true`, anyone with the URL can run queries. Keep it off, or front Query with your own authenticating proxy.
+- **Run exactly one Compactor per bucket, across all installs and regions** — a second one corrupts the block layout and requires manual repair.
+- **Cross-GVC stores need a firewall change on the Prometheus side** — the sidecar workload must allow inbound `same-org` or list this Query workload (see [Store Endpoints](#store-endpoints)).
+- **No deduplication happening?** `queryReplicaLabels` must exactly match the external label name your HA Prometheus pair sets (`replica` by default).
+- **Long-term reads need both halves on the same bucket** — a sidecar uploading blocks to it, and `storeGateway.enabled: true` here to serve them.
+- **Disabling the storage tier does not remove existing cloud grants from the identity** — the platform deep-merges updates, so a previously-applied AWS/GCP binding stays until you remove it (edit the identity, or uninstall and reinstall the release).
+
+## External References
+
+<CardGroup cols={2}>
+    <Card title="Thanos Documentation" icon="book" href="https://thanos.io/tip/thanos/getting-started.md/">
+    Official Thanos documentation
+    </Card>
+    <Card title="Query Component" icon="magnifying-glass-chart" href="https://thanos.io/tip/components/query.md/">
+    Global query layer, fan-out, and deduplication reference
+    </Card>
+    <Card title="Store Gateway Component" icon="database" href="https://thanos.io/tip/components/store.md/">
+    Serving historical bucket blocks to the query layer
+    </Card>
+    <Card title="Compactor Component" icon="compress" href="https://thanos.io/tip/components/compact.md/">
+    Compaction, downsampling, and retention reference
+    </Card>
+    <Card title="Thanos (GitHub)" icon="github" href="https://github.com/thanos-io/thanos">
+    Source code and releases
+    </Card>
+    <Card title="Thanos Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/thanos">
+    View the source files, default values, and chart definition
+    </Card>
+</CardGroup>

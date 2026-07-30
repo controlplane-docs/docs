@@ -1,24 +1,57 @@
 ---
 title: OpenTelemetry Collector
+description: Deploy the OpenTelemetry Collector on Control Plane using the Template Catalog. OTLP trace and metrics ingestion feeding Control Plane tracing and any Prometheus-remote-write store, with optional bearer-token or mTLS authenticated public endpoints.
+keywords: ['otel', 'otlp', 'distributed tracing', 'span metrics', 'spanmetrics', 'prometheus remote write', 'metrics ingestion', 'bearer token', 'mtls', 'telemetry pipeline', 'observability', 'trace collector']
 ---
 
 ## Overview
 
-OpenTelemetry Collector is an observability service that receives, processes, and exports metrics, logs, and traces to the Control Plane tracing backend. This template deploys an OTel Collector workload with pre-configured receiver and processor configuration.
+The OpenTelemetry Collector receives, processes, and exports telemetry over OTLP. This template deploys a stateless collector that feeds Control Plane's native tracing, and can additionally ingest OTLP metrics and push them to any Prometheus-remote-write-compatible store — such as this catalog's [Prometheus template](/template-catalog/templates/prometheus) — with optional authenticated public ingestion (bearer token or mTLS).
+
+### Architecture
+
+- **Collector** — A standard, stateless workload. `replicas` copies run behind one endpoint; `2` or more forms an HA ingestion pool that keeps accepting telemetry through rolling restarts and replica loss.
+- **Traces** — Applications send OTLP to the collector; it normalizes spans, derives span metrics, and forwards traces to the Control Plane tracing backend.
+- **Metrics** *(optional)* — An OTLP-to-`prometheus_remote_write` pipeline pushes ingested metrics to the store you configure.
+- **Public ingestion** *(optional)* — Bearer-token auth over the canonical HTTPS endpoint, or mutual TLS over a direct TCP load balancer. Public access always requires auth plus an explicit CIDR allowlist.
 
 ### What Gets Created
 
-- **Standard Workload** — An OTel Collector workload that supports both a simple and an advanced mode allowing you to run a minimal setup for quick deployment or a fully customized configuration.
-- **Secret** — An opaque secret for configuring the collector.
-- **Identity & Policy** — An identity and policy bound to the OTel Collector workload with `reveal` access to the secret.
+- **Standard Collector Workload** — Runs the collector in either a simple (knob-driven) or advanced (full custom config) mode.
+- **Secret** — An opaque secret holding the rendered collector configuration, mounted as a file.
+- **Identity & Policy** — An identity bound to the workload with `reveal` access to the config secret and — only when auth is enabled — the auth secret you name.
+- **Direct Load Balancer** *(optional)* — TCP passthrough on ports `4317`/`4318`, created only for public mTLS ingestion.
 
 <Note>
-This template does not create a GVC. You will need to deploy it to an existing GVC and enable tracing at the GVC level after installing, specifying the target workload and port. This will trigger a restart of all workloads in the GVC.
+This template does not create a GVC. You will need to deploy it into an existing GVC and enable tracing at the GVC level after installing, specifying the target workload and port. This will trigger a restart of all workloads in the GVC.
 </Note>
 
-## Installation
+## Prerequisites
 
-To install, follow the instructions for your preferred method:
+None for a default install. The two auth modes have prerequisites:
+
+- **Bearer auth** (`auth.method: bearer`) — an opaque secret holding the token, created **before** install (a missing secret leaves the deployment waiting on it). Set `auth.bearer.secretName` to its name:
+
+  ```bash
+  openssl rand -hex 32 | tr -d '\n' | cpln secret create-opaque --name my-otel-ingest-token --encoding plain -f -
+  ```
+
+- **mTLS auth** (`auth.method: mtls`) — a dictionary secret created **before** install with exactly the keys `cert` (server certificate), `key` (server private key), and `ca` (the CA that signed your client certificates). Set `auth.mtls.secretName` to its name:
+
+  ```yaml
+  kind: secret
+  name: my-otel-mtls-certs
+  type: dictionary
+  data:
+    cert: |-
+      -----BEGIN CERTIFICATE----- ...
+    key: |-
+      -----BEGIN PRIVATE KEY----- ...
+    ca: |-
+      -----BEGIN CERTIFICATE----- ...
+  ```
+
+Install the template using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -44,7 +77,209 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-Step 1 is completed while deploying the template. After deploying the template, complete the following steps to finish configuration:
+<Warning>
+The default `otelCollector.mode` changed from `advanced` to `simple` in template version 1.1.0. If you customized `advanced.config` while relying on the old default, set `mode: advanced` explicitly when upgrading.
+</Warning>
+
+The default `values.yaml` for this template:
+
+```yaml
+# IMPORTANT:
+# - Traces: after installing, enable tracing at the GVC level (triggers a restart of all workloads in the GVC).
+# - Metrics: set metrics.enabled=true and point remoteWrite.endpoint at any Prometheus-remote-write-compatible store.
+otelCollector:
+  image: otel/opentelemetry-collector-contrib:0.157.0
+  mode: simple # simple: structured config from the knobs below | advanced: advanced.config is used verbatim
+  replicas: 1 # stateless; 2+ runs an HA ingestion pool behind the same endpoint
+  resources:
+    cpu: 200m
+    memory: 256Mi
+
+  # Simple Mode
+  simple:
+    processors:
+      transform:
+        traceStatements: # Normalizes dynamic span URLs to a fixed value. Substitute PLACEHOLDER, e.g. 'user/profile'
+          - replace_pattern(span.attributes["http.url"], "^.*(PLACEHOLDER).*$", "/PLACEHOLDER")
+    spanmetrics:
+      histogram: # Span-duration histogram buckets — tune to your SLO thresholds
+        # Buckets MUST be duration strings ("250ms", "1s"). Bare numbers are
+        # parsed as NANOSECONDS by the collector, silently breaking the histogram.
+        buckets: ["1ms", "5ms", "10ms", "25ms", "50ms", "100ms", "250ms", "500ms", "1s", "2.5s", "5s"]
+        unit: ms # ms or s (output unit of the recorded histogram)
+
+  # Advanced Mode — full collector config, used verbatim when mode: advanced.
+  # Public ingestion contract in advanced mode: bind your authed receiver to
+  # 0.0.0.0:4318 (HTTP) / 0.0.0.0:4319 (gRPC); keep health_check on 0.0.0.0:13133 for probes.
+  advanced:
+    config: |
+      extensions:
+        health_check:
+          endpoint: 0.0.0.0:13133
+        pprof:
+          endpoint: 0.0.0.0:8180
+
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+
+      processors:
+        batch:
+        resource:
+          attributes:
+            - key: workload
+              from_attribute: service.name
+              action: insert
+        transform:
+          trace_statements:
+            - context: span
+              statements:
+                - replace_pattern(span.attributes["http.url"], "^.*(PLACEHOLDER).*$", "/PLACEHOLDER")
+
+      connectors:
+        spanmetrics:
+          dimensions:
+            - name: http.url
+            - name: http.method
+            - name: http.status_code
+          histogram:
+            explicit:
+              buckets: ["1ms", "5ms", "10ms", "25ms", "50ms", "100ms", "250ms", "500ms", "1s", "2.5s", "5s"]
+            unit: ms
+
+      exporters:
+        otlp:
+          endpoint: http://tracing.controlplane:80
+          tls:
+            insecure: true
+        prometheus:
+          endpoint: 0.0.0.0:8889
+
+      service:
+        pipelines:
+          traces:
+            receivers: [otlp]
+            processors: [resource, transform, batch]
+            exporters: [otlp, spanmetrics]
+          metrics:
+            receivers: [spanmetrics]
+            processors: [batch]
+            exporters: [prometheus]
+        extensions: [pprof, health_check]
+        telemetry:
+          logs:
+            level: INFO
+
+# ─── Metrics Ingestion (simple mode) ─────────────────────────────────────────
+metrics:
+  enabled: false # adds an OTLP→remote-write metrics pipeline (simple mode; in advanced mode define it in advanced.config)
+  remoteWrite:
+    endpoint: http://my-prometheus.my-gvc.cpln.local:9095/api/v1/write # any Prometheus-remote-write-compatible URL
+
+# ─── Ingestion Auth ──────────────────────────────────────────────────────────
+auth:
+  method: none # none | bearer | mtls — must not be none when publicAccess is enabled
+  bearer:
+    secretName: "" # opaque secret holding the token (e.g. my-otel-ingest-token) — create BEFORE install
+  mtls:
+    secretName: "" # dictionary secret with keys cert, key, ca (server cert/key + client CA) — create BEFORE install
+
+# ─── Access ──────────────────────────────────────────────────────────────────
+publicAccess:
+  enabled: false # public ingestion: bearer → canonical https endpoint; mtls → direct TCP 4317/4318
+  allowedCidrs: [] # REQUIRED when enabled — sender CIDRs, e.g. ["203.0.113.0/24"]; use ["0.0.0.0/0"] to explicitly allow all
+internalAccess:
+  type: same-gvc # who inside the org can reach the collector internally: none | same-gvc | same-org
+```
+
+### Mode and Replicas
+
+- `otelCollector.mode` — Set to `simple` (the default) for a structured configuration generated from the knobs below, or `advanced` to provide a fully customized configuration. In `advanced` mode, the entire `otelCollector.advanced.config` is passed to the collector verbatim.
+- `otelCollector.replicas` — The collector is stateless, so replicas need no coordination. Set `2` or more for an HA ingestion pool behind the same endpoint; ingestion keeps succeeding through rolling restarts and replica loss.
+
+### Simple Mode
+
+- `simple.processors.transform.traceStatements` — A list of `replace_pattern` statements that normalize dynamic URL segments in `http.url` span attributes. Replace `PLACEHOLDER` with the path segment you want to collapse, e.g. `user/profile`.
+- `simple.spanmetrics.histogram.buckets` — Span-duration histogram bucket boundaries. Tune these to align with your SLO thresholds.
+- `simple.spanmetrics.histogram.unit` — Output unit of the recorded histogram. Choose `ms` (milliseconds) or `s` (seconds).
+
+<Warning>
+Histogram buckets must be **duration strings** (`"250ms"`, `"1s"`). Bare numbers are parsed as **nanoseconds** by the collector, silently collapsing every span into the `+Inf` bucket. If you carried numeric buckets over from a 1.0.x install, convert them (e.g. `250` → `"250ms"`) when upgrading.
+</Warning>
+
+### Metrics Ingestion
+
+```yaml
+metrics:
+  enabled: true   # adds an OTLP → prometheus_remote_write pipeline (simple mode only)
+  remoteWrite:
+    endpoint: http://my-prometheus.my-gvc.cpln.local:9095/api/v1/write  # any Prometheus-remote-write-compatible URL
+```
+
+With `metrics.enabled: true`, OTLP metrics posted to the collector (internally, or publicly with auth) are pushed to the store at `metrics.remoteWrite.endpoint`. Any Prometheus-remote-write-compatible URL works — for example, this catalog's [Prometheus template](/template-catalog/templates/prometheus) receives remote write at `http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095/api/v1/write`, and a [Thanos](/template-catalog/templates/thanos) query tier on top gives you a global view of what lands there. One collector pushes to one store; run multiple installs for multiple targets.
+
+### Ingestion Auth
+
+```yaml
+auth:
+  method: bearer  # none | bearer | mtls — required (not none) for public ingestion
+  bearer:
+    secretName: my-otel-ingest-token  # opaque secret created BEFORE install (see Prerequisites)
+  mtls:
+    secretName: my-otel-mtls-certs    # dictionary secret (cert/key/ca) created BEFORE install
+```
+
+Auth applies to a dedicated `otlp/ingest` receiver on `4318` (HTTP) / `4319` (gRPC). The plain gRPC `:4317` receiver stays unauthenticated for the GVC tracing integration and is never exposed publicly.
+
+- **`bearer`** — Senders present `Authorization: Bearer <token>`; requests without the token (or with the wrong one) are rejected with `401`. Public bearer ingestion runs over the canonical HTTPS endpoint and is **HTTP-only** — OTLP/gRPC does not pass the canonical endpoint; use mTLS for public gRPC.
+- **`mtls`** — The collector serves your certificate and requires a client certificate signed by your CA; the TLS handshake itself rejects unauthenticated clients. Public mTLS ingestion runs over a direct TCP load balancer on `4318` (HTTP) and `4317` (gRPC); the canonical `https://` endpoint intentionally stops accepting traffic in this mode.
+
+### Access
+
+```yaml
+publicAccess:
+  enabled: true                     # bearer → canonical https endpoint; mtls → direct TCP 4317/4318
+  allowedCidrs: ["203.0.113.0/24"]  # REQUIRED when enabled; use ["0.0.0.0/0"] to explicitly allow all
+internalAccess:
+  type: same-gvc                    # none | same-gvc | same-org
+```
+
+Public ingestion always requires auth: enabling `publicAccess` with `auth.method: none` or an empty `allowedCidrs` fails at install — opening to the world requires an explicit `["0.0.0.0/0"]`. `internalAccess.type` controls which workloads inside the org can reach the collector internally (`none`, `same-gvc`, or `same-org`).
+
+### Advanced Mode
+
+The `advanced.config` block accepts a full [OpenTelemetry Collector configuration](https://opentelemetry.io/docs/collector/configuration/) and is fully authoritative. The shipped default config provides:
+
+| Component | Description |
+|-----------|-------------|
+| `receivers.otlp` | Accepts telemetry from your applications over gRPC on port `4317` and HTTP on `4318` |
+| `processors.resource` | Copies `service.name` into a `workload` attribute for easier filtering |
+| `processors.transform` | Normalizes dynamic URL segments in span attributes |
+| `connectors.spanmetrics` | Derives duration histograms and request metrics from trace spans |
+| `exporters.otlp` | Forwards traces to the Control Plane tracing backend |
+| `exporters.prometheus` | Exposes span-derived metrics for scraping on port `8889` |
+
+The `metrics.*` knobs are refused in advanced mode (the install fails rather than silently ignoring them). To ingest metrics, add the pipeline to your config yourself:
+
+```yaml
+exporters:
+  prometheus_remote_write:
+    endpoint: http://my-prometheus.my-gvc.cpln.local:9095/api/v1/write
+service:
+  pipelines:
+    metrics/otlp:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [prometheus_remote_write]
+```
+
+The `auth.*` and `publicAccess.*` knobs still wire the secret mounts, reveal policy, firewall, and load balancer in advanced mode, but your config must bind the authed receiver to `0.0.0.0:4318` (HTTP) / `0.0.0.0:4319` (gRPC) — certificate and token files are mounted at `/etc/otel-collector/tls/{server.crt,server.key,ca.crt}` and `/etc/otel-collector/auth/token`. Keep `health_check` on `0.0.0.0:13133` or readiness probes are skipped.
+
+## Setting Up Tracing
 
 **1. Normalize URL patterns (recommended)**
 
@@ -75,11 +310,9 @@ http://<otel-collector-workload-name>.<gvc-name>.cpln.local:4317
 
 Navigate to the GVC where the OpenTelemetry Collector is installed and enable tracing. Set the target workload on port `4317`. This triggers a restart of all workloads in the GVC so they begin emitting traces to the collector.
 
-
 **4. Query span metrics in Grafana**
 
-Span metrics are exposed via Prometheus on port `8889` of the collector workload which is configured and exposed by the workload.
-Use the `spanmetrics` connector to build dashboards and alerts. The metric name suffix automatically changes based on the unit defined in your configuration to ensure data consistency.
+Span metrics are exposed via Prometheus on port `8889` of the collector workload. Use the `spanmetrics` connector's output to build dashboards and alerts. The metric name suffix automatically changes based on the unit defined in your configuration:
 
 ```
 traces_span_metrics_duration_milliseconds_bucket{http_url="/your-endpoint"}
@@ -91,121 +324,30 @@ If you changed the unit to `s` in the histogram, the metric name changes to:
 traces_span_metrics_duration_seconds_bucket{http_url="/your-endpoint"}
 ```
 
-The default `values.yaml` for this template:
-```yaml
-# IMPORTANT:
-# After installing the collector, you must enable tracing at the GVC level which will trigger a restart on all workloads.
-otelCollector:
-  image: otel/opentelemetry-collector-contrib:0.148.0
-  mode: advanced # controls which config is used:
-               # - simple: minimal setup for quick deployment.
-               # - advanced: fully customizable configuration.
-  resources:
-    cpu: 200m
-    memory: 256Mi
+Span-metric series first appear roughly 60–90 seconds after the first span — the spanmetrics connector flushes on a 60-second interval, and `:8889` serves an empty response until then.
 
-  # Simple Mode
-  simple:
-    processors:
-      transform:
-        traceStatements: # Simplifies spans by replacing dynamic data with a fixed value. Substitute PLACEHOLDER with the URL segment you want to normalize, e.g. 'user/profile'
-          - replace_pattern(span.attributes["http.url"], "^.*(PLACEHOLDER).*$", "/PLACEHOLDER")
+## Connecting
 
-    spanmetrics:
-      histogram: # Histogram bucket boundaries in ms for span duration distribution — tune to match your SLO thresholds
-        buckets: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
-        unit: ms # Bucket values are interpreted in milliseconds (choose: ms or s)
+| Endpoint | Address | Auth |
+|---|---|---|
+| In-GVC OTLP gRPC (traces + metrics) | `RELEASE_NAME.GVC_NAME.cpln.local:4317` | None (GVC tracing target) |
+| In-GVC OTLP HTTP | `http://RELEASE_NAME.GVC_NAME.cpln.local:4318` | None, or bearer when auth is on (in mTLS mode use plain gRPC `:4317` instead) |
+| Public OTLP HTTP (bearer) | `https://CANONICAL_ENDPOINT/v1/traces`, `/v1/metrics` | `Authorization: Bearer <token>` |
+| Public OTLP (mTLS) | `DIRECT_LB_ENDPOINT:4318` (HTTP), `:4317` (gRPC) | Client certificate signed by your CA |
+| Spanmetrics scrape | `http://RELEASE_NAME.GVC_NAME.cpln.local:8889/metrics` | None |
 
-  # Advanced Mode
-  advanced:
-    config: |
-      extensions:
-        health_check:
-        pprof:
-          endpoint: 0.0.0.0:8180
+The canonical endpoint (and the direct load balancer endpoint in mTLS mode) is in `status.canonicalEndpoint` of `cpln workload get RELEASE_NAME -o yaml`. The bearer token is whatever you stored in your prerequisite secret. Use the full `.cpln.local` hostname for in-GVC senders.
 
-      receivers:
-        otlp:
-          protocols:
-            grpc:
-              endpoint: 0.0.0.0:4317
+## Important Notes
 
-      processors:
-        batch:
-        resource:
-          attributes:
-            - key: workload
-              from_attribute: service.name
-              action: insert
-        transform:
-          trace_statements:
-            - context: span
-              statements:
-                - replace_pattern(span.attributes["http.url"], "^.*(PLACEHOLDER).*$", "/PLACEHOLDER")
-
-      connectors:
-        spanmetrics:
-          dimensions:
-            - name: http.url
-            - name: http.method
-            - name: http.status_code
-          histogram:
-            explicit:
-              buckets: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
-            unit: ms
-
-      exporters:
-        debug:
-          verbosity: detailed
-        otlp:
-          endpoint: http://tracing.controlplane:80
-          tls:
-            insecure: true
-        prometheus:
-          endpoint: 0.0.0.0:8889
-
-      service:
-        pipelines:
-          traces:
-            receivers: [otlp]
-            processors: [resource, transform, batch]
-            exporters: [otlp, debug, spanmetrics]
-          metrics:
-            receivers: [spanmetrics]
-            processors: [batch]
-            exporters: [prometheus]
-
-        extensions: [pprof, health_check]
-
-        telemetry:
-          logs:
-            level: INFO
-```
-
-### Mode
-
-- `otelCollector.mode` — Set to `simple` for a minimal setup for quick deployment, or `advanced` to provide a fully customized configuration. In `advanced` mode, the entire `otelCollector.advanced.config` is passed directly to the collector.
-
-### Simple Mode
-
-- `simple.processors.transform.traceStatements` — A list of `replace_pattern` statements that normalize dynamic URL segments in `http.url` span attributes. Replace `PLACEHOLDER` with the path segment you want to collapse, e.g. `user/profile`.
-- `simple.spanmetrics.histogram.buckets` — Histogram bucket boundaries in milliseconds for span duration distribution. Tune these to align with your SLO thresholds.
-- `simple.spanmetrics.histogram.unit` — Unit for histogram bucket values. Choose `ms` (milliseconds) or `s` (seconds).
-
-### Advanced Mode
-
-The `advanced.config` block accepts a full [OpenTelemetry Collector configuration](https://opentelemetry.io/docs/collector/configuration/).
-
-
-| Component | Description |
-|-----------|-------------|
-| `receivers.otlp` | Accepts traces from your application over gRPC on port `4317` |
-| `processors.resource` | Copies `service.name` into a `workload` attribute for easier filtering |
-| `processors.transform` | Normalizes dynamic URL segments in span attributes |
-| `connectors.spanmetrics` | Derives duration histograms and request metrics from trace spans |
-| `exporters.otlp` | Forwards traces to the Control Plane tracing backend |
-| `exporters.prometheus` | Exposes span-derived metrics for scraping on port `8889` |
-| `exporters.debug` | Logs spans to the workload's stdout — useful during development |
+- **The default `mode` changed from `advanced` to `simple` in template version 1.1.0** — if you customized `advanced.config` while relying on the old default, set `mode: advanced` explicitly when upgrading.
+- **Histogram buckets must be duration strings** (`"250ms"`, `"1s"`) — bare numbers are parsed as nanoseconds, which silently breaks the histogram.
+- Enable tracing at the GVC level after install (target the collector workload, port `4317`); this restarts all workloads in the GVC.
+- Public ingestion requires auth: `publicAccess.enabled` with `auth.method: none` or an empty `allowedCidrs` fails at install — opening to the world requires an explicit `["0.0.0.0/0"]`.
+- Create the auth secret before installing — a missing secret leaves the deployment waiting on it.
+- mTLS uses the direct load balancer (raw TCP), not the canonical endpoint; in mTLS mode the canonical `https://` endpoint intentionally stops accepting traffic.
+- **In mTLS mode, in-GVC senders must use the plain internal gRPC port `:4317`** — the TLS-terminating ingest ports (`4318`/`4319`) are reachable only by external clients via the direct load balancer.
+- One collector pushes to one remote-write store; run multiple installs for multiple targets.
 
 ## External References
 
@@ -216,8 +358,14 @@ The `advanced.config` block accepts a full [OpenTelemetry Collector configuratio
     <Card title="OTel SDK Setup" icon="book" href="https://opentelemetry.io/docs/languages/">
     Language-specific SDK guides for instrumenting your application
     </Card>
-    <Card title="Spanmetrics Connector" icon="book" href="https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/connector/spanmetricsconnector">
+    <Card title="Spanmetrics Connector" icon="chart-line" href="https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/connector/spanmetricsconnector">
     Reference for the spanmetrics connector configuration
+    </Card>
+    <Card title="Prometheus Remote Write Exporter" icon="database" href="https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/prometheusremotewriteexporter">
+    Reference for the prometheusremotewrite exporter
+    </Card>
+    <Card title="OTLP Specification" icon="file-lines" href="https://opentelemetry.io/docs/specs/otlp/">
+    The OpenTelemetry protocol specification
     </Card>
     <Card title="OTel Collector Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/otel-collector">
     View the source files, default values, and chart definition
