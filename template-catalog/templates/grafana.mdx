@@ -1,0 +1,524 @@
+---
+title: Grafana
+description: Deploy Grafana OSS on Control Plane using the Template Catalog. Dashboards and alerting over your own datasources, backed by a highly available PostgreSQL app database, with datasource provisioning as code and multi-replica alerting HA coordinated by Redis Sentinel.
+keywords: ['grafana oss', 'promql', 'datasource provisioning', 'alert rules', 'alertmanager', 'kibana alternative', 'chronograf alternative', 'metrics visualization', 'time series dashboards', 'redis sentinel', 'prometheus datasource', 'thanos datasource', 'self-hosted', 'observability', 'grafana template']
+---
+
+## Overview
+
+Grafana is the open-source (AGPL-3.0) dashboarding and alerting front end for time-series and SQL data. This template deploys Grafana OSS as a stateless app tier backed by a highly available PostgreSQL app database — every dashboard, user, alert rule, and saved datasource lives in that database, so the Grafana workload itself holds no state and can run multiple replicas.
+
+This template exists to visualize **data you own**: the catalog's [Prometheus](/template-catalog/templates/prometheus), [Thanos](/template-catalog/templates/thanos), and [Grafana Mimir](/template-catalog/templates/mimir) installs, your own SQL databases, and external systems. It is not an observability stack in itself — it ships no collectors, no exporters, and no data.
+
+<Info>
+**This template ships zero dashboards and zero datasources.** A fresh install has an empty dashboard list and an empty datasource list — you connect your own datasources (in the UI or [as code](#provisioning-datasources)) and build or import your own dashboards. Control Plane's console already provides built-in workload-metrics dashboards for every workload; this template is for the data those dashboards do not cover.
+</Info>
+
+### Architecture
+
+- **Grafana** — A stateless standard workload serving the UI and HTTP API on port `3000`. The `replicas` knob controls how many instances run; all replicas share the same PostgreSQL app database.
+- **PostgreSQL (HA, default)** — The [postgres-highly-available](/template-catalog/templates/postgres-highly-available) template as a subchart: 3× Patroni PostgreSQL, 3× etcd, and a HAProxy leader-routing endpoint Grafana connects through.
+- **PostgreSQL (dev/lightweight, optional)** — The single-instance [postgres](/template-catalog/templates/postgres) template instead, for lighter non-HA deployments.
+- **Redis Sentinel (optional)** — The [redis](/template-catalog/templates/redis) template as a subchart in Sentinel mode. Grafana's alerting HA uses it to coordinate alert evaluation across replicas, so exactly one notification is sent per alert. Required when `replicas` is 2 or more.
+- **Hardened defaults** — User signup, anonymous access, and upstream telemetry are all disabled. When public access is on, Grafana's `root_url` is derived automatically from the canonical endpoint.
+
+### What Gets Created
+
+- **Standard Grafana Workload** — `replicas` stateless instances serving the UI and API on port `3000`.
+- **Database Workloads** — HA mode: a stateful Patroni PostgreSQL workload, a stateful etcd workload, and a standard HAProxy leader-routing workload. Single mode: one stateful PostgreSQL workload.
+- **Redis Workloads** *(optional)* — A Redis workload and a Sentinel workload (3 replicas each by default) when `redis.enabled` is true.
+- **Volume Sets** — The database subchart's persistent volumes (10 GiB per replica by default), plus the etcd volumes in HA mode. Grafana itself has none.
+- **Secrets** — A dictionary secret holding the admin bootstrap credentials and the datasource-encryption key, the database credentials created by the subchart, and — only when `datasources.definitions` is set — an opaque secret holding the rendered datasource provisioning file.
+- **Identity & Policy** — A least-privilege policy granting the Grafana identity `reveal` on exactly the secrets it uses, including any prerequisite datasource-credential or SMTP secrets you name.
+- **Cron Backup Workload** *(optional)* — When database backups are enabled.
+
+<Note>
+This template does not create a GVC. You must deploy it into an existing GVC.
+</Note>
+
+## Prerequisites
+
+A default install has no prerequisites. Three optional features each need a secret or a bucket created **before** you install:
+
+| Feature | What you must create first |
+|---|---|
+| Credentialed provisioned datasources | One [dictionary secret](/guides/create-secret/dictionary) per entry in `datasources.credentialSecrets`, holding the credential keys |
+| Authenticated SMTP | An [opaque secret](/guides/create-secret/opaque) with encoding `plain` holding the SMTP password, named in `smtp.passwordSecretName` |
+| Database backups | A bucket and access setup on AWS S3, Google Cloud Storage, or an S3-compatible server — see [Backing Up](#backing-up) |
+
+<Warning>
+Change `admin.password`, `admin.secretKey`, and the database password before installing — all three ship with `change-me` placeholder defaults. `admin.user` and `admin.password` are applied on first boot only, and `admin.secretKey` is effectively write-once: it encrypts every datasource credential stored in the database, so rotating it later makes those credentials undecryptable.
+</Warning>
+
+Install the template using your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Choosing a Database Mode
+
+Exactly one of the two database modes must be enabled — the chart enforces this at render and fails the install with a clear message otherwise.
+
+| | `postgresHA` (default) | `postgres` |
+|---|---|---|
+| What runs | 3× Patroni PostgreSQL, 3× etcd, HAProxy leader endpoint | One single-replica PostgreSQL workload |
+| Database failover | Automatic (Patroni leader election) | None |
+| Footprint | 8 replicas across 3 workloads | 1 workload |
+| Best for | Production | Development and lightweight installs |
+
+In HA mode the full stack converges in roughly 6 minutes on a fresh install: etcd comes up first, then the PostgreSQL cluster and its HAProxy endpoint, then Grafana runs its schema migrations. Single mode is faster.
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+image: grafana/grafana:13.1.1
+
+replicas: 1 # 1 = single instance; >=2 = HA tier over shared Postgres (requires redis.enabled: true)
+
+resources:
+  cpu: 1000m
+  memory: 1Gi
+  minCpu: 500m
+  minMemory: 512Mi
+
+admin:
+  user: admin
+  password: change-me-grafana-1 # initial admin login password
+  # Encrypts datasource credentials stored in the DB (AES-256). Set once BEFORE
+  # install and never change it — rotating breaks every saved datasource secret.
+  secretKey: change-me-grafana-secret-key
+
+# Grafana datasource provisioning entries, passed through verbatim. Point them at
+# YOUR datasources (prometheus/thanos/mimir templates, your DBs, external APIs).
+datasources:
+  definitions: []
+  # - name: Prometheus
+  #   type: prometheus
+  #   access: proxy
+  #   url: http://RELEASE-prometheus.GVC.cpln.local:9095 # prometheus template
+  #   isDefault: true
+  # - name: Thanos
+  #   type: prometheus
+  #   access: proxy
+  #   url: http://RELEASE-thanos.GVC.cpln.local:10902 # thanos Query template
+  # - name: AppDB
+  #   type: postgres
+  #   url: my-db-host:5432
+  #   user: grafana_reader
+  #   jsonData: { database: appdb, sslmode: disable }
+  #   secureJsonData:
+  #     password: $PG_PASSWORD # interpolated from credentialSecrets below
+
+  # Credential env exposure: user-created dictionary secrets (MUST EXIST BEFORE
+  # INSTALL when listed). Each key becomes an env var referenced as $KEY above.
+  credentialSecrets: []
+  # - name: my-grafana-ds-credentials
+  #   keys: [PG_PASSWORD]
+
+smtp: # alert notification emails
+  enabled: false
+  host: smtp.example.com:587 # host:port
+  user: "" # empty = unauthenticated SMTP
+  passwordSecretName: "" # opaque secret (encoding: plain) with the SMTP password; create BEFORE install
+  fromAddress: grafana@example.com
+  fromName: Grafana
+
+publicAccess:
+  enabled: true # UI on the canonical *.cpln.app HTTPS endpoint
+
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # used with workload-list
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+postgresHA: # default: highly available PostgreSQL app database
+  enabled: true
+  postgres:
+    username: grafana
+    password: change-me-grafana-db-password # change before installing
+    database: grafana
+  replicas: 3
+  volumeset:
+    capacity: 10 # initial capacity in GiB per replica (minimum is 10)
+
+  backup: # optional database backups — see Backing Up
+    enabled: false
+    mode: logical # logical or wal-g
+    resources:
+      cpu: 100m
+      memory: 128Mi
+    logical:
+      image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
+      schedule: "0 2 * * *"
+    walg:
+      intervalSeconds: 21600
+    provider: aws # options: aws, gcp, minio
+    aws:
+      bucket: grafana-pg-backup-bucket
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account
+      policyName: grafana-pg-backup-policy
+      prefix: postgres/backups
+    gcp:
+      bucket: grafana-pg-backup-bucket
+      cloudAccountName: my-gcs-cloud-account
+      prefix: postgres/backups
+    minio:
+      endpoint: http://my-minio-workload:9000
+      bucket: grafana-pg-backup-bucket
+      accessKey: my-minio-username
+      secretKey: my-minio-password
+      prefix: postgres/backups
+
+postgres: # dev/lightweight: single-instance PostgreSQL (disable postgresHA first)
+  enabled: false
+  config:
+    username: grafana
+    password: change-me-grafana-db-password # change before installing
+    database: grafana
+  volumeset:
+    capacity: 10 # initial capacity in GiB (minimum is 10)
+
+  backup: # optional database backups — see Backing Up
+    enabled: false
+    image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0
+    schedule: "0 2 * * *"
+    resources:
+      cpu: 100m
+      memory: 128Mi
+    provider: aws # options: aws, gcp, minio
+    aws:
+      bucket: grafana-pg-backup-bucket
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account
+      policyName: grafana-pg-backup-policy
+      prefix: postgres/backups
+    gcp:
+      bucket: grafana-pg-backup-bucket
+      cloudAccountName: my-gcs-cloud-account
+      prefix: postgres/backups
+    minio:
+      endpoint: http://my-minio-workload:9000
+      bucket: grafana-pg-backup-bucket
+      accessKey: my-minio-username
+      secretKey: my-minio-password
+      prefix: postgres/backups
+
+redis: # Sentinel-mode Redis — alerting-HA coordination; required when replicas >= 2
+  enabled: false
+  redis:
+    image: redis:7.4
+    replicas: 3
+    resources:
+      cpu: 200m
+      memory: 256Mi
+      minCpu: 80m
+      minMemory: 128Mi
+  sentinel:
+    image: redis:7.4
+    replicas: 3
+    resources:
+      cpu: 200m
+      memory: 256Mi
+      minCpu: 80m
+      minMemory: 128Mi
+```
+
+### Grafana Instance
+
+- `image` — The Grafana OSS container image.
+- `replicas` — Number of Grafana instances. `1` is a single instance; `2` or more forms an HA tier over the shared app database and **requires `redis.enabled: true`** — see [High Availability](#high-availability).
+- `resources` — CPU and memory for the Grafana container.
+- `admin.user` / `admin.password` — The initial admin login, applied on **first boot only**. Changing them after install does not modify the existing account — change the password inside Grafana instead. The default `admin`/`admin` login does not work; the values you set are what apply.
+- `admin.secretKey` — The key Grafana uses to encrypt datasource credentials at rest in the app database. Set it once before installing and never rotate it: every saved datasource secret is encrypted with it, and a changed key makes them undecryptable.
+
+Signup (`GF_USERS_ALLOW_SIGN_UP`), anonymous access, and upstream analytics/update checks are disabled by the template and are not configurable.
+
+### Access
+
+- `publicAccess.enabled` — Serve the UI and API on the canonical `*.cpln.app` HTTPS endpoint (default). Everything behind the endpoint is gated by Grafana's own login, and Grafana's `root_url` is set to that endpoint automatically. Set to `false` for an internal-only instance — external requests are then refused at the edge while in-GVC callers still reach it per `internalAccess`.
+- `internalAccess.type` — Internal firewall scope of the Grafana workload:
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access. |
+| `same-gvc` | Allow access from all workloads in the same GVC (default). |
+| `same-org` | Allow access from all workloads in the same organization. |
+| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
+
+Firewall changes applied by an upgrade take up to about 30 seconds to propagate.
+
+### App Database
+
+Enable exactly one of `postgresHA` (production, default) or `postgres` (dev/lightweight) — see [Choosing a Database Mode](#choosing-a-database-mode). In both modes, **change the database password before installing** (`postgresHA.postgres.password` / `postgres.config.password`). Grafana is wired to the active database automatically: the HAProxy leader endpoint in HA mode, or the single instance directly in dev mode. In HA mode `postgresHA.proxy.enabled` must stay `true` — that HAProxy endpoint is Grafana's stable database address, and disabling it is rejected at render.
+
+### High Availability
+
+Grafana holds no local state, so scaling the app tier is a matter of raising `replicas`. Alert evaluation is the one thing that must be coordinated: without coordination every replica would evaluate the same rule and send its own notification.
+
+```yaml
+replicas: 2   # any value >= 2
+redis:
+  enabled: true   # required when replicas >= 2
+```
+
+- Coordination uses Grafana's **Redis-Sentinel alerting HA mode** — the Sentinel workload deployed by the `redis` subchart, not gossip-based peer clustering. Each replica registers itself under its own peer name, and exactly one notification is delivered per firing alert.
+- The chart refuses to render `replicas >= 2` without `redis.enabled: true`.
+- Redis and Sentinel ship without authentication — the same-GVC internal firewall is the boundary. Enabling Redis or Sentinel auth is rejected at render in this version.
+- Multi-replica behavior verified in testing: a full rolling restart and a killed replica both served every request without a single non-200 response, and a killed replica was replaced in about 98 seconds.
+
+### SMTP
+
+Grafana sends alert notification emails through the SMTP server you configure. Leave `smtp.enabled: false` if you use webhook, chat, or other contact points instead.
+
+```yaml
+smtp:
+  enabled: true
+  host: smtp.example.com:587   # host:port
+  user: mailer                 # omit for unauthenticated SMTP
+  passwordSecretName: my-smtp-password   # pre-created opaque secret (encoding: plain)
+  fromAddress: grafana@example.com
+  fromName: Grafana
+```
+
+`smtp.passwordSecretName` is required whenever `smtp.user` is set. The password stays in the [opaque secret](/guides/create-secret/opaque) — it never passes through Helm values — and the chart grants the Grafana identity `reveal` on exactly that secret.
+
+## Provisioning Datasources
+
+You can add datasources in the UI at any time. `datasources.definitions` additionally lets you declare them as code: each entry is a standard [Grafana datasource provisioning](https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources) entry, rendered verbatim into a provisioning file that the workload mounts at startup.
+
+<Note>
+Provisioned datasources are read-only in the Grafana UI. To change one, change the value and upgrade the release.
+</Note>
+
+For catalog services running in the same GVC, use their internal endpoints:
+
+```yaml
+datasources:
+  definitions:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      url: http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095   # prometheus template
+      isDefault: true
+    - name: Thanos
+      type: prometheus
+      access: proxy
+      url: http://RELEASE_NAME-thanos.GVC_NAME.cpln.local:10902      # thanos Query template
+```
+
+### Datasource Credentials
+
+Credentials for provisioned datasources never go into Helm values. Put them in a [dictionary secret](/guides/create-secret/dictionary) you create before installing, list the secret under `datasources.credentialSecrets`, and reference each key as `$KEY` in the provisioning entry. Every listed key is exposed to the container as an environment variable, Grafana interpolates it when it loads the provisioning file, and the chart grants the workload `reveal` on exactly that secret.
+
+<Steps>
+  <Step title="Create the dictionary secret">
+    Create a [dictionary secret](/guides/create-secret/dictionary) — for example `my-grafana-ds-credentials` with the key `PG_PASSWORD` — **before** installing.
+  </Step>
+  <Step title="List it under credentialSecrets">
+    Add the secret name and the keys you want exposed to `datasources.credentialSecrets`.
+  </Step>
+  <Step title="Reference the key in the definition">
+    Use `$PG_PASSWORD` wherever the credential belongs in the provisioning entry.
+  </Step>
+</Steps>
+
+```yaml
+datasources:
+  definitions:
+    - name: AppDB
+      type: postgres
+      url: my-db-host:5432
+      user: grafana_reader
+      jsonData: { database: appdb, sslmode: disable }
+      secureJsonData:
+        password: $PG_PASSWORD
+  credentialSecrets:
+    - name: my-grafana-ds-credentials
+      keys: [PG_PASSWORD]
+```
+
+The provisioning file itself only ever contains the literal `$PG_PASSWORD` placeholder — the value stays in the secret.
+
+### Control Plane Metrics as a Datasource
+
+Control Plane's own metrics store is Prometheus-compatible and holds more than the console's built-in dashboards display, including [custom metrics](/reference/workload/custom-metrics) your workloads expose, cost-relevant series such as `egress`, `cross_zone_traffic`, and `volume_set_*`, and cron and stability counters. Adding it as a datasource complements the built-in workload dashboards rather than replacing them — reach for it when you need custom application metrics, cost views, alerting you own and route yourself, or a single pane that mixes platform metrics with your other datasources.
+
+Follow the [centralized metrics management guide](/guides/centralized-metrics-management) for the endpoint details, then wire the token in as a datasource credential:
+
+<Steps>
+  <Step title="Create a service account with readMetrics">
+    Create a service account granted the `readMetrics` permission on the org and generate a key for it.
+  </Step>
+  <Step title="Store the key in a dictionary secret">
+    Put the key in a [dictionary secret](/guides/create-secret/dictionary) — for example under the key `CPLN_METRICS_TOKEN` — and list the secret under `datasources.credentialSecrets`.
+  </Step>
+  <Step title="Add the datasource definition">
+    Point a `prometheus`-type datasource at `https://metrics.cpln.io/metrics/org/YOUR_ORG` and send the token as an `Authorization` header.
+  </Step>
+</Steps>
+
+```yaml
+datasources:
+  definitions:
+    - name: Control Plane metrics
+      type: prometheus
+      access: proxy
+      url: https://metrics.cpln.io/metrics/org/YOUR_ORG
+      jsonData:
+        httpHeaderName1: Authorization
+      secureJsonData:
+        httpHeaderValue1: Bearer $CPLN_METRICS_TOKEN
+  credentialSecrets:
+    - name: my-grafana-ds-credentials
+      keys: [CPLN_METRICS_TOKEN]
+```
+
+<Warning>
+A workload's built-in `CPLN_TOKEN` does **not** authenticate against the metrics endpoint. Use a service-account key with the `readMetrics` permission.
+</Warning>
+
+## Connecting
+
+| What | Value |
+|---|---|
+| UI / API (public) | `https://<canonical>.cpln.app` — `status.canonicalEndpoint` of `{release}-grafana` |
+| Internal (same GVC) | `http://{release}-grafana.{gvc}.cpln.local:3000` |
+| Login | `admin.user` / `admin.password` |
+| App database (internal, HA mode) | `{release}-postgres-ha-proxy.{gvc}.cpln.local:5432`, credentials in the `{release}-postgres-config` secret |
+| App database (internal, single mode) | `{release}-postgres.{gvc}.cpln.local:5432`, credentials in the `{release}-pg-config` secret |
+
+Health and readiness are served at `/api/health`, which reports the Grafana version and the app-database status:
+
+```bash
+curl -s https://<canonical>.cpln.app/api/health
+```
+
+The [Grafana HTTP API](https://grafana.com/docs/grafana/latest/developers/http_api/) is available on the same endpoint for scripted dashboard, datasource, and alert-rule management.
+
+## Backing Up
+
+Database backups are optional and disabled by default. They cover the app database — the dashboards, users, alert rules, and saved datasources that make up your Grafana instance. Enable them with `postgresHA.backup.enabled` or `postgres.backup.enabled` (matching your database mode), and complete the storage setup for your provider **before** installing. The values below are shown under `backup.*` — set them within the enabled database block.
+
+<Tabs>
+  <Tab title="AWS S3">
+    <Steps>
+      <Step title="Create a bucket">
+        Create an S3 bucket. Set `backup.aws.bucket` and `backup.aws.region` to match.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `backup.aws.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        Create an AWS IAM policy with the JSON below (replace `YOUR_BUCKET`), then set `backup.aws.policyName` to the policy's name:
+
+        ```json
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Action": [
+              "s3:ListBucket",
+              "s3:GetBucketLocation",
+              "s3:GetObject",
+              "s3:GetObjectVersion",
+              "s3:PutObject",
+              "s3:DeleteObject",
+              "s3:DeleteObjectVersion",
+              "s3:AbortMultipartUpload"
+            ],
+            "Resource": [
+              "arn:aws:s3:::YOUR_BUCKET",
+              "arn:aws:s3:::YOUR_BUCKET/*"
+            ]
+          }]
+        }
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    <Steps>
+      <Step title="Create a bucket">
+        Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your GCP project. Set `backup.gcp.cloudAccountName` to its name — the backup identity reaches the bucket keylessly, with no stored credentials.
+      </Step>
+    </Steps>
+    <Warning>
+    Grant the `Storage Admin` role to the GCP service account created for the Cloud Account (`roles/storage.objectAdmin` scoped to the bucket also works).
+    </Warning>
+  </Tab>
+  <Tab title="S3-compatible (MinIO, R2, Wasabi)">
+    <Steps>
+      <Step title="Create a bucket">
+        Create your bucket on the server. Set `backup.minio.bucket` to its name.
+      </Step>
+      <Step title="Set the endpoint">
+        Set `backup.minio.endpoint` to the S3 API address including port. For the [MinIO](/template-catalog/templates/minio) template deployed in the same GVC, this is `http://WORKLOAD_NAME:9000`.
+      </Step>
+      <Step title="Set credentials">
+        Set `backup.minio.accessKey` and `backup.minio.secretKey` to credentials with access to the bucket.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+In HA mode, `backup.mode` selects `logical` (scheduled `pg_dump` via a cron workload) or `wal-g` (continuous WAL archiving). The single-instance mode takes scheduled logical dumps.
+
+## Important Notes
+
+- **Change `admin.password`, `admin.secretKey`, and the database password before installing.** The admin login applies on first boot only, and `admin.secretKey` is effectively write-once — rotating it makes every stored datasource credential undecryptable.
+- **This template ships no dashboards and no datasources.** It is the pane for data you own; Control Plane's console already provides built-in workload-metrics dashboards, so there is no reason to recreate those here.
+- **Scaling requires Redis** — set `replicas >= 2` together with `redis.enabled: true`. The chart refuses to render multi-replica without it, because Sentinel-coordinated alerting is what keeps one firing alert from producing one notification per replica.
+- **Dashboards, users, and alert rules live in the app database** and survive Grafana restarts, redeployments, and replica replacement. **Uninstall deletes the database volume sets** — enable backups if the data matters.
+- **Prerequisite secrets you create are not owned by the release** — datasource-credential and SMTP secrets survive `helm uninstall` and must be deleted manually if you no longer need them.
+- **With `publicAccess.enabled: false`, Grafana's `root_url` is not derived** from a canonical endpoint, so absolute links in alert emails from an internal-only instance point at localhost. Keep public access on if you rely on links in email notifications.
+- **Grafana Live push updates are per-instance** in multi-replica mode; dashboard auto-refresh and alerting are unaffected.
+- **This template ships Grafana OSS only** — Enterprise features such as fine-grained RBAC, reporting, and query caching are not available.
+
+## External References
+
+<CardGroup cols={2}>
+    <Card title="Grafana Documentation" icon="book" href="https://grafana.com/docs/grafana/latest/">
+    Official Grafana documentation
+    </Card>
+    <Card title="Provisioning Datasources" icon="database" href="https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources">
+    Reference for the datasource provisioning entries used by this template
+    </Card>
+    <Card title="Alerting High Availability" icon="bell" href="https://grafana.com/docs/grafana/latest/alerting/set-up/configure-high-availability/">
+    How Grafana coordinates alert evaluation across replicas
+    </Card>
+    <Card title="Configuration Reference" icon="gear" href="https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/">
+    Every Grafana setting and its environment-variable name
+    </Card>
+    <Card title="Grafana HTTP API" icon="code" href="https://grafana.com/docs/grafana/latest/developers/http_api/">
+    Manage dashboards, datasources, and alert rules programmatically
+    </Card>
+    <Card title="Grafana Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/grafana">
+    View the source files, default values, and chart definition
+    </Card>
+</CardGroup>
