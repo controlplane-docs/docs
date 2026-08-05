@@ -223,7 +223,7 @@ When moving or renaming pages, add a redirect entry in `docs.json` under the `re
 These are the most common sources of documentation errors:
 
 1. **Scale to zero** is ONLY for Serverless workloads with `rps` or `concurrency` strategies
-2. **Capacity AI** does NOT work with Stateful workloads or CPU autoscaling
+2. **Capacity AI** works on every workload type but does NOT work with CPU autoscaling, multi-metric autoscaling, or GPUs
 3. **Secret access** requires three steps: identity + policy + reference (all three mandatory)
 4. **Identities** are GVC-scoped, a workload can reference only one, but an identity can be shared across multiple workloads in the same GVC. One cloud account per provider
 5. **Pull secrets** are GVC-level, not per-workload. A pull secret assigned to a GVC allows all workloads in that GVC to pull images from the configured registry (Docker Hub, ECR, GCR, etc.)
