@@ -115,7 +115,7 @@ A workload without firewall config cannot reach its database, be reached by user
 | --- | --- | --- | --- | --- |
 | Scale to zero | `rps` or `concurrency` | KEDA only | KEDA only | No |
 | Ports | Exactly 1 container × 1 port (required) | 0 or more | 0 or more | Must NOT expose any |
-| Capacity AI | Yes (default) | Yes (default) | **Always disabled** | N/A |
+| Capacity AI | Yes (default) | Yes (default) | Supported | Yes (default), applied at the next run |
 | Persistent volumes | No | No | Yes (volume sets) | No |
 | `replicaDirect` LB | No | No | **Only this type** | No |
 | `spec.job` | Forbidden | Forbidden | Forbidden | Required |
@@ -125,8 +125,8 @@ A workload without firewall config cannot reach its database, be reached by user
 | Max containers per workload | 8 | 8 | 8 | 8 |
 
 - **Workload type is immutable.** Changing type requires delete + recreate. Capture state first: `cpln workload get NAME --gvc GVC -o yaml-slim > NAME.bak.yaml`.
-- **Capacity AI** is incompatible with: Stateful, CPU autoscaling, multi-metric autoscaling, GPUs.
-- **Cron** deploys to ALL GVC locations with no overrides. `spec.job` with `schedule` required; probes, autoscaling, `timeoutSeconds`, `capacityAI`, `debug` ignored.
+- **Capacity AI** works on every workload type (on by default for Standard, Serverless, and Cron). It is incompatible with: CPU autoscaling, multi-metric autoscaling, GPUs.
+- **Cron** deploys to ALL GVC locations with no overrides. `spec.job` with `schedule` required; probes, autoscaling, `timeoutSeconds`, `debug` ignored. `capacityAI` applies and is on by default, taking effect at the next scheduled run.
 - **Workload name** max 49 chars; cannot end with `-headless`.
 - For container name reservations, probe XOR rules, GPU constraints, and full validation, fetch [/reference/workload/general](https://docs.controlplane.com/reference/workload/general) when authoring manifests.
 
