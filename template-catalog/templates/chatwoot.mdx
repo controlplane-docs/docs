@@ -1,0 +1,613 @@
+---
+title: Chatwoot
+description: Deploy Chatwoot on Control Plane using the Template Catalog. Open-source customer engagement with a live-chat widget, shared inboxes, and an omni-channel agent desk, backed by a Sidekiq worker, a pgvector-capable PostgreSQL, and a bundled Redis.
+keywords: ['chatwoot', 'live chat', 'chat widget', 'customer support', 'help desk', 'shared inbox', 'omnichannel', 'intercom alternative', 'zendesk alternative', 'freshdesk alternative', 'crisp alternative', 'sidekiq', 'actioncable', 'websockets', 'chatwoot template']
+---
+
+## Overview
+
+Chatwoot is an open-source customer engagement platform — an embeddable live-chat widget, a shared email inbox, and an omni-channel agent desk in one application. This template deploys the **Community Edition** (`-ce`, MIT core): a Rails web tier serving the dashboard, REST API, widget, and WebSockets on port `3000`, a Sidekiq worker for background jobs and migrations, a bundled single-node Redis, and a highly available pgvector-capable PostgreSQL cluster. Attachments go to a persistent volume or to object storage.
+
+### Architecture
+
+- **Chatwoot web** — A stateful workload running the official image, serving the agent dashboard, the REST and public APIs, the chat widget, and the ActionCable WebSocket endpoint on port `3000`. Scale it with `chatwoot.replicas`.
+- **Chatwoot worker** — A standard workload running Sidekiq from the same image. It also runs the database migrations and the first-run bootstrap on boot, so it is a fixed single replica; background throughput scales through `worker.concurrency` instead.
+- **PostgreSQL (HA, default)** — The [postgres-highly-available](/template-catalog/templates/postgres-highly-available) template as a subchart: 3× Patroni PostgreSQL 17.5, 3× etcd, and a HAProxy leader endpoint Chatwoot connects through. Its image ships **pgvector**, which Chatwoot's schema requires.
+- **PostgreSQL (dev/lightweight, optional)** — The single-instance [postgres](/template-catalog/templates/postgres) template instead, on a pgvector image.
+- **Redis** — A bundled single-node stateful workload with AOF persistence and password authentication, carrying the Sidekiq queues, the ActionCable pub/sub channel that drives every live update, the cache, and the one-time install-onboarding flag.
+
+### What Gets Created
+
+- **Stateful Chatwoot Web Workload** — `{release}-chatwoot` on port `3000`, at `chatwoot.replicas` replicas, with `/api` as its readiness probe and `/health` as its liveness probe.
+- **Standard Chatwoot Worker Workload** — `{release}-chatwoot-worker`, a fixed single replica running Sidekiq, migrations, and the first-run bootstrap. It has no inbound access and no ports.
+- **Stateful Redis Workload** — `{release}-chatwoot-redis` on port `6379`, pinned to one node, reachable only from inside the GVC.
+- **Database Workloads** — HA mode: a stateful Patroni PostgreSQL workload, a stateful etcd workload, and a HAProxy leader-routing workload. Single-instance mode: one stateful PostgreSQL workload.
+- **Volume Sets** — `{release}-chatwoot-redis-vs` for the Redis AOF file at `/data`, `{release}-chatwoot-storage` for local attachments at `/app/storage` (only when `storage.type` is `local`), plus the database subchart's volumes.
+- **Secrets** — A template-created dictionary secret (`{release}-chatwoot-creds`) holding the bundled Redis password, two opaque start-script secrets for the web and worker containers, and the database credentials from the subchart. Your prerequisite keys secret is *not* created by the template — see [Prerequisites](#prerequisites).
+- **Identity & Policy** — One identity shared by the web and worker workloads, and a policy granting it `reveal` on exactly the secrets those workloads read: the database credentials, the two start scripts, the Redis credentials secret, your prerequisite secret, and — when configured — the S3 key and SMTP secrets. In keyless S3 mode the identity also carries the cloud account link and your bucket-scoped IAM policy.
+
+<Note>
+This template does not create a GVC. You must deploy it into an existing GVC.
+</Note>
+
+## Prerequisites
+
+Chatwoot signs its sessions and encrypts sensitive columns with four keys that you supply through a [dictionary secret](/guides/create-secret/dictionary) created **before** installing. The values are never passed through Helm values.
+
+<Steps>
+  <Step title="Create the keys secret">
+    All four keys are required. Generate them with `openssl`:
+
+    ```bash
+    cpln secret create-dictionary --name my-chatwoot-secrets \
+      --entry SECRET_KEY_BASE="$(openssl rand -hex 64)" \
+      --entry ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY="$(openssl rand -hex 16)" \
+      --entry ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY="$(openssl rand -hex 16)" \
+      --entry ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT="$(openssl rand -hex 16)"
+    ```
+
+    Set `secrets.name` to the secret's name (default `my-chatwoot-secrets`). Secrets are org-level, so no GVC flag is involved.
+  </Step>
+  <Step title="Back the values up">
+    Store a copy somewhere safe, outside Control Plane. All four keys are write-once for the life of the installation.
+  </Step>
+  <Step title="Change the bundled credentials">
+    Change the database password (`postgresHA.postgres.password` or `postgres.config.password`) and the Redis password (`redis.auth.password`) from their placeholder defaults before installing. Both seed their component on first boot and are not updated by later value edits.
+  </Step>
+</Steps>
+
+<Warning>
+Create the keys secret **before** installing — the workloads reference it by name, and a missing secret pauses the deployment indefinitely, which looks like a broken install. The keys are also write-once: rotating `SECRET_KEY_BASE` logs out every user, and rotating any `ACTIVE_RECORD_ENCRYPTION_*` key makes stored two-factor secrets undecryptable, locking out every agent who enabled MFA.
+</Warning>
+
+Everything else works with the defaults. Three optional features need their own setup first:
+
+- **Object-storage attachments** — an existing bucket plus either a Control Plane cloud account (AWS S3) or a static-key secret (S3-compatible servers). See [Attachment Storage](#attachment-storage). Required if you plan to run more than one web replica.
+- **Authenticated SMTP** — a dictionary secret holding `SMTP_USERNAME` and `SMTP_PASSWORD`. See [Email](#email).
+- **Database backups** — a bucket and access setup for one of the supported providers. See [Backing Up](#backing-up).
+
+Once your keys secret exists, install the template using your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## First Run
+
+Chatwoot ships no default account. The first browser session to reach the endpoint runs the onboarding wizard and creates the super admin.
+
+<Steps>
+  <Step title="Wait for the web workload to report ready">
+    On the default HA database path a first install takes roughly eight minutes end to end: the Patroni cluster elects a leader, the worker then loads the schema and runs 158 migrations, and only then does the web tier pass its readiness probe. The single-instance database path is closer to three and a half minutes.
+  </Step>
+  <Step title="Complete the onboarding wizard">
+    Browse to the canonical `*.cpln.app` endpoint of the `{release}-chatwoot` workload. It redirects to `/installation/onboarding`, where the form creates your account and the super admin user. Do this as soon as the workload is ready — the wizard is unauthenticated until it is completed.
+  </Step>
+  <Step title="Create an inbox">
+    In the dashboard, add an inbox — a website widget for live chat, or an API channel for a custom integration. The widget snippet and the API channel identifier are issued there.
+  </Step>
+  <Step title="Configure email before inviting agents">
+    Agent invitations, password resets, and email-channel replies are all delivered by mail. Set up [SMTP](#email) before you invite your team.
+  </Step>
+</Steps>
+
+Once an inbox exists, incoming visitor messages and agent replies travel over the WebSocket connection: an agent sees a new message without refreshing, and the widget receives the agent's reply live.
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+chatwoot:
+  image: chatwoot/chatwoot:v4.16.2-ce # Community Edition (MIT core); pin a released tag
+  replicas: 1 # >1 REQUIRES storage.type s3 or s3-compatible
+  frontendUrl: "" # public base URL used in links; empty = derive from the canonical endpoint
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 2Gi # a Rails process under boot migrations OOMs below this
+
+worker: # Sidekiq; single replica — it also runs migrations and the first-run bootstrap
+  concurrency: 10 # SIDEKIQ_CONCURRENCY; also the worker's Postgres pool size
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 2Gi
+
+secrets:
+  name: my-chatwoot-secrets # dictionary secret with the four root-of-trust keys — MUST exist before install
+
+storage:
+  type: local # local | s3 | s3-compatible (object storage required for replicas > 1)
+  local:
+    volumeset:
+      capacity: 10 # GiB (minimum 10); mounted at /app/storage
+  s3: # AWS S3 — keyless only (no static keys accepted)
+    bucket: my-chatwoot-bucket
+    region: us-east-1
+    cloudAccountName: my-s3-cloud-account # Control Plane cloud account
+    policyName: my-chatwoot-s3-policy # your bucket-scoped IAM policy
+  s3Compatible: # MinIO / SeaweedFS / Spaces — static keys
+    bucket: my-chatwoot-bucket
+    region: us-east-1 # any value; most S3-compatible servers ignore it
+    endpoint: http://my-minio-workload:9000 # S3 API address, with scheme and port
+    forcePathStyle: true # true for most S3-compatible servers
+    auth:
+      secretName: my-chatwoot-s3-keys # dictionary secret with STORAGE_ACCESS_KEY_ID + STORAGE_SECRET_ACCESS_KEY
+
+smtp:
+  enabled: false # off = agent invites, password resets and email replies FAIL
+  address: smtp.example.com # SMTP_ADDRESS (note: not SMTP_HOST)
+  port: 587
+  domain: "" # HELO domain; empty = omitted
+  authentication: login # plain | login | cram_md5; empty = unauthenticated relay
+  enableStarttlsAuto: true # false for a plaintext mail catcher
+  fromEmail: Chatwoot <no-reply@example.com> # MAILER_SENDER_EMAIL
+  auth:
+    secretName: "" # optional dictionary secret with SMTP_USERNAME + SMTP_PASSWORD
+
+publicAccess:
+  enabled: true # HTTPS UI, API, widget and WebSockets on the auto *.cpln.app endpoint
+
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # used only with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+postgresHA: # default: highly available PostgreSQL 17.5, pgvector native
+  enabled: true
+  postgres:
+    username: chatwoot
+    password: change-me-chatwoot-pg # change before installing
+    database: chatwoot
+  replicas: 3
+  resources: # per Patroni replica; the default install runs 3 of these
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 2Gi
+  volumeset:
+    capacity: 10 # GiB per replica (minimum 10)
+  backup:
+    enabled: false # optional — see Backing Up
+    mode: logical # logical | wal-g
+    logical:
+      image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
+      schedule: "0 2 * * *" # daily at 2am UTC
+    walg:
+      intervalSeconds: 21600
+    provider: aws # aws | gcp | minio
+    aws:
+      bucket: my-chatwoot-pg-backup-bucket
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account
+      policyName: my-chatwoot-pg-backup-policy
+      prefix: postgres/backups
+    gcp:
+      bucket: my-chatwoot-pg-backup-bucket
+      cloudAccountName: my-gcs-cloud-account
+      prefix: postgres/backups
+    minio:
+      endpoint: http://my-minio-workload:9000
+      bucket: my-chatwoot-pg-backup-bucket
+      accessKey: my-minio-username
+      secretKey: my-minio-password
+      prefix: postgres/backups
+
+postgres: # dev/lightweight: single-instance PostgreSQL (disable postgresHA first)
+  enabled: false
+  image: pgvector/pgvector:pg18 # MUST carry pgvector — stock postgres:18 does not
+  config:
+    username: chatwoot
+    password: change-me-chatwoot-pg # change before installing
+    database: chatwoot
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 1Gi
+  volumeset:
+    capacity: 10 # GiB (minimum 10)
+  backup:
+    enabled: false # optional — see Backing Up
+    image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0
+    schedule: "0 2 * * *" # daily at 2am UTC
+    provider: aws # aws | gcp | minio
+    aws:
+      bucket: my-chatwoot-pg-backup-bucket
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account
+      policyName: my-chatwoot-pg-backup-policy
+      prefix: postgres/backups
+    gcp:
+      bucket: my-chatwoot-pg-backup-bucket
+      cloudAccountName: my-gcs-cloud-account
+      prefix: postgres/backups
+    minio:
+      endpoint: http://my-minio-workload:9000
+      bucket: my-chatwoot-pg-backup-bucket
+      accessKey: my-minio-username
+      secretKey: my-minio-password
+      prefix: postgres/backups
+
+redis: # bundled single node — queues, live updates, cache (required)
+  image: redis:8
+  auth:
+    password: change-me-chatwoot-redis # letters/digits/-/_ only; change before installing
+  resources:
+    minCpu: 100m
+    maxCpu: 400m
+    minMemory: 256Mi
+    maxMemory: 512Mi
+  volumeset:
+    capacity: 10 # GiB (minimum 10); AOF at /data
+```
+
+### Chatwoot Web
+
+- `chatwoot.image` — The Community Edition image, used by both the web and worker workloads. Pin a released `-ce` tag.
+- `chatwoot.replicas` — Web-tier replica count. Anything above `1` requires object storage; see [Scaling](#scaling).
+- `chatwoot.frontendUrl` — The public base URL Chatwoot puts in the widget snippet, email links, and callbacks, including the `https://` scheme. Leave it empty to derive it from the web workload's canonical endpoint; set it when you serve Chatwoot on a custom domain. The worker advertises the same URL, so mailer links always point at the web tier.
+- `chatwoot.resources` — CPU and memory bounds for the web container. The memory ceiling leaves headroom for the Rails boot path.
+
+### Sidekiq Worker
+
+- `worker.concurrency` — Number of background jobs Sidekiq processes in parallel. It also sets this process's PostgreSQL connection-pool size.
+- `worker.resources` — CPU and memory bounds for the worker container.
+
+The worker is a fixed single replica: it runs the database migrations and the first-run bootstrap, which are not safe to run concurrently on a fresh database. Scale background throughput with `worker.concurrency` instead.
+
+<Note>
+The worker workload has no probes — Sidekiq exposes no port, and its failure mode is process exit, which restarts the container. It therefore reports `ready` as soon as it is scheduled, even while it is still migrating. Worker readiness is not a health signal; read its logs instead.
+</Note>
+
+### Attachment Storage
+
+`storage.type` decides where uploaded files and images are kept.
+
+<Tabs>
+  <Tab title="Local volume (default)">
+    Attachments are written to a persistent volume set mounted at `/app/storage` on the web workload, and survive restarts, redeploys, and upgrades under the same release name.
+
+    ```yaml
+    storage:
+      type: local
+      local:
+        volumeset:
+          capacity: 10 # GiB (minimum 10)
+    ```
+
+    The volume is attached to the web workload only, so the Sidekiq worker cannot read attachments in this mode — attachment emails and ActiveStorage analyze and purge jobs cannot succeed. Local storage also works only with a single replica. Use object storage for production.
+  </Tab>
+  <Tab title="AWS S3 (keyless)">
+    AWS S3 uses a Control Plane cloud identity: no credentials are stored anywhere, and the workload's identity vends temporary credentials at runtime. This is the only supported way to reach AWS S3 — the chart accepts static keys for S3-compatible endpoints only.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create an S3 bucket. Set `storage.s3.bucket` and `storage.s3.region` to match.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `storage.s3.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        Create an AWS IAM policy with the JSON below (replace `YOUR_BUCKET_NAME` with your bucket), then set `storage.s3.policyName` to the policy's name:
+
+        ```json
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket"
+              ],
+              "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+              ]
+            }
+          ]
+        }
+        ```
+      </Step>
+      <Step title="Switch the storage type">
+        Set `storage.type: s3`. The template attaches the cloud account and your policy to the Chatwoot identity, and no access keys exist anywhere.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="S3-compatible (MinIO and others)">
+    S3-compatible servers cannot federate with a cloud account, so they use static access keys held in a dictionary secret.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create the bucket on your server. For the [MinIO](/template-catalog/templates/minio) template deployed in the same GVC, the S3 API address is `http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000`.
+      </Step>
+      <Step title="Set the endpoint">
+        Set `storage.type: s3-compatible`, `storage.s3Compatible.endpoint` to the S3 API address including scheme and port, and keep `storage.s3Compatible.forcePathStyle: true` (required by most S3-compatible servers).
+      </Step>
+      <Step title="Create the key secret">
+        Create a dictionary secret with the server's credentials **before** installing, and set `storage.s3Compatible.auth.secretName` to its name:
+
+        ```bash
+        cpln secret create-dictionary --name my-chatwoot-s3-keys \
+          --entry STORAGE_ACCESS_KEY_ID=YOUR_ACCESS_KEY \
+          --entry STORAGE_SECRET_ACCESS_KEY=YOUR_SECRET_KEY
+        ```
+
+        The Chatwoot identity is granted `reveal` on exactly this secret.
+      </Step>
+    </Steps>
+
+    <Warning>
+    Chatwoot serves an attachment by redirecting the browser to the storage endpoint. `storage.s3Compatible.endpoint` must therefore be an address your agents' and visitors' browsers can reach — an in-GVC-only address such as `http://my-minio.my-gvc.cpln.local:9000` makes attachments appear broken outside the GVC, even though the upload itself succeeded.
+    </Warning>
+  </Tab>
+</Tabs>
+
+### Scaling
+
+`chatwoot.replicas` sets how many web replicas run. Replicas share the database and the bundled Redis, so a message received by one replica reaches a WebSocket client connected to another.
+
+```yaml
+chatwoot:
+  replicas: 2
+storage:
+  type: s3
+  s3:
+    bucket: my-chatwoot-bucket
+    region: us-east-1
+    cloudAccountName: my-s3-cloud-account
+    policyName: my-chatwoot-s3-policy
+```
+
+<Warning>
+`chatwoot.replicas` above `1` requires `storage.type` `s3` or `s3-compatible`. Local attachments live on a per-replica volume, so a file uploaded through one replica would `404` from another. The chart refuses to render the combination.
+</Warning>
+
+At two replicas, forcing a redeployment of the web workload served every request without a single HTTP error, and a live agent reply still reached the visitor's socket while both replicas were serving.
+
+### Email
+
+SMTP is **off by default**, and a default install works without it — the onboarding wizard creates the super admin with no email confirmation, and that account signs in with its password.
+
+```yaml
+smtp:
+  enabled: true
+  address: smtp.example.com
+  port: 587
+  domain: example.com
+  authentication: login
+  enableStarttlsAuto: true
+  fromEmail: Chatwoot <no-reply@example.com>
+  auth:
+    secretName: my-chatwoot-smtp # dictionary secret with SMTP_USERNAME + SMTP_PASSWORD
+```
+
+- `smtp.address` — The relay hostname. Chatwoot reads `SMTP_ADDRESS`, not `SMTP_HOST`.
+- `smtp.domain` — The HELO domain. Empty omits it.
+- `smtp.authentication` — `plain`, `login`, or `cram_md5`. Leave it empty for an unauthenticated relay.
+- `smtp.enableStarttlsAuto` — Set `false` only for a plaintext relay such as a local mail catcher.
+- `smtp.fromEmail` — The `From` address on outbound mail.
+- `smtp.auth.secretName` — Optional dictionary secret with the relay credentials, created before installing:
+
+```bash
+cpln secret create-dictionary --name my-chatwoot-smtp \
+  --entry SMTP_USERNAME=apikey --entry SMTP_PASSWORD=YOUR_PASSWORD
+```
+
+Leave it empty for a relay that needs no authentication. When it is set, the Chatwoot identity is granted `reveal` on exactly that secret.
+
+<Warning>
+With SMTP disabled, Chatwoot falls back to `sendmail`, which is absent from the image, so nothing is delivered: agent invitations, password resets, and email-channel replies all fail. Configure `smtp.*` before inviting agents.
+</Warning>
+
+### Access
+
+- `publicAccess.enabled` — Serve the dashboard, API, widget, and WebSockets on the auto-assigned `*.cpln.app` HTTPS endpoint (default). Because the widget and visitors live outside the GVC, public access is on by default. Set to `false` for an internal-only instance: external requests are refused at the edge, and in-GVC callers still reach it per `internalAccess`.
+- `internalAccess.type` — Controls which workloads can reach the Chatwoot web tier over the internal network:
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access. |
+| `same-gvc` | Allow access from all workloads in the same GVC (default). |
+| `same-org` | Allow access from all workloads in the same organization. |
+| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
+
+The worker and the bundled Redis are never publicly reachable: the worker accepts no inbound traffic at all, and Redis accepts only same-GVC traffic.
+
+### Database
+
+Enable exactly one of `postgresHA` (default) or `postgres` — the chart refuses to render with both or neither enabled. Chatwoot is wired to the active database automatically: the HAProxy leader endpoint in HA mode, or the single instance directly.
+
+- **`postgresHA` (default)** — 3× Patroni PostgreSQL 17.5 with etcd and a HAProxy leader endpoint. Its image ships pgvector natively, which is why it is the default. A first install on this path takes roughly eight minutes.
+- **`postgres`** — One PostgreSQL instance for lighter, non-production deployments. It reaches ready in a few minutes but has no failover.
+
+In both modes, **change the database password before installing** (`postgresHA.postgres.password` / `postgres.config.password`) — it seeds the database on first boot and is not updated by later value edits.
+
+<Warning>
+Choose the database mode **before** installing — it cannot be switched later. Flipping `postgresHA.enabled` / `postgres.enabled` on a live release points Chatwoot at a different, empty database (a separate volume set, and a different PostgreSQL major version), so the app re-runs onboarding and your existing conversations are orphaned rather than migrated.
+</Warning>
+
+<Warning>
+In single-instance mode, `postgres.image` must carry pgvector. Chatwoot's schema runs `CREATE EXTENSION "vector"`, which the stock `postgres:` image does not provide. The chart refuses to render against a stock `postgres:` image rather than letting the install fail later as a cryptic schema error — keep the default `pgvector/pgvector:pg18` unless you supply your own pgvector build.
+</Warning>
+
+<Note>
+On the HA path the worker crash-loops a handful of times during the first install, logging `PG::ConnectionBad … server closed the connection unexpectedly` while Patroni elects a leader. This is expected and self-heals as soon as the leader accepts writes.
+</Note>
+
+### Redis
+
+- `redis.image` — The bundled Redis image.
+- `redis.auth.password` — Password for the bundled Redis, embedded in Chatwoot's `REDIS_URL`. **Change it before installing.** Only letters, digits, `-`, and `_` are accepted; other characters would corrupt the connection URL, and the chart rejects them.
+- `redis.resources` — CPU and memory bounds for the Redis container.
+- `redis.volumeset.capacity` — Volume size in GiB for the append-only file at `/data`. Persistence is on and eviction is disabled, so a queued job is never silently dropped.
+
+Redis is required and runs as a **single node by design**, not as a simplification: it carries the pub/sub channel behind every live update, and Redis does not propagate published messages between replicas, so a multi-node topology would silently drop a share of the broadcasts that make the dashboard and widget update in real time.
+
+That single node has two operational consequences worth planning for.
+
+<Warning>
+**Restart the web workload after any Redis restart.** If the bundled Redis restarts — a redeploy, a reschedule, or an upgrade — the queues and the cache reconnect on their own, but the web tier's real-time subscriber does not. Live updates then stop silently: nothing is logged, the health endpoint stays green, and agents and visitors simply stop seeing new messages until they refresh. Force a redeployment of the `{release}-chatwoot` workload to restore it, which takes about three to four minutes.
+
+```bash
+cpln workload force-redeployment {release}-chatwoot --gvc GVC_NAME
+```
+</Warning>
+
+<Warning>
+**Expect a few minutes of `503`s during a Helm upgrade.** An upgrade restarts the bundled Redis, and the web readiness endpoint reports unhealthy without Redis, so every web replica leaves the load balancer until Redis is back — measured at roughly 32% failed requests across a three-minute window, even at two replicas. Upgrade during a quiet period. A redeployment of the web workload alone does not restart Redis and rolls cleanly.
+</Warning>
+
+## Connecting
+
+| What | Value |
+|---|---|
+| Public UI, API, and widget | `https://<canonical>.cpln.app` — `status.canonicalEndpoint` of `{release}-chatwoot` (`cpln workload get {release}-chatwoot -o yaml`) |
+| WebSocket endpoint | `wss://<canonical>.cpln.app/cable` — used by the dashboard and the widget, no separate configuration |
+| Health checks | `/api` (readiness — reports PostgreSQL and Redis status) and `/health` (liveness), both unauthenticated |
+| Internal (same GVC) | `http://{release}-chatwoot.{gvc}.cpln.local:3000` |
+| Login | The super admin account created by the onboarding wizard |
+| PostgreSQL (internal, HA mode) | `{release}-postgres-ha-proxy.{gvc}.cpln.local:5432`, credentials in the `{release}-postgres-config` secret |
+| PostgreSQL (internal, single mode) | `{release}-postgres.{gvc}.cpln.local:5432`, credentials from `postgres.config` |
+| Redis (internal) | `{release}-chatwoot-redis.{gvc}.cpln.local:6379`, password from `redis.auth.password` |
+
+## Managing the Installation
+
+Chatwoot keeps instance-wide settings in its database rather than in environment variables, so they are managed in the application after install, not through Helm values.
+
+Sign in as the super admin and open `https://<canonical>.cpln.app/super_admin`. Under **Settings** you can change instance configuration, including `ENABLE_ACCOUNT_SIGNUP`, which controls whether visitors can create their own accounts. **Self-serve signup is off on a fresh install** — accounts are created by the onboarding wizard and by agent invitations until you turn it on.
+
+## Backing Up
+
+Database backups are optional and disabled by default. They cover the PostgreSQL database — the conversations, contacts, inboxes, and users that make up your Chatwoot instance. Attachments are not included; in object-storage mode they live in your bucket, and in local mode on the attachment volume set.
+
+Enable backups with `postgresHA.backup.enabled` or `postgres.backup.enabled` (matching your database mode), and complete the storage setup for your provider **before** installing. The values below are shown under `backup.*` — set them within the enabled database block.
+
+<Tabs>
+  <Tab title="AWS S3">
+    <Steps>
+      <Step title="Create a bucket">
+        Create an S3 bucket. Set `backup.aws.bucket` and `backup.aws.region` to match.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `backup.aws.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        Create an AWS IAM policy with the JSON below (replace `YOUR_BUCKET`), then set `backup.aws.policyName` to the policy's name:
+
+        ```json
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Action": [
+              "s3:GetObject",
+              "s3:PutObject",
+              "s3:DeleteObject",
+              "s3:ListBucket",
+              "s3:GetObjectVersion",
+              "s3:DeleteObjectVersion"
+            ],
+            "Resource": [
+              "arn:aws:s3:::YOUR_BUCKET",
+              "arn:aws:s3:::YOUR_BUCKET/*"
+            ]
+          }]
+        }
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    <Steps>
+      <Step title="Create a bucket">
+        Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your GCP project. Set `backup.gcp.cloudAccountName` to its name — access is keyless.
+      </Step>
+    </Steps>
+    <Warning>
+    Grant the `Storage Object Admin` role (`roles/storage.objectAdmin`) on that bucket to the GCP service account created for the Cloud Account.
+    </Warning>
+  </Tab>
+  <Tab title="S3-compatible (MinIO and others)">
+    <Steps>
+      <Step title="Create a bucket">
+        Create your bucket on the server. Set `backup.minio.bucket` to its name.
+      </Step>
+      <Step title="Set the endpoint">
+        Set `backup.minio.endpoint` to the S3 API address including scheme and port. For the [MinIO](/template-catalog/templates/minio) template deployed in the same GVC, this is `http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000`.
+      </Step>
+      <Step title="Set credentials">
+        Set `backup.minio.accessKey` and `backup.minio.secretKey` to credentials with access to the bucket.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+In HA mode, `backup.mode` selects `logical` (a scheduled `pg_dump` run by a cron workload) or `wal-g` (continuous WAL archiving). The single-instance mode takes scheduled logical dumps. `backup.prefix` is the key prefix within the bucket, and `backup.*.schedule` is a standard cron expression in UTC.
+
+## Important Notes
+
+- **Create the keys secret before installing** — `secrets.name` must point at an existing dictionary secret holding `SECRET_KEY_BASE` and the three `ACTIVE_RECORD_ENCRYPTION_*` keys. A missing secret pauses the deployment and the install looks broken until it exists.
+- **All four keys are write-once** — rotating `SECRET_KEY_BASE` logs out every user, and rotating an `ACTIVE_RECORD_ENCRYPTION_*` key makes stored two-factor secrets undecryptable. Back the values up outside Control Plane.
+- **Complete the onboarding wizard right after install** — the first browser session to reach the endpoint creates the super admin account, with no email confirmation.
+- **Restart the web workload after any Redis restart** — queues and cache recover on their own, but live updates stay dead, silently, until the web tier restarts.
+- **A Helm upgrade restarts the bundled Redis and costs a few minutes of `503`s** — the web readiness probe fails while Redis is down, so replicas leave the load balancer. Upgrade during a quiet period.
+- **Choose the database mode before installing** — switching `postgresHA` and `postgres` on a live release points Chatwoot at a different, empty database.
+- **In single-instance mode the database image must carry pgvector** — keep `postgres.image` on a pgvector build; the chart refuses to render against a stock `postgres:` image.
+- **`chatwoot.replicas` above `1` requires object storage** — local attachments are per-replica and would `404` across replicas.
+- **In `local` storage mode the worker cannot read attachments** — the volume is attached to the web workload only, so attachment emails and ActiveStorage analyze and purge jobs fail. Use object storage for production.
+- **AWS S3 is keyless only** — a cloud account plus a bucket-scoped IAM policy. Static keys are accepted only for S3-compatible endpoints.
+- **With SMTP off, no mail is delivered** — agent invites, password resets, and email-channel replies all fail. Configure `smtp.*` before inviting agents.
+- **Do not scale the worker** — it is a fixed singleton that also runs migrations and the first-run bootstrap. Scale background throughput with `worker.concurrency`.
+- **Self-serve signup is managed in the app, not in values** — turn it on at `/super_admin` → **Settings**; it is off on a fresh install.
+- **Enterprise features are not included** — the `-ce` image omits SSO/SAML and SCIM, audit logs, agent capacity management, custom branding, SLA policies, and Captain AI. The core is MIT-licensed.
+- **Data survives restarts and upgrades** — conversations live in the database volume sets and local attachments in the storage volume set. Uninstalling deletes those volume sets and everything in them; your keys secret is yours and survives an uninstall.
+
+## External References
+
+<CardGroup cols={2}>
+    <Card title="Chatwoot Self-Hosted Docs" icon="book" href="https://developers.chatwoot.com/self-hosted">
+    Official self-hosting documentation
+    </Card>
+    <Card title="Environment Variables" icon="gear" href="https://developers.chatwoot.com/self-hosted/configuration/environment-variables">
+    Every setting the Chatwoot application reads from its environment
+    </Card>
+    <Card title="Community vs Enterprise" icon="scale-balanced" href="https://developers.chatwoot.com/self-hosted/enterprise-edition">
+    What the Community Edition image includes and excludes
+    </Card>
+    <Card title="Product Guides" icon="headset" href="https://chatwoot.com/docs/product">
+    Inboxes, channels, agents, and day-to-day usage
+    </Card>
+    <Card title="Chatwoot on GitHub" icon="github" href="https://github.com/chatwoot/chatwoot">
+    Source code and release notes
+    </Card>
+    <Card title="Chatwoot Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/chatwoot">
+    View the source files, default values, and chart definition
+    </Card>
+</CardGroup>
