@@ -1,0 +1,473 @@
+---
+title: Polaris
+description: Deploy Apache Polaris on Control Plane using the Template Catalog. An Apache Iceberg REST catalog backed by PostgreSQL that lets Trino, Spark and any Iceberg client read and write tables in an S3-compatible bucket. Covers prerequisite secrets, catalog creation, and the metastore modes.
+keywords: ['lakehouse', 'data lakehouse', 'data lake', 'hive metastore alternative', 'aws glue alternative', 'unity catalog alternative', 'nessie alternative', 'table format', 'parquet', 'trino iceberg', 'spark iceberg', 'pyiceberg', 'oauth2 client credentials', 'realm', 'polaris template']
+---
+
+## Overview
+
+Apache Polaris is an [Apache Iceberg](https://iceberg.apache.org/) **REST catalog** — the service that tells a query engine which tables exist, where their metadata lives in object storage, and who may read them. It is the piece that turns a bucket of Parquet files into a lakehouse.
+
+This template completes a stack the catalog already has the other two thirds of: **[seaweedfs](/template-catalog/templates/seaweedfs) (or any S3-compatible bucket) stores the data, Polaris is the catalog, and [trino](/template-catalog/templates/trino) runs the queries** — all wired over internal GVC DNS, with no data leaving your organization. That exact path was verified end to end: Trino created schemas and tables through Polaris, inserted and read rows back, and the resulting Parquet data files and Iceberg metadata were confirmed in the SeaweedFS bucket from SeaweedFS's own side. See [Building a Lakehouse](#building-a-lakehouse).
+
+Polaris itself is stateless. Every catalog, namespace, table pointer, principal and grant lives in a PostgreSQL metastore that the template deploys for you, so a `replicas` knob scales the catalog horizontally with no coordination to configure.
+
+### Architecture
+
+- **Polaris server** — A `standard` workload serving the Iceberg REST API and the Polaris management API on port `8181`, and Quarkus health and metrics on port `8182`. Stateless, with a `replicas` knob.
+- **Bootstrap workload** — Runs the official `polaris-admin-tool` image once to create the realm schema and the root principal, then idles. Always one replica, and idempotent — a restart or upgrade re-runs it harmlessly.
+- **Metastore** — A single-instance [postgres](/template-catalog/templates/postgres) by default, or [postgres-highly-available](/template-catalog/templates/postgres-highly-available) with one flag.
+- **Realm** — Polaris isolates tenants by realm. This template ships exactly one and does not require the `Polaris-Realm` header, which is what makes Trino's Iceberg REST connector work against it.
+
+### What Gets Created
+
+- **Standard Polaris Workload** — `replicas` interchangeable replicas serving `8181` and `8182`.
+- **Standard Bootstrap Workload** — One replica, no ports, unreachable from anywhere. It initializes the realm and then sleeps.
+- **Bootstrap Script Secret** — An [opaque secret](/guides/create-secret/opaque) holding the shell script the bootstrap workload runs, mounted as a file.
+- **Two Identities & Two Policies** — Split for least privilege: only the bootstrap principal can reveal your root credentials, and only the server principal can reveal the token signing key and the object-storage credentials.
+- **PostgreSQL Metastore** — The `postgres` or `postgres-highly-available` subchart, with its own workload, volume set and config secret.
+- **No Volume Set for Polaris** — The server writes nothing to local disk that must survive a restart.
+
+<Note>
+This template does not create a GVC. You must deploy it into an existing GVC.
+</Note>
+
+## Prerequisites
+
+**Two Control Plane secrets must exist before you install.** They are referenced by name, never passed through values, and the deployment waits indefinitely on a secret that does not exist — an install that looks stuck is almost always a missing one of these.
+
+<Steps>
+  <Step title="Create the root credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) with `CLIENT_ID` and `CLIENT_SECRET`. These become the realm's root principal at bootstrap, and are what Trino, Spark and any other Iceberg REST client authenticate with. Neither value may contain a comma.
+
+    ```bash
+    cpln secret create-dictionary --name my-polaris-root-credentials \
+      --entry CLIENT_ID=root --entry CLIENT_SECRET="$(openssl rand -hex 24)"
+    ```
+  </Step>
+  <Step title="Create the token signing key secret">
+    An [opaque secret](/guides/create-secret/opaque) whose payload is a random string of 32 or more characters. Every replica signs and validates access tokens with it, so tokens survive restarts and are accepted across replicas.
+
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | \
+      cpln secret create-opaque --name my-polaris-signing-key --encoding plain -f -
+    ```
+  </Step>
+</Steps>
+
+Both secrets are yours, not the release's — `helm uninstall` leaves them in place.
+
+Optional:
+
+- **Object-storage credentials** for the bucket holding your Iceberg data — a dictionary secret with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. See [Object Storage](#object-storage). Polaris runs without it; catalogs can be added later.
+- **A cloud account and bucket** only if you turn on the metastore's backup pass-through. See [Backing Up](#backing-up).
+
+## Installation
+
+Install the template using your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+<Warning>
+**A default install takes about 90 seconds, and part of it looks like a failure.** While PostgreSQL is still starting, the Polaris server restarts a couple of times logging `Failed to start quarkus`, and the bootstrap workload logs `attempt failed (metastore not ready yet?) - retrying in 10s`. Both self-heal: the measured warm-up was **2 restarts within 32 seconds**, after which the server started cleanly. Do not interrupt it. On the `postgresHA` metastore the same sequence takes about **6 minutes** (measured 348 seconds), because Patroni and etcd have to converge first.
+</Warning>
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+image: apache/polaris:1.7.0
+
+# Stateless replicas behind one metastore. All replicas share the token signing
+# key below, so a token minted by one is accepted by every other.
+replicas: 1
+
+resources:
+  minCpu: 500m
+  maxCpu: 1000m
+  minMemory: 1Gi
+  maxMemory: 2Gi # JVM heap is a percentage OF THIS — see jvm.maxRAMPercentage
+
+jvm:
+  maxRAMPercentage: 70 # max heap as a percentage of resources.maxMemory; allowed range 40–80
+
+# Polaris isolates tenants by realm. PERMANENT after first install.
+realm: POLARIS
+
+rootCredentials:
+  secretName: my-polaris-root-credentials # dictionary secret with CLIENT_ID and CLIENT_SECRET
+
+tokenSigningKey:
+  secretName: my-polaris-signing-key # opaque secret (encoding: plain), payload = 32+ random chars
+
+# Credentials Polaris uses for its OWN metadata I/O against S3-compatible storage.
+storage:
+  credentialsSecretName: "" # e.g. my-seaweedfs-s3-credentials
+  region: us-east-1 # AWS_REGION; S3-compatible servers ignore the value but the SDK requires one
+
+# Runs the official admin tool once against the metastore, then idles.
+bootstrap:
+  image: apache/polaris-admin-tool:1.7.0 # keep this tag in lockstep with `image`
+  resources:
+    minCpu: 100m
+    maxCpu: 400m
+    minMemory: 128Mi
+    maxMemory: 1Gi
+
+publicAccess:
+  enabled: false # true = Iceberg REST + management API on the auto *.cpln.app HTTPS endpoint
+
+internalAccess: # who may reach Polaris from inside Control Plane
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # used with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+# ─── Metastore: single-instance PostgreSQL (default) ──────────────
+postgres:
+  enabled: true
+  config:
+    username: polaris
+    password: change-me-polaris-db # change before installing
+    database: polaris
+  resources:
+    minCpu: 200m
+    maxCpu: 500m
+    minMemory: 256Mi
+    maxMemory: 512Mi
+  volumeset:
+    capacity: 10 # initial capacity in GiB (minimum is 10)
+  backup:
+    enabled: false # true = scheduled DB backups to object storage
+    provider: aws # options: aws, gcp, minio
+    # plus aws / gcp / minio blocks — see Backing Up
+
+# ─── Metastore: Highly Available PostgreSQL ───────────────────────
+# set postgresHA.enabled: true (and postgres.enabled: false) for near-zero-downtime
+# upgrades and automatic failover
+postgresHA:
+  enabled: false
+  postgres:
+    username: polaris
+    password: change-me-polaris-db # change before installing
+    database: polaris
+  replicas: 3
+  volumeset:
+    capacity: 10 # initial capacity in GiB per replica (minimum is 10)
+  backup:
+    enabled: false
+    mode: logical # logical or wal-g
+    provider: aws # options: aws, gcp, minio
+```
+
+### Server and Replicas
+
+- `image` — The official upstream image. The chart is shipped and tested on Polaris 1.7.0.
+- `replicas` — Number of Polaris replicas (default `1`, minimum `1`). Replicas are interchangeable: they share the metastore and the token signing key, so a token minted by one is accepted by every other and a catalog created through one is immediately visible on the rest. Raise it for capacity and to keep serving through a rolling restart — see [Availability](#availability).
+- `resources.minCpu` / `maxCpu` / `minMemory` / `maxMemory` — CPU and memory per replica. `minMemory` may not exceed `maxMemory`, and `maxCpu:minCpu` may not exceed 4:1 (a Control Plane limit); the chart refuses to render otherwise, naming the value to fix.
+
+### JVM and Memory
+
+`jvm.maxRAMPercentage` (default `70`, allowed range 40–80) sets the JVM heap as a percentage of `resources.maxMemory`, so `maxMemory` is normally the only number you change. Capacity AI is disabled on both workloads: the JVM sizes its heap from the container limit at startup, so shrinking the container afterwards would be an out-of-memory kill with no diagnostic.
+
+### Realm
+
+`realm` (default `POLARIS`) is the tenant namespace the bootstrap workload creates. This template ships exactly one realm and does **not** require the `Polaris-Realm` header — a header-less request resolves to this realm, which is what Trino's Iceberg REST connector needs, since it cannot send an arbitrary header. Requests naming a different realm are rejected with `404`.
+
+<Warning>
+**`realm` is permanent after the first install.** Renaming it bootstraps a new, empty realm and hides the existing catalogs — they are not deleted, and changing the name back makes them visible again, but nothing is migrated between realms.
+</Warning>
+
+### Credentials
+
+- `rootCredentials.secretName` — Name of the prerequisite dictionary secret holding `CLIENT_ID` and `CLIENT_SECRET`. Required.
+- `tokenSigningKey.secretName` — Name of the prerequisite opaque secret whose payload is the shared HMAC signing key. Required.
+
+The signing key is mounted unconditionally, not only when `replicas` is above 1: Polaris's own default generates a key per JVM process, so even a single replica would hand out tokens that its own restart rejects with `401`.
+
+<Warning>
+**Root credentials are write-once.** They are applied when the realm is first bootstrapped; changing the secret afterwards has no effect on the existing realm. Rotate by creating a new principal through the management API instead. Rotating `tokenSigningKey` *does* take effect and invalidates every outstanding token — clients must request a new one.
+</Warning>
+
+### Object Storage
+
+- `storage.credentialsSecretName` — Name of a dictionary secret with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, used for Polaris's **own** Iceberg metadata reads and writes. Empty by default, which is a valid install: the server runs and answers, but catalogs backed by object storage cannot read or write.
+- `storage.region` — Value of `AWS_REGION`. S3-compatible servers ignore it, but the AWS SDK requires one.
+
+With [seaweedfs](/template-catalog/templates/seaweedfs) or [minio](/template-catalog/templates/minio) in the same GVC, point this at the *same* dictionary secret that deployment already uses (`s3.credentialsSecretName` for SeaweedFS) — there is nothing else to create. For AWS S3, create an access key scoped to the bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": ["s3:ListBucket", "s3:GetBucketLocation"], "Resource": "arn:aws:s3:::my-polaris-bucket" },
+    { "Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"], "Resource": "arn:aws:s3:::my-polaris-bucket/*" }
+  ]
+}
+```
+
+<Warning>
+**This version does not vend STS credentials.** Polaris does not hand short-lived, scoped credentials to query engines, so **each engine needs its own object-storage credentials** in addition to these. Keep `iceberg.rest-catalog.vended-credentials-enabled=false` in Trino, and set `stsUnavailable: true` when you create a catalog on an S3-compatible server.
+</Warning>
+
+### Bootstrap
+
+`bootstrap.image` is the official admin tool image; keep its tag in lockstep with `image`. `bootstrap.resources` sizes the one-shot container.
+
+The bootstrap workload runs the admin tool against the metastore, creates the realm schema and the root principal, and then idles — it exits nothing and serves nothing, so it stays `ready` after its work is done. The operation is idempotent: on any restart or upgrade it logs `Realm 'POLARIS' is already bootstrapped; skipping` and idles again. Nothing calls it, and its internal firewall is set to `none`.
+
+### Access
+
+- `publicAccess.enabled` — `false` by default. When `true`, the Iceberg REST API and the Polaris management API are served over HTTPS on the automatically assigned `*.cpln.app` canonical endpoint.
+- `internalAccess.type` — Which workloads inside Control Plane may reach Polaris:
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access — this hides Polaris from query engines in the same GVC. |
+| `same-gvc` | Allow access from all workloads in the same GVC (default). |
+| `same-org` | Allow access from all workloads in the same organization, including other GVCs. |
+| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`, e.g. `//gvc/GVC_NAME/workload/WORKLOAD_NAME`. |
+
+<Note>
+**Port `8182` is never published on the public endpoint.** The canonical endpoint routes to the workload's first declared container port, which is `8181`. Polaris serves the unauthenticated Quarkus health, metrics and info endpoints only on `8182`, so with public access on, `/q/metrics`, `/q/health` and `/q/info` all return `404` from the internet while `:8182/q/metrics` answers normally inside the GVC. Firewall changes take up to a couple of minutes to propagate.
+</Note>
+
+### Metastore
+
+Exactly one of `postgres` (default) and `postgresHA` must be enabled — the chart enforces this at render and fails with a message naming the fix.
+
+| | `postgres` (default) | `postgresHA` |
+|---|---|---|
+| What runs | One single-replica PostgreSQL workload | 3× Patroni PostgreSQL, 3× etcd, an HAProxy leader endpoint |
+| Database failover | None — a node failure reschedules and reattaches the same volume | Automatic (Patroni leader election) |
+| Footprint | 1 workload | 8 replicas across 3 workloads |
+| Time to ready | ~90 s | ~6 min |
+
+Switch by setting `postgres.enabled: false` and `postgresHA.enabled: true`. Polaris is wired to whichever is active automatically — the single instance directly, or the HAProxy leader endpoint in HA mode. **Change the database password before installing** in either mode (`postgres.config.password` or `postgresHA.postgres.password`); the default is an obvious placeholder.
+
+Each Polaris replica opens up to 20 JDBC connections, plus the bootstrap workload — about 21 of PostgreSQL's default 100 at `replicas: 1`, and about 61 at `replicas: 3`.
+
+## Building a Lakehouse
+
+Storage, catalog, and engine are three separate templates. This is the whole path, verified end to end.
+
+<Steps>
+  <Step title="Deploy the storage layer">
+    Install [seaweedfs](/template-catalog/templates/seaweedfs) with a bucket for your warehouse (`s3.buckets: [lakehouse]`), or use [minio](/template-catalog/templates/minio) or AWS S3. Note the dictionary secret holding its `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
+  </Step>
+  <Step title="Deploy Polaris against that bucket">
+    Set `storage.credentialsSecretName` to that same secret, and create the two prerequisite secrets from [Prerequisites](#prerequisites) first.
+  </Step>
+  <Step title="Get an access token">
+    Every API call needs a bearer token, obtained with the root credentials:
+
+    ```bash
+    curl -X POST https://<canonical>.cpln.app/api/catalog/v1/oauth/tokens \
+      --user "$CLIENT_ID:$CLIENT_SECRET" \
+      -d grant_type=client_credentials -d scope=PRINCIPAL_ROLE:ALL
+    ```
+  </Step>
+  <Step title="Create a catalog">
+    Catalogs are a day-2 API call, not an install-time value:
+
+    ```bash
+    curl -X POST https://<canonical>.cpln.app/api/management/v1/catalogs \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+      "catalog": {
+        "name": "lakehouse",
+        "type": "INTERNAL",
+        "properties": { "default-base-location": "s3://my-bucket/warehouse" },
+        "storageConfigInfo": {
+          "storageType": "S3",
+          "allowedLocations": ["s3://my-bucket/warehouse"],
+          "endpoint": "http://my-seaweedfs.my-gvc.cpln.local:8333",
+          "endpointInternal": "http://my-seaweedfs.my-gvc.cpln.local:8333",
+          "pathStyleAccess": true,
+          "stsUnavailable": true,
+          "region": "us-east-1"
+        }
+      }
+    }'
+
+    # Let the root principal administer the new catalog
+    curl -X PUT https://<canonical>.cpln.app/api/management/v1/principal-roles/service_admin/catalog-roles/lakehouse \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{"catalogRole":{"name":"catalog_admin"}}'
+    ```
+
+    `pathStyleAccess: true` and `stsUnavailable: true` are what an S3-compatible server needs. Drop `endpoint`, `endpointInternal` and `pathStyleAccess` for AWS S3 itself.
+  </Step>
+  <Step title="Point Trino at it">
+    Add this catalog to the [trino](/template-catalog/templates/trino) template's values. Trino authenticates to Polaris with the root credentials and talks to the bucket with its own S3 keys — credential vending is off, so both sides hold static credentials:
+
+    ```yaml
+    catalogs:
+      - name: iceberg
+        properties: |
+          connector.name=iceberg
+          iceberg.catalog.type=rest
+          iceberg.rest-catalog.uri=http://my-polaris.my-gvc.cpln.local:8181/api/catalog
+          iceberg.rest-catalog.security=OAUTH2
+          iceberg.rest-catalog.oauth2.credential=${ENV:POLARIS_CLIENT_ID}:${ENV:POLARIS_CLIENT_SECRET}
+          iceberg.rest-catalog.oauth2.scope=PRINCIPAL_ROLE:ALL
+          iceberg.rest-catalog.warehouse=lakehouse
+          iceberg.rest-catalog.vended-credentials-enabled=false
+          fs.native-s3.enabled=true
+          s3.endpoint=http://my-seaweedfs.my-gvc.cpln.local:8333
+          s3.region=us-east-1
+          s3.path-style-access=true
+          s3.aws-access-key=${ENV:S3_ACCESS_KEY}
+          s3.aws-secret-key=${ENV:S3_SECRET_KEY}
+        secrets:
+          - env: POLARIS_CLIENT_ID
+            secretName: my-polaris-root-credentials
+            secretKey: CLIENT_ID
+          - env: POLARIS_CLIENT_SECRET
+            secretName: my-polaris-root-credentials
+            secretKey: CLIENT_SECRET
+          - env: S3_ACCESS_KEY
+            secretName: my-seaweedfs-s3-credentials
+            secretKey: AWS_ACCESS_KEY_ID
+          - env: S3_SECRET_KEY
+            secretName: my-seaweedfs-s3-credentials
+            secretKey: AWS_SECRET_ACCESS_KEY
+    ```
+  </Step>
+  <Step title="Query it">
+    `CREATE SCHEMA`, `CREATE TABLE`, `INSERT` and `SELECT` now work against tables stored in the bucket:
+
+    ```sql
+    CREATE SCHEMA iceberg.demo;
+    CREATE TABLE iceberg.demo.t (a integer, b varchar);
+    INSERT INTO iceberg.demo.t VALUES (1,'alpha'), (2,'beta'), (3,'gamma');
+    SELECT count(*) FROM iceberg.demo.t;
+
+    -- where the data actually landed
+    SELECT file_path FROM iceberg.demo."t$files";
+    ```
+  </Step>
+</Steps>
+
+Any other Iceberg REST client — Spark, PyIceberg, Flink — connects the same way: the REST URI, OAuth2 client credentials, and the warehouse name.
+
+## Connecting
+
+| What | Value |
+|---|---|
+| Base URL (public) | `https://<canonical>.cpln.app` — `status.canonicalEndpoint` of `{release}-polaris`. Available when `publicAccess.enabled`. |
+| Base URL (internal) | `http://{release}-polaris.{gvc}.cpln.local:8181` |
+| Iceberg REST API | `{base}/api/catalog` |
+| Polaris management API | `{base}/api/management/v1` |
+| OAuth2 token endpoint | `{base}/api/catalog/v1/oauth/tokens` |
+| Health and metrics | `http://{release}-polaris.{gvc}.cpln.local:8182/q/health` and `/q/metrics` — **in-GVC only** |
+| Credentials | `CLIENT_ID` / `CLIENT_SECRET` from your `rootCredentials` secret |
+| Metastore (single mode) | `{release}-postgres.{gvc}.cpln.local:5432`, credentials in the `{release}-pg-config` secret |
+| Metastore (HA mode) | `{release}-postgres-ha-proxy.{gvc}.cpln.local:5432`, credentials in the `{release}-postgres-config` secret |
+
+Same-GVC clients use plain `http://` over the mesh's mTLS; external clients use `https://` with TLS terminated at the platform edge. A request with no bearer token, or a wrong client secret, is rejected with `401`.
+
+## Availability
+
+Polaris is stateless and every replica shares both the metastore and the token signing key, so `replicas` is a real availability knob. Measured at `replicas: 2` with an authenticated request every 0.5 s from another workload, through the service DNS name:
+
+| Event | Impact |
+|---|---|
+| Rolling upgrade (`replicas: 2`) | **403 of 403 requests returned HTTP 200** — zero non-2xx. The rollout converged in 95 s. |
+| Scaling down 2 → 1 | **384 of 384 requests returned HTTP 200** — zero non-2xx. |
+
+Catalog state survived both events. At the default `replicas: 1` a rolling upgrade replaces the only replica, so requests fail for the duration of the restart; raise `replicas` to keep serving through one.
+
+The metastore is the other half of the picture: with the default single-instance `postgres`, a database restart takes Polaris down with it for as long as PostgreSQL takes to come back. `postgresHA` removes that with Patroni failover, at the cost of a larger footprint and a slower first install.
+
+## Backing Up
+
+Metastore backups are off by default and need no cloud account. Turn them on with `postgres.backup.enabled: true` (or `postgresHA.backup.enabled: true`) and configure a provider — the backup runs inside the PostgreSQL subchart, so this is that template's mechanism, passed straight through.
+
+<Tabs>
+  <Tab title="AWS S3">
+    Create the bucket, a Control Plane [cloud account](/guides/create-cloud-account), and an IAM policy scoped to the bucket:
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": "arn:aws:s3:::my-polaris-backup-bucket" },
+        { "Effect": "Allow", "Action": ["s3:PutObject","s3:GetObject","s3:DeleteObject"], "Resource": "arn:aws:s3:::my-polaris-backup-bucket/*" }
+      ]
+    }
+    ```
+
+    Then set `provider: aws` and the `aws.bucket`, `aws.region`, `aws.cloudAccountName` and `aws.policyName` values.
+  </Tab>
+  <Tab title="GCP Cloud Storage">
+    Create the bucket and a Control Plane [cloud account](/guides/create-cloud-account), grant its service account **Storage Object Admin** (`roles/storage.objectAdmin`) on the bucket, then set `provider: gcp` and the `gcp.bucket` and `gcp.cloudAccountName` values.
+  </Tab>
+  <Tab title="MinIO / S3-compatible">
+    No cloud account is needed — the keys authenticate directly. Set `provider: minio` and the `minio.endpoint`, `minio.bucket`, `minio.accessKey` and `minio.secretKey` values. A [seaweedfs](/template-catalog/templates/seaweedfs) or [minio](/template-catalog/templates/minio) deployment in the same GVC works as the target.
+  </Tab>
+</Tabs>
+
+In HA mode, `postgresHA.backup.mode` selects `logical` (scheduled `pg_dump`) or `wal-g` (continuous WAL archiving).
+
+## Important Notes
+
+- **Create both prerequisite secrets before installing.** Without them the workloads wait on a secret that does not exist, and the install looks broken with no useful error.
+- **Expect a warm-up and do not interrupt it.** A default install is ready in about **90 seconds**, including a **2-restart, ~32-second** crash loop while PostgreSQL boots. The `postgresHA` metastore takes about **6 minutes** before Polaris answers. Both are normal.
+- **Root credentials are write-once**; they are applied only at first bootstrap. Rotate by creating a new principal through the management API.
+- **Rotating the token signing key invalidates every outstanding token** — clients must request a new one.
+- **`realm` is permanent.** Renaming it bootstraps a new, empty realm and hides the existing catalogs.
+- **Change the metastore password before installing** (`postgres.config.password` or `postgresHA.postgres.password`) — the default is a placeholder.
+- **No credential vending in this version.** Polaris and each query engine hold their own static object-storage credentials; keep `iceberg.rest-catalog.vended-credentials-enabled=false` in Trino.
+- **Health and metrics are in-GVC only.** They are served on port `8182`, which the public canonical endpoint does not route to.
+- **Polaris does not migrate its own database schema.** Treat a future Polaris version bump as an explicit schema step, not something startup handles.
+- **Metastore volumes survive restarts, redeploys and upgrades; uninstalling deletes them** — and every catalog definition with them. The Iceberg data in your bucket is untouched, but the catalog that indexed it is gone. Use `postgresHA` and/or backups for anything you care about.
+- **Uninstall does not delete your prerequisite secrets** — they are your resources, created outside the release.
+
+## External References
+
+<CardGroup cols={2}>
+  <Card title="Apache Polaris Documentation" icon="book" href="https://polaris.apache.org/releases/1.7.0/">
+    Official documentation for the shipped release
+  </Card>
+  <Card title="Configuration Reference" icon="sliders" href="https://polaris.apache.org/releases/1.7.0/configuration/configuration-reference/">
+    Every server setting and its environment-variable name
+  </Card>
+  <Card title="Relational JDBC Metastore" icon="database" href="https://polaris.apache.org/releases/1.7.0/metastores/relational-jdbc/">
+    The PostgreSQL persistence backend this template uses
+  </Card>
+  <Card title="Admin Tool" icon="wrench" href="https://polaris.apache.org/releases/1.7.0/admin-tool/">
+    The bootstrap tool the init workload runs
+  </Card>
+  <Card title="Creating a Catalog on S3" icon="bucket" href="https://polaris.apache.org/releases/1.7.0/getting-started/creating-a-catalog/s3/">
+    Storage configuration for S3 and S3-compatible servers
+  </Card>
+  <Card title="Access Control" icon="lock" href="https://polaris.apache.org/releases/1.7.0/managing-security/access-control/">
+    Principals, roles, and grants beyond the root principal
+  </Card>
+  <Card title="Trino Iceberg REST Catalog" icon="plug" href="https://trino.io/docs/483/object-storage/metastores.html">
+    The connector properties used to point Trino at Polaris
+  </Card>
+  <Card title="Polaris Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/polaris">
+    View the source files, default values, and chart definition
+  </Card>
+</CardGroup>
