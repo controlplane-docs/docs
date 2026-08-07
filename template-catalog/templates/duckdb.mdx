@@ -1,0 +1,385 @@
+---
+title: DuckDB
+description: Deploy DuckDB on Control Plane using the Template Catalog. A cron workload that runs your SQL script on a schedule and exits — a batch job runner, not a query service. Covers scheduling, object storage, attached databases, and credential handling.
+keywords: ['olap', 'parquet', 'csv', 'in-process analytics', 'embedded analytics engine', 'etl', 'elt', 'athena alternative', 'sqlite alternative', 'pandas alternative', 'data transform', 'httpfs', 'attach postgres', 'duckdb template']
+---
+
+## Overview
+
+DuckDB is an in-process analytical SQL engine that reads and writes Parquet, CSV and JSON directly, queries object storage over the S3 API, and can attach live PostgreSQL, MySQL and SQLite databases. This template runs a SQL script of yours on a cron schedule and exits.
+
+<Warning>
+**This is a scheduled job runner, not a query service.** The workload is a cron job: it starts, runs your script, and terminates. It binds no port, has no endpoint, and nothing is listening after install — that is correct behavior, not a broken deployment. If you want an always-on SQL endpoint that BI tools and JDBC clients connect to, install [trino](/template-catalog/templates/trino) instead.
+</Warning>
+
+The read path overlaps Trino: both query Parquet in object storage and join across attached databases. The difference is cost shape. Trino keeps a coordinator and workers running so a query can arrive at any moment; DuckDB here consumes nothing between runs and bills only for the minutes its job is executing. Pick this template when the work is a known transform on a known schedule, and Trino when a human or a dashboard needs to ask ad-hoc questions.
+
+### What Gets Created
+
+- **Cron Workload** — `{release}-duckdb`, running the official `duckdb/duckdb` image once per schedule. No ports, no load balancer, `internal.inboundAllowType: none` and an empty inbound CIDR list. Outbound is open.
+- **Preamble Secret** — `{release}-duckdb-preamble`, an [opaque secret](/guides/create-secret/opaque) of `SET` statements mounted at `/etc/duckdb/preamble.sql` and executed before your script.
+- **Script Secret** *(optional)* — `{release}-duckdb-script`, holding `sql.inline`, mounted at `/etc/duckdb/job.sql`. Not created at all when you supply your own secret through `sql.secretName`.
+- **Identity & Policy** — `{release}-duckdb-identity` with a policy granting `reveal` on exactly the secrets this release mounts — the preamble, the script, your `secretEnv` secrets and your object-store credential secret. When `objectStore.type: aws`, the identity also carries the cloud-account binding.
+- **No Volume Sets** — no volume is attached. See [Memory and Storage](#memory-and-storage).
+
+<Note>
+This template does not create a GVC. You must deploy it into an existing GVC.
+</Note>
+
+## Prerequisites
+
+- **None for a default install.** The shipped `sql.inline` is a self-test that needs no credentials and no cloud account.
+- **Outbound access to `extensions.duckdb.org:443`** on every run. The template's firewall allows all outbound traffic, so this works out of the box unless your organization restricts egress. See [Extensions](#extensions).
+- **For `objectStore.type: aws`** — an AWS bucket, a Control Plane cloud account, and a bucket-scoped IAM policy. See [Object Storage](#object-storage).
+- **For `objectStore.type: s3-compatible`** — a reachable S3-compatible endpoint and a [dictionary secret](/guides/create-secret/dictionary) holding its access keys, created **before** install.
+- **For `sql.secretName`** — an [opaque secret](/guides/create-secret/opaque) containing your SQL, created **before** install.
+- **For `secretEnv[]`** — every referenced secret must exist **before** install.
+
+## Installation
+
+Install the template using your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+# DuckDB runs a SQL script on a schedule and exits. It binds no port and is NOT a
+# query service — if you want an always-on SQL endpoint, install `trino` instead.
+image: duckdb/duckdb:1.5.5
+
+# ─── Schedule ─────────────────────────────────────────────────────────────────
+schedule: "0 2 * * *" # cron expression in UTC — always quote it (e.g. "*/15 * * * *")
+suspend: false # true = never run automatically; start it with `cpln workload cron start`
+activeDeadlineSeconds: 3600 # a run still going is terminated within ~2 min of this
+
+# ─── SQL ──────────────────────────────────────────────────────────────────────
+# The script the job runs. `secretName` wins when both are set.
+sql:
+  inline: |
+    -- Default self-test. Replace with your own transform.
+    SELECT 'duckdb-template-ok' AS status, version() AS duckdb_version, now() AS run_at;
+  secretName: "" # opaque secret (encoding plain, payload = SQL) used INSTEAD of inline, e.g. my-duckdb-script
+
+# Environment variables sourced from Control Plane secrets, readable in your SQL
+# as getenv('NAME'). For an ATTACHed database name the entry after the driver's
+# own password variable (PGPASSWORD, MYSQL_PWD) — ATTACH takes a string literal,
+# so getenv() cannot be concatenated into its connection string.
+secretEnv: []
+# secretEnv:
+#   - name: PGPASSWORD
+#     secretName: my-postgres-credentials # must exist BEFORE install
+#     secretKey: password # omit for an opaque secret (uses its payload)
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+# DuckDB reads the HOST's RAM and core count, not the container's limits, so the
+# template derives memory_limit and threads from these and sets them explicitly.
+# The job mounts no volume, so every job must fit in memory — raise maxMemory
+# rather than relying on spill. maxCpu:minCpu may not exceed 4:1.
+resources:
+  minCpu: 500m
+  maxCpu: 2000m # also sets DuckDB threads: one per whole core, minimum 1
+  minMemory: 1Gi
+  maxMemory: 4Gi
+
+tuning:
+  memoryLimitPercent: 60 # DuckDB memory_limit = this percent of maxMemory (20–80)
+
+# ─── Object storage ───────────────────────────────────────────────────────────
+# Registers a DuckDB S3 secret so your SQL can read and write s3:// paths.
+objectStore:
+  type: none # options: none, aws, s3-compatible
+
+  aws: # keyless — credentials come from the workload identity, no keys anywhere
+    region: us-east-1
+    cloudAccountName: my-s3-cloud-account # must exist BEFORE install
+    policyName: my-duckdb-bucket-policy # IAM policy scoped to your bucket (see README)
+
+  s3Compatible: # SeaweedFS, MinIO, Cloudflare R2, GCS interoperability, Tigris
+    endpoint: my-seaweedfs.my-gvc.cpln.local:8333 # host:port, no http:// prefix
+    region: us-east-1
+    urlStyle: path # options: path, vhost
+    useSsl: false
+    credentialsSecretName: my-duckdb-s3-credentials # dictionary secret: access-key-id, secret-access-key
+```
+
+### Schedule
+
+- `image` — The DuckDB container image. The chart is shipped and tested on DuckDB 1.5.5.
+- `schedule` — A five-field cron expression interpreted in **UTC**. Always quote it; the chart rejects anything that is not exactly five fields.
+- `suspend` — `true` installs the job without ever running it automatically. Trigger it by hand with `cpln workload cron start`.
+- `activeDeadlineSeconds` — Upper bound on a single run's duration.
+
+<Warning>
+`activeDeadlineSeconds` is not a hard cut. The deadline is *detected* on time, but the container is terminated within roughly **two minutes** of it, and keeps consuming its full CPU and memory allocation for that window. Size the value with that slack in mind rather than treating it as an exact ceiling — and see [Confirming a Run Succeeded](#confirming-a-run-succeeded), because a run killed this way can still print the success marker on its way out.
+</Warning>
+
+Runs never overlap (`concurrencyPolicy: Forbid`) and a failed run is not retried (`restartPolicy: Never`) — the next scheduled run simply starts as normal.
+
+### SQL Script
+
+Your script comes from one of two places, and `sql.secretName` wins when both are set:
+
+| Source | When to use it |
+|---|---|
+| `sql.inline` | The default. The script lives in your values and ships with the release. |
+| `sql.secretName` | The script is too large for a values file, or you want to change it without a Helm upgrade. Point it at an [opaque secret](/guides/create-secret/opaque) whose payload is the SQL. |
+
+With `sql.secretName` set, the template's own script secret is not created at all and the workload mounts your secret directly:
+
+```bash
+printf '%s' "SELECT 42 AS answer;" | cpln secret create-opaque \
+  --name my-duckdb-script --encoding plain -f -
+```
+
+The chart refuses to render when both are empty — there would be nothing to run.
+
+Before your script, the job executes a template-generated preamble containing `.bail on` and the derived `memory_limit`, `threads`, `temp_directory` and `extension_directory` settings. Because the preamble runs first, a `SET` in your own script always wins.
+
+### Credentials in SQL
+
+`secretEnv[]` turns Control Plane secrets into container environment variables, readable from your SQL with `getenv('NAME')`. The value never appears in your values file or in the rendered workload spec — only a `cpln://secret/...` reference does.
+
+| Field | Description |
+|---|---|
+| `name` | `UPPER_SNAKE_CASE` environment variable name. Must be unique across entries. |
+| `secretName` | Name of the Control Plane secret. It must exist **before** install. |
+| `secretKey` | Key within a [dictionary secret](/guides/create-secret/dictionary). Omit it for an [opaque secret](/guides/create-secret/opaque), which uses its payload. |
+
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_DEFAULT_REGION` are rejected — object-store credentials are owned by `objectStore`, and setting them here would silently override it.
+
+<Warning>
+**`getenv()` cannot be concatenated into an `ATTACH` string.** `ATTACH` takes a string *literal*, not an expression, so a connection string built with `'... password=' || getenv('PGPASSWORD')` fails to parse:
+
+```text
+Parser Error: syntax error at or near "||"
+```
+
+This applies equally to the `postgres`, `mysql` and `sqlite` attach types.
+</Warning>
+
+Instead, name the `secretEnv` entry after the database driver's own password variable and leave the password out of the connection string entirely — the driver reads it from the environment:
+
+| Attach type | Name the `secretEnv` entry |
+|---|---|
+| `postgres` | `PGPASSWORD` |
+| `mysql` | `MYSQL_PWD` |
+
+```yaml
+secretEnv:
+  - name: PGPASSWORD
+    secretName: my-postgres-credentials # must exist BEFORE install
+    secretKey: password # omit for an opaque secret (uses its payload)
+```
+
+```sql
+ATTACH 'dbname=postgres user=postgres host=my-postgres.my-gvc.cpln.local' AS pg (TYPE postgres, READ_ONLY);
+COPY (SELECT * FROM pg.public.events) TO 's3://my-bucket/events.parquet' (FORMAT parquet);
+```
+
+`getenv('NAME')` still works anywhere an ordinary expression is allowed — a `WHERE` clause, a computed column, a `COPY` destination built with `||`. The restriction is specific to `ATTACH`. If a credential truly must sit inline, put the whole connection string into a `sql.secretName` secret instead.
+
+Templates deployed in the same GVC are reachable at `{workload-name}.{gvc}.cpln.local` — for example [postgres](/template-catalog/templates/postgres) on `5432` or [mysql](/template-catalog/templates/mysql) on `3306`.
+
+### Resources and Tuning
+
+DuckDB reads the *host machine's* RAM and core count rather than the container's limits, so left alone it would size itself for hardware it does not have and get OOM-killed. The template therefore derives both settings from your values and writes them into the preamble explicitly:
+
+| Setting | Derived from | At the defaults |
+|---|---|---|
+| `memory_limit` | `tuning.memoryLimitPercent` of `resources.maxMemory` | `2457MiB` (60% of 4Gi) |
+| `threads` | One per whole core of `resources.maxCpu`, minimum 1 | `2` |
+
+`tuning.memoryLimitPercent` must be between 20 and 80. Above 80 is the default DuckDB behavior that gets containers killed; below 20 wastes the container.
+
+The chart validates the resource block at render time and refuses to install with a message naming the value to fix: `minMemory` may not exceed `maxMemory`, `minCpu` may not exceed `maxCpu`, and `maxCpu:minCpu` may not exceed 4:1 (a Control Plane limit).
+
+### Memory and Storage
+
+**No volume is attached to this workload**, which has two consequences worth planning around.
+
+Every job must fit in memory. Size the work with `resources.maxMemory` and `tuning.memoryLimitPercent` rather than relying on spill. DuckDB's out-of-core operators do still function, but they spill to container-local scratch at `/tmp/duckdb-temp` bounded by container disk — not to a sized, persistent volume. Larger-than-memory processing is not a capability this template offers.
+
+No `.duckdb` database file is kept either. Every run starts from an empty in-memory database, so results must be written somewhere durable: object storage, or a table in an attached database.
+
+### Extensions
+
+DuckDB extensions are written to `/tmp/duckdb-extensions`, which is container-local scratch. Because there is no cache volume, **extensions are re-downloaded from `extensions.duckdb.org` on every single run**. This is a real per-run dependency: a job that runs fine today will fail if egress to that host is later blocked.
+
+The commonly used `httpfs` and `aws` extensions autoload on first use of an `s3://` path, so most scripts never issue an explicit `INSTALL`.
+
+### Object Storage
+
+`objectStore.type` decides whether the preamble registers a DuckDB S3 secret. Anything other than `none` lets your SQL read and write `s3://` paths directly.
+
+<Tabs>
+  <Tab title="None (default)">
+    No S3 secret is registered. The job can still read local files, HTTP URLs and attached databases.
+
+    ```yaml
+    objectStore:
+      type: none
+    ```
+  </Tab>
+  <Tab title="AWS S3 (keyless)">
+    The job receives short-lived credentials from its own workload identity — no access keys are created, stored or injected anywhere.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create your S3 bucket and set `objectStore.aws.region` to its region.
+      </Step>
+      <Step title="Set up a Cloud Account">
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `objectStore.aws.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        Create an AWS IAM policy with the JSON below (replace `YOUR_BUCKET_NAME`), then set `objectStore.aws.policyName` to the policy's name:
+
+        ```json
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:ListBucket",
+                "s3:GetBucketLocation"
+              ],
+              "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME"
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject"
+              ],
+              "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+            }
+          ]
+        }
+        ```
+
+        Drop `s3:PutObject` and `s3:DeleteObject` if the job only reads.
+      </Step>
+      <Step title="Select the mode">
+        Set `objectStore.type: aws`. The chart requires `region`, `cloudAccountName` and `policyName` in this mode and refuses to render without them.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="S3-compatible">
+    Covers [SeaweedFS](/template-catalog/templates/seaweedfs), [MinIO](/template-catalog/templates/minio), Cloudflare R2, Tigris, and Google Cloud Storage through its S3 interoperability endpoint. These servers cannot federate with a cloud account, so they use static keys held in a secret.
+
+    <Steps>
+      <Step title="Create a bucket and access key">
+        Create the bucket on your server, plus an access key and secret key pair with read and write access to it. For Google Cloud Storage these are HMAC keys, created under Cloud Storage → Settings → Interoperability.
+      </Step>
+      <Step title="Create the credentials secret">
+        Create a [dictionary secret](/guides/create-secret/dictionary) with exactly these two keys, and set `objectStore.s3Compatible.credentialsSecretName` to its name:
+
+        ```bash
+        cpln secret create-dictionary --name my-duckdb-s3-credentials \
+          --entry access-key-id=YOUR_ACCESS_KEY \
+          --entry secret-access-key=YOUR_SECRET_KEY
+        ```
+
+        The DuckDB identity is granted `reveal` on exactly this secret.
+      </Step>
+      <Step title="Set the endpoint">
+        Set `objectStore.type: s3-compatible` and `objectStore.s3Compatible.endpoint` to the server's `host:port` with **no** `http://` or `https://` prefix — the chart rejects a scheme and tells you to use `useSsl` instead.
+
+        | Provider | `endpoint` | `urlStyle` | `useSsl` |
+        |---|---|---|---|
+        | SeaweedFS in the same GVC | `my-seaweedfs.my-gvc.cpln.local:8333` | `path` | `false` |
+        | MinIO in the same GVC | `my-minio.my-gvc.cpln.local:9000` | `path` | `false` |
+        | Google Cloud Storage | `storage.googleapis.com` | `path` | `true` |
+        | Cloudflare R2 | `<account-id>.r2.cloudflarestorage.com` | `path` | `true` |
+        | AWS S3 with static keys | `s3.us-east-1.amazonaws.com` | `vhost` | `true` |
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Connecting
+
+This template exposes nothing to connect to — it is a job, not a server. Observe and drive it instead:
+
+| What | How |
+|---|---|
+| Public URL | None. The workload binds no port and accepts no inbound traffic. |
+| Internal host:port | None. |
+| Job output | `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-duckdb"}' --limit 200 --since 1h` |
+| Run history | `cpln workload cron get RELEASE_NAME-duckdb --gvc GVC_NAME` |
+| Run it now | `cpln workload cron start RELEASE_NAME-duckdb --gvc GVC_NAME` |
+| Credentials | None are issued. The job reads the secrets you name in `secretEnv` and `objectStore`. |
+
+## Confirming a Run Succeeded
+
+A run succeeded only when **both** of these are true:
+
+1. The line `duckdb-job-complete` appears in the job's log output.
+2. The run's status is `Successful` in `cpln workload cron get`.
+
+Check both, never either one alone. Each covers a hole in the other:
+
+- **The marker alone is not enough.** A run terminated for exceeding `activeDeadlineSeconds` can finish its script inside the termination lag and print the marker on its way out, while the platform has already recorded the run as failed.
+- **The status alone is not enough.** DuckDB's CLI can exit `0` on some failed scripts ([upstream issue #16574](https://github.com/duckdb/duckdb/issues/16574)), which would leave the run looking successful.
+
+The marker is emitted by a final statement the template appends after your script, and the preamble's `.bail on` stops execution at the first error — so a SQL error aborts the script and the marker is never printed. Alerting on the pair is what makes the signal trustworthy in both directions.
+
+## Important Notes
+
+- **This is a batch job, not a query service.** Nothing is listening after install; that is correct behavior. For an always-on SQL endpoint, use [trino](/template-catalog/templates/trino).
+- **Check both success signals** — the `duckdb-job-complete` marker *and* a run status of `Successful`. Neither one alone is reliable.
+- **`activeDeadlineSeconds` terminates a run within roughly two minutes of the deadline**, not exactly at it, and the container bills for that window.
+- **Every job must fit in memory.** No volume is attached, so raise `resources.maxMemory` rather than relying on spill.
+- **Never `SET memory_limit` higher than the container.** Change `tuning.memoryLimitPercent` instead — DuckDB left to itself targets 80% of the *host* machine and gets OOM-killed.
+- **No `.duckdb` file is kept.** Every run starts from an empty in-memory database; write results to object storage or an attached database.
+- **Extensions are re-downloaded on every run** from `extensions.duckdb.org`. Every execution depends on that host being reachable.
+- **Prerequisite secrets must exist before install**, and uninstalling the release does not delete them — the template only removes the secrets it created itself.
+- **Installing this template several times is scale-out, not high availability.** Separate releases with different scripts or schedules run independently, but there is no failover: if tonight's container dies, tonight's job did not happen.
+- **One script per install, by design.** Multi-step, conditional or retrying pipelines belong in [airflow](/template-catalog/templates/airflow).
+
+## External References
+
+<CardGroup cols={2}>
+    <Card title="DuckDB Documentation" icon="book" href="https://duckdb.org/docs/stable/">
+    Official DuckDB documentation
+    </Card>
+    <Card title="CLI Arguments" icon="terminal" href="https://duckdb.org/docs/stable/clients/cli/arguments.html">
+    The CLI flags this template uses to run your script
+    </Card>
+    <Card title="Configuration Reference" icon="sliders" href="https://duckdb.org/docs/stable/configuration/overview.html">
+    Every setting available to a preamble or script
+    </Card>
+    <Card title="S3 API Support" icon="cloud" href="https://duckdb.org/docs/stable/core_extensions/httpfs/s3api.html">
+    Reading and writing s3:// paths with httpfs
+    </Card>
+    <Card title="Tuning Workloads" icon="gauge" href="https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads.html">
+    How memory and thread settings affect performance
+    </Card>
+    <Card title="DuckDB Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/duckdb">
+    View the source files, default values, and chart definition
+    </Card>
+</CardGroup>
