@@ -282,7 +282,11 @@ postgresML:
     location: aws-us-east-1 # logical mode only: the ONE location the nightly job runs in
     resources:
       cpu: 100m
-      memory: 128Mi
+      # 512Mi, matching postgres-multi-location's own default. At 128Mi the GCP
+      # path OOMs with NO log output: logical jobs merely report `failed` and the
+      # wal-g sidecar loops on OOMKilled while WAL archives with no base backup.
+      # Do not lower this without re-testing the GCS path.
+      memory: 512Mi
     logical:
       image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
       schedule: "0 2 * * *"
@@ -369,7 +373,7 @@ Each listed key is exposed to both workloads as an environment variable and inte
 
 ### SMTP
 
-Grafana sends alert notification emails through the SMTP server you configure, and the **alert evaluator is what actually sends them**. `smtp.passwordSecretName` is required whenever `smtp.user` is set, and the password stays in a pre-created [opaque secret](/guides/create-secret/opaque) with encoding `plain`. Leave `smtp.enabled: false` if you use webhook or chat contact points instead.
+Grafana sends alert notification emails through the SMTP server you configure, and the **alert evaluator is what actually sends them**. The SMTP path is configured and render-verified but has **not been exercised end to end** — validate it against your own server before relying on alert email. `smtp.passwordSecretName` is required whenever `smtp.user` is set, and the password stays in a pre-created [opaque secret](/guides/create-secret/opaque) with encoding `plain`. Leave `smtp.enabled: false` if you use webhook or chat contact points instead.
 
 ### Access
 
@@ -466,8 +470,8 @@ Measured on three locations (`aws-us-east-1`, `aws-eu-central-1`, `aws-us-west-2
 |---|---|
 | Cold install to all tiers ready, `replicas: 1` | **4 m 44 s** — HAProxy and etcd first, then the Patroni cluster, then Grafana's 713 schema migrations (5.79 s with the primary local) |
 | Cold install at `replicas: 2` | About **7 minutes** for every location to report ready, and up to about **12 minutes** for every individual replica |
-| Grafana-only change (for example `replicas: 1` → `3`) | **Zero downtime** — 1160 probe samples across four endpoints during the rollout, no failures |
-| Any `helm upgrade` that touches the database tier | Database writes unavailable in **every** location for about **117 s**, and the Grafana tier returns `503` for part of that window |
+| Grafana-only change (for example `replicas: 1` → `3`) | **Zero downtime** — 1160 probe samples across four endpoints, no failures. **Does not apply to the first upgrade after an install**, which re-applies every tier once regardless of what changed |
+| Any `helm upgrade` that touches the database tier | Database writes unavailable in **every** location for about **117 s**; the Grafana tier is down longer because reads fail too — measured recovery about **4 minutes**, with one location out for **5–6 minutes** |
 | Loss of the evaluator's replica | **21 s** without alert evaluation; the UI tier is unaffected |
 
 <Warning>
@@ -487,7 +491,7 @@ Measured on three locations (`aws-us-east-1`, `aws-eu-central-1`, `aws-us-west-2
 Backups are disabled by default and cover the app database — the dashboards, users, alert rules and saved datasources that make up your Grafana. Enable them with `postgresML.backup.enabled: true`, choose `logical` (a scheduled `pg_dumpall` cron workload in the one location named by `postgresML.backup.location`) or `wal-g` (continuous archiving from whichever member is currently the primary), and complete the storage setup for your provider **before** installing.
 
 <Warning>
-The backup path has been exercised against **AWS S3** only, and no restore has been performed by us. The `gcp` and `minio` providers are configured the same way but have not been exercised — validate them in a test install, and rehearse your restore procedure, before relying on either.
+The backup path has been exercised against **AWS S3** and **MinIO**, and a **wal-g restore has been verified end to end** (base backup plus WAL replay into an empty data directory, checksum-identical to source). The logical restore and the volume-set swap procedure have not been exercised. The `gcp` and `minio` providers are configured the same way but have not been exercised — validate them in a test install, and rehearse your restore procedure, before relying on either.
 </Warning>
 
 <Tabs>
@@ -569,7 +573,7 @@ The backup path has been exercised against **AWS S3** only, and no restore has b
 - **Create the admin password, encryption key and database credentials secrets before installing.** The chart creates none of them; without them the deployment waits on secrets that do not exist while `helm install` reports success.
 - **The GVC in `global.gvc.name` must not already exist.** Helm adopts an existing one and deletes it on uninstall, taking every unrelated workload with it.
 - **Never rotate or delete the encryption key.** Every instance in every location decrypts stored datasource credentials with it; changing it makes them all unreadable and alert rules that query them fail.
-- **Every `helm upgrade` that touches the database tier is a planned outage** of roughly two minutes, during which both Grafana tiers return errors. Changes confined to the Grafana workloads roll with zero downtime.
+- **Every `helm upgrade` that touches the database tier is a planned outage.** Database writes stop for about 117 s and the Grafana tiers return errors for longer — measured recovery about 4 minutes, one location 5–6 minutes. The first upgrade after any install costs this even for a Grafana-only change. Changes confined to the Grafana workloads roll with zero downtime.
 - **An upgrade that adds a secret reference can pause the rollout for about 9–10 minutes** while Helm reports success. It clears itself — do not re-run the upgrade or edit policies.
 - **Alert evaluation stops if you lose `alerting.location`, and the UI will not show it.** Repoint the knob and upgrade; that restarts only the evaluator.
 - **Silences must be created against the evaluator, from a workload in `alerting.location`** — its internal address returns `503` from every other location.
