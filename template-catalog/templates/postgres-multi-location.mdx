@@ -1,0 +1,561 @@
+---
+title: Postgres Multi-Location
+description: Deploy a single PostgreSQL 17 Patroni cluster stretched across Control Plane locations, with one primary, asynchronous streaming replicas elsewhere, automatic cross-location promotion, leader-routing HAProxy, optional PgBouncer pooling, and optional backups to object storage.
+keywords: ['postgres multi region', 'cross-region postgres', 'geo replication', 'disaster recovery database', 'patroni', 'etcd quorum', 'streaming replication', 'automatic failover', 'warm standby', 'rds multi-az alternative', 'aurora global alternative', 'pgbouncer', 'wal-g', 'regional redundancy']
+---
+
+## Overview
+
+Postgres Multi-Location deploys **one** PostgreSQL 17 Patroni cluster whose members span several Control Plane locations: a single primary that takes all traffic, asynchronous streaming replicas in the other locations, and automatic promotion of a replica in a surviving location when the primary's location is lost. An HAProxy tier in every location routes connections to whichever member currently holds the leader lock, so applications connect to a stable name in their own region and never need to know where the primary is.
+
+Consensus is provided by a bundled [`etcd-multi-location`](/template-catalog/templates/etcd-multi-location) cluster with one member per location — that quorum, not PostgreSQL, decides what the cluster survives.
+
+<Note>
+For a cluster inside a single location, use [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) instead.
+</Note>
+
+### How Many Locations You Need
+
+The consensus store commits a write only when a **majority** of its members agree, and it runs exactly one member per location.
+
+| Locations | Majority | Location losses survived | What happens when one location is lost |
+|---|---|---|---|
+| **2** | 2 | **0** | The surviving replica holds current data but stays **read-only**. Promotion is **manual**. |
+| **3** | 2 | **1** | **Automatic failover** — a replica in a surviving location is promoted and every proxy re-routes to it. |
+| **5** | 3 | **2** | Survives losing **two** locations. |
+
+With N locations you survive `floor((N-1)/2)` losses, so an even count buys nothing over the odd count below it. Two locations cannot form a symmetric quorum, which is why that topology is a warm standby rather than an automatic-failover cluster.
+
+### What Gets Created
+
+- **GVC** — A new GVC pinned to the configured locations. This template always creates it.
+- **Stateful Patroni PostgreSQL Workload** — `{release}-postgres-ml`, running PostgreSQL 17 with Patroni. Each configured location runs `replicas` members, every member gets its own volume, and every member is individually addressable. PostgreSQL listens on `5432` and the Patroni REST API on `8008`.
+- **Stateful etcd Workload** — `{release}-etcd`, the bundled `etcd-multi-location` chart providing consensus, one member per location.
+- **HAProxy Leader-Routing Workload** *(optional, enabled by default)* — `{release}-postgres-ml-proxy`, one tier per location, each routing to the single current primary.
+- **PgBouncer Workload** *(optional)* — `{release}-postgres-ml-pgbouncer`, a connection pooler, one tier per location, pooling into that location's HAProxy.
+- **Cron Backup Workload** *(optional)* — `{release}-postgres-ml-backup`, a scheduled `pg_dumpall` to object storage, running in exactly one location.
+- **WAL-G Sidecar** *(optional)* — A sidecar on every Patroni member; only the member holding the leader lock archives WAL and pushes base backups.
+- **Volume Sets** — `{release}-postgres-ml-vs` for the PostgreSQL data directory (`ext4`, final snapshot with 7-day retention), plus the etcd cluster's own volume set.
+- **Secrets** — Opaque secrets holding the Patroni startup script, the HAProxy startup script, and the WAL-G backup script. The **database credentials secret is not created by this template** — see [Prerequisites](#prerequisites).
+- **Identity & Policy** — An identity per workload group with `reveal` on exactly the secrets in play, plus a bucket-scoped cloud binding when backups are enabled.
+
+<Note>
+This template creates its own GVC. You do not need to create one before installing.
+</Note>
+
+## Prerequisites
+
+<Warning>
+The GVC named in `global.gvc.name` **must not already exist**. Helm adopts a GVC that does, and `helm uninstall` then deletes it along with every unrelated workload in it. Always point this template at a fresh GVC name.
+</Warning>
+
+PostgreSQL credentials are supplied through a [dictionary secret](/guides/create-secret/dictionary) that you create **before** installing. They are never passed through Helm values.
+
+<Steps>
+  <Step title="Create the credentials secret">
+    The secret must hold exactly three keys — `username`, `password` and `database`:
+
+    ```bash
+    cpln secret create-dictionary --name my-postgres-ml-credentials \
+      --entry username=postgres \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=mydb
+    ```
+
+    Use plain identifiers for `username` and `database` — they are used unquoted when the database is created. Secrets are org-level, so no GVC flag is involved.
+  </Step>
+  <Step title="Point the template at it">
+    Set `postgres.credentialsSecretName` to the secret's name.
+  </Step>
+  <Step title="Read the credentials back later">
+    ```bash
+    cpln secret reveal my-postgres-ml-credentials
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+Create the secret **before** installing. Without it `helm install` still reports success, but the workload sits at zero replicas in every location with `The secret ... no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` in `cpln workload get-deployments`. Creating the secret afterwards clears the wedge on its own within a few minutes — no reinstall or upgrade is needed.
+</Warning>
+
+Backups need additional setup before they can be enabled — see [Backing Up](#backing-up).
+
+To install, follow the instructions for your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+global:
+  gvc:
+    # This chart CREATES this GVC. It must NOT already exist: Helm adopts a GVC
+    # that does, and `helm uninstall` then DELETES it and everything in it.
+    name: postgres-multi-location-gvc
+    # Minimum 2 locations. 3 gives automatic failover, 5 survives losing two;
+    # 2 gives a warm standby with MANUAL promotion.
+    # `replicas` is Patroni members per location; etcd always runs 1 per location.
+    locations:
+      - name: aws-us-east-1
+        replicas: 1
+      - name: aws-eu-central-1
+        replicas: 1
+      - name: aws-us-west-2
+        replicas: 1
+
+image: controlplanecorporation/patroni-postgres:0.7
+
+resources:
+  minCpu: 500m
+  minMemory: 1Gi
+  maxCpu: 1
+  maxMemory: 2Gi
+
+postgres:
+  # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+  # A `dictionary` secret holding exactly three keys: `username`, `password` and
+  # `database`. If it does not exist at install time the deployment WEDGES
+  # waiting on it and looks broken.
+  credentialsSecretName: my-postgres-ml-credentials
+
+# Preferred location for the primary. CHANGING THIS ON A LIVE CLUSTER MOVES THE
+# LEADER: the value is baked into the startup script, so editing it restarts every
+# member (~2 min of interrupted writes) and the election that follows picks this
+# location. To move a primary WITHOUT a restart, use patronictl switchover.
+# Empty = no preference.
+primaryLocation: ""
+
+volumeset:
+  capacity: 10 # initial capacity in GiB (minimum is 10)
+  autoscaling:
+    enabled: false
+    maxCapacity: 100 # GiB, when autoscaling is enabled
+    minFreePercentage: 10 # free-space trigger
+    scalingFactor: 1.2 # growth multiplier
+
+internalAccess:
+  type: same-gvc # options: same-gvc, same-org, workload-list
+  workloads: [] # only used when type is workload-list
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+# ─── Leader-routing proxy ─────────────────────────────────────────────────────
+# One HAProxy tier per location; every one routes to the single current primary.
+proxy:
+  enabled: true # automatically enabled when pgbouncer.enabled is true
+  image: haproxy:2.9
+  resources:
+    cpu: 100m
+    memory: 128Mi
+  minReplicas: 2
+  maxReplicas: 2
+
+# ─── PgBouncer connection pooler ──────────────────────────────────────────────
+# One tier per location, each pooling into its location's HAProxy.
+pgbouncer:
+  enabled: false
+  image: edoburu/pgbouncer:v1.25.1-p0
+  poolMode: transaction # options: session, transaction, statement
+  defaultPoolSize: 25 # real Postgres connections PgBouncer keeps per replica
+  maxClientConn: 1000 # client connections PgBouncer accepts per replica
+  maxDbConnections: 100 # hard cap on total Postgres connections
+  minReplicas: 2
+  maxReplicas: 4
+  resources:
+    cpu: 200m
+    memory: 128Mi
+
+# ─── Backups ──────────────────────────────────────────────────────────────────
+backup:
+  enabled: false
+  mode: logical # logical or wal-g
+  # `logical` mode ONLY. A cron workload runs in EVERY location of its GVC, so
+  # without this the job would fire once per location every night and write N
+  # copies into one bucket. Pick the ONE location it runs in — nearest your
+  # bucket. `wal-g` mode ignores it: that archives from whichever member is
+  # currently the primary, wherever that is.
+  location: aws-us-east-1
+  resources: # applies to whichever mode is enabled
+    cpu: 100m
+    memory: 128Mi
+
+  logical:
+    image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0 # 17.1.0 = Postgres 17, 18.1.0 = Postgres 18
+    schedule: "0 2 * * *" # cron schedule, default is daily at 02:00 UTC
+
+  walg:
+    intervalSeconds: 21600 # seconds between base backups, default is every 6 hours
+
+  # storage settings are applied to whichever mode is enabled
+  provider: aws # options: aws, gcp, minio
+
+  aws:
+    bucket: my-postgres-ml-bucket
+    region: us-east-1
+    cloudAccountName: my-s3-cloud-account
+    policyName: my-postgres-ml-backup-policy # bucket-scoped IAM policy
+    prefix: postgres/backups # folder within the bucket
+
+  gcp:
+    bucket: my-postgres-ml-bucket
+    cloudAccountName: my-gcs-cloud-account
+    prefix: postgres/backups # folder within the bucket
+
+  minio: # a self-hosted MinIO workload, or any S3-compatible endpoint
+    endpoint: http://my-minio-workload:9000 # e.g. http://WORKLOAD_NAME:9000 in the same GVC
+    bucket: my-postgres-ml-bucket
+    # REQUIRED PREREQUISITE SECRET when provider is `minio` — a `dictionary`
+    # secret holding `accessKey` and `secretKey`.
+    credentialsSecretName: my-postgres-ml-minio-credentials
+    prefix: postgres/backups # folder within the bucket
+
+# ─── etcd (subchart: etcd-multi-location) ─────────────────────────────────────
+etcd:
+  image: controlplanecorporation/etcd:0.1
+  resources:
+    cpu: 500m
+    memory: 512Mi
+  tuning:
+    heartbeatIntervalMs: 250
+    electionTimeoutMs: 5000
+  volumeset:
+    capacity: 10
+  internalAccess:
+    type: same-gvc
+    workloads: []
+  recovery:
+    # EMERGENCY ONLY — see "Recovering From a Lost Location".
+    forceNewClusterInLocation: ""
+```
+
+### GVC and Locations
+
+The GVC name and the location list live under `global.gvc` so that Helm passes the same values to the bundled etcd cluster. Never configure the two location lists separately.
+
+- `global.gvc.name` — Name of the GVC this chart creates. It must not already exist.
+- `global.gvc.locations[].name` — A Control Plane location (e.g. `aws-us-east-1`). At least 2 are required; see [How Many Locations You Need](#how-many-locations-you-need).
+- `global.gvc.locations[].replicas` — Number of Patroni members in that location. etcd always runs exactly one member per location regardless of this value. Members are named `{workload}-{location}-{index}`, so they stay unique when a location runs more than one.
+
+Removing a location from the list is the supported way to shrink the cluster. Do not suspend a location instead — see [Important Notes](#important-notes).
+
+### Credentials
+
+`postgres.credentialsSecretName` names the dictionary secret described in [Prerequisites](#prerequisites). The template creates no credentials of its own, and PgBouncer reads the same secret.
+
+<Note>
+The credentials are written into the data directory when the cluster first bootstraps. Rotating the secret afterwards does not change the database — change the password with `ALTER ROLE` first, then update the secret to match.
+</Note>
+
+### Preferred Primary Location
+
+`primaryLocation` gives one location a higher failover priority than the others, so it wins the leader election when all members are eligible. Leaving it empty means no preference.
+
+<Warning>
+`primaryLocation` is baked into the Patroni startup script, so changing it on a live cluster rewrites that script and restarts every member. That costs the full [upgrade write outage](#availability-and-planned-outages) and the election that follows moves the leader. To move a primary without a restart, use `patronictl switchover` instead.
+</Warning>
+
+The preference biases elections; it does not fail back automatically after an outage. A cluster whose preferred location is restored keeps its current leader until the next election.
+
+### Resources and Storage
+
+- `image` — The Patroni + PostgreSQL 17 image.
+- `resources.minCpu` / `resources.minMemory` — Reserved CPU and memory per member.
+- `resources.maxCpu` / `resources.maxMemory` — Limits per member.
+- `volumeset.capacity` — Initial volume size in GiB (minimum 10). Every member gets its own volume.
+- `volumeset.autoscaling.enabled` — Expand the volume automatically as it fills. When enabled:
+  - `maxCapacity` — Maximum volume size in GiB.
+  - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
+  - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
+
+### Internal Access
+
+`internalAccess` applies to the PostgreSQL, HAProxy and PgBouncer tiers alike. There is no public access in this version — every endpoint is internal to Control Plane.
+
+| Type | Description |
+|------|-------------|
+| `same-gvc` | Allow access from all workloads in the same GVC (default) |
+| `same-org` | Allow access from all workloads in the same organization |
+| `workload-list` | Allow access only from the workload links in `internalAccess.workloads` |
+
+<Note>
+A firewall change is not instant. Closing access down was measured at under a minute, while re-opening it took over three minutes. Allow up to about four minutes and re-test before concluding the setting did not apply.
+</Note>
+
+### Leader-Routing Proxy
+
+Only the member holding the leader lock accepts writes; the rest are read-only. HAProxy polls each member's Patroni REST API and forwards connections to whichever one currently answers as the primary, so applications get a stable endpoint in their own location. `proxy.minReplicas` / `proxy.maxReplicas` are **per location** — the default of 2 means 2 replicas in each configured location.
+
+| Endpoint | Description |
+|---|---|
+| `:8404/healthz` | Healthy when a primary backend is reachable, unhealthy otherwise |
+| `:8405/stats` | Live HAProxy stats, including the health of each member |
+
+<Note>
+The proxy is required for `logical` backups, which must dump from the current primary, and the chart refuses to render without it. Enabling PgBouncer enables the proxy implicitly, even if `proxy.enabled` is set to `false`.
+</Note>
+
+### PgBouncer Connection Pooling
+
+PgBouncer multiplexes application connections into a smaller pool of real database connections. It pools into its own location's HAProxy rather than into a member, so leader routing and failover stay transparent. When enabled it becomes the connection endpoint applications use.
+
+| Mode | Description |
+|------|-------------|
+| `transaction` | Connection held for one transaction, then returned to the pool. Best for most web and API workloads. Not compatible with `SET` variables, temporary tables or advisory locks. |
+| `session` | Connection held for the whole client session. Compatible with everything, less reuse — raise `defaultPoolSize` to your expected concurrency. |
+| `statement` | Connection returned after every statement. Transactions are not supported. |
+
+- `pgbouncer.defaultPoolSize` — Real PostgreSQL connections kept per PgBouncer replica (default `25`).
+- `pgbouncer.maxClientConn` — Client connections accepted per PgBouncer replica (default `1000`).
+- `pgbouncer.maxDbConnections` — Hard cap on total PostgreSQL connections, so scaling PgBouncer out cannot exhaust the primary.
+- `pgbouncer.minReplicas` / `pgbouncer.maxReplicas` — Autoscaling bounds, **per location**.
+
+## Connecting
+
+Everything is internal to Control Plane. Substitute your release name and the GVC name from `global.gvc.name`.
+
+| What | Where |
+|---|---|
+| PostgreSQL, pooled (when PgBouncer is enabled) | `RELEASE_NAME-postgres-ml-pgbouncer.GVC_NAME.cpln.local:5432` |
+| PostgreSQL, current primary (recommended otherwise) | `RELEASE_NAME-postgres-ml-proxy.GVC_NAME.cpln.local:5432` |
+| PostgreSQL, one specific member | `replica-INDEX.RELEASE_NAME-postgres-ml.LOCATION.GVC_NAME.cpln.local:5432` |
+| Patroni REST API | Port `8008` on the same per-member names (`/primary`, `/replica`, `/health`) |
+| HAProxy health and stats | `:8404/healthz` and `:8405/stats` on the proxy workload |
+| Credentials | The dictionary secret named by `postgres.credentialsSecretName` |
+
+The proxy endpoint in every location reaches the same primary, wherever it is. Per-member names are useful for read-only queries against a nearby replica, or as a fallback when the proxy is disabled — but a client using them has to poll the members to discover which one is currently the primary.
+
+## Availability and Planned Outages
+
+Measured on a three-location cluster (`aws-us-east-1`, `aws-eu-central-1`, `aws-us-west-2`) with one member per location and a one-second write probe running in each location.
+
+| Event | Measured impact |
+|---|---|
+| Clean install to all three members ready | **169 s** — leader elected, both replicas streaming with no lag |
+| Graceful loss of the member holding the leader lock | Switchover in **3.19 s**; writes unavailable **4.7–5.8 s** per location; the old member rejoined as a streaming replica after **2 m 16 s** |
+| Any `helm upgrade`, including one that changes nothing | Writes unavailable in **every** location for about **117 s** |
+| Restart of the etcd tier | About **19 s** of write unavailability; recovers automatically |
+
+<Warning>
+**Treat every `helm upgrade` as a planned write outage of roughly two minutes.** Members do not restart one at a time: the field that would serialize the rollout is not retained by the platform, so all members go down together and no location can write during the window. This was measured on an upgrade that changed nothing at all, so it applies to any values change, including enabling a feature.
+</Warning>
+
+<Note>
+During an etcd outage Patroni's failsafe mode keeps the primary serving writes — it held for about 60 seconds with zero failed writes. Once the replicas' own health checks start failing, the failsafe loses its precondition and the primary demotes itself, which is where the ~19 s of unavailability comes from. The cluster re-promotes and resumes on its own; no operator action is needed.
+</Note>
+
+### Application Retry Logic
+
+Applications must retry on transient database errors. Two are worth handling explicitly during a failover:
+
+- Connection-level failures — `server closed the connection unexpectedly`, `terminating connection due to administrator command`.
+- `ERROR: cannot execute INSERT in a read-only transaction`, seen briefly when the proxy forwards to a member that has just been demoted and its health check has not yet flipped.
+
+Exponential backoff over a window of a few seconds covers a failover; an upgrade needs a window of a couple of minutes or a maintenance pause.
+
+### Data Loss on Failover
+
+Replication is **asynchronous**. A promoted replica applies everything it has received, so a failover can lose the transactions that had not yet reached it — bounded by the replication lag at the instant of failure. Check lag with `pg_stat_replication` on the primary; in the service mesh every replication client reports the same `client_addr`, so use `application_name` (the member name) to tell members apart.
+
+## Operating the Cluster
+
+Members are named `{workload}-{location}-{index}`, for example `my-db-postgres-ml-aws-us-east-1-0`. `patronictl` reads the config the startup script writes to `/tmp/patroni_config.yml`:
+
+```bash
+# Every member, its location, role and replication lag
+cpln workload exec RELEASE_NAME-postgres-ml --gvc GVC_NAME --container patroni-postgres \
+  -- patronictl -c /tmp/patroni_config.yml list
+
+# Move a live primary to another location — a planned, near-zero-downtime handover
+cpln workload exec RELEASE_NAME-postgres-ml --gvc GVC_NAME --container patroni-postgres \
+  -- patronictl -c /tmp/patroni_config.yml switchover --candidate RELEASE_NAME-postgres-ml-LOCATION-0 --force
+```
+
+Consensus-level settings (`ttl`, `loop_wait`, `retry_timeout`, `maximum_lag_on_failover`, failsafe mode) are written once, when the cluster is first initialized, and are not values knobs. Change them on a live cluster with `patronictl edit-config`.
+
+### Recovering From a Lost Location
+
+With **3 or more locations** this section does not apply — losing one location is an automatic failover.
+
+With **2 locations**, losing one loses consensus quorum permanently: the survivor holds current data but cannot be granted the leader lock, and consensus writes time out. To rebuild from the surviving member, set `etcd.recovery.forceNewClusterInLocation` to that member's location and run a `helm upgrade`. Once writes are accepted again, return the value to `""` and reprovision the failed location's members — their volumes must be reset before they rejoin.
+
+## Backing Up
+
+Backups are disabled by default. Set `backup.enabled: true`, choose a mode, and configure a storage provider.
+
+| Mode | Shape | Runs where | Good for |
+|---|---|---|---|
+| `logical` | Scheduled `pg_dumpall` cron workload | Exactly one location — `backup.location` | Portable SQL dumps, cross-version migration, smaller databases |
+| `wal-g` | Sidecar on every member, active only on the primary | Follows the primary | Continuous WAL archiving and point-in-time recovery on larger databases |
+
+`backup.location` exists because **a cron workload runs in every location of its GVC**. Without it a three-location cluster would dump the same database three times a night into one bucket. Pick the location nearest the bucket — that is where the dump is read and uploaded from. It applies to `logical` mode only: the WAL-G sidecar runs on every member but only the one holding the leader lock pushes, so the archive follows the primary across a failover with no selector needed.
+
+- `backup.logical.schedule` — Cron expression for the dump (default: daily at 02:00 UTC). The dump runs through the proxy, so it always hits the current primary, and includes roles and all databases.
+- `backup.walg.intervalSeconds` — Seconds between base backups (default `21600`, every 6 hours). WAL segments are archived continuously in between.
+- `backup.resources.cpu` / `backup.resources.memory` — Resources for whichever mode is enabled.
+
+<Note>
+Switching `backup.mode` to or from `wal-g` restarts PostgreSQL, because it changes `archive_mode`. Enabling `logical` backups does not. After enabling `wal-g`, confirm `SHOW archive_mode` reports `on` in every location before relying on the archive — one location can take up to about ten minutes to pick up the new configuration.
+</Note>
+
+<Warning>
+The backup path has been exercised against **AWS S3** only: dumps and WAL/base backups are written and verified in the bucket. **A wal-g restore has been verified end to end** (base backup plus WAL replay into an empty data directory, checksum-identical to source); the logical restore and the volume-set swap procedure below have **not** been exercised — the procedures below are documented, not tested. The `gcp` and `minio` providers are configured the same way but have not been exercised — validate them in a test install before relying on them. Likewise, rehearse your restore procedure in a scratch environment before you need it.
+</Warning>
+
+### AWS S3
+
+Before enabling backup with `provider: aws`, complete the following in your AWS account:
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion"
+            ],
+            "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+            ]
+        }
+    ]
+}
+```
+
+4. Set `backup.aws.policyName` to the name of the policy created in step 3. This bucket-scoped policy is all the workload identity needs — no broad managed policy is required.
+5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+
+### GCS
+
+Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account. The template additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket named in `backup.gcp.bucket`.
+4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+
+### MinIO
+
+No Cloud Account is needed — credentials are supplied as a secret.
+
+1. Create a bucket in MinIO. Set `backup.minio.bucket` to its name.
+2. Set `backup.minio.endpoint` to the MinIO S3 API address including the port. For the [minio](/template-catalog/templates/minio) template deployed in the same GVC, use `http://WORKLOAD_NAME:9000`.
+3. Create a dictionary secret holding the MinIO credentials and set `backup.minio.credentialsSecretName` to its name. For the `minio` template these are its `admin.username` and `admin.password`:
+
+```bash
+cpln secret create-dictionary --name my-postgres-ml-minio-credentials \
+  --entry accessKey=MINIO_ACCESS_KEY \
+  --entry secretKey=MINIO_SECRET_KEY
+```
+
+4. Set `backup.minio.prefix` to the folder path where backups will be stored.
+
+## Restoring a Backup
+
+<Note>
+  These procedures are documented from upstream, not exercised by us — no restore was
+  performed during testing. Rehearse them in a scratch environment before you need them.
+</Note>
+
+### Logical
+
+Stream the dump back through the proxy, which writes to the current primary. Run this from a client with access to the bucket:
+
+```sh
+export PGPASSWORD="PASSWORD"
+
+aws s3 cp "s3://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
+  | gunzip \
+  | psql \
+      --host=RELEASE_NAME-postgres-ml-proxy.GVC_NAME.cpln.local \
+      --port=5432 \
+      --username=USERNAME \
+      --dbname=postgres
+
+unset PGPASSWORD
+```
+
+For GCS, replace the `aws s3 cp` with `gsutil cp "gs://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" -`. For MinIO, add `--endpoint-url "http://MINIO_ENDPOINT:9000"` and run `aws configure set default.s3.addressing_style path` first.
+
+### WAL-G
+
+A point-in-time restore needs an empty data directory, so restore into a new volume set:
+
+1. Run `wal-g backup-list` to identify the desired backup.
+2. Stop the Patroni workload.
+3. Create a new volume set and mount it at `/var/lib/postgresql/data` on a one-off restore workload.
+4. Run `wal-g backup-fetch /var/lib/postgresql/data/pgdata BACKUP_NAME`.
+5. Re-point the Patroni workload at the restored volume set and start it.
+6. Change the WAL-G prefix before re-enabling backups, or the new cluster's WAL collides with the old system identifier.
+
+## Important Notes
+
+- **Create the credentials secret before installing.** `postgres.credentialsSecretName` names a secret this template does not create. Without it the deployment waits on a secret that does not exist; creating it afterwards clears the wedge within a few minutes.
+- **The GVC in `global.gvc.name` must not already exist.** Helm adopts an existing GVC and deletes it on uninstall, taking every unrelated workload with it.
+- **Every `helm upgrade` interrupts writes in all locations for about two minutes.** Plan changes as maintenance windows.
+- **Replication is asynchronous**, so a failover can lose the most recent transactions — bounded by the replication lag at the moment of failure.
+- **`primaryLocation` moves a live primary.** Changing it restarts every member, which costs the full upgrade outage and triggers an election. It does not fail back automatically after an outage.
+- **Never suspend a location.** Suspending and resuming one permanently withdraws its endpoints from the other locations' service discovery while every status surface still reports healthy. Remove a location from `global.gvc.locations` instead.
+- **Allow about two minutes after a cold install** before believing a member is unreachable — cross-location service discovery takes that long to converge. Firewall changes can take up to about four minutes.
+- **Consensus-level settings are not values knobs.** They are written once, at first initialization; change them with `patronictl edit-config`.
+- **Cost scales with write volume multiplied by the members outside the primary's location.** Each of them receives a full copy of the WAL stream, and cross-region traffic is billed. Read-mostly workloads are inexpensive to stretch; write-heavy ones are not.
+
+## External References
+
+<CardGroup cols={2}>
+    <Card title="Patroni Documentation" icon="book" href="https://patroni.readthedocs.io/en/latest/">
+    Patroni clustering and automatic failover documentation
+    </Card>
+    <Card title="patronictl Reference" icon="terminal" href="https://patroni.readthedocs.io/en/latest/patronictl.html">
+    Command reference for inspecting and switching over a cluster
+    </Card>
+    <Card title="Patroni Dynamic Configuration" icon="sliders" href="https://patroni.readthedocs.io/en/latest/dynamic_configuration.html">
+    The consensus-level settings changed with `patronictl edit-config`
+    </Card>
+    <Card title="PostgreSQL 17 Documentation" icon="database" href="https://www.postgresql.org/docs/17/">
+    Official PostgreSQL documentation
+    </Card>
+    <Card title="WAL-G Documentation" icon="box-archive" href="https://wal-g.readthedocs.io/">
+    Continuous archiving and point-in-time recovery
+    </Card>
+    <Card title="etcd Documentation" icon="server" href="https://etcd.io/docs/v3.6/">
+    Official etcd documentation
+    </Card>
+    <Card title="PgBouncer Documentation" icon="database" href="https://www.pgbouncer.org/config.html">
+    PgBouncer configuration reference
+    </Card>
+    <Card title="Postgres Multi-Location Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/postgres-multi-location">
+    View the source files, default values, and chart definition
+    </Card>
+</CardGroup>
