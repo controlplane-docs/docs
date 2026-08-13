@@ -52,6 +52,12 @@ No Docker on this machine or CI runner? Add `--remote` to build remotely — the
 
   # Build without cache
   cpln image build --name my-app:v1 --push --no-cache
+
+  # Pass a value the Dockerfile reads with ARG
+  cpln image build --name my-app:v1 --push --build-arg NODE_VERSION=22
+
+  # Mount a secret for one RUN step, without baking it into the image
+  cpln image build --name my-app:v1 --push --secret id=npmtoken,src=cpln://secret/npm-token
   ```
 
   | Flag | Description |
@@ -61,6 +67,8 @@ No Docker on this machine or CI runner? Add `--remote` to build remotely — the
   | `--push` | Push the image to your org's private registry after building |
   | `--no-cache` | Build without using cache |
   | `--platform`, `-p` | Target platform (default: `linux/amd64`) |
+  | `--build-arg` | Set a Dockerfile `ARG` value. See [Build Arguments](#build-arguments) |
+  | `--secret` | Expose a secret to a `RUN` step. See [Build Secrets](#build-secrets) |
 
   <Info>
   When `--dir` is specified, the Dockerfile in that directory is used by default. Use `--dockerfile` to override this behavior.
@@ -137,6 +145,11 @@ No Docker on this machine or CI runner? Add `--remote` to build remotely — the
 
   # Start the build and return immediately
   cpln image build --name my-app:v1 --remote --detach
+
+  # Pass a build argument and mount a secret from your org
+  cpln image build --name my-app:v1 --remote \
+    --build-arg NODE_VERSION=22 \
+    --secret id=npmtoken,src=cpln://secret/npm-token
   ```
 
   | Flag | Description |
@@ -147,11 +160,15 @@ No Docker on this machine or CI runner? Add `--remote` to build remotely — the
   | `--branch` | Branch to build (requires `--repo`, defaults to the repository's default branch) |
   | `--detach` | Return as soon as the build starts instead of following it |
   | `--no-cache` | Ignore cached layers and re-upload the whole folder |
+  | `--build-arg` | Set a Dockerfile `ARG` value. See [Build Arguments](#build-arguments) |
+  | `--secret` | Mount a secret from your org. See [Build Secrets](#build-secrets) |
 
   **What gets uploaded:** the folder is filtered by `.dockerignore`, or by `.gitignore` when there is no `.dockerignore`, and is limited to 500 MB and 20,000 files. Common junk such as `.git`, `node_modules`, `__pycache__`, and `.venv` is excluded either way. Later builds of the same image upload only the files that changed. Symlinks travel as links, so one pointing outside the build folder fails the build.
 
   <Info>
   A remote build detects how to build the source itself, so the local build flags do not apply. `--dockerfile`, `--builder`, `--buildpack`, `--env`, `--env-file`, `--trust-builder`, `--trust-extra-buildpacks`, `--platform`, and `--push` are rejected together with `--remote`, and the image is built for `linux/amd64`.
+
+  `--build-arg` and `--secret` do apply. A secret must name one in your org with `src=cpln://secret/<name>`.
   </Info>
 
   Build logs stream until the image is pushed. Pressing `Ctrl+C` stops watching but leaves the build running remotely; check the result with `cpln image get my-app:v1`.
@@ -161,6 +178,109 @@ No Docker on this machine or CI runner? Add `--remote` to build remotely — the
   </Note>
 </Tab>
 </Tabs>
+
+### Build Arguments
+
+`--build-arg` sets a value the Dockerfile reads with `ARG`. It takes docker's own two forms: a `NAME=value` pair, or a bare `NAME` whose value comes from your environment.
+
+```bash
+# Set the value directly
+cpln image build --name my-app:v1 --push --build-arg NODE_VERSION=22
+
+# Take the value from the environment
+export GIT_SHA=$(git rev-parse --short HEAD)
+cpln image build --name my-app:v1 --push --build-arg GIT_SHA
+
+# Repeat the option for each argument
+cpln image build --name my-app:v1 --push \
+  --build-arg NODE_VERSION=22 \
+  --build-arg GIT_SHA
+```
+
+The Dockerfile declares each one it uses:
+
+```dockerfile
+ARG NODE_VERSION=22
+FROM node:${NODE_VERSION}-alpine
+
+ARG GIT_SHA
+LABEL org.opencontainers.image.revision=$GIT_SHA
+```
+
+**Common uses**
+
+| Use case | Example |
+|----------|---------|
+| Pin a base image version | `--build-arg NODE_VERSION=22` |
+| Stamp provenance into a label | `--build-arg GIT_SHA` |
+| Switch a build variant | `--build-arg BUILD_TARGET=production` |
+| Select a package mirror | `--build-arg NPM_REGISTRY=https://nexus.internal/repo/npm` |
+| Force a cache bust | `--build-arg CACHEBUST=$(date +%s)` |
+
+<Warning>
+A build argument is not a secret. Its value becomes part of the image's build and cache keys, and anyone who can pull the image can recover it. Use [`--secret`](#build-secrets) for tokens, keys, and passwords.
+</Warning>
+
+<Note>
+A bare `NAME` that is unset in your environment sends nothing, so the Dockerfile's own `ARG` default applies. A build with no Dockerfile prints a warning naming the arguments it could not consume and continues, since buildpack builds have no `ARG` mechanism.
+</Note>
+
+### Build Secrets
+
+`--secret` exposes a credential to a single `RUN` step. Unlike a build argument, the value is mounted as a file for the length of that step only: it never lands in the image, its layers, or its build cache.
+
+The option takes docker's own form, `id=<id>[,src=<source>]`, and `src` additionally accepts a secret in your org.
+
+```bash
+# A secret in your org
+cpln image build --name my-app:v1 --push \
+  --secret id=npmtoken,src=cpln://secret/npm-token
+
+# One field of a dictionary or structured secret
+cpln image build --name my-app:v1 --push \
+  --secret id=dbpass,src=cpln://secret/db-creds.password
+
+# A file on this machine, the way docker reads one
+cpln image build --name my-app:v1 --push \
+  --secret id=npmtoken,src=./npm-token.txt
+
+# Repeat the option for each secret
+cpln image build --name my-app:v1 --push \
+  --secret id=npmtoken,src=cpln://secret/npm-token \
+  --secret id=certkey,src=cpln://secret/client-tls.key
+```
+
+The Dockerfile reads it by the same `id`, at `/run/secrets/<id>`:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM node:22-alpine
+
+COPY package*.json ./
+RUN --mount=type=secret,id=npmtoken,required=true \
+    NPM_TOKEN="$(cat /run/secrets/npmtoken)" npm ci
+```
+
+**Sources `src` accepts**
+
+| Source | Meaning |
+|--------|---------|
+| `cpln://secret/<name>` | An [opaque secret](/guides/create-secret/opaque) in your org, mounted whole |
+| `cpln://secret/<name>.<field>` | One field of a structured secret, such as a [dictionary](/guides/create-secret/dictionary) entry or a [userpass](/guides/create-secret/userpass) password |
+| `<path>` | A file on this machine, exactly as docker reads it |
+| omitted, or `env=<VAR>` | An environment variable on this machine, exactly as docker reads it |
+
+<Info>
+A `--remote` build accepts only the `cpln://secret/...` sources. The build service resolves them itself with your credentials, so the value never leaves the platform. A file path or an environment variable is rejected.
+</Info>
+
+<Tip>
+Add `required=true` to the mount. Without it, a missing secret mounts nothing and the build carries on with an empty credential, which usually surfaces much later as a confusing authentication error.
+</Tip>
+
+<Note>
+Build secrets require Docker Buildx for local builds, and a Dockerfile in either mode. Buildpack builds cannot consume secrets, so the build is rejected before it starts.
+</Note>
 
 ## Use Images in Workloads
 
@@ -276,6 +396,28 @@ See [CI/CD Usage](/cli-reference/ci-cd-development/ci-cd) for complete automatio
 
 <Accordion title="Authentication failed or 403">
   Re-run `cpln image docker-login` to refresh credentials and double check that you don't have typos in the org name.
+</Accordion>
+
+<Accordion title="--secret requires a Dockerfile build">
+  Buildpack builds have no secret mechanism, so the option is rejected before the build starts. Add a Dockerfile to the build context, or drop `--secret`.
+</Accordion>
+
+<Accordion title="Build secrets require Docker Buildx">
+  Local builds mount secrets through Buildx, which is not installed. Install the plugin as shown above, or build remotely with `--remote`.
+</Accordion>
+
+<Accordion title="The mounted secret is empty">
+  The `id` in `--secret id=<id>` and the `id` in `RUN --mount=type=secret,id=<id>` must match. When they do not, BuildKit mounts nothing and the build continues silently. Add `required=true` to the mount so the build fails at that step instead.
+</Accordion>
+
+<Accordion title='secret "..." is a dictionary secret, so name the field you need'>
+  A structured secret holds several fields, so the reference must select one:
+
+  ```bash
+  --secret id=dbpass,src=cpln://secret/db-creds.password
+  ```
+
+  The message lists the fields the secret carries. An [opaque secret](/guides/create-secret/opaque) needs no field, since it holds a single value.
 </Accordion>
 
 <Accordion title="Push denied">
