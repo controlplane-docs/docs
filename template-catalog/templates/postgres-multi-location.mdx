@@ -393,7 +393,7 @@ During an etcd outage Patroni's failsafe mode keeps the primary serving writes �
 ### Upgrading From 1.0.0 or 1.0.1
 
 <Warning>
-**Version 1.0.2 renamed every PostgreSQL-side resource, and there is no in-place upgrade path.** The `-ml` infix is gone: the workloads, secrets, identity, policy and — critically — the **volume set** are now named `{release}-postgres…` instead of `{release}-postgres-ml…`. Running `helm upgrade` from 1.0.0 or 1.0.1 provisions a **new, empty volume set** and leaves the old one behind, still holding your data and still billing. The upgrade reports success and the cluster comes up healthy with no data in it.
+**Version 1.0.2 renamed every PostgreSQL-side resource, there is no in-place upgrade path, and the upgrade DELETES the volume set holding your data. Back up before you go anywhere near it.** The `-ml` infix is gone: the workloads, secrets, identity, policy and — critically — the **volume set** are now named `{release}-postgres…` instead of `{release}-postgres-ml…`. Running `helm upgrade` from 1.0.0 or 1.0.1 creates a new, empty volume set and then names the old one in its cleanup phase; it is gone seconds later, with no reachable final snapshot despite `snapshots.createFinalSnapshot`. There is no leftover copy to recover from.
 </Warning>
 
 | Resource | 1.0.0 / 1.0.1 | 1.0.2 |
@@ -405,22 +405,31 @@ During an etcd outage Patroni's failsafe mode keeps the primary serving writes �
 | Backup workload | `{release}-postgres-ml-backup` | `{release}-postgres-backup` |
 | Identity, policy, secrets | `{release}-postgres-ml-…` | `{release}-postgres-…` |
 
-The bundled etcd cluster's resources were never renamed and are unaffected.
+The bundled etcd cluster's resources were never renamed and are unaffected — which is the only reason a measured upgrade kept its data at all.
+
+**Why the data survived a measured upgrade, and why that is not a plan.** Helm creates the new workload before it deletes the old one, and because etcd's volume set kept its name the cluster still had its DCS. All three new members therefore cloned the database from the still-running old primary (`bootstrapped from leader …`). That old primary kept serving for **86 seconds** after Helm reported it deleted, and a 7.5 MB database cloned in **12 seconds**. A database that cannot finish a base backup inside that window has nothing to fall back on, because the volume holding it has already been destroyed — that failure case is *inferred, not observed*, and it is not a race worth running.
+
+Two further consequences of the same upgrade, both measured:
+
+- **No writable primary for about 2 minutes 22 seconds.** The upgrade bounces the etcd tier too, so Patroni cannot immediately expire the stale leader key.
+- **`{release}-postgres-ml-proxy` is deleted and never returns.** Every application connection string has to move to `{release}-postgres-proxy`; nothing recovers on its own.
 
 Migrate with a backup and restore rather than an upgrade:
 
 <Steps>
-  <Step title="Back up the existing cluster">
-    Use `backup.mode: logical`, or run a `pg_dumpall` against the proxy endpoint of the old release.
+  <Step title="Back up the existing cluster — first, and before anything else">
+    Use `backup.mode: logical`, or run a `pg_dumpall` against the proxy endpoint of the old release. This
+    dump is the only copy of your data that survives the rename, so verify it before you touch the release.
   </Step>
   <Step title="Uninstall the old release">
-    `cpln helm uninstall RELEASE_NAME --gvc GVC_NAME`. Confirm afterwards which volume sets remain.
+    `cpln helm uninstall RELEASE_NAME --gvc GVC_NAME`.
   </Step>
   <Step title="Install 1.0.2 and restore">
     Install the new version, then load the dump back through the proxy — see [Restoring a Backup](#restoring-a-backup).
   </Step>
-  <Step title="Delete the orphaned volume set">
-    Once you have verified the restored data, delete the leftover `{release}-postgres-ml-vs`. It is billed until you do.
+  <Step title="Move every client to the new proxy hostname">
+    Update each application's connection string from `{release}-postgres-ml-proxy` to
+    `{release}-postgres-proxy`. The old hostname no longer exists.
   </Step>
 </Steps>
 
@@ -590,7 +599,7 @@ A point-in-time restore needs an empty data directory, so restore into a new vol
 
 ## Important Notes
 
-- **Do not `helm upgrade` a 1.0.0 or 1.0.1 cluster to 1.0.2.** Resource names dropped the `-ml` infix in 1.0.2, so the upgrade succeeds, comes up healthy and is **empty** — your data stays on the old volume set, which is orphaned and still billing. Back up, uninstall, reinstall and restore instead: see [Upgrading From 1.0.0 or 1.0.1](#upgrading-from-1-0-0-or-1-0-1).
+- **Back up before upgrading a 1.0.0 or 1.0.1 cluster to 1.0.2.** Resource names dropped the `-ml` infix in 1.0.2, and the upgrade **deletes** the old volume set — there is no orphaned copy and no reachable final snapshot. Data survived a measured upgrade only because the new members re-cloned from the old primary during an 86-second window before it was torn down. Back up, uninstall, reinstall and restore instead, and move every connection string to `{release}-postgres-proxy`: see [Upgrading From 1.0.0 or 1.0.1](#upgrading-from-1-0-0-or-1-0-1).
 - **Create the credentials secret before installing.** `postgres.credentialsSecretName` names a secret this template does not create. Without it the deployment waits on a secret that does not exist; creating it afterwards clears the wedge within a few minutes.
 - **The GVC in `global.gvc.name` must not already exist.** Helm adopts an existing GVC and deletes it on uninstall, taking every unrelated workload with it.
 - **Every `helm upgrade` interrupts writes in all locations for about two minutes.** Plan changes as maintenance windows.
