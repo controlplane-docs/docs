@@ -140,11 +140,17 @@ postgres:
   # waiting on it and looks broken.
   credentialsSecretName: my-postgres-credentials
 
-# Preferred location for the primary. CHANGING THIS ON A LIVE CLUSTER MOVES THE
-# LEADER: the value is baked into the startup script, so editing it restarts every
-# member (~2 min of interrupted writes) and the election that follows picks this
-# location. To move a primary WITHOUT a restart, use patronictl switchover.
-# Empty = no preference.
+# Preferred location for the primary. It does three things:
+#   1. On a FRESH install it decides where the primary starts — members in other
+#      locations wait up to 90s for this one to initialise the cluster first.
+#      If it is down or slow they bootstrap anyway (logged as a WARNING) and the
+#      primary starts elsewhere; move it later with patronictl switchover.
+#   2. It biases FAILOVER elections toward this location (failover_priority).
+#   3. CHANGING IT ON A LIVE CLUSTER MOVES THE LEADER: the value is baked into
+#      the startup script, so editing it restarts every member (~2 min of
+#      interrupted writes) and the election that follows picks this location.
+#      To move a primary WITHOUT a restart, use patronictl switchover.
+# Empty = no preference, and the primary starts wherever a member gets there first.
 primaryLocation: ""
 
 volumeset:
@@ -278,7 +284,18 @@ The credentials are written into the data directory when the cluster first boots
 
 ### Preferred Primary Location
 
-`primaryLocation` gives one location a higher failover priority than the others, so it wins the leader election when all members are eligible. Leaving it empty means no preference.
+`primaryLocation` names the location you want the primary in. Patroni treats "which member initializes an empty cluster" and "which member wins a failover" as separate questions, and the knob addresses both:
+
+- **On a fresh install it biases where the primary starts.** Since template version 1.0.2, a member outside the preferred location whose data directory is empty holds back before bootstrapping: it polls the preferred location's members and proceeds as soon as one answers as the leader — or as a replica, which means the cluster is already initialized elsewhere and waiting cannot move it.
+- **On a running cluster it biases failover elections** toward that location through Patroni's `failover_priority` tag, a tiebreaker between candidates that have replayed the same amount of WAL.
+
+Leaving it empty means no preference: the primary starts wherever a member gets there first.
+
+<Note>
+**The head start is a bounded preference, not a guarantee.** The wait is capped at 90 seconds, so if the preferred location is slow to start, down or misconfigured, another member bootstraps the cluster where it is and logs a `WARNING` naming the consequence. Move the primary afterwards with `patronictl switchover --candidate`. The wait cannot split the cluster: the consensus store is the arbiter, so a member that gives up early finds the cluster already initialized and clones as a replica instead. Before version 1.0.2 the knob rendered only the failover tag, so a fresh install raced and the primary could land in any location.
+</Note>
+
+**Check where the leader actually landed before judging a slow first install.** Every write goes to the primary, so a primary outside `primaryLocation` puts a cross-region hop in front of your entire write path, and schema migrations are where that shows up first. On [Grafana Multi-Location](/template-catalog/templates/grafana-multi-location), which bundles this template, the same 713 migrations took about **5 seconds** with the primary local and roughly **15 minutes** when it bootstrapped in another region — and the Grafana instances waiting on them restarted repeatedly meanwhile (**15** container restarts, against none with the primary in place).
 
 <Warning>
 `primaryLocation` is baked into the Patroni startup script, so changing it on a live cluster rewrites that script and restarts every member. That costs the full [upgrade write outage](#availability-and-planned-outages) and the election that follows moves the leader. To move a primary without a restart, use `patronictl switchover` instead.
@@ -541,7 +558,7 @@ A point-in-time restore needs an empty data directory, so restore into a new vol
 - **The GVC in `global.gvc.name` must not already exist.** Helm adopts an existing GVC and deletes it on uninstall, taking every unrelated workload with it.
 - **Every `helm upgrade` interrupts writes in all locations for about two minutes.** Plan changes as maintenance windows.
 - **Replication is asynchronous**, so a failover can lose the most recent transactions — bounded by the replication lag at the moment of failure.
-- **`primaryLocation` moves a live primary.** Changing it restarts every member, which costs the full upgrade outage and triggers an election. It does not fail back automatically after an outage.
+- **Set `primaryLocation` before the first install if you care where the primary is.** Since version 1.0.2 it also biases where the primary bootstraps: members elsewhere wait up to 90 seconds for the preferred location, then bootstrap anyway and log a `WARNING`. Changing it later moves a live primary — that restarts every member, costs the full upgrade outage and triggers an election — and it does not fail back automatically after an outage.
 - **Never suspend a location.** Suspending and resuming one permanently withdraws its endpoints from the other locations' service discovery while every status surface still reports healthy. Remove a location from `global.gvc.locations` instead.
 - **Allow about two minutes after a cold install** before believing a member is unreachable — cross-location service discovery takes that long to converge. Firewall changes can take up to about four minutes.
 - **Consensus-level settings are not values knobs.** They are written once, at first initialization; change them with `patronictl edit-config`.
