@@ -22,6 +22,8 @@ The OpenTelemetry Collector receives, processes, and exports telemetry over OTLP
 - **Identity & Policy** — An identity bound to the workload with `reveal` access to the config secret and — only when auth is enabled — the auth secret you name.
 - **Direct Load Balancer** *(optional)* — TCP passthrough on ports `4317`/`4318`, created only for public mTLS ingestion.
 
+The workload, secret, identity and policy each carry a description explaining its role in the console (the direct load balancer is a field on the workload, not a resource of its own). The workload's description follows the mode: in `simple` mode it names the ports the collector binds, and in `advanced` mode it says the configuration is user-supplied and does not assert the ingestion ports, since those are then yours to choose.
+
 <Note>
 This template does not create a GVC. You will need to deploy it into an existing GVC and enable tracing at the GVC level after installing, specifying the target workload and port. This will trigger a restart of all workloads in the GVC.
 </Note>
@@ -178,7 +180,7 @@ otelCollector:
 metrics:
   enabled: false # adds an OTLP→remote-write metrics pipeline (simple mode; in advanced mode define it in advanced.config)
   remoteWrite:
-    endpoint: http://my-prometheus.my-gvc.cpln.local:9095/api/v1/write # any Prometheus-remote-write-compatible URL
+    endpoint: http://YOUR_WORKLOAD.YOUR_GVC.cpln.local:9095/api/v1/write # any Prometheus-remote-write-compatible URL
 
 # ─── Ingestion Auth ──────────────────────────────────────────────────────────
 auth:
@@ -217,10 +219,24 @@ Histogram buckets must be **duration strings** (`"250ms"`, `"1s"`). Bare numbers
 metrics:
   enabled: true   # adds an OTLP → prometheus_remote_write pipeline (simple mode only)
   remoteWrite:
-    endpoint: http://my-prometheus.my-gvc.cpln.local:9095/api/v1/write  # any Prometheus-remote-write-compatible URL
+    endpoint: http://YOUR_WORKLOAD.YOUR_GVC.cpln.local:9095/api/v1/write  # any Prometheus-remote-write-compatible URL
 ```
 
 With `metrics.enabled: true`, OTLP metrics posted to the collector (internally, or publicly with auth) are pushed to the store at `metrics.remoteWrite.endpoint`. Any Prometheus-remote-write-compatible URL works — for example, this catalog's [Prometheus template](/template-catalog/templates/prometheus) receives remote write at `http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095/api/v1/write`, and a [Thanos](/template-catalog/templates/thanos) query tier on top gives you a global view of what lands there. One collector pushes to one store; run multiple installs for multiple targets.
+
+<Warning>
+**Substitute both halves of the endpoint — the workload name *and* the GVC.** Since template version 1.2.2 a leftover `YOUR_WORKLOAD`, `YOUR_GVC` or `my-gvc.cpln.local` is rejected at install, in `metrics.remoteWrite.endpoint` when `metrics.enabled: true` (simple mode) or anywhere in `otelCollector.advanced.config` (advanced mode); the message names the placeholder it found and nothing is created, because the check runs before any resource is applied. A default install is unaffected — `metrics.enabled` is `false`, so the shipped placeholder endpoint installs as-is.
+
+The check exists because the alternative is worse. **An endpoint that does not resolve fails silently at the last hop:** the sender receives HTTP `200`, the collector accepts and batches the data, and then the exporter logs `Exporting failed. Dropping data.` with a `dropped_items` count and discards it. The workload stays `ready`, no status surface reports a problem, and Grafana shows an empty metric picker with no error. If metrics never arrive and nothing looks wrong, check the exporter endpoint first:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="WORKLOAD_NAME"}' | grep -i 'dropping data'
+```
+
+A GVC genuinely named `my-gvc` also trips the check — a deliberate trade of one loud, legible rejection against a failure mode that drops every metric in silence.
+</Warning>
+
+**Remote write also renames your metrics.** The exporter appends a unit and type suffix following the OTLP-to-Prometheus translation rules, so a metric your application emits as `my_metric` is stored as `my_metric_ratio`, `my_metric_seconds` and so on according to its OTLP unit, and a counter sent as `demo_counter` arrives as `demo_counter_total`. Query the suffixed name in Prometheus, not the one your app emits. This is the second thing that hides metrics after an unsubstituted endpoint, and the symptom is identical — you search the Grafana metric picker for the name your app sends and find nothing — so check it next when the endpoint turns out to be fine.
 
 ### Ingestion Auth
 
@@ -263,12 +279,12 @@ The `advanced.config` block accepts a full [OpenTelemetry Collector configuratio
 | `exporters.otlp` | Forwards traces to the Control Plane tracing backend |
 | `exporters.prometheus` | Exposes span-derived metrics for scraping on port `8889` |
 
-The `metrics.*` knobs are refused in advanced mode (the install fails rather than silently ignoring them). To ingest metrics, add the pipeline to your config yourself:
+The `metrics.*` knobs are refused in advanced mode (the install fails rather than silently ignoring them). To ingest metrics, add the pipeline to your config yourself — substituting both the workload name and the GVC in the exporter endpoint, which is checked at install (see [Metrics Ingestion](#metrics-ingestion)):
 
 ```yaml
 exporters:
   prometheus_remote_write:
-    endpoint: http://my-prometheus.my-gvc.cpln.local:9095/api/v1/write
+    endpoint: http://YOUR_WORKLOAD.YOUR_GVC.cpln.local:9095/api/v1/write
 service:
   pipelines:
     metrics/otlp:
@@ -347,6 +363,8 @@ The canonical endpoint (and the direct load balancer endpoint in mTLS mode) is i
 - Create the auth secret before installing — a missing secret leaves the deployment waiting on it.
 - mTLS uses the direct load balancer (raw TCP), not the canonical endpoint; in mTLS mode the canonical `https://` endpoint intentionally stops accepting traffic.
 - **In mTLS mode, in-GVC senders must use the plain internal gRPC port `:4317`** — the TLS-terminating ingest ports (`4318`/`4319`) are reachable only by external clients via the direct load balancer.
+- **Substitute both the workload name and the GVC in the remote-write endpoint.** A leftover placeholder is rejected at install since version 1.2.2, but the reason matters: an unresolvable endpoint drops metrics silently — the sender gets `200`, the collector logs `Exporting failed. Dropping data.`, and nothing else reports a problem. Diagnose with `cpln logs '{gvc="GVC_NAME", workload="WORKLOAD_NAME"}' | grep -i 'dropping data'`.
+- **Remote write appends a unit and type suffix to metric names.** A metric sent as `my_metric` is stored as `my_metric_ratio`, `my_metric_seconds` and so on following its OTLP unit, and a counter sent as `demo_counter` becomes `demo_counter_total` — query the suffixed name in Prometheus, not the one your app emits. Like an unsubstituted endpoint, this shows up as an empty Grafana metric picker.
 - One collector pushes to one remote-write store; run multiple installs for multiple targets.
 
 ## External References

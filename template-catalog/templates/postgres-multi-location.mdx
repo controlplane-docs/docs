@@ -140,11 +140,17 @@ postgres:
   # waiting on it and looks broken.
   credentialsSecretName: my-postgres-credentials
 
-# Preferred location for the primary. CHANGING THIS ON A LIVE CLUSTER MOVES THE
-# LEADER: the value is baked into the startup script, so editing it restarts every
-# member (~2 min of interrupted writes) and the election that follows picks this
-# location. To move a primary WITHOUT a restart, use patronictl switchover.
-# Empty = no preference.
+# Preferred location for the primary. It does three things:
+#   1. On a FRESH install it decides where the primary starts — members in other
+#      locations wait up to 90s for this one to initialise the cluster first.
+#      If it is down or slow they bootstrap anyway (logged as a WARNING) and the
+#      primary starts elsewhere; move it later with patronictl switchover.
+#   2. It biases FAILOVER elections toward this location (failover_priority).
+#   3. CHANGING IT ON A LIVE CLUSTER MOVES THE LEADER: the value is baked into
+#      the startup script, so editing it restarts every member (~2 min of
+#      interrupted writes) and the election that follows picks this location.
+#      To move a primary WITHOUT a restart, use patronictl switchover.
+# Empty = no preference, and the primary starts wherever a member gets there first.
 primaryLocation: ""
 
 volumeset:
@@ -198,7 +204,11 @@ backup:
   location: aws-us-east-1
   resources: # applies to whichever mode is enabled
     cpu: 100m
-    memory: 128Mi
+    # 512Mi, not 128Mi: the GCP path OOMs at 128Mi with NO log output —
+    # logical jobs merely report `failed`, and the wal-g sidecar loops on
+    # OOMKilled while WAL archives with no base backup. AWS and MinIO are
+    # fine at 128Mi; a default has to work for every provider.
+    memory: 512Mi
 
   logical:
     image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0 # 17.1.0 = Postgres 17, 18.1.0 = Postgres 18
@@ -223,6 +233,11 @@ backup:
     prefix: postgres/backups # folder within the bucket
 
   minio: # a self-hosted MinIO workload, or any S3-compatible endpoint
+    # MUST be reachable from EVERY location: wal-g's restore_command runs on
+    # every member, and a member that cannot reach the archive never finishes
+    # starting — its container is recycled every 160s indefinitely. A MinIO
+    # workload in ONE location answers 503 from the others, so for wal-g use
+    # a multi-location endpoint or an external S3-compatible service.
     endpoint: http://my-minio-workload:9000 # e.g. http://WORKLOAD_NAME:9000 in the same GVC
     bucket: my-postgres-bucket
     # REQUIRED PREREQUISITE SECRET when provider is `minio` — a `dictionary`
@@ -269,7 +284,18 @@ The credentials are written into the data directory when the cluster first boots
 
 ### Preferred Primary Location
 
-`primaryLocation` gives one location a higher failover priority than the others, so it wins the leader election when all members are eligible. Leaving it empty means no preference.
+`primaryLocation` names the location you want the primary in. Patroni treats "which member initializes an empty cluster" and "which member wins a failover" as separate questions, and the knob addresses both:
+
+- **On a fresh install it biases where the primary starts.** Since template version 1.0.2, a member outside the preferred location whose data directory is empty holds back before bootstrapping: it polls the preferred location's members and proceeds as soon as one answers as the leader — or as a replica, which means the cluster is already initialized elsewhere and waiting cannot move it.
+- **On a running cluster it biases failover elections** toward that location through Patroni's `failover_priority` tag, a tiebreaker between candidates that have replayed the same amount of WAL.
+
+Leaving it empty means no preference: the primary starts wherever a member gets there first.
+
+<Note>
+**The head start is a bounded preference, not a guarantee.** The wait is capped at 90 seconds, so if the preferred location is slow to start, down or misconfigured, another member bootstraps the cluster where it is and logs a `WARNING` naming the consequence. Move the primary afterwards with `patronictl switchover --candidate`. The wait cannot split the cluster: the consensus store is the arbiter, so a member that gives up early finds the cluster already initialized and clones as a replica instead. Before version 1.0.2 the knob rendered only the failover tag, so a fresh install raced and the primary could land in any location.
+</Note>
+
+**Check where the leader actually landed before judging a slow first install.** Every write goes to the primary, so a primary outside `primaryLocation` puts a cross-region hop in front of your entire write path, and schema migrations are where that shows up first. On [Grafana Multi-Location](/template-catalog/templates/grafana-multi-location), which bundles this template, the same 713 migrations took about **5 seconds** with the primary local and stretched to **minutes** when it bootstrapped in another region. In the pair of test installs measured that way, the cold install took **11 m 41 s** with the primary remote against **4 m 19 s** with it in place, and the Grafana instances waiting on the migrations restarted **15** times against **2** — every figure in that comparison comes from those two runs.
 
 <Warning>
 `primaryLocation` is baked into the Patroni startup script, so changing it on a live cluster rewrites that script and restarts every member. That costs the full [upgrade write outage](#availability-and-planned-outages) and the election that follows moves the leader. To move a primary without a restart, use `patronictl switchover` instead.
@@ -364,6 +390,51 @@ Measured on a three-location cluster (`aws-us-east-1`, `aws-eu-central-1`, `aws-
 During an etcd outage Patroni's failsafe mode keeps the primary serving writes — it held for about 60 seconds with zero failed writes. Once the replicas' own health checks start failing, the failsafe loses its precondition and the primary demotes itself, which is where the ~19 s of unavailability comes from. The cluster re-promotes and resumes on its own; no operator action is needed.
 </Note>
 
+### Upgrading From 1.0.0 or 1.0.1
+
+<Warning>
+**Version 1.0.2 renamed every PostgreSQL-side resource, there is no in-place upgrade path, and the upgrade DELETES the volume set holding your data. Back up before you go anywhere near it.** The `-ml` infix is gone: the workloads, secrets, identity, policy and — critically — the **volume set** are now named `{release}-postgres…` instead of `{release}-postgres-ml…`. Running `helm upgrade` from 1.0.0 or 1.0.1 creates a new, empty volume set and then names the old one in its cleanup phase; it is gone seconds later, with no reachable final snapshot despite `snapshots.createFinalSnapshot`. There is no leftover copy to recover from.
+</Warning>
+
+| Resource | 1.0.0 / 1.0.1 | 1.0.2 |
+|---|---|---|
+| Patroni workload | `{release}-postgres-ml` | `{release}-postgres` |
+| **Volume set (your data)** | `{release}-postgres-ml-vs` | `{release}-postgres-vs` |
+| HAProxy workload | `{release}-postgres-ml-proxy` | `{release}-postgres-proxy` |
+| PgBouncer workload | `{release}-postgres-ml-pgbouncer` | `{release}-postgres-pgbouncer` |
+| Backup workload | `{release}-postgres-ml-backup` | `{release}-postgres-backup` |
+| Identity, policy, secrets | `{release}-postgres-ml-…` | `{release}-postgres-…` |
+
+The bundled etcd cluster's resources were never renamed and are unaffected — which is the only reason a measured upgrade kept its data at all.
+
+**Why the data survived a measured upgrade, and why that is not a plan.** Helm creates the new workload before it deletes the old one, and because etcd's volume set kept its name the cluster still had its DCS. All three new members therefore cloned the database from the still-running old primary (`bootstrapped from leader …`). That old primary kept serving for **86 seconds** after Helm reported it deleted, and a 7.5 MB database cloned in **12 seconds**. A database that cannot finish a base backup inside that window has nothing to fall back on, because the volume holding it has already been destroyed — that failure case is *inferred, not observed*, and it is not a race worth running.
+
+Two further consequences of the same upgrade, both measured:
+
+- **No writable primary for about 2 minutes 22 seconds.** The upgrade bounces the etcd tier too, so Patroni cannot immediately expire the stale leader key.
+- **`{release}-postgres-ml-proxy` is deleted and never returns.** Every application connection string has to move to `{release}-postgres-proxy`; nothing recovers on its own.
+
+Migrate with a backup and restore rather than an upgrade:
+
+<Steps>
+  <Step title="Back up the existing cluster — first, and before anything else">
+    Use `backup.mode: logical`, or run a `pg_dumpall` against the proxy endpoint of the old release. This
+    dump is the only copy of your data that survives the rename, so verify it before you touch the release.
+  </Step>
+  <Step title="Uninstall the old release">
+    `cpln helm uninstall RELEASE_NAME --gvc GVC_NAME`.
+  </Step>
+  <Step title="Install 1.0.2 and restore">
+    Install the new version, then load the dump back through the proxy — see [Restoring a Backup](#restoring-a-backup).
+  </Step>
+  <Step title="Move every client to the new proxy hostname">
+    Update each application's connection string from `{release}-postgres-ml-proxy` to
+    `{release}-postgres-proxy`. The old hostname no longer exists.
+  </Step>
+</Steps>
+
+Fresh installs of 1.0.2 are unaffected — this applies only to clusters created with an earlier version.
+
 ### Application Retry Logic
 
 Applications must retry on transient database errors. Two are worth handling explicitly during a failover:
@@ -419,7 +490,7 @@ Switching `backup.mode` to or from `wal-g` restarts PostgreSQL, because it chang
 </Note>
 
 <Warning>
-The backup path has been exercised against **AWS S3** only: dumps and WAL/base backups are written and verified in the bucket. **A wal-g restore has been verified end to end** (base backup plus WAL replay into an empty data directory, checksum-identical to source); the logical restore and the volume-set swap procedure below have **not** been exercised — the procedures below are documented, not tested. The `gcp` and `minio` providers are configured the same way but have not been exercised — validate them in a test install before relying on them. Likewise, rehearse your restore procedure in a scratch environment before you need it.
+Every provider has been exercised in both modes. **AWS S3** and **MinIO / S3-compatible** passed in `logical` and `wal-g` mode alike, at the shipped settings. **Google Cloud Storage** works but is memory-sensitive: at `backup.resources.memory: 128Mi` it failed in both modes — a `logical` job simply reports `failed` with no error line anywhere, and the `wal-g` sidecar is OOM-killed in a loop, which takes its member out of service and triggers leader elections while WAL keeps accumulating with no base backup to restore it against. It passed at 256Mi (`logical`) and 512Mi (`wal-g`), and this template ships **512Mi**, at or above both proven values — which is why the values comment warns against lowering it. Both restores have been verified end to end: a **wal-g restore** (base backup plus WAL replay into an empty data directory, checksum-identical to source) and a **logical restore** (a `pg_dumpall` artifact replayed into an `initdb`-fresh cluster with zero errors, roles, ownership and sequence positions preserved). The **volume-set swap** in the WAL-G procedure below has **not** been exercised — that step is documented, not tested. Rehearse your restore procedure in a scratch environment before you need it.
 </Warning>
 
 ### AWS S3
@@ -467,6 +538,10 @@ Before enabling backup with `provider: gcp`, complete the following in your GCP 
 
 ### MinIO
 
+<Warning>
+**In `wal-g` mode the endpoint must be reachable from every location.** WAL-G's `restore_command` runs on every member, and a member that cannot reach the archive never finishes starting — its container is recycled roughly every 160 seconds, indefinitely. A MinIO workload that runs in only one location answers `503` immediately from the others, which is exactly the shape a same-GVC MinIO invites: measured with two of three members looping for over 20 minutes. Nothing looks wrong from a client, because the leader stays healthy and writes keep succeeding while the cluster quietly loses all of its redundancy. For `wal-g`, point the endpoint at a MinIO deployment present in every location or at an external S3-compatible service. `logical` mode is unaffected — its cron runs only in `backup.location` — and AWS S3 and GCS are global endpoints, so they never hit this.
+</Warning>
+
 No Cloud Account is needed — credentials are supplied as a secret.
 
 1. Create a bucket in MinIO. Set `backup.minio.bucket` to its name.
@@ -484,8 +559,11 @@ cpln secret create-dictionary --name my-postgres-minio-credentials \
 ## Restoring a Backup
 
 <Note>
-  These procedures are documented from upstream, not exercised by us — no restore was
-  performed during testing. Rehearse them in a scratch environment before you need them.
+  Both restore paths have been verified end to end, though not by running these exact commands: the
+  `pg_dumpall` artifact was replayed with `psql` into an `initdb`-fresh cluster rather than through the
+  proxy into a live one, and the WAL-G restore was fetched and replayed into an empty directory rather
+  than onto a swapped volume set. The steps below are the operational form of those procedures — rehearse
+  them in a scratch environment before you need them.
 </Note>
 
 ### Logical
@@ -521,11 +599,12 @@ A point-in-time restore needs an empty data directory, so restore into a new vol
 
 ## Important Notes
 
+- **Back up before upgrading a 1.0.0 or 1.0.1 cluster to 1.0.2.** Resource names dropped the `-ml` infix in 1.0.2, and the upgrade **deletes** the old volume set — there is no orphaned copy and no reachable final snapshot. Data survived a measured upgrade only because the new members re-cloned from the old primary during an 86-second window before it was torn down. Back up, uninstall, reinstall and restore instead, and move every connection string to `{release}-postgres-proxy`: see [Upgrading From 1.0.0 or 1.0.1](#upgrading-from-1-0-0-or-1-0-1).
 - **Create the credentials secret before installing.** `postgres.credentialsSecretName` names a secret this template does not create. Without it the deployment waits on a secret that does not exist; creating it afterwards clears the wedge within a few minutes.
 - **The GVC in `global.gvc.name` must not already exist.** Helm adopts an existing GVC and deletes it on uninstall, taking every unrelated workload with it.
 - **Every `helm upgrade` interrupts writes in all locations for about two minutes.** Plan changes as maintenance windows.
 - **Replication is asynchronous**, so a failover can lose the most recent transactions — bounded by the replication lag at the moment of failure.
-- **`primaryLocation` moves a live primary.** Changing it restarts every member, which costs the full upgrade outage and triggers an election. It does not fail back automatically after an outage.
+- **Set `primaryLocation` before the first install if you care where the primary is.** Since version 1.0.2 it also biases where the primary bootstraps: members elsewhere wait up to 90 seconds for the preferred location, then bootstrap anyway and log a `WARNING`. Changing it later moves a live primary — that restarts every member, costs the full upgrade outage and triggers an election — and it does not fail back automatically after an outage.
 - **Never suspend a location.** Suspending and resuming one permanently withdraws its endpoints from the other locations' service discovery while every status surface still reports healthy. Remove a location from `global.gvc.locations` instead.
 - **Allow about two minutes after a cold install** before believing a member is unreachable — cross-location service discovery takes that long to converge. Firewall changes can take up to about four minutes.
 - **Consensus-level settings are not values knobs.** They are written once, at first initialization; change them with `patronictl edit-config`.
