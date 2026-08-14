@@ -1,6 +1,6 @@
 ---
 title: Grafana Multi-Location
-description: Deploy Grafana OSS across several Control Plane locations behind one endpoint, with dashboards, users, sessions and datasource credentials shared through a stretched Patroni PostgreSQL cluster, and alert rules evaluated exactly once — by a single pinned evaluator, or by every location with Redis-coordinated alerting HA.
+description: Deploy Grafana OSS across several Control Plane locations behind one endpoint, with dashboards, users, sessions and datasource credentials shared through a stretched Patroni PostgreSQL cluster, and alert rules evaluated exactly once — by one pinned evaluator or by Redis-coordinated alerting HA.
 keywords: ['grafana multi region', 'cross-region dashboards', 'geo-distributed', 'regional redundancy', 'alerting ha', 'unified alerting', 'exactly-once evaluation', 'redis sentinel', 'stretched postgres', 'patroni', 'datasource provisioning', 'kibana alternative', 'grafana oss', 'disaster recovery', 'georouted endpoint']
 ---
 
@@ -509,7 +509,7 @@ redisML:
     passwordSecretName: my-grafana-sentinel-password
 ```
 
-The two are independent — setting one without the other is valid. Grafana authenticates with `ha_redis_password` and `ha_redis_sentinel_password`, reading the **same secrets** the Redis tier reads, so the two sides cannot drift apart. Testing confirmed both ports reject unauthenticated clients (`NOAUTH`) and a wrong password (`WRONGPASS`), while all six Grafana instances registered their peer keys inside the authenticated keyspace.
+The two are independent — setting one without the other is valid. Grafana authenticates with `ha_redis_password` and `ha_redis_sentinel_password`, reading the **same secrets** the Redis tier reads, so the two sides cannot drift apart. Testing confirmed both ports reject unauthenticated clients (`NOAUTH`) and a wrong password (`WRONGPASS`) — both on a fresh install with the passwords set from the first boot, and when authentication is turned on, rotated or removed on an already-running authless install — while all six Grafana instances registered their peer keys inside the authenticated keyspace.
 
 <Warning>
 **If you do set these names, a name that does not resolve stops the Grafana UI, not just alerting** — Grafana mounts the same secret. `cpln helm install` still reports **success**; the Redis, Sentinel and Grafana UI tiers then sit at **0 replicas** with no containers and therefore no logs. The explanation is on each workload's `status.versions[].message` — not the top-level `status.message`, which is empty — and reads `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Create the missing secret and it recovers on its own in about 5–6 minutes; no Helm action is needed, and re-running the upgrade does not speed it up.
@@ -528,7 +528,7 @@ Everything below concerns the two shapes available while alerting is on. Grafana
 | Who evaluates rules | The dedicated `{release}-grafana-alerting` workload — 1 replica, 1 location | **Every UI instance**, in every location |
 | Exactly-once delivery | A property of the topology: there is only one evaluator | Redis-coordinated: peers order themselves and share a notification log |
 | Extra tier | None | 1 Redis + 1 Sentinel **per location** |
-| Losing a location | Alert evaluation **stops** until you repoint `alerting.location` and upgrade | Evaluation **continues** in the surviving locations |
+| Losing a location | Alert evaluation **stops** until you repoint `alerting.location` and upgrade | Evaluation **continues** in the surviving locations (derived — see the note below; a true region outage cannot be simulated here) |
 | Minimum locations | 2 | **3** — the chart refuses to render below that |
 | **Data-source query load** | **1×** | **(locations × replicas)×** |
 | Silences | Do not reliably propagate — see the workaround below | Expected to propagate through the shared peer (upstream behaviour, not exercised in our testing) |
@@ -557,7 +557,7 @@ Verified in testing at `replicas: 3` across three locations: all **9 UI instance
   curl -u admin:PASSWORD http://RELEASE_NAME-grafana-alerting.GVC_NAME.cpln.local:3000/api/alertmanager/grafana/api/v2/silences
   ```
 
-  The API requires credentials — unauthenticated returns `401`.
+  The API requires credentials, so the `-u` flag is not optional.
 
 <Warning>
 **The evaluator only answers from inside `alerting.location`.** Its internal name resolves to the GVC address from every location, but the other locations have no local upstream for it and return `503`. Run the silence command from a workload replica that is running in `alerting.location`.
@@ -571,7 +571,7 @@ Measured across three locations at `replicas: 2` (six evaluating instances):
 
 | What was measured | Result |
 |---|---|
-| Exactly-once delivery | **21 deliveries / 21 firing cycles / 21 distinct request IDs over 9 m 59 s**, against **126** if the six instances were uncoordinated |
+| Exactly-once delivery | On the shipped authless default, **19 deliveries / 19 firing cycles / 19 distinct request IDs over 9 m 30 s**, against **114** if the six instances were uncoordinated. A run with the Redis tier authenticated measured **21 / 21 / 21 over 9 m 59 s** against **126** |
 | Notification links | `externalURL`, `generatorURL` and `silenceURL` are all the UI tier's canonical endpoint and return `200` when authenticated |
 | Redis unhealthy | Degrades to **duplicate** notifications — one per instance — and **never goes silent**; the longest gap during a five-minute Redis outage was 15 s, and it re-converged about **40 s** after the fault stopped, with no operator action |
 | A `helm upgrade`, including a no-op | **80–95 s** of duplicate notifications while the Redis tier is patched and peers churn (4 extra notifications over a 93 s window), then exactly-once resumes |
@@ -583,7 +583,7 @@ Measured across three locations at `replicas: 2` (six evaluating instances):
 Two more properties to design around:
 
 - **Which location sends is not pinnable.** The sender is chosen by sorted peer name, and a standard workload's name carries a ReplicaSet hash that changes on every rollout — the elected sender moved from `aws-us-east-1` to `aws-us-west-2` between two installs of the same chart. Do not build routing, filtering or egress-IP allowlisting on the assumption that a particular location sends.
-- **After a location is lost, hand-off is not instant.** Redis peer keys carry a **5-minute TTL**, so a dead location's peers hold their positions until it expires. Alerting continues from the survivors throughout; what varies is which instance sends.
+- **After a location is lost, hand-off is not instant — and this one is derived, not timed.** Two things were measured directly: the Redis peer keys carry a **5-minute TTL**, so a dead location's peers keep their positions until it expires, and a location other than the previous sender was observed taking alerting over on its own after a rollout reordered the peers. The loss *event* itself has never been observed — no platform primitive simulates a true region outage — so "alerting continues from the survivors and only the sending instance changes" follows from those two measurements rather than from a timed failover.
 
 ## Cross-Location Behavior
 
@@ -633,7 +633,7 @@ Measured on three locations (`aws-us-east-1`, `aws-eu-central-1`, `aws-us-west-2
 | Cold install to all tiers ready, `replicas: 1` | **4 m 44 s** — HAProxy and etcd first, then the Patroni cluster, then Grafana's 713 schema migrations (5.79 s with the primary local) |
 | Cold install at `replicas: 2` | About **7 minutes** for every location to report ready, and up to about **12 minutes** for every individual replica |
 | Grafana-only change (for example `replicas: 1` → `3`) | **Zero downtime** — 1160 probe samples across four endpoints, no failures. **Does not apply to the first upgrade after an install**, which re-applies every tier once regardless of what changed |
-| Cold install with alerting HA on, `replicas: 2` | **4 m 22 s** and **6 m 11 s** in two separate runs, with the Redis and Sentinel tiers ready about a minute in |
+| Cold install with alerting HA on, `replicas: 2` | **4 m 22 s**, **4 m 44 s** and **6 m 11 s** in three separate runs, with the Redis and Sentinel tiers ready about a minute in |
 | Any `helm upgrade` that touches the database tier | Database writes unavailable in **every** location for about **117 s**; the Grafana tier is down longer because reads fail too — measured recovery about **4 minutes**, with one location out for **5–6 minutes** |
 | Any `helm upgrade` with alerting HA on, including a no-op | **80–95 s** of duplicate alert notifications while the Redis tier is patched and the peers churn; never silence |
 | Loss of the evaluator's replica (HA off) | **21 s** without alert evaluation, then the replacement re-notifies whatever is firing; the UI tier is unaffected |
@@ -647,7 +647,7 @@ Measured on three locations (`aws-us-east-1`, `aws-eu-central-1`, `aws-us-west-2
 </Warning>
 
 <Note>
-**A single `Failed to lock database` line during a cold start is expected.** Grafana takes a non-blocking advisory lock to run schema migrations and exits if another instance holds it; the platform restarts it and the next attempt succeeds against the already-migrated schema. Seven restarts across the tier were observed on a three-location cold install, all from this race.
+**A single `Failed to lock database` line during a cold start is expected.** Grafana takes a non-blocking advisory lock to run schema migrations and exits if another instance holds it; the platform restarts it and the next attempt succeeds against the already-migrated schema. On a three-location cold install of the shipped chart this was measured at **zero to three** such restarts — three with alerting HA on, none with it off.
 </Note>
 
 ## Backing Up
@@ -746,7 +746,7 @@ The backup path has been exercised against **AWS S3** and **MinIO**, and a **wal
 - **Alerting HA multiplies data-source query load by (locations × replicas)** — 3× at the defaults — because every instance evaluates every rule and Redis dedupes the notification, not the query.
 - **Alerting HA is blocked below 3 locations, on purpose.** Sentinel elects a master by a majority of locations, so at 2 locations losing either one leaves no quorum.
 - **With alerting HA on, an unhealthy Redis means duplicate notifications, never silence.** Check the `{release}-redis` and `{release}-sentinel` workloads before suspecting your alert rules.
-- **With alerting HA on, a `helm upgrade` costs 80–95 s of duplicate notifications**, even an upgrade that changes nothing, and post-outage sender hand-off is not instant — Redis peer keys carry a 5-minute TTL.
+- **With alerting HA on, a `helm upgrade` costs 80–95 s of duplicate notifications**, even an upgrade that changes nothing, and post-outage sender hand-off is not instant — the Redis peer keys' 5-minute TTL was measured, but the hand-off itself is derived from it rather than timed against a real outage.
 - **Which location sends notifications is not pinnable with alerting HA on.** The sender is chosen by sorted peer name and moved between regions across two installs of the same chart, so do not route, filter or egress-allowlist on it.
 - **The alerting-HA Redis tier is unauthenticated by default**, reachable only from inside this chart's GVC. If you deploy anything else into that GVC, authenticate it — write access to it is enough to suppress alert notifications. See [Authenticating the Redis Tier](#authenticating-the-redis-tier).
 - **If you do set `redisML.redis.passwordSecretName` or `redisML.sentinel.passwordSecretName`, a wrong name stops the Grafana UI too**, because Grafana reads the same secret — and `helm install` still reports success. If a tier sits at 0 replicas after install, read `status.versions[].message` on the workload.
@@ -756,7 +756,7 @@ The backup path has been exercised against **AWS S3** and **MinIO**, and a **wal
 - **Every location except the database primary's pays a cross-region round trip per query**, because Grafana has no read/write splitting. Set `postgresML.primaryLocation` where most of your users are.
 - **Scaling `replicas` has no alerting-related restriction** — it applies to the UI tier only, in every location including `alerting.location`. Watch the connection budget instead.
 - **`replicas: 2` or higher lengthens a cold install** to roughly 7 minutes per location and up to about 12 minutes for every replica. Nothing is wrong; there is simply more to schedule.
-- **Grafana Live has no HA engine here**, so a live-streamed message reaches only the browsers connected to the same instance. Dashboard auto-refresh, queries, alerting, provisioning, login and the API are unaffected.
+- **Grafana Live has no HA engine here**, so a live-streamed message reaches only the browsers connected to the same instance — carried over from the single-location [Grafana](/template-catalog/templates/grafana) template's multi-replica behaviour, and not exercised in this template's own testing. Dashboard auto-refresh, queries, alerting, provisioning, login and the API are unaffected.
 - **With `publicAccess.enabled: false`, links in alert notifications point at the internal GVC address** and will not open from a browser outside the GVC.
 - **Never suspend a location.** Suspending and resuming one permanently withdraws its endpoints from the other locations' service discovery while every status surface still reports healthy. Remove a location from `global.gvc.locations` instead.
 - **Uninstall deletes every volume set the chart created** — the database, etcd and, with alerting HA on, Redis and Sentinel — along with the GVC. Enable backups if the data matters. Prerequisite secrets you created are not owned by the release and survive it.
