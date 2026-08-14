@@ -1,6 +1,6 @@
 ---
 title: Grafana Multi-Location
-description: Deploy Grafana OSS across several Control Plane locations behind one endpoint, with dashboards, users, sessions and datasource credentials shared through a stretched Patroni PostgreSQL cluster, and every firing alert notified exactly once — by one pinned evaluator or Redis-coordinated alerting HA.
+description: Deploy Grafana OSS across Control Plane locations behind one endpoint, with dashboards, users, sessions and datasource credentials shared through a stretched Patroni PostgreSQL cluster, and exactly one instance sending each firing alert's notification — a pinned evaluator or Redis-coordinated HA.
 keywords: ['grafana multi region', 'cross-region dashboards', 'geo-distributed', 'regional redundancy', 'alerting ha', 'unified alerting', 'exactly-once alerting', 'redis sentinel', 'stretched postgres', 'patroni', 'datasource provisioning', 'kibana alternative', 'grafana oss', 'disaster recovery', 'georouted endpoint']
 ---
 
@@ -8,7 +8,7 @@ keywords: ['grafana multi region', 'cross-region dashboards', 'geo-distributed',
 
 Grafana Multi-Location deploys **one logical Grafana** whose UI/API instances run in every location of a chart-created multi-location GVC, behind a single georouted `*.cpln.app` endpoint. Every dashboard, user, org, session, alert rule and saved datasource lives in a [`postgres-multi-location`](/template-catalog/templates/postgres-multi-location) cluster stretched across the same locations, so Grafana itself holds no state: there is no volume, no session affinity and nothing to hand over when an instance is replaced.
 
-A firing alert is always **notified exactly once**, in one of two shapes you choose with `alerting.highAvailability.enabled`:
+**Exactly one instance sends each firing alert's notification**, in one of two shapes you choose with `alerting.highAvailability.enabled`:
 
 - **Off (the default)** — a **separate single-replica workload** runs in one location with rule execution enabled, and it is disabled on every UI instance. Exactly-once evaluation is a property of the topology: nothing is elected at runtime, and no value of `replicas` can produce a second evaluator. Losing that location stops evaluation.
 - **On** — that workload is not created at all. Every UI instance in every location evaluates every rule, and a stretched Redis tier coordinates the peers so exactly one **notification** is sent. Alert evaluation then survives the loss of a location, at the cost of multiplying data-source query load.
@@ -382,7 +382,7 @@ The GVC name and location list live under `global.gvc` so that Helm passes the s
 
 ### Grafana UI Tier
 
-- `image` — The Grafana OSS container image. An Alpine-based variant is required: the boot wrapper needs a shell.
+- `image` — The Grafana OSS container image. It must provide `/bin/bash`: the chart overrides the entrypoint to run Grafana's `/run.sh` through a boot wrapper. The default Alpine-based official image does.
 - `replicas` — Grafana UI instances **per location**. It carries no alerting-related restriction in either mode — the only thing to watch is the connection budget below.
 - `resources` — `minCpu`/`minMemory` are the reservation, `maxCpu`/`maxMemory` the limit, applied per instance.
 - `database.maxOpenConn` — Maximum database connections **per instance**.
@@ -583,7 +583,7 @@ Measured across three locations at `replicas: 2` (six evaluating instances):
 Two more properties to design around:
 
 - **Which location sends is not pinnable.** The sender is chosen by sorted peer name, and a standard workload's name carries a ReplicaSet hash that changes on every rollout — the elected sender moved from `aws-us-east-1` to `aws-us-west-2` between two installs of the same chart. Do not build routing, filtering or egress-IP allowlisting on the assumption that a particular location sends.
-- **After a location is lost, hand-off is not instant — and this one is derived, not timed.** Two things were measured directly: the Redis peer keys carry a **5-minute TTL**, so a dead location's peers keep their positions until it expires, and a location other than the previous sender was observed taking alerting over on its own after a rollout reordered the peers. The loss *event* itself has never been observed — no platform primitive simulates a true region outage — so "alerting continues from the survivors and only the sending instance changes" follows from those two measurements rather than from a timed failover.
+- **After a location is lost, hand-off is not instant — and this one is derived, not timed.** Two things were measured directly: the Redis peer keys carry a **5-minute TTL**, so a dead location's peers keep their positions until it expires, and a location other than the previous sender was observed taking alerting over on its own after a rollout reordered the peers. The loss *event* itself has never been observed — no platform primitive simulates a true region outage — so "alerting continues from the survivors and only the sending instance changes" follows from those two measurements rather than from a timed failover. On the same basis, expect roughly **30 s** of extra delay before the first notification from a survivor, decaying to zero as the dead peer keys expire (derived from the 5-minute TTL and Grafana's peer-timeout default, not timed).
 
 ## Cross-Location Behavior
 
@@ -655,7 +655,7 @@ Measured on three locations (`aws-us-east-1`, `aws-eu-central-1`, `aws-us-west-2
 Backups are disabled by default and cover the app database — the dashboards, users, alert rules and saved datasources that make up your Grafana. Enable them with `postgresML.backup.enabled: true`, choose `logical` (a scheduled `pg_dumpall` cron workload in the one location named by `postgresML.backup.location`) or `wal-g` (continuous archiving from whichever member is currently the primary), and complete the storage setup for your provider **before** installing.
 
 <Warning>
-The backup path has been exercised against **AWS S3** and **MinIO**, and a **wal-g restore has been verified end to end** (base backup plus WAL replay into an empty data directory, checksum-identical to source). The logical restore and the volume-set swap procedure have not been exercised. The `gcp` and `minio` providers are configured the same way but have not been exercised — validate them in a test install, and rehearse your restore procedure, before relying on either.
+Backups come from the `postgres-multi-location` subchart and were not exercised in this template's own testing; the results below are from that template's test runs. **AWS S3** and **MinIO / S3-compatible** were exercised in both `logical` and `wal-g` modes at the shipped settings. **Google Cloud Storage** works but is memory-sensitive: it failed at `postgresML.backup.resources.memory: 128Mi` and passed at 256Mi (logical) and 512Mi (wal-g) — this template ships **512Mi**, above both thresholds, which is why the values comment warns against lowering it. Both restores have been verified end to end there: a **wal-g restore** (base backup plus WAL replay into an empty data directory, checksum-identical to source) and a **logical restore** (`pg_dumpall` into a clean cluster, 0 errors, roles and sequences preserved). The volume-set swap procedure has not been exercised. Rehearse your restore procedure before you rely on it.
 </Warning>
 
 <Tabs>
@@ -718,6 +718,8 @@ The backup path has been exercised against **AWS S3** and **MinIO**, and a **wal
       </Step>
       <Step title="Set the endpoint">
         Set `postgresML.backup.minio.endpoint` to the S3 API address including the port. For the [MinIO](/template-catalog/templates/minio) template in the same GVC, that is `http://WORKLOAD_NAME:9000`.
+
+        **The endpoint must be reachable from every location.** In `wal-g` mode every member runs `restore_command`, so a MinIO workload that runs in only one location leaves the members in the other locations in a permanent restart loop — silently, because the leader stays healthy and writes keep succeeding. Run your S3-compatible endpoint in every location of the GVC, or use S3/GCS, which are global.
       </Step>
       <Step title="Create the credentials secret">
         Create a [dictionary secret](/guides/create-secret/dictionary) and set `postgresML.backup.minio.credentialsSecretName` to its name, then set `postgresML.backup.minio.prefix` to the folder path:
