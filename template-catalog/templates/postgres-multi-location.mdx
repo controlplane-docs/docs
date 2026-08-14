@@ -198,7 +198,11 @@ backup:
   location: aws-us-east-1
   resources: # applies to whichever mode is enabled
     cpu: 100m
-    memory: 128Mi
+    # 512Mi, not 128Mi: the GCP path OOMs at 128Mi with NO log output —
+    # logical jobs merely report `failed`, and the wal-g sidecar loops on
+    # OOMKilled while WAL archives with no base backup. AWS and MinIO are
+    # fine at 128Mi; a default has to work for every provider.
+    memory: 512Mi
 
   logical:
     image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0 # 17.1.0 = Postgres 17, 18.1.0 = Postgres 18
@@ -223,6 +227,11 @@ backup:
     prefix: postgres/backups # folder within the bucket
 
   minio: # a self-hosted MinIO workload, or any S3-compatible endpoint
+    # MUST be reachable from EVERY location: wal-g's restore_command runs on
+    # every member, and a member that cannot reach the archive never finishes
+    # starting — its container is recycled every 160s indefinitely. A MinIO
+    # workload in ONE location answers 503 from the others, so for wal-g use
+    # a multi-location endpoint or an external S3-compatible service.
     endpoint: http://my-minio-workload:9000 # e.g. http://WORKLOAD_NAME:9000 in the same GVC
     bucket: my-postgres-bucket
     # REQUIRED PREREQUISITE SECRET when provider is `minio` — a `dictionary`
@@ -419,7 +428,7 @@ Switching `backup.mode` to or from `wal-g` restarts PostgreSQL, because it chang
 </Note>
 
 <Warning>
-The backup path has been exercised against **AWS S3** only: dumps and WAL/base backups are written and verified in the bucket. **A wal-g restore has been verified end to end** (base backup plus WAL replay into an empty data directory, checksum-identical to source); the logical restore and the volume-set swap procedure below have **not** been exercised — the procedures below are documented, not tested. The `gcp` and `minio` providers are configured the same way but have not been exercised — validate them in a test install before relying on them. Likewise, rehearse your restore procedure in a scratch environment before you need it.
+Every provider has been exercised in both modes. **AWS S3** and **MinIO / S3-compatible** passed in `logical` and `wal-g` mode alike, at the shipped settings. **Google Cloud Storage** works but is memory-sensitive: at `backup.resources.memory: 128Mi` it failed in both modes — a `logical` job simply reports `failed` with no error line anywhere, and the `wal-g` sidecar is OOM-killed in a loop, which takes its member out of service and triggers leader elections while WAL keeps accumulating with no base backup to restore it against. It passed at 256Mi (`logical`) and 512Mi (`wal-g`), and this template ships **512Mi**, at or above both proven values — which is why the values comment warns against lowering it. Both restores have been verified end to end: a **wal-g restore** (base backup plus WAL replay into an empty data directory, checksum-identical to source) and a **logical restore** (a `pg_dumpall` artifact replayed into an `initdb`-fresh cluster with zero errors, roles, ownership and sequence positions preserved). The **volume-set swap** in the WAL-G procedure below has **not** been exercised — that step is documented, not tested. Rehearse your restore procedure in a scratch environment before you need it.
 </Warning>
 
 ### AWS S3
@@ -467,6 +476,10 @@ Before enabling backup with `provider: gcp`, complete the following in your GCP 
 
 ### MinIO
 
+<Warning>
+**In `wal-g` mode the endpoint must be reachable from every location.** WAL-G's `restore_command` runs on every member, and a member that cannot reach the archive never finishes starting — its container is recycled roughly every 160 seconds, indefinitely. A MinIO workload that runs in only one location answers `503` immediately from the others, which is exactly the shape a same-GVC MinIO invites: measured with two of three members looping for over 20 minutes. Nothing looks wrong from a client, because the leader stays healthy and writes keep succeeding while the cluster quietly loses all of its redundancy. For `wal-g`, point the endpoint at a MinIO deployment present in every location or at an external S3-compatible service. `logical` mode is unaffected — its cron runs only in `backup.location` — and AWS S3 and GCS are global endpoints, so they never hit this.
+</Warning>
+
 No Cloud Account is needed — credentials are supplied as a secret.
 
 1. Create a bucket in MinIO. Set `backup.minio.bucket` to its name.
@@ -484,8 +497,11 @@ cpln secret create-dictionary --name my-postgres-minio-credentials \
 ## Restoring a Backup
 
 <Note>
-  These procedures are documented from upstream, not exercised by us — no restore was
-  performed during testing. Rehearse them in a scratch environment before you need them.
+  Both restore paths have been verified end to end, though not by running these exact commands: the
+  `pg_dumpall` artifact was replayed with `psql` into an `initdb`-fresh cluster rather than through the
+  proxy into a live one, and the WAL-G restore was fetched and replayed into an empty directory rather
+  than onto a swapped volume set. The steps below are the operational form of those procedures — rehearse
+  them in a scratch environment before you need them.
 </Note>
 
 ### Logical
