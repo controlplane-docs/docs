@@ -1,27 +1,58 @@
 ---
 title: DBeaver
-description: Deploy DBeaver on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and web-based database administration with CloudBeaver.
-keywords: ['cloudbeaver', 'sql client', 'db gui', 'sql workbench', 'datagrip alternative', 'pgadmin alternative', 'web sql ide', 'multi-db client', 'browser db tool', 'phpmyadmin alternative']
+description: Deploy DBeaver CloudBeaver on Control Plane using the Template Catalog. A browser-based SQL client and database administration console with a persistent workspace, an admin password held in a prerequisite secret, and no public access by default.
+keywords: ['cloudbeaver', 'sql client', 'db gui', 'sql workbench', 'datagrip alternative', 'pgadmin alternative', 'web sql ide', 'multi-db client', 'browser db tool', 'phpmyadmin alternative', 'prerequisite secret', 'admin password rotation']
 ---
 
 ## Overview
 
-DBeaver is a web-based database administration tool that provides a modern interface for managing multiple database connections. This template deploys the self-hosted [CloudBeaver](https://github.com/dbeaver/cloudbeaver) web application — the browser-based edition of DBeaver — with automatic admin user creation, giving you immediate access to a full-featured SQL editor, connection manager, and data browser for a wide range of database systems including PostgreSQL, MySQL, MariaDB, MongoDB, Redis, SQLite, Oracle, SQL Server, and more.
+DBeaver is a web-based database administration tool that provides a modern interface for managing multiple database connections. This template deploys the self-hosted [CloudBeaver](https://github.com/dbeaver/cloudbeaver) web application — the browser-based edition of DBeaver — giving you a full-featured SQL editor, connection manager, and data browser for PostgreSQL, MySQL, MariaDB, MongoDB, Redis, SQLite, Oracle, SQL Server, and more.
+
+The admin account is bootstrapped from an [opaque secret](/guides/create-secret/opaque) you create before installing, and the console is reachable only from inside the GVC unless you deliberately publish it.
+
+<Warning>
+**Version 1.3.0 is a security fix. Read [Upgrading From 1.2.1 or Earlier](#upgrading-from-1-2-1-or-earlier) before you upgrade.** Versions up to 1.2.1 shipped a working admin password (`Password123`) as a `values.yaml` default and hardcoded the workload's inbound firewall to `0.0.0.0/0` with no way to turn it off, so a default install published a database administration console to the internet behind a password published in a public repository. In 1.3.0 the password moved to a prerequisite secret and public access became an opt-in knob that defaults to off — **which changes the behavior of an existing install when you upgrade.**
+</Warning>
 
 ### What Gets Created
 
-- **Workload** — A DBeaver web application container with persistent storage and an admin user pre-configured on startup.
-- **Volume Set** — Persistent storage for workspace data, connections, and settings.
-- **Secret** — An opaque secret storing the admin username and password, injected into the container at startup.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the admin credentials secret.
+- **Stateful CloudBeaver Workload** (`RELEASE_NAME-dbeaver`) — a single CloudBeaver instance serving the web UI and API on port `8978`.
+- **Volume Set** (`RELEASE_NAME-dbeaver-vs`) — a 10 GiB `ext4` volume mounted at `/opt/cloudbeaver/workspace`, holding the server configuration, saved connections, and user accounts. Daily snapshots with 7-day retention.
+- **Identity & Policy** — an identity bound to the workload and a policy granting it `reveal` on exactly the admin-password secret you created, and nothing else.
+- **No template-created secret** — the only credential lives in the prerequisite secret you own.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
 </Note>
 
+## Prerequisites
+
+**One [opaque secret](/guides/create-secret/opaque) must exist before you install.** The admin password guards a database administration console, and whoever holds it can query every database that console is connected to — so it is never a Helm value and never lands in the release.
+
+<Steps>
+  <Step title="Create the admin password secret">
+    Choose your own strong password (CloudBeaver requires at least 8 characters) and store it as the secret's payload:
+
+    ```bash
+    printf '%s' 'YOUR-STRONG-PASSWORD' | cpln secret create-opaque --name my-dbeaver-admin-password --encoding plain -f -
+    ```
+
+    Set `admin.passwordSecretName` to the name you used. The default in `values.yaml` is `my-dbeaver-admin-password`.
+  </Step>
+  <Step title="Pick an admin login name">
+    Set `admin.name` to the login name you want. It is not sensitive and stays a plain value; the default is `cbadmin`.
+  </Step>
+</Steps>
+
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** `cpln helm install` still exits 0 and reports success, all four resources are created, and the workload then never starts — it sits at zero replicas with the message `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` There are no container logs to diagnose from, because the container never ran. Create the secret first, and after installing confirm with `cpln workload get-deployments RELEASE_NAME-dbeaver --gvc GVC_NAME` rather than trusting the Helm output.
+</Warning>
+
+Nothing else is required for a default install.
+
 ## Installation
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -52,9 +83,26 @@ The default `values.yaml` for this template:
 ```yaml
 image: dbeaver/cloudbeaver:25.2.0
 
+# ─── Admin Login (prerequisite secret) ────────────────────────────────────────
+# The admin password guards the CloudBeaver web login, and whoever holds it can
+# reach every database this console is connected to — so it never transits
+# values or the Helm release. Create the opaque secret (encoding: plain) BEFORE
+# install; see README Prerequisites.
 admin:
-  name: adminusername
-  password: Password123
+  name: cbadmin # admin login name (not sensitive)
+  passwordSecretName: my-dbeaver-admin-password # opaque secret holding the admin password; must EXIST BEFORE INSTALL
+
+# ─── Access ───────────────────────────────────────────────────────────────────
+publicAccess:
+  # false = not reachable from the internet. Setting this true publishes a
+  # database administration console, and its login form, to the whole internet.
+  enabled: false
+
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # used with workload-list
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
 resources:
   cpu: 500m
@@ -66,25 +114,120 @@ volumeset:
 
 ### Admin Credentials
 
-- `admin.name` — Username for the admin account created on first startup.
-- `admin.password` — Password for the admin account. **Change this before deploying.**
+- `admin.name` — the admin login name, created when the workspace is first initialized. Not sensitive, so it stays a plain value. Default `cbadmin`.
+- `admin.passwordSecretName` — the name of the opaque secret holding the admin password. The chart references it as `cpln://secret/NAME.payload`, so the password itself never appears in the workload spec or the Helm release.
 
-These values are stored as a Control Plane secret and injected into the container at startup. No manual user creation is required — log in with these credentials immediately after deployment.
+<Warning>
+**The admin password cannot be rotated by changing the secret.** Both credentials are consumed only when an empty workspace is initialized on the volume set. On every later boot CloudBeaver reads the account it already stored in its workspace database and ignores the environment. This was measured: after rewriting the secret's payload and restarting the workload, the container held the **new** value while the **old password still logged in** and the new one was rejected with `Invalid user credentials`.
+
+To change the password, use the CloudBeaver UI (**Administration → Users**), or uninstall — which deletes the volume set and every saved connection with it — and reinstall.
+</Warning>
+
+<Warning>
+**CloudBeaver logs the submitted password hash, and its API accepts that hash in place of the password.** At the image's default log level, login requests appear in `cpln logs` with the credential included, and replaying that value against the API authenticates successfully — so anyone who can read this workload's logs can log in as the admin. This is upstream CloudBeaver behavior, not something the chart configures; the move to a prerequisite secret does not close it. Treat log access to this workload as equivalent to admin access to every database it is connected to.
+</Warning>
+
+### Access
+
+- `publicAccess.enabled` — when `true`, the workload's external inbound firewall opens to `0.0.0.0/0` and Control Plane assigns a `*.cpln.app` canonical endpoint. **Defaults to `false`.** With it off, requests to the canonical endpoint return `403 RBAC: access denied`.
+- `internalAccess.type` — which workloads inside Control Plane may reach the console. **Defaults to `same-gvc`.**
+- `internalAccess.workloads` — list of workload links, used only when `type` is `workload-list`.
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access allowed |
+| `same-gvc` | Allow access from all workloads in the same GVC |
+| `same-org` | Allow access from all workloads in the same organization |
+| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads` |
+
+<Note>
+**An access change takes up to a couple of minutes to take effect.** Firewall changes propagate asynchronously: enabling public access was measured at 107 seconds from upgrade to the first `200`, and disabling it at about 120 seconds, passing through `503` and `504` on the way. Re-poll before concluding the knob did nothing.
+
+A request blocked by `internalAccess.type: none` **hangs until your client times out** rather than being refused — the TCP connection is accepted by the local sidecar and no bytes are ever returned. "Connected, but no response" is what a correctly closed internal firewall looks like here.
+</Note>
+
+### Outbound Connectivity
+
+The workload ships with an empty outbound firewall (`outboundAllowCIDR: []`), and there is no value to change it.
+
+<Warning>
+**CloudBeaver can only reach databases inside its own GVC.** Outbound TLS connections to the public internet do not complete — measured as a connection reset during the TLS handshake (`curl` exit code 35) from the CloudBeaver container, while a control workload in the same GVC with open egress reached the same hosts normally. In practice this means **managed databases such as Amazon RDS, Google Cloud SQL, and MongoDB Atlas cannot be connected**. Point connections at in-GVC hosts over internal DNS instead, e.g. `my-postgres.GVC_NAME.cpln.local:5432`.
+
+Note that DNS still resolves and a bare TCP connect can appear to succeed, because the sidecar accepts the socket before the connection is reset — do not infer working egress from either.
+</Warning>
 
 ### Resources and Storage
 
 - `resources.cpu` / `resources.memory` — CPU and memory allocated to the CloudBeaver workload.
-- `volumeset.capacity` — Persistent volume size in GiB for workspace data, connections, and settings (minimum 10).
+- `volumeset.capacity` — persistent volume size in GiB for workspace data, saved connections, and user accounts (minimum 10).
 
-### Accessing CloudBeaver
+## Connecting
 
-Once deployed, open the workload's endpoint in your browser and log in with the admin credentials configured in your values file.
+| Path | Address | Notes |
+|------|---------|-------|
+| Public UI | `https://CANONICAL_ENDPOINT` | Only when `publicAccess.enabled` is `true`. Read the endpoint from `status.canonicalEndpoint` in `cpln workload get RELEASE_NAME-dbeaver --gvc GVC_NAME -o yaml`. |
+| Internal UI and API | `http://RELEASE_NAME-dbeaver.GVC_NAME.cpln.local:8978` | Subject to `internalAccess.type`. |
+| Admin credentials | `admin.name` from your values, plus the payload of the secret named in `admin.passwordSecretName` | Reveal it with `cpln secret reveal my-dbeaver-admin-password`. |
+
+Add database connections from the UI after logging in, pointing them at in-GVC hosts over internal DNS.
+
+## Upgrading From 1.2.1 or Earlier
+
+<Warning>
+**After upgrading, the console is no longer reachable from the internet, and your existing admin password keeps working.** Both are expected. Plan the upgrade rather than discovering it.
+</Warning>
+
+| Behavior | 1.2.1 and earlier | 1.3.0 |
+|---|---|---|
+| Admin password | `admin.password` value, defaulting to `Password123` | `admin.passwordSecretName`, naming an opaque secret you create |
+| Admin login name | `admin.name`, defaulting to `adminusername` | `admin.name`, defaulting to `cbadmin` — still a plain value |
+| Public access | Hardcoded `0.0.0.0/0` inbound, no knob | `publicAccess.enabled`, defaulting to `false` |
+| Internal access | Hardcoded `none` | `internalAccess.type`, defaulting to `same-gvc` |
+| Chart-created secret | A secret holding the admin name and password | None — the chart creates no secret |
+
+What to do before upgrading:
+
+<Steps>
+  <Step title="Create the admin password secret">
+    Even though it will not change the account you already log in with, the workload will not start without it. Use the same password your install currently uses so nothing is ambiguous later:
+
+    ```bash
+    printf '%s' 'YOUR-EXISTING-PASSWORD' | cpln secret create-opaque --name my-dbeaver-admin-password --encoding plain -f -
+    ```
+
+    Then set `admin.passwordSecretName` to that name, and remove `admin.password` from your values — it no longer exists in the chart.
+  </Step>
+  <Step title="Decide whether you still want public access">
+    If you were relying on the internet-facing URL, set `publicAccess.enabled: true` explicitly. If you were not, do nothing and the console becomes internal-only. Either way, allow a couple of minutes for the firewall change to propagate.
+  </Step>
+  <Step title="Expect your old password to keep working">
+    The account already exists in the workspace database, so the upgrade does not re-bootstrap it — see [Admin Credentials](#admin-credentials). If the password you were using is one you would rather not keep, change it in the CloudBeaver UI after the upgrade.
+  </Step>
+</Steps>
+
+## Important Notes
+
+- **Create the admin-password secret before installing.** A missing secret does not fail the install — `cpln helm install` reports success and the workload then sits at zero replicas waiting on it, with no container logs to diagnose from.
+- **The admin password is read only when the workspace is first initialized.** Rotating the secret afterwards changes what the container sees and changes nothing about who can log in. Change it in the CloudBeaver UI instead.
+- **Anyone who can read this workload's logs can authenticate as the admin**, because CloudBeaver logs the submitted password hash and its API accepts that hash as a credential.
+- **`publicAccess.enabled: true` puts a database administration console on the public internet.** Anyone who reaches it needs only the admin password to query every connected database. Prefer leaving it off and reaching the UI from inside the GVC.
+- **Egress is closed and there is no knob for it** — only databases inside the same GVC can be connected. Managed services such as RDS, Cloud SQL, and Atlas are unreachable.
+- **Access changes take up to a couple of minutes to propagate.** A `publicAccess` or `internalAccess` change that appears to do nothing has usually just not settled yet.
+- **The first `helm upgrade` after an install restarts the workload**, taking the UI down for roughly 30 to 60 seconds even when nothing about the values changed. This template runs a single replica, so there is no other instance to serve during the restart. Later no-op upgrades do not restart it.
+- **Saved connections and users live on the volume set** and survive redeploys and upgrades. `cpln helm uninstall` deletes the volume set, taking every saved connection with it.
+- **The prerequisite secret is not owned by the release** — it survives `cpln helm uninstall` and must be deleted manually if you no longer need it.
 
 ## External References
 
 <CardGroup cols={2}>
-    <Card title="CloudBeaver Documentation" icon="book" href="https://cloudbeaver.io/docs/">
+    <Card title="CloudBeaver Documentation" icon="book" href="https://dbeaver.com/docs/cloudbeaver/">
     Official DBeaver CloudBeaver documentation
+    </Card>
+    <Card title="Server Configuration" icon="gear" href="https://dbeaver.com/docs/cloudbeaver/Server-configuration/">
+    Reference for CloudBeaver server settings
+    </Card>
+    <Card title="Admin Password Recovery" icon="key" href="https://dbeaver.com/docs/cloudbeaver/Admin-Password-Recovery/">
+    Upstream procedure for regaining admin access
     </Card>
     <Card title="DBeaver GitHub" icon="github" href="https://github.com/dbeaver/cloudbeaver">
     CloudBeaver open-source repository
