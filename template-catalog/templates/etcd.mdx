@@ -1,12 +1,12 @@
 ---
 title: etcd
 description: Deploy etcd on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and distributed key-value store cluster setup with peer discovery.
-keywords: ['kv store', 'service discovery', 'config store', 'consul alternative', 'zookeeper alternative', 'k8s backend', 'distributed lock', 'raft consensus', 'leader election', 'coordination service']
+keywords: ['kv store', 'service discovery', 'config store', 'consul alternative', 'zookeeper alternative', 'k8s backend', 'distributed lock', 'raft consensus', 'leader election', 'coordination service', 'auto-compaction', 'nospace alarm', 'backend quota', 'etcdctl']
 ---
 
 ## Overview
 
-etcd is a distributed, reliable key-value store designed for the most critical data of a distributed system. It provides consistent coordination, service discovery, and configuration management across distributed systems, making it a common foundation for cluster health and orchestration. This template deploys an etcd cluster as a stateful workload with configurable replica count and persistent storage.
+etcd is a distributed, reliable key-value store designed for the most critical data of a distributed system. It provides consistent coordination, service discovery, and configuration management across distributed systems, making it a common foundation for cluster health and orchestration. This template deploys an etcd cluster as a stateful workload with configurable replica count, persistent storage, and auto-compaction configured so the backend does not grow without bound.
 
 ### What Gets Created
 
@@ -58,6 +58,13 @@ resources:
 
 multiZone: false
 
+# etcd keeps every superseded revision until told otherwise, so compaction is
+# required rather than optional and cannot be switched off here.
+tuning:
+  autoCompactionMode: periodic # periodic (retention is a duration) or revision (a revision count)
+  autoCompactionRetention: 1h # periodic needs an explicit unit (1h, 30m, 24h); revision takes a count
+  quotaBackendBytes: 0 # backend size limit in bytes; 0 = etcd's own default of 2 GiB
+
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
 
@@ -83,6 +90,43 @@ The replica count must always be an odd number. etcd uses the Raft consensus alg
 
 - `volumeset.capacity` — Persistent volume size in GiB for etcd data (minimum 10).
 
+### Compaction and Backend Growth
+
+etcd never discards a superseded revision on its own. Every write creates a new revision and the old one is kept until a **compaction** removes it, so the backend grows with **time alone** whenever a client writes on a timer — Patroni, for example, renews its leader lease roughly every 10 seconds, which produces new revisions whether or not any application data changes. Measured on an otherwise idle cluster: about **151,000 revisions and 19 MB per day**, which reaches etcd's default 2 GiB backend quota in roughly **110 days**.
+
+When the quota is reached, etcd raises a cluster-wide `NOSPACE` alarm and **every member goes read-only** until an operator intervenes. Auto-compaction is what prevents that, and this template configures it by default.
+
+```yaml
+tuning:
+  autoCompactionMode: periodic # periodic (retention is a duration) or revision (a revision count)
+  autoCompactionRetention: 1h # periodic needs an explicit unit (1h, 30m, 24h); revision takes a count
+  quotaBackendBytes: 0 # backend size limit in bytes; 0 = etcd's own default of 2 GiB
+```
+
+- `tuning.autoCompactionMode` — How `autoCompactionRetention` is read. `periodic` treats it as a time window; `revision` treats it as a number of revisions to keep. There is no "off" — an unrecognized mode is rejected at render time.
+- `tuning.autoCompactionRetention` — How much history is kept before old revisions are discarded. The default `1h` keeps the backend flat. Raising it to `24h` or more buys a longer history window at the cost of a larger backend.
+- `tuning.quotaBackendBytes` — Backend size ceiling in bytes. `0` (the default) means the flag is not passed at all and etcd applies its own 2 GiB limit. Leave it at `0` unless the keyspace genuinely outgrows that; 8 GiB (`8589934592`) is etcd's own suggested maximum, above which it warns at startup.
+
+<Warning>
+**In `periodic` mode a retention value without a unit means hours.** etcd reads a bare `30` as thirty *hours*, not thirty minutes. This template rejects an unsuffixed value at render time rather than letting it become a silently wrong window — write `30m`, `1h` or `24h`.
+</Warning>
+
+<Warning>
+**`quotaBackendBytes` takes a plain byte count, not a size suffix.** etcd itself refuses `--quota-backend-bytes 2Gi` at boot and the cluster would crash-loop, so a `2Gi`-style value is rejected at render time instead. Write `2147483648`.
+</Warning>
+
+Compaction is deliberately not switchable off: a retention of `0`, an unrecognized mode and a negative quota (which etcd reads as "no quota at all") are each rejected at render time. Each one produces a chart that installs cleanly and fails weeks later.
+
+<Note>
+**Compaction frees pages for reuse inside the backend file; it does not shrink the file.** The reported `dbSize` therefore plateaus rather than dropping, while `dbSizeInUse` falls back to the size of the live keyspace. That is the expected behavior and is sufficient to stay under the quota, because reclaimed pages are reused for new writes. Only `etcdctl defrag` returns space to the filesystem, and this template does not automate it — defragmentation blocks the member it runs on.
+
+Testing measured the mechanism directly on a shortened retention window: the compacted revision advanced from 1 to 4001, `dbSizeInUse` collapsed from 5.76 MB to 20,480 bytes while `dbSize` stayed at about 5.8 MB, and reads of pre-compaction revisions then failed with `required revision has been compacted`. The multi-day `dbSize` plateau is **derived from that mechanism rather than observed** over days.
+</Note>
+
+<Note>
+`etcdctl endpoint status` reports `QUOTA | 0 B` when `quotaBackendBytes` is `0`, because that column reflects the flag rather than the effective limit. The effective quota in that case is still etcd's 2 GiB default, which etcd logs at startup as `enabled backend quota with default value`.
+</Note>
+
 ### Multi-Zone
 
 - `multiZone` — When `true`, distributes replicas equally across available zones for higher availability.
@@ -101,11 +145,33 @@ The `internal_access` section controls which workloads can reach the etcd cluste
 | `same-org` | Allow access from all workloads in the same organization |
 | `workload-list` | Allow access only from specific workloads listed in `workloads` |
 
+## If the Backend Quota Is Already Full
+
+Auto-compaction is configured from template version `1.4.2` onward. Earlier versions passed no compaction flags at all, so a cluster installed from one of them retains every revision it has ever written and grows until it hits the quota.
+
+<Warning>
+**Upgrading turns compaction on, but it cannot rescue a cluster that has already filled its backend.** Compaction stops further growth; it never shrinks an existing backend file. Once etcd has raised a `NOSPACE` alarm, writes stay rejected until an operator compacts, defragments each member and disarms the alarm — an upgrade does none of that.
+</Warning>
+
+The symptom usually surfaces in the client rather than in etcd. A Patroni replica that cannot renew its lease exits *cleanly*, so it restart-loops with `exitCode: 0` and `reason: Completed` and a climbing restart count — which reads as healthy and gets misdiagnosed as a database fault. Check etcd first.
+
+Both inspection commands are read-only and safe to run on a live cluster:
+
+```bash
+cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl endpoint status --cluster -w table
+cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl alarm list
+```
+
+A `DB SIZE` close to 2.1 GB on every member, plus `NOSPACE` in the alarm list, confirms it. A healthy cluster prints nothing at all for `alarm list`. Recovery from there — compacting to a revision, defragmenting each member, then disarming the alarm — is an operator procedure this template deliberately does not perform, because each step is disruptive and the order matters. Follow etcd's [maintenance guide](https://etcd.io/docs/v3.6/op-guide/maintenance/) and plan it as a maintenance window.
+
 ## External References
 
 <CardGroup cols={2}>
     <Card title="etcd Documentation" icon="book" href="https://etcd.io/docs/v3.6/">
     Official etcd documentation
+    </Card>
+    <Card title="Maintenance and Compaction" icon="broom" href="https://etcd.io/docs/v3.6/op-guide/maintenance/">
+    Compaction, defragmentation, and clearing a NOSPACE alarm
     </Card>
     <Card title="Hardware Recommendations" icon="server" href="https://etcd.io/docs/v3.6/op-guide/hardware/">
     etcd hardware and resource sizing guidelines
