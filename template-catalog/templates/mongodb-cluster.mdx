@@ -222,12 +222,24 @@ resources:
   cpu: 1
   memory: 2Gi
 
+# ─── Credentials (prerequisite secrets) ───────────────────────────────────────
+# BOTH SECRETS MUST EXIST BEFORE YOU INSTALL — the deployment wedges waiting on a
+# secret that does not exist. Neither value passes through Helm values, so neither
+# lands in the release. See Prerequisites in the README for the exact commands.
 mongodb:
-  username: admin
-  password: mypassword
-  database: mydatabase
-  # REQUIRED: Generate with `openssl rand -base64 32`
-  replicaSetKey: "Ol0GnqpqntkcnjprS+Pu/1Ji8fcSEKb8f4zkF5c+dEQ="
+  # `dictionary` secret holding exactly three keys: `username`, `password`,
+  # `database`. This is the credential you put in your applications' connection
+  # strings, and the root user the cluster is bootstrapped with.
+  credentialsSecretName: my-mongodb-credentials
+
+  # `opaque` secret (encoding: plain) holding the replica set keyfile — the shared
+  # key cluster members authenticate to each other with. Anyone holding it can join
+  # a member to the replica set, so it is kept SEPARATE from the credentials above.
+  # CONTENT RULES (mongod rejects anything else): 6-1024 characters from the base64
+  # alphabet only — A-Z a-z 0-9 + / = — after whitespace is stripped. Generate with
+  # `openssl rand -base64 756`; do NOT invent a passphrase, hyphens alone break it.
+  # It CANNOT be changed after the cluster is initialized.
+  keyfileSecretName: my-mongodb-keyfile
 
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
@@ -254,22 +266,26 @@ proxy:
 backup:
   enabled: false
   mode: logical # options: logical, physical
+
   schedule: "0 2 * * *" # daily at 2am UTC
+
   provider: aws # options: aws or gcp
 
+  # Logical backup (mongodump)
   logical:
     image: ghcr.io/controlplane-com/backup-images/mongo-backup:8.0
     resources:
       cpu: 100m
       memory: 128Mi
 
+  # Physical backup (Percona Backup for MongoDB)
   physical:
     image: percona/percona-backup-mongodb:2.14.0
-    resources:      # pbm-agent sidecar (runs continuously)
+    resources:
       cpu: 100m
       memory: 128Mi
     cron:
-      resources:    # backup trigger job (runs briefly on schedule)
+      resources:
         cpu: 50m
         memory: 64Mi
 
@@ -286,9 +302,11 @@ backup:
     prefix: mongodb-cluster/backups
 ```
 
-### Locations
+### GVC and Locations
 
-Configure which Control Plane locations to deploy into and how many replicas to run per location. Each entry in `gvc.locations` creates a set of MongoDB replicas at that location.
+`gvc.name` names the GVC this template **creates** — it must not match an existing GVC, as explained in [The GVC This Template Creates](#the-gvc-this-template-creates).
+
+`gvc.locations` sets which Control Plane locations to deploy into and how many replicas to run per location. Each entry creates a set of MongoDB replicas at that location.
 
 **Single Location** — all replicas in one location. A minimum of 3 replicas is required for majority quorum:
 
@@ -316,17 +334,32 @@ gvc:
 Aim for an odd total replica count (3, 5, 7, 9) across all locations to guarantee a clear majority in all split-brain scenarios.
 </Note>
 
+Adding a location to an existing cluster works without any manual step: new members discover the primary through the seed list and register themselves into the replica set. This was verified across `aws-us-east-1` and `aws-eu-central-1` in a single replica set.
+
+<Warning>
+**Never reorder `gvc.locations` after installing — only append.** The first entry is the bootstrap location: replica 0 there is the member that initializes the replica set. Moving a different location into first position points that logic at a replica with an empty data directory, which can initialize a second, independent replica set.
+</Warning>
+
 ### Multi-Zone
 
 Set `multiZone: true` to spread replicas across availability zones within each location, protecting against zone-level failures. Verify your selected location(s) support multi-zone before enabling.
 
 ### MongoDB Settings
 
-- `mongodb.username` / `mongodb.password` — Admin credentials. Change these before deploying to production.
-- `mongodb.database` — Default database name created at startup.
-- `mongodb.replicaSetKey` — Shared secret used to authenticate replica set members to each other. **Must be generated before deploying** with `openssl rand -base64 32`. This value must not be changed after the cluster is initialized — doing so requires a full cluster restart.
+- `mongodb.credentialsSecretName` — Name of the dictionary secret holding `username`, `password` and `database`. The cluster is bootstrapped with this user on first start, and this is the credential your applications use. Must exist before install — see [Prerequisites](#prerequisites).
+- `mongodb.keyfileSecretName` — Name of the opaque secret holding the replica set keyfile. Must exist before install, and its contents must be generated with `openssl rand -base64 756`.
 - `resources.cpu` / `resources.memory` — Resource limits applied to each MongoDB replica.
 - `image` — MongoDB image. Defaults to `percona/percona-server-mongodb:8.0`.
+
+Neither credential is a Helm value, so neither appears in the release. The two secrets stay separate so that an application granted `reveal` on the database credentials cannot also read the key that lets a member join the replica set.
+
+<Warning>
+**The keyfile cannot be changed after the cluster is initialized.** It authenticates replica set members to each other; replacing it requires every member to restart with the new key at the same time, which means planned downtime.
+</Warning>
+
+<Note>
+The `database` entry of the credentials secret is for your own connection strings — the cluster is bootstrapped with the admin user, and MongoDB creates a database the first time you write to it.
+</Note>
 
 ### HAProxy Proxy
 
@@ -337,7 +370,7 @@ HAProxy is enabled by default and strongly recommended. In a MongoDB replica set
 - `proxy.resources` — CPU and memory limits for the proxy workload.
 
 <Note>
-HAProxy is required when using logical backups (`backup.mode: logical`). Physical (PBM) backups connect directly to replicas and do not require the proxy.
+**Backups do not use the proxy.** Both the logical and the physical backup jobs connect to `replica-0` directly, so disabling the proxy does not affect them. The proxy matters for clients that cannot track the primary themselves.
 </Note>
 
 ### Storage
@@ -362,19 +395,25 @@ Connect using the appropriate endpoint depending on your setup:
 
 | Setup | Hostname | Port |
 |-------|----------|------|
-| Via HAProxy (writes + reads) | `{release-name}-mongo-proxy.{gvc}.cpln.local` | `27017` |
-| Direct per-replica (read-only or internal) | `replica-{N}.{release-name}-mongo.{location}.{gvc}.cpln.local` | `27017` |
+| Via HAProxy (writes + reads) | `RELEASE_NAME-mongo-proxy.GVC_NAME.cpln.local` | `27017` |
+| Direct per-replica (read-only or internal) | `replica-N.RELEASE_NAME-mongo.LOCATION.GVC_NAME.cpln.local` | `27017` |
 
-Example connection string via proxy:
+The username, password and database name are the three entries of your credentials secret. Read them back with:
 
+```bash
+cpln secret reveal my-mongodb-credentials -o yaml
 ```
-mongodb://admin:mypassword@{release-name}-mongo-proxy.{gvc}.cpln.local:27017/mydatabase?authSource=admin
+
+Example connection string via the proxy:
+
+```text
+mongodb://USERNAME:PASSWORD@RELEASE_NAME-mongo-proxy.GVC_NAME.cpln.local:27017/DATABASE?authSource=admin
 ```
 
 To offload reads from the primary, add `readPreference=secondaryPreferred` to your connection string and connect directly to a replica:
 
-```
-mongodb://admin:mypassword@replica-0.{release-name}-mongo.{location}.{gvc}.cpln.local:27017/mydatabase?authSource=admin&readPreference=secondaryPreferred
+```text
+mongodb://USERNAME:PASSWORD@replica-0.RELEASE_NAME-mongo.LOCATION.GVC_NAME.cpln.local:27017/DATABASE?authSource=admin&readPreference=secondaryPreferred
 ```
 
 <Note>
@@ -382,6 +421,18 @@ Secondary reads may be slightly stale due to replication lag. Use `readPreferenc
 </Note>
 
 Configure `maxPoolSize` in your MongoDB driver to prevent connection exhaustion. A per-app-replica pool of 10–50 connections is a reasonable starting point for most workloads.
+
+The cluster has no public endpoint — it is reachable only from inside the org, subject to [Firewall](#firewall).
+
+### Failover Behavior
+
+When the primary goes away, the remaining members elect a new one and the proxy re-routes to it. Clients connected through the proxy keep the same connection string and need no change.
+
+In testing, stopping the primary replica of a three-member cluster restored write availability in **5 seconds or less**, with data written before the failover intact and writes after it landing on the new primary. The stopped replica was rescheduled and rejoined as a secondary about **3 minutes** later. That timing reflects a graceful handover — the container steps down the primary before it exits — so an abrupt node loss takes longer, bounded by MongoDB's election timeout.
+
+<Warning>
+**Do not lose a replica while an upgrade is rolling.** Any `helm upgrade` restarts the MongoDB tier one replica at a time, which takes roughly **7 minutes** for three replicas. Losing another member during that window can leave a three-member cluster with one live member and no quorum. Wait for the rollout to finish before performing any maintenance.
+</Warning>
 
 ## Backing Up
 
