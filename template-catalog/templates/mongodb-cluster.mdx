@@ -445,7 +445,15 @@ Two backup modes are available:
 
 Set `backup.enabled: true`, choose a `mode`, set `backup.provider`, and fill in the corresponding provider block.
 
-The backup job region determines where the backup cron workload runs. For AWS, the Control Plane location is automatically derived from `backup.aws.region` (e.g., `us-east-1` → `aws-us-east-1`). For GCP, the job runs in the first location listed in `gvc.locations`.
+The backup job region determines where the backup cron workload runs. For AWS, the Control Plane location is automatically derived from `backup.aws.region` (e.g., `us-east-1` → `aws-us-east-1`), and that derived location must be one of your `gvc.locations` — the template refuses to render otherwise. For GCP, the job runs in the first location listed in `gvc.locations`.
+
+Both modes connect to `replica-0` directly rather than through the proxy, so `proxy.enabled: false` does not affect them.
+
+<Note>
+**Logical backups are verified end to end**, including the scheduled `mongodump` and the upload to S3 using the workload identity's Cloud Account binding. **Physical (PBM) mode is not verified** on this template — it renders and installs, but no backup or restore has been proven through it. Prefer `logical` unless you are prepared to validate `physical` yourself.
+</Note>
+
+Enabling `physical` mode adds a `pbm-agent` sidecar to every MongoDB replica, which restarts the whole stateful tier — allow roughly 7 minutes for a three-replica cluster.
 
 ### AWS S3
 
@@ -510,17 +518,17 @@ You must add the `Storage Admin` role to the GCP service account created for the
 Run the following from a client with network access to the cluster and access to the bucket. Connect to the **proxy** workload so writes land on the current primary.
 
 **AWS S3:**
-```sh
+```bash
 mongorestore \
-  --uri="mongodb://USERNAME:PASSWORD@{release-name}-mongo-proxy.{gvc}.cpln.local:27017/?authSource=admin" \
+  --uri="mongodb://USERNAME:PASSWORD@RELEASE_NAME-mongo-proxy.GVC_NAME.cpln.local:27017/?authSource=admin" \
   --gzip \
   --archive=<(aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.gz -)
 ```
 
 **GCS:**
-```sh
+```bash
 mongorestore \
-  --uri="mongodb://USERNAME:PASSWORD@{release-name}-mongo-proxy.{gvc}.cpln.local:27017/?authSource=admin" \
+  --uri="mongodb://USERNAME:PASSWORD@RELEASE_NAME-mongo-proxy.GVC_NAME.cpln.local:27017/?authSource=admin" \
   --gzip \
   --archive=<(gsutil cp gs://BUCKET_NAME/PREFIX/BACKUP_FILE.gz -)
 ```
@@ -529,14 +537,18 @@ mongorestore \
 
 Physical restores require stopping the MongoDB workload and restoring data files directly. All replicas must participate.
 
+<Warning>
+Physical backup and restore have not been verified on this template. Treat the steps below as PBM's documented procedure rather than a proven path, and rehearse them on a throwaway cluster before relying on them.
+</Warning>
+
 <Steps>
   <Step title="Exec into a pbm-agent container">
-    ```sh
-    cpln workload exec {release-name}-mongo --gvc {gvc} --location {location} --replica 0 --container pbm-agent -- /bin/sh
+    ```bash
+    cpln workload exec RELEASE_NAME-mongo --gvc GVC_NAME --location LOCATION --replica RELEASE_NAME-mongo-0 --container pbm-agent -- /bin/sh
     ```
   </Step>
   <Step title="List available backups">
-    ```sh
+    ```bash
     MONGO_URI="mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@localhost:27017/admin?replicaSet=rs0&authSource=admin&authMechanism=SCRAM-SHA-256"
     pbm list --mongodb-uri="${MONGO_URI}"
     ```
@@ -545,7 +557,7 @@ Physical restores require stopping the MongoDB workload and restoring data files
     Stop the workload via the Control Plane console or CLI before restoring.
   </Step>
   <Step title="Run the restore">
-    ```sh
+    ```bash
     pbm restore BACKUP_NAME --mongodb-uri="${MONGO_URI}"
     ```
   </Step>
@@ -569,18 +581,25 @@ Scaling down requires manually removing departing replicas from the replica set 
 Before reducing the replica count, connect to the primary and remove each departing replica:
 
 ```js
-rs.remove("replica-{N}.{release-name}-mongo.{location}.{gvc}.cpln.local:27017")
+rs.remove("replica-N.RELEASE_NAME-mongo.LOCATION.GVC_NAME.cpln.local:27017")
 ```
 
 After all departing replicas are removed from the config, apply the template upgrade to reduce the count.
 
 ## Important Notes
 
+- **Both prerequisite secrets must exist before you install.** A missing one wedges the deployment with no log output at all; the only diagnostic is `status.versions[].message` on the workload. See [Prerequisites](#prerequisites).
+- **Generate the keyfile, never invent one.** It must be 6-1024 characters from the base64 alphabet (`A-Z a-z 0-9 + / =`) — a `change-me-...` style placeholder will not boot. Use `openssl rand -base64 756`.
+- **The keyfile cannot be changed after the cluster is initialized.** Replacing it requires restarting every member with the new key at the same time.
+- **`gvc.name` must not match an existing GVC.** Helm adopts an existing GVC and deletes it on uninstall, taking every unrelated workload with it.
+- **The default is nine members across three regions.** Cross-region traffic is billed — reduce `gvc.locations` for a single-region deployment.
+- **Never reorder `gvc.locations` after install**, only append. The first entry is the bootstrap location that initializes the replica set.
 - **Minimum replicas**: Use at least 3 replicas per location for HA. A 2-replica cluster cannot maintain quorum if one replica fails.
-- **Replica set key**: The `replicaSetKey` must be generated before deployment and must not be changed after the cluster is initialized. Changing it requires a full cluster restart.
 - **Odd total replica count**: Aim for an odd total number of replicas across all locations (3, 5, 7, 9) to guarantee a clear majority in all failover scenarios.
+- **Any upgrade rolls the MongoDB tier** — about 7 minutes for three replicas. Avoid other maintenance during that window.
+- **Physical (PBM) backups are unverified** on this template; logical backups are verified end to end.
 - **Read from secondaries**: To offload reads from the primary, use `readPreference=secondaryPreferred` in your connection string. Secondary reads may be slightly stale due to replication lag.
-- **Connection pooling**: Configure `maxPoolSize` in your MongoDB driver to prevent connection exhaustion. A per-app-replica pool of 10–50 is a reasonable starting point.
+- **Connection pooling**: Configure `maxPoolSize` in your MongoDB driver to prevent connection exhaustion. A per-app-replica pool of 10-50 is a reasonable starting point.
 
 ## External References
 
