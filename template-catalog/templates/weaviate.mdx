@@ -65,7 +65,7 @@ printf '%s' "sk-..." | \
 Set `modules.openai.apiKeySecretName` (or the `anthropic`, `cohere`, `huggingface` equivalent) to that name. Leaving a provider's `apiKeySecretName` empty means the provider is genuinely off: no environment variable, no `reveal` grant, and no outbound internet access on the workload. All three were confirmed against the live resources on a default install, where the container could not reach `api.openai.com` at all.
 
 <Warning>
-**Naming a provider secret gives you a live, billable integration.** It is not inert configuration held in reserve — see [Provider Modules Load Regardless of modules.enabled](#provider-modules-load-regardless-of-modules-enabled). Only supply a provider key when you intend that provider to be used.
+**Naming a provider secret gives you a live, billable integration.** It is not inert configuration held in reserve — see [Provider Modules Load Regardless of the Module List](#provider-modules-load-regardless-of-the-module-list). Only supply a provider key when you intend that provider to be used.
 </Warning>
 
 ### Cloud Storage
@@ -236,7 +236,7 @@ Anonymous access is disabled unconditionally. In testing, an unauthenticated req
 Naming any provider secret, or enabling backups, opens outbound internet access on the Weaviate workload so it can reach that API. With neither, the workload has no egress at all.
 
 <Warning>
-The comment in `values.yaml` — "supplying a key alone does not activate it" — **overstates what `modules.enabled` does** on Weaviate 1.38. See [Provider Modules Load Regardless of modules.enabled](#provider-modules-load-regardless-of-modules-enabled).
+The comment in `values.yaml` — "supplying a key alone does not activate it" — **overstates what `modules.enabled` does** on Weaviate 1.38. See [Provider Modules Load Regardless of the Module List](#provider-modules-load-regardless-of-the-module-list).
 </Warning>
 
 ### Resources
@@ -268,3 +268,75 @@ All four settings were exercised against a live cluster, including the negative 
 <Note>
 **A firewall change takes up to a couple of minutes to take effect.** Measured propagation was 45–95 seconds. A denial surfaces to the caller as `HTTP 503 upstream connect error`, which is indistinguishable from an unhealthy upstream — re-test after a couple of minutes before concluding a knob did not work.
 </Note>
+
+## Upgrading From 1.0.1 or Earlier
+
+`1.1.0` is a security release. Every credential the chart used to accept as a value is now a secret you create and reference by name, and carrying a `1.0.1` values file forward **fails at render** with a message naming its replacement — nothing silently falls back to a default.
+
+| `1.0.1` and earlier | `1.1.0` | Why |
+|---|---|---|
+| `apiKey` (a working 64-character key) | `apiKeySecretName` → required prerequisite `opaque` secret | The default key was published in this repository and shared by every install that did not override it. It is the only authentication Weaviate has |
+| `modules.openai.apiKey` and the `anthropic`, `cohere`, `huggingface` equivalents | `modules.{provider}.apiKeySecretName` → optional prerequisite `opaque` secrets | Your own provider billing keys were landing in the Helm release in plaintext |
+| `internal_access` | `internalAccess` | Renamed only; the fields (`type`, `workloads`) are unchanged |
+| `clusterName` | Removed | It was never rendered into any resource. Nothing replaces it |
+
+The render guard for the API key reads:
+
+```text
+weaviate: `apiKey` was removed in 1.1.0 — the API key is now a REQUIRED prerequisite
+`opaque` secret (encoding: plain). Create it, then set `apiKeySecretName` to its name.
+```
+
+<Steps>
+  <Step title="Rotate the key, do not carry it forward">
+    Generate a **new** key and create the secret as shown in [Prerequisites](#prerequisites). The old default was public, so an install that used it should be treated as having had its data readable and writable by anyone who found it. If you overrode the default with your own value, that value still travelled in the Helm release and is worth rotating too.
+  </Step>
+  <Step title="Replace the removed keys">
+    Delete `apiKey`, `clusterName`, and any `modules.{provider}.apiKey` entries from your values. Set `apiKeySecretName`, rename `internal_access` to `internalAccess`, and create a provider secret for each provider you actually use.
+  </Step>
+  <Step title="Update every client">
+    The API key changes, so every application, notebook, and client library holding the old bearer token must be updated.
+  </Step>
+  <Step title="Plan the restart">
+    A `helm upgrade` restarts the cluster one replica at a time. Read [Rolling Restarts Can Split a Replica Out of the Cluster](#rolling-restarts-can-split-a-replica-out-of-the-cluster) first and verify cluster health afterwards — the platform's ready status will not tell you if a node failed to rejoin.
+  </Step>
+</Steps>
+
+## Cluster Behavior and Known Limits
+
+Both limitations below are **pre-existing** — `1.1.0` changed no clustering configuration — and both were confirmed on a live three-replica cluster.
+
+### Rolling Restarts Can Split a Replica Out of the Cluster
+
+A single redeployment of a three-replica cluster left one node **permanently split out of the Raft cluster**. The restarted node came up as a leaderless `Candidate` — it had Raft log entries on disk but had applied none of them, so its schema state was empty. The other two replicas elected a leader without it, and it **never rejoined**: it was still in that state 31 minutes later, and it did not recover on its own.
+
+The part that makes this dangerous is what the platform reports:
+
+- **All three replicas report `ready`.** The readiness probe checks `/v1/.well-known/live`, which only proves the HTTP server is up, so the split node stays in the service-DNS rotation.
+- **Roughly a third of client requests fail silently.** A 60-sample probe against the load-balanced service DNS measured `200: 42 (70%)` and `404: 18 (30%)` — exactly one node in three. The failures are `404 Not Found`, an answered, routed response rather than a connection error, so a client sees "no such collection", not "cluster unhealthy".
+
+This is a **rejoin** defect, not a rollout-pacing one: the restart of the other two replicas was seamless, with 270 of 270 probe samples returning `200` while they cycled one at a time.
+
+<Warning>
+**`replicas: 3` is not safe across an upgrade**, and `helm upgrade` is how you will meet this. A restart is routine — an upgrade, an image bump, a platform reschedule — so **verify cluster health after any restart instead of trusting the platform's ready status.**
+</Warning>
+
+Check membership from inside any replica. A healthy cluster reports one `Leader` and two `Follower` nodes on the same term, and `/v1/nodes` lists every replica as `HEALTHY`:
+
+```bash
+cpln workload exec {release}-weaviate --gvc {gvc} --container weaviate -- \
+  /bin/sh -c "wget -qO- --header='Authorization: Bearer YOUR_API_KEY' \
+  http://localhost:8080/v1/cluster/statistics"
+```
+
+A split node reports `"state":"Candidate"` with an empty `leaderId` and `"lastContact":"never"`, and `/v1/nodes` queried from a healthy replica lists fewer nodes than you deployed. A single-replica install (`replicas: 1`) has no Raft membership to lose and is not exposed to this.
+
+### Provider Modules Load Regardless of the Module List
+
+`modules.enabled` does not gate the API-based vectorizer and generative modules. With `modules.enabled: []` and only a provider secret named, `text2vec-openai` was still loaded, a collection could be created with `"vectorizer":"text2vec-openai"`, and inserting an object with **no vector** made Weaviate call the provider and store the embedding it returned. `/v1/meta` reports the same 41 modules loaded whether `ENABLE_MODULES` is set or not — on 1.38 these modules are compiled in and always available.
+
+<Warning>
+The risk is the **inverse** of what the values comment suggests. Supplying a provider key "just to have it configured" gives you a **live, billable** provider integration that will be used the moment any collection specifies that vectorizer. Only name a provider secret when you intend that provider to be used, and remove the secret name when you stop using it.
+</Warning>
+
+`modules.enabled` still has a job — it is the documented upstream knob and it is how the backup modules are turned on, which the template does for you when `backup.enabled: true`. It is simply not a safety gate on provider access.
