@@ -97,3 +97,174 @@ To install, follow the instructions for your preferred method:
     Declare templates in your Pulumi programs
     </Card>
 </CardGroup>
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+# ─── Cluster ──────────────────────────────────────────────────────────────────
+replicas: 3
+
+image: semitechnologies/weaviate:1.38.0
+
+# ─── Authentication ───────────────────────────────────────────────────────────
+# REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+# An `opaque` secret (encoding: plain) whose entire payload is the API key:
+#   printf '%s' "$(openssl rand -hex 32)" | \
+#     cpln secret create-opaque --name my-weaviate-api-key --encoding plain -f -
+# If it does not exist at install time the deployment WEDGES waiting on it and
+# looks broken. See Prerequisites in the README.
+apiKeySecretName: my-weaviate-api-key
+
+# Username the API key maps to. Not a secret — it is the admin-list identity.
+apiUser: admin@example.com
+
+# ─── Query Behavior ───────────────────────────────────────────────────────────
+# Default result limit for queries
+queryDefaultsLimit: 25
+
+# Default vectorizer module applied to new collections
+# Options: none, text2vec-openai, text2vec-cohere, text2vec-huggingface, text2vec-aws
+defaultVectorizerModule: none
+
+# ─── AI Modules ───────────────────────────────────────────────────────────────
+modules:
+  # Every module you intend to use must be listed here — supplying a key alone
+  # does not activate it.
+  # Common options: text2vec-openai, text2vec-cohere, text2vec-huggingface,
+  #                 generative-openai, generative-cohere, generative-anthropic,
+  #                 qna-openai, ref2vec-centroid
+  enabled: []
+
+  # OPTIONAL PREREQUISITE SECRETS — one `opaque` secret (encoding: plain) per
+  # provider, holding only that provider's key. Empty = provider off: no env
+  # var, no reveal grant, no outbound egress opened.
+  #   printf '%s' "sk-..." | \
+  #     cpln secret create-opaque --name my-weaviate-openai-key --encoding plain -f -
+  openai:
+    apiKeySecretName: "" # e.g. my-weaviate-openai-key
+  anthropic:
+    apiKeySecretName: "" # e.g. my-weaviate-anthropic-key
+  cohere:
+    apiKeySecretName: "" # e.g. my-weaviate-cohere-key
+  huggingface:
+    apiKeySecretName: "" # e.g. my-weaviate-huggingface-key
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+# HNSW vector indexes are RAM-resident. Rough sizing:
+#   memory ≈ vectors × dimensions × 4 bytes × 1.5
+cpu: 2
+memory: 4Gi
+
+# ─── Storage ──────────────────────────────────────────────────────────────────
+volumes:
+  data:
+    initialCapacity: 20 # GiB per replica (platform minimum 10)
+    autoscaling:
+      maxCapacity: 200
+      minFreePercentage: 20
+      scalingFactor: 1.5
+
+# ─── Placement ────────────────────────────────────────────────────────────────
+multiZone:
+  enabled: false # true = spread replicas across AZs (location must support it)
+
+# ─── Access ───────────────────────────────────────────────────────────────────
+# Weaviate is reachable only from inside Control Plane — there is no public
+# endpoint, by design. See Important Notes in the README.
+internalAccess:
+  type: same-gvc # none | same-gvc | same-org | workload-list
+  workloads: [] # used only with workload-list
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+# ─── Backup ───────────────────────────────────────────────────────────────────
+backup:
+  enabled: false
+  provider: aws # aws | gcp
+  schedule: "0 2 * * *" # cron in UTC — daily at 02:00
+
+  resources:
+    cpu: 250m
+    memory: 256Mi
+
+  aws:
+    bucket: my-weaviate-backup-bucket
+    region: us-east-1
+    cloudAccountName: my-s3-cloud-account
+    policyName: my-weaviate-backup-policy
+    path: weaviate/backups
+
+  gcp:
+    bucket: my-weaviate-backup-bucket
+    cloudAccountName: my-gcs-cloud-account
+    path: weaviate/backups
+```
+
+### Cluster
+
+- `replicas` — Number of Weaviate nodes. Three is the default and the practical minimum for Raft, which needs a quorum (2 of 3) to elect a leader and accept schema changes. Read [Rolling Restarts Can Split a Replica Out of the Cluster](#rolling-restarts-can-split-a-replica-out-of-the-cluster) before running a multi-replica cluster in production.
+- `image` — The Weaviate image and tag. The template is tested on `semitechnologies/weaviate:1.38.0`.
+
+A first install of three replicas took about **165 seconds** to reach all-ready in testing: the first replica is ready at roughly 60 seconds and the ordered rollout paces the remaining two.
+
+### Authentication
+
+- `apiKeySecretName` — Name of the pre-created `opaque` secret whose entire payload is the API key. Required; see [Prerequisites](#prerequisites). The key is read straight from the secret into `AUTHENTICATION_APIKEY_ALLOWED_KEYS` and never appears in the Helm release, the rendered manifest, or the stored workload spec.
+- `apiUser` — The username the API key maps to, and the entry in Weaviate's admin list. This is an identity, not a credential, so it is an ordinary value and is stored in the template's own dictionary secret.
+
+Anonymous access is disabled unconditionally. In testing, an unauthenticated request and a request with a wrong key both returned `401 Unauthorized`, and only the exact key from the secret returned `200`.
+
+### Query Behavior
+
+- `queryDefaultsLimit` — Default result limit applied to queries that do not specify one.
+- `defaultVectorizerModule` — The vectorizer applied to new collections. Leave it at `none` when your application supplies its own vectors; set it to a provider module to have Weaviate call that provider's embedding API on insert and query.
+
+### AI Modules
+
+- `modules.enabled` — List of modules written to Weaviate's `ENABLE_MODULES` variable. When backups are enabled the template appends `backup-s3` or `backup-gcs` to this list for you.
+- `modules.openai.apiKeySecretName`, `modules.anthropic.apiKeySecretName`, `modules.cohere.apiKeySecretName`, `modules.huggingface.apiKeySecretName` — Name of the `opaque` secret holding that provider's key. Empty means the provider is off.
+
+| Module | Type | Provider | Secret knob |
+|--------|------|----------|-------------|
+| `text2vec-openai`, `generative-openai`, `qna-openai` | Vectorizer / Generative | OpenAI | `modules.openai.apiKeySecretName` |
+| `generative-anthropic` | Generative | Anthropic | `modules.anthropic.apiKeySecretName` |
+| `text2vec-cohere`, `generative-cohere` | Vectorizer / Generative | Cohere | `modules.cohere.apiKeySecretName` |
+| `text2vec-huggingface` | Vectorizer | Hugging Face | `modules.huggingface.apiKeySecretName` |
+
+Naming any provider secret, or enabling backups, opens outbound internet access on the Weaviate workload so it can reach that API. With neither, the workload has no egress at all.
+
+<Warning>
+The comment in `values.yaml` — "supplying a key alone does not activate it" — **overstates what `modules.enabled` does** on Weaviate 1.38. See [Provider Modules Load Regardless of modules.enabled](#provider-modules-load-regardless-of-modules-enabled).
+</Warning>
+
+### Resources
+
+- `cpu` / `memory` — Limits applied to each Weaviate replica.
+
+Memory is the sizing constraint, not CPU: HNSW vector indexes are held in RAM. Size roughly as `vectors × dimensions × 4 bytes × 1.5`. Under-provisioning surfaces as an out-of-memory restart rather than slow queries.
+
+### Storage
+
+- `volumes.data.initialCapacity` — Initial volume size in GiB per replica. The platform minimum is 10.
+- `volumes.data.autoscaling.maxCapacity` — Maximum volume size in GiB.
+- `volumes.data.autoscaling.minFreePercentage` — Free-space percentage that triggers a scale-up.
+- `volumes.data.autoscaling.scalingFactor` — Multiplier applied to current capacity when scaling up.
+
+Volume data survives a redeploy. After a full restart in testing, all objects written beforehand were still present and byte-identical, including their original write timestamps.
+
+### Placement
+
+Set `multiZone.enabled: true` to spread replicas across availability zones within the location. Verify the location supports multi-zone before enabling.
+
+### Access
+
+- `internalAccess.type` — Which workloads may reach Weaviate: `none`, `same-gvc` (default), `same-org`, or `workload-list`.
+- `internalAccess.workloads` — Used only with `workload-list`. Full workload links, for example `//gvc/GVC_NAME/workload/WORKLOAD_NAME`.
+
+All four settings were exercised against a live cluster, including the negative case: a workload absent from `workload-list` was refused, and adding it to the list let it through.
+
+<Note>
+**A firewall change takes up to a couple of minutes to take effect.** Measured propagation was 45–95 seconds. A denial surfaces to the caller as `HTTP 503 upstream connect error`, which is indistinguishable from an unhealthy upstream — re-test after a couple of minutes before concluding a knob did not work.
+</Note>
