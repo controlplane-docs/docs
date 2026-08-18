@@ -24,7 +24,7 @@ Control Plane is a hybrid platform for deploying and managing containerized work
 - AI Plugin: `controlplane-com/ai-plugin` (recommended for Claude Code, Codex, Antigravity CLI — bundles MCP Server with skills, agents, slash commands, and guardrails)
 - MCP Server: `https://mcp.cpln.io/mcp` (80+ tools for any MCP-compatible AI client; OAuth + per-org consent)
 - Docs: https://docs.controlplane.com (page index for AI agents: https://docs.controlplane.com/llms.txt)
-- Full CLI conventions and hallucination traps: https://docs.controlplane.com/cli-conventions.md
+- Full CLI conventions and hallucination traps: https://docs.controlplane.com/public/cli-conventions.md
 
 ## When to use this skill
 
@@ -282,7 +282,7 @@ Override per command: `--org`, `--gvc`, `--profile`.
 
 ### The verification rule
 
-**Never write a `cpln` command from memory.** Verify with `cpln <command> --help` or the MCP `cpln_suggest` tool. If a command is not in the resource command map below, assume it doesn't exist. Full conventions: https://docs.controlplane.com/cli-conventions.md
+**Never write a `cpln` command from memory.** Verify with `cpln <command> --help` or the MCP `cpln_suggest` tool. If a command is not in the resource command map below, assume it doesn't exist. Full conventions: https://docs.controlplane.com/public/cli-conventions.md
 
 ### Command structure
 
@@ -587,7 +587,7 @@ Before submitting:
 **Always-relevant alongside this skill:**
 
 - [llms.txt](https://docs.controlplane.com/llms.txt) — comprehensive page index for AI agents
-- [cli-conventions.md](https://docs.controlplane.com/cli-conventions.md) — full CLI structure, shared flags, resource command map
+- [cli-conventions.md](https://docs.controlplane.com/public/cli-conventions.md) — full CLI structure, shared flags, resource command map
 
 **Fetch when authoring manifests for that resource:**
 
