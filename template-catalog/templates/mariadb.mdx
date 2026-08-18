@@ -1,12 +1,18 @@
 ---
 title: MariaDB
-description: Deploy MariaDB on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and single-replica setup with optional phpMyAdmin web interface.
+description: Deploy MariaDB on Control Plane using the Template Catalog. Covers prerequisite credential secrets, volumes, internal access, the optional phpMyAdmin console, and scheduled backups to S3 or GCS.
 keywords: ['mysql fork', 'mysql alternative', 'rdbms', 'sql database', 'oltp', 'innodb', 'mariadb client', 'galera', 'mysqldump', 'binlog', 'gtid']
 ---
 
 ## Overview
 
-MariaDB is an open-source relational database management system and a drop-in replacement for MySQL. This template deploys a single-replica MariaDB instance with persistent storage and an optional phpMyAdmin web interface for database management.
+MariaDB is an open-source relational database management system and a drop-in replacement for MySQL. This template deploys a single-replica MariaDB instance with persistent storage, an optional phpMyAdmin console, and optional scheduled dumps to AWS S3 or GCS.
+
+Every credential comes from a secret you create **before** installing. Nothing sensitive passes through Helm values, so no password lands in the release, the stored workload spec, or the logs.
+
+<Warning>
+**Upgrading an install created with `1.3.2` or earlier is a breaking change.** The `config` block and `enablePhpMyAdmin` no longer exist, and an upgrade that still sets either one stops with an error naming its replacement rather than silently falling back to a default password. See [Upgrading From 1.3.2 or Earlier](#upgrading-from-1-3-2-or-earlier).
+</Warning>
 
 <Note>
 MariaDB on Control Plane operates as a single-replica deployment. Do not scale up the replica count, as this would result in multiple isolated instances rather than a replicated cluster.
@@ -14,20 +20,62 @@ MariaDB on Control Plane operates as a single-replica deployment. Do not scale u
 
 ### What Gets Created
 
-- **Stateful MariaDB Workload** — A single-replica MariaDB database container with configurable resources.
-- **Volume Set** — Persistent storage for MariaDB data, with optional autoscaling.
-- **Secret** — An opaque secret storing the database name, root password, and user credentials, injected into the container at startup.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the database credentials secret, and cloud storage access when backup is enabled.
-- **phpMyAdmin Workload** *(optional)* — A web-based database management interface. Enabled when `enablePhpMyAdmin: true`.
-- **Backup Cron Workload** *(optional)* — A scheduled `mysqldump` backup job that writes compressed dumps to AWS S3 or GCS.
+- **Stateful MariaDB Workload** — `{release}-maria`, a single-replica MariaDB container serving TCP on port `3306`, with configurable resources.
+- **Volume Set** — `{release}-maria-vs`, an `ext4` volume mounted at `/var/lib/mysql` holding all database data, with optional autoscaling.
+- **Identity & Policy** — `{release}-maria-identity` and `{release}-maria-policy`, granting the database and backup workloads `reveal` on exactly the two credential secrets you created, and nothing else. Cloud storage access is added to the identity when backup is enabled.
+- **phpMyAdmin Workload** *(optional)* — `{release}-phpmyadmin`, a browser-based database console on port `80`. Off by default, and internal-only when enabled.
+- **Backup Cron Workload** *(optional)* — `{release}-maria-backup`, a scheduled `mysqldump` job that writes compressed dumps to AWS S3 or GCS.
+
+<Note>
+This template creates no secret of its own. Both credentials live in secrets you own, which means uninstalling the release never destroys them.
+</Note>
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
 </Note>
 
+## Prerequisites
+
+**Two secrets must exist before you install.** They are deliberately separate: granting an application `reveal` on the database credentials must not also hand it the MariaDB `root` account. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the application credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. MariaDB creates this user and this database on first boot, and this is the credential your applications put in their connection strings:
+
+    ```bash
+    cpln secret create-dictionary --name my-mariadb-credentials \
+      --entry username=appuser \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=appdb
+    ```
+
+    Set `credentialsSecretName` to the name you used.
+  </Step>
+  <Step title="Create the root password secret">
+    An [opaque secret](/guides/create-secret/opaque) with encoding `plain`, whose payload is the MariaDB `root` password:
+
+    ```bash
+    printf '%s' "$(openssl rand -hex 24)" | cpln secret create-opaque --name my-mariadb-root-password --encoding plain -f -
+    ```
+
+    Set `rootPasswordSecretName` to the name you used.
+  </Step>
+  <Step title="Read either credential back later">
+    ```bash
+    cpln secret reveal my-mariadb-credentials
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+Create both secrets **before** installing. `helm install` still reports success without them, but the workload never starts and reports `The secret ... no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` in `cpln workload get-deployments` — which reads as a broken template rather than a missing prerequisite.
+</Warning>
+
+Backups need a bucket and a cloud account as well — see [Backup](#backup). Nothing else is required.
+
 ## Installation
 
-This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
+To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -51,12 +99,74 @@ This template has no external prerequisites unless backup is enabled. To install
     </Card>
 </CardGroup>
 
+The database reaches `ready` roughly 40 seconds after install, once its readiness probe has authenticated against the root password from your secret.
+
+## Upgrading From 1.3.2 or Earlier
+
+Version `1.4.0` moved every credential out of Helm values and closed the phpMyAdmin console by default. Earlier versions shipped working defaults — a `root-password` root password and a `password` user password — behind a console that was enabled and published to the entire internet with no way to turn it off.
+
+| | `1.3.2` and earlier | `1.4.0` |
+|---|---|---|
+| Database credentials | `config.user`, `config.password`, `config.db` values | `credentialsSecretName` — a dictionary secret you create |
+| Root password | `config.rootPassword` value | `rootPasswordSecretName` — an opaque secret you create |
+| Chart-created credentials secret | Held every credential | Not created at all |
+| phpMyAdmin | `enablePhpMyAdmin: true`, always public | `phpMyAdmin.enabled: false`, with its own `publicAccess` and `internalAccess` |
+| phpMyAdmin image | `phpmyadmin/phpmyadmin:latest` | `phpmyadmin:5.2.3-apache`, pinned |
+
+<Warning>
+**A `helm upgrade` that still carries the old values is rejected before anything is applied.** Both removed keys stop the render and name their replacement. A real `cpln helm upgrade` that still set `config.rootPassword` was refused with the first message below and left the running release untouched and healthy:
+
+```text
+mariadb: the `config` block was removed in 1.4.0 — database credentials are no longer values. Create a
+`dictionary` secret with `username`, `password` and `database`, an `opaque` secret with the root password,
+and set `credentialsSecretName` and `rootPasswordSecretName` to their names. See Prerequisites in the README.
+```
+
+```text
+mariadb: `enablePhpMyAdmin` was renamed in 1.4.0 — use `phpMyAdmin.enabled` instead. Note phpMyAdmin now
+defaults to OFF, and to internal-only access when enabled (`phpMyAdmin.publicAccess.enabled`).
+```
+
+This is deliberate: a silently ignored `config.rootPassword` would leave you believing you had set a password you had not.
+</Warning>
+
+To upgrade an existing install:
+
+<Steps>
+  <Step title="Create the two secrets">
+    Follow [Prerequisites](#prerequisites). Set their contents to the credentials your database **already uses** if you want existing applications to keep connecting unchanged.
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `config` in its entirety and `enablePhpMyAdmin`. Set `credentialsSecretName` and `rootPasswordSecretName` instead, and set `phpMyAdmin.enabled: true` if you still want the console.
+  </Step>
+  <Step title="Upgrade">
+    The upgrade restarts the single replica; data on the volume set is untouched.
+  </Step>
+</Steps>
+
+<Note>
+Credentials are read only when the data directory is first initialized, so an upgrade does not rewrite them. If the secrets you create hold different values from the ones the volume was built with, the database keeps its existing users and passwords — change them with `ALTER USER` from inside MariaDB.
+</Note>
+
 ## Configuration
 
 The default `values.yaml` for this template:
 
 ```yaml
 image: mariadb:11
+
+# ─── Credentials (prerequisite secrets) ───────────────────────────────────────
+# BOTH SECRETS MUST EXIST BEFORE YOU INSTALL — the deployment wedges waiting on a
+# secret that does not exist. Neither value passes through Helm values, so neither
+# lands in the release. See Prerequisites in the README for the exact commands.
+
+# `dictionary` secret holding exactly three keys: `username`, `password`, `database`.
+# This is the credential you put in your applications' connection strings.
+credentialsSecretName: my-mariadb-credentials
+
+# `opaque` secret (encoding: plain) holding the MariaDB root password. Deliberately
+# separate, so sharing the application credentials above does not hand out root.
+rootPasswordSecretName: my-mariadb-root-password
 
 resources:
   minCpu: 100m
@@ -66,30 +176,36 @@ resources:
 
 timeoutSeconds: 15
 
-config:
-  user: username
-  password: password
-  rootPassword: root-password
-  db: test
-
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
   autoscaling:
-    enabled: false
-    maxCapacity: 100 # Maximum capacity in GiB
-    minFreePercentage: 10 # Trigger scaling when free space drops below this percentage
-    scalingFactor: 1.2 # Multiply current capacity by this factor when scaling up
+    enabled: false # Set to true to enable autoscaling
+    maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
+    minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
+    scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
 
-internalAccess:
+internalAccess: # Which workloads may reach MariaDB on port 3306
   type: same-gvc # options: none, same-gvc, same-org, workload-list
-  workloads: # Note: can only be used if type is same-gvc or workload-list
+  workloads: [] # only used when type is workload-list
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
-enablePhpMyAdmin: true
+# ─── phpMyAdmin (optional admin console) ──────────────────────────────────────
+phpMyAdmin:
+  enabled: false # true deploys a phpMyAdmin console alongside the database
+  image: phpmyadmin:5.2.3-apache
+  publicAccess:
+    enabled: false # true publishes the console, and its login form, to the whole internet
+  internalAccess:
+    type: same-gvc # options: none, same-gvc, same-org, workload-list
+    workloads: [] # only used when type is workload-list
+      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+  resources:
+    cpu: 100m
+    memory: 128Mi
 
 backup:
   enabled: false
-  image: controlplanecorporation/mysql-backup:1.0 # compatible with all MariaDB versions
+  image: ghcr.io/controlplane-com/backup-images/mysql-backup:1.0.0 # compatible with all MariaDB versions
   schedule: "0 2 * * *"   # daily at 2am UTC
 
   resources:
@@ -103,23 +219,23 @@ backup:
     region: us-east-1
     cloudAccountName: my-backup-cloudaccount
     policyName: my-backup-policy
-    prefix: mariadb/backups
+    prefix: mariadb/backups # folder name where your backups will be stored
 
   gcp:
     bucket: my-backup-bucket
     cloudAccountName: my-backup-cloudaccount
-    prefix: mariadb/backups
+    prefix: mariadb/backups # folder name where your backups will be stored
 ```
 
 ### Credentials
 
-- `config.db` — Name of the database created on startup.
-- `config.rootPassword` — Password for the MariaDB root user. **Change before deploying to production.**
-- `config.user` — Name of the non-root database user created on startup.
-- `config.password` — Password for the non-root user. **Change before deploying to production.**
+- `credentialsSecretName` — Name of the dictionary secret holding `username`, `password` and `database`. MariaDB creates that user and that database on first boot.
+- `rootPasswordSecretName` — Name of the opaque secret (encoding `plain`) holding the `root` password.
+
+Both are referenced as `cpln://secret/...` in the workload, so the values you install with contain only the secret **names**. The policy grants `reveal` on exactly these two secrets, and an application handed the dictionary secret has no path to the root account — the application password is rejected as `root`.
 
 <Note>
-These values are only applied on first startup when the data directory is empty. Updating them after the initial deployment will have no effect on the running database. To change credentials or the database name on an existing instance, use MariaDB's native commands (e.g. `ALTER USER`, `RENAME DATABASE`).
+Credentials are applied only on first startup, while the data directory is empty. Rotating either secret afterwards does not change the stored passwords; use MariaDB's native commands (for example `ALTER USER`) on a running instance.
 </Note>
 
 ### Resources
@@ -136,6 +252,8 @@ These values are only applied on first startup when the data directory is empty.
   - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
   - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
 
+Data survives redeploys and upgrades. `cpln helm uninstall` deletes the volume set, and the database with it.
+
 ### Internal Access
 
 - `internalAccess.type` — Controls which workloads can connect to MariaDB on port `3306`:
@@ -147,26 +265,49 @@ These values are only applied on first startup when the data directory is empty.
 | `same-org` | Allow access from all workloads in the same organization |
 | `workload-list` | Allow access only from specific workloads listed in `workloads` |
 
+- `internalAccess.workloads` — Workload links (`//gvc/GVC_NAME/workload/WORKLOAD_NAME`), used only when `type` is `workload-list`.
+
+The database itself is never published to the internet by this template. Reach it from inside the GVC, or from outside through your own proxy.
+
 ### phpMyAdmin
 
-- `enablePhpMyAdmin` — When `true`, deploys a phpMyAdmin workload for browser-based database management. Disable by setting to `false`.
+- `phpMyAdmin.enabled` — Deploy a phpMyAdmin console alongside the database. **Off by default.**
+- `phpMyAdmin.image` — Pinned console image (`phpmyadmin:5.2.3-apache`, the official Docker library repository).
+- `phpMyAdmin.publicAccess.enabled` — Publish the console, and its login form, to the whole internet. Off by default.
+- `phpMyAdmin.internalAccess` — Which workloads may reach the console, using the same `type` values as the database's own `internalAccess`. This knob governs the console only; the database has its own.
+- `phpMyAdmin.resources.cpu` / `phpMyAdmin.resources.memory` — Resources for the console container.
 
-### Connecting to MariaDB
+The console holds **no credential of its own**. It runs without an identity and with no access to any secret: it presents a login form, and you supply either the application credentials or `root` plus the root password there. Nothing is pre-filled, and a compromise of the console container yields no password.
 
-Once deployed, connect to the database from within the same GVC using:
+<Warning>
+**`phpMyAdmin.publicAccess.enabled: true` puts a database console on the public internet.** Anyone who reaches it needs only a valid database password to read and write everything. Prefer leaving it off and reaching the console over `http://{release}-phpmyadmin.GVC_NAME.cpln.local` from inside the GVC.
+</Warning>
 
-```text
-RELEASE_NAME-maria.GVC_NAME.cpln.local:3306
-```
+<Note>
+Access changes take a short while to propagate. Turning `publicAccess` on was measured returning `421`, then `503`, then `200` over roughly 34 seconds — a request made immediately after the upgrade is not evidence that the knob failed. Toggling console access re-applies only the console workload; the database is not restarted.
+</Note>
+
+## Connecting to MariaDB
+
+| Path | Address | Notes |
+|---|---|---|
+| Database | `{release}-maria.GVC_NAME.cpln.local:3306` | Subject to `internalAccess.type`. |
+| phpMyAdmin (internal) | `http://{release}-phpmyadmin.GVC_NAME.cpln.local` | Only when `phpMyAdmin.enabled: true`. |
+| phpMyAdmin (public) | `https://CANONICAL_ENDPOINT` | Only when `phpMyAdmin.publicAccess.enabled: true`. Read the endpoint from `status.canonicalEndpoint` in `cpln workload get {release}-phpmyadmin -o yaml`. |
+| Application credentials | `cpln secret reveal CREDENTIALS_SECRET_NAME` | Never stored in the Helm release. |
+| Root password | `cpln secret reveal ROOT_SECRET_NAME` | Never stored in the Helm release. |
 
 ## Backup
 
-Backup is disabled by default. When enabled, a cron workload runs `mysqldump` on the configured schedule and uploads compressed dumps to AWS S3 or GCS.
+Backup is disabled by default. When enabled, a cron workload dumps the database named in your credentials secret and uploads a compressed dump to AWS S3 or GCS on the configured schedule.
 
 - `backup.enabled` — Enable scheduled backups.
+- `backup.image` — Backup container image, compatible with all MariaDB versions.
 - `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
 - `backup.provider` — `aws` or `gcp`.
 - `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+
+The job reads the database name, user, password and root password from your two prerequisite secrets, and takes the bucket, region and prefix as plain configuration.
 
 ### AWS S3
 
@@ -208,12 +349,12 @@ Before enabling backup with `provider: gcp`, complete the following in your GCP 
 
 1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
-3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account. The template binds `roles/storage.objectAdmin` on exactly that bucket.
 4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
 
 ## Restoring a Backup
 
-Run the following from a client with access to the backup bucket. For GCS, replace `aws s3 cp s3://...` with `gsutil cp gs://...`.
+Run the following from a client with access to the backup bucket. For GCS, replace `aws s3 cp s3://...` with `gsutil cp gs://...`. Add `-p` to have the client prompt for the root password, which you can read with `cpln secret reveal ROOT_SECRET_NAME`.
 
 ```sh
 aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.gz - \
