@@ -40,7 +40,7 @@ public/             — Static files served at root
 
 ### CLI Command Accuracy
 
-**Never write a cpln command from memory.** Verify with `cpln <command> --help`. Full CLI conventions, resource command map, and hallucination traps: https://docs.controlplane.com/cli-conventions.md
+**Never write a cpln command from memory.** Verify with `cpln <command> --help`. Full CLI conventions, resource command map, and hallucination traps: https://docs.controlplane.com/public/cli-conventions.md
 
 ### Do NOT edit generated content
 
