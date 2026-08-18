@@ -1,32 +1,38 @@
 ---
 title: Langfuse
-description: Deploy the full Langfuse LLM observability stack on Control Plane. Covers object storage prerequisites, secret generation, accessing the UI, sending traces, LLM connections, and backup recommendations.
-keywords: ['langfuse', 'llm observability', 'llm tracing', 'ai evaluation', 'opentelemetry', 'clickhouse', 'bullmq', 'nextjs', 'self-hosted langfuse', 'prompt management', 'llm monitoring']
+description: Deploy the Langfuse LLM observability stack on Control Plane. Covers the prerequisite auth secret, the headless admin account, closed self-service signup, object storage for traces and media, sending traces, and upgrading from 1.0.x.
+keywords: ['llm observability', 'llm tracing', 'prompt management', 'llm evaluation', 'langsmith alternative', 'helicone alternative', 'clickhouse', 'bullmq', 'nextauth', 'openai api key storage', 'ai agent monitoring', 'trace ingestion', 'self-hosted']
 ---
 
 ## Overview
 
-Langfuse is an open-source LLM observability and evaluation platform. This template deploys the full Langfuse stack on Control Plane — UI, background worker, and all required data stores — ready to receive traces from any LLM application.
+Langfuse is an open-source LLM observability and evaluation platform — traces, prompt management, evaluations, and a playground. This template deploys the full self-hosted stack on Control Plane: the web app, a background worker, and its three datastores, with trace data landing in an object store you own.
+
+The instance is closed by default. Self-service registration is off, and the owner account is provisioned at boot from a secret you create — so a public endpoint does not hand a stranger an account.
+
+<Warning>
+**Upgrading an existing 1.0.0 or 1.0.1 install?** Version 1.1.0 removed six values keys and moved all auth key material into a prerequisite secret. `helm upgrade` fails at render if you carry the old keys forward. See [Upgrading From 1.0.0 or 1.0.1](#upgrading-from-1-0-0-or-1-0-1) before you start.
+</Warning>
 
 ### Architecture
 
-- **Langfuse Web** — Next.js application serving the UI and public API. Autoscales between 2 and 5 replicas.
-- **Langfuse Worker** — Background processor for trace ingestion, automated evaluations, and third-party integrations.
-- **PostgreSQL** — Stores all configuration data: users, projects, API keys, prompts, datasets, and evaluation configs.
-- **Redis** — BullMQ ingestion queue and short-lived cache for API keys and prompts.
-- **ClickHouse** — Columnar store for all traces, observations, and scores. Powers all dashboard queries. Data files are written directly to object storage.
-- **Object Storage** — AWS S3 or GCS. Shared between ClickHouse (data files) and Langfuse (raw event buffer and media uploads) using separate key prefixes (`clickhouse/`, `events/`, `media/`).
+- **Langfuse Web** — Next.js app serving the UI and public API on port `3000`. Autoscales between 2 and 5 replicas on CPU.
+- **Langfuse Worker** — Background processor for trace ingestion, automated evaluations, and integrations.
+- **PostgreSQL** — The [postgres](/template-catalog/templates/postgres) template as a subchart. Stores users, projects, API keys, prompts, datasets, and evaluation configs.
+- **Redis** — BullMQ ingestion queue and the API key/prompt cache, on a persistent volume set.
+- **ClickHouse** — Columnar store for all traces, observations, and scores; powers the dashboards. Its data parts live in the object store, so the volume set holds local metadata only.
+- **Object Storage** — AWS S3 or Google Cloud Storage. One bucket serves both ClickHouse (`clickhouse/`) and Langfuse (`events/`, `media/`).
 
 ### What Gets Created
 
-- **Standard Langfuse Web Workload** — The Next.js UI and public API with autoscaling enabled.
-- **Standard Langfuse Worker Workload** — Background trace ingestion and evaluation processor.
-- **Stateful PostgreSQL Workload** — Single-replica Postgres with a persistent volume set.
-- **Stateful Redis Workload** — Single-replica Redis for the BullMQ queue and cache.
-- **Stateful ClickHouse Workload** — Single-node ClickHouse with a persistent volume set for local metadata.
-- **Volume Sets** — One persistent volume set each for PostgreSQL and ClickHouse.
-- **Identity & Policy** — An identity bound to all workloads with `reveal` access to all secrets, and cloud storage access for the object store.
-- **Secrets** — Opaque secrets for all component credentials and Langfuse auth keys.
+- **Stateful Langfuse Web Workload** — The UI and public API on port `3000`, autoscaling between `langfuse.web.minReplicas` and `langfuse.web.maxReplicas`.
+- **Stateful Langfuse Worker Workload** — One replica by default, processing the ingestion queue.
+- **Stateful ClickHouse Workload** — Single node on ports `8123` (HTTP) and `9000` (native).
+- **Stateful Redis Workload** — Single node on port `6379`.
+- **PostgreSQL Subchart Resources** — A stateful PostgreSQL workload with its own volume set, identity, policy, and credentials secret.
+- **Volume Sets** — `{release}-langfuse-redis-vs` and `{release}-langfuse-clickhouse-vs`, plus the PostgreSQL subchart's, at 10 GiB each by default.
+- **Secrets** — A dictionary secret holding the bundled datastore credentials, and two secrets holding the ClickHouse startup and storage configuration. The auth secret and the GCS credentials secret are **prerequisite secrets you create yourself**; the chart references them by name and never creates, modifies, or deletes them.
+- **Identity & Policy** — An identity for the Langfuse workloads and a policy granting it `reveal` on exactly those secrets. On the AWS path the identity is also linked to your cloud account with your bucket-scoped IAM policy.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
@@ -34,18 +40,53 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ## Prerequisites
 
-Object storage must be configured before deploying. Both ClickHouse and Langfuse use the same bucket with separate key prefixes — create the bucket and credentials as described below, then fill in the `objectStore` section of `values.yaml`.
+Two things must be in place before you install: the auth secret, and the object storage the traces are written to.
 
-### AWS S3
+### Auth Secret
+
+**A [dictionary secret](/guides/create-secret/dictionary) holding five keys must exist before you install.** It carries the key material that signs sessions and encrypts stored provider credentials, plus the login for the account the template provisions — none of which should ever sit in `values.yaml`, where it would land in the Helm release for the life of the install.
+
+Create it with your own values, then set `langfuse.auth.secretName` to the name you used:
+
+```bash
+cpln secret create-dictionary --name my-langfuse-auth \
+  --entry nextAuthSecret="$(openssl rand -base64 32)" \
+  --entry encryptionKey="$(openssl rand -hex 32)" \
+  --entry salt="$(openssl rand -base64 32)" \
+  --entry adminEmail="you@example.com" \
+  --entry adminPassword="$(openssl rand -base64 18)"
+```
+
+Every one of the five keys is required, and the names are exact:
+
+| Key | What it does |
+|---|---|
+| `nextAuthSecret` | Signs session tokens. Anyone holding it can forge a signed-in session. |
+| `encryptionKey` | Encrypts the LLM provider API keys your users store in Langfuse — their OpenAI, Anthropic, and other credentials. Must be exactly 64 hex characters. **It cannot be rotated**: changing it makes every stored provider key unreadable. |
+| `salt` | Hashes Langfuse's own API keys. |
+| `adminEmail` | The owner account provisioned at boot — this is how you first sign in. |
+| `adminPassword` | Its password, 8 characters minimum. Record it; it is shown nowhere. |
+
+Use three different random values for `nextAuthSecret`, `encryptionKey`, and `salt`, and keep a copy of `encryptionKey` somewhere safe outside Control Plane.
+
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** `cpln helm install` still exits 0 and reports success, but the web and worker workloads never start — they report `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Create the secret first, and after installing confirm with `cpln workload get-deployments {release}-langfuse-web --gvc {gvc}` rather than trusting the Helm output.
+</Warning>
+
+### Object Storage
+
+Both ClickHouse and Langfuse use one bucket with separate key prefixes. Pick one provider and complete its setup before installing.
+
+#### AWS S3
 
 <Steps>
   <Step title="Create a bucket">
     Create an S3 bucket. Set `objectStore.aws.bucket` to its name and `objectStore.aws.region` to its region.
   </Step>
   <Step title="Set up a Cloud Account">
-    If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account). Set `objectStore.aws.cloudAccountName` to its name.
+    If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `objectStore.aws.cloudAccountName` to its name — the workloads then reach the bucket keylessly, with no stored credentials.
   </Step>
-  <Step title="Create an IAM policy">
+  <Step title="Create a bucket-scoped IAM policy">
     Create an IAM policy with the following JSON (replace `YOUR_BUCKET_NAME`) and set `objectStore.aws.policyName` to its name:
 
     ```json
@@ -73,20 +114,18 @@ Object storage must be configured before deploying. Both ClickHouse and Langfuse
   </Step>
 </Steps>
 
-### GCS
+#### Google Cloud Storage
 
 <Note>
-GCS uses S3-compatible HMAC authentication for this template. A Control Plane Cloud Account is not required.
+Langfuse and ClickHouse reach GCS over its S3-compatible endpoint, so this path uses an HMAC key pair rather than a Control Plane Cloud Account.
 </Note>
 
 <Steps>
   <Step title="Create a bucket">
     Create a GCS bucket. Set `objectStore.gcp.bucket` to its name.
   </Step>
-  <Step title="Create a service account and HMAC key">
-    In the GCP console, go to **Settings → Interoperability** and click **Create a key for a service account → Create new account**. Name the service account, assign the `Storage Object Admin` role, and click **Done**. Copy the provided HMAC access key and secret into `objectStore.gcp.accessKeyId` and `objectStore.gcp.secretAccessKey`.
-
-    Or use the CLI:
+  <Step title="Create a service account and an HMAC key">
+    Grant the service account `roles/storage.objectAdmin` on the bucket, then create an HMAC key for it:
 
     ```bash
     gcloud config set project YOUR_PROJECT_ID
@@ -99,14 +138,23 @@ GCS uses S3-compatible HMAC authentication for this template. A Control Plane Cl
       --member="serviceAccount:langfuse-storage@$(gcloud config get-value project).iam.gserviceaccount.com" \
       --role="roles/storage.objectAdmin"
 
-    gsutil hmac create langfuse-storage@$(gcloud config get-value project).iam.gserviceaccount.com
+    gcloud storage hmac create langfuse-storage@$(gcloud config get-value project).iam.gserviceaccount.com
+    ```
+
+    In the console the same key lives under **Cloud Storage → Settings → Interoperability → Create a key for a service account**.
+  </Step>
+  <Step title="Put the pair in a dictionary secret">
+    The HMAC pair never passes through Helm values. Create a second [dictionary secret](/guides/create-secret/dictionary) and set `objectStore.gcp.credentialsSecretName` to its name:
+
+    ```bash
+    cpln secret create-dictionary --name my-langfuse-gcs-credentials \
+      --entry accessKeyId="YOUR_HMAC_ACCESS_ID" \
+      --entry secretAccessKey="YOUR_HMAC_SECRET"
     ```
   </Step>
 </Steps>
 
-### Installation
-
-Once object storage is ready, install using your preferred method:
+Once the auth secret and object storage are ready, install using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -135,25 +183,36 @@ Once object storage is ready, install using your preferred method:
 The default `values.yaml` for this template:
 
 ```yaml
-# Object store - used by both ClickHouse (data files) and Langfuse (raw event buffer + media)
-# Both services share the same bucket using separate key prefixes
+# ─── Object store ─────────────────────────────────────────────────────────────
+# One bucket serves BOTH ClickHouse (data parts, prefix `clickhouse/`) and
+# Langfuse (raw event buffer `events/`, media uploads `media/`).
 objectStore:
   provider: aws # Options: aws, gcp
   aws:
     bucket: my-langfuse-bucket
     region: us-east-1
-    cloudAccountName: my-cloudaccount
-    policyName: my-custom-policy
+    cloudAccountName: my-langfuse-cloudaccount # Control Plane Cloud Account — keyless S3 access
+    policyName: my-langfuse-policy # pre-created AWS IAM policy scoped to the bucket above
   gcp:
     bucket: my-langfuse-bucket
-    accessKeyId: my-gcs-key        # GCS HMAC key ID
-    secretAccessKey: my-gcs-secret # GCS HMAC secret key
+    # REQUIRED PREREQUISITE SECRET when provider is `gcp` — CREATE IT BEFORE YOU
+    # INSTALL, or the deployment wedges waiting on a secret that does not exist.
+    # A `dictionary` secret with exactly two keys: `accessKeyId`, `secretAccessKey`
+    # (a GCS HMAC pair). See README Prerequisites for the exact command.
+    credentialsSecretName: my-langfuse-gcs-credentials
 
-# Langfuse application
+# ─── Langfuse application ─────────────────────────────────────────────────────
 langfuse:
+  # Public base URL — feeds auth redirects and the sign-out/error pages NextAuth
+  # renders server-side, and decides whether the session cookie gets the Secure
+  # flag. Empty = derived from the platform canonical endpoint when publicAccess
+  # is on. Set it only for a custom domain, and include the scheme:
+  #   publicUrl: https://langfuse.example.com
+  publicUrl: ""
+
   web:
-    image: langfuse/langfuse:3
-    minReplicas: 2  # Keep at 2+ for zero-downtime rolling deploys
+    image: langfuse/langfuse:3.225.2
+    minReplicas: 2 # Keep at 2+ for zero-downtime rolling deploys
     maxReplicas: 5
     resources:
       minCpu: 500m
@@ -162,7 +221,7 @@ langfuse:
       maxMemory: 2Gi
 
   worker:
-    image: langfuse/langfuse-worker:3
+    image: langfuse/langfuse-worker:3.225.2
     replicas: 1
     resources:
       minCpu: 250m
@@ -171,15 +230,40 @@ langfuse:
       maxMemory: 1Gi
 
   auth:
-    nextAuthSecret: ""    # Required: openssl rand -base64 32
-    encryptionKey: ""     # Required: openssl rand -hex 32 (must be exactly 64 hex characters)
-    salt: ""              # Required: openssl rand -base64 32
+    # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL. If it does not
+    # exist the deployment WEDGES waiting on it and looks like a platform fault.
+    # A `dictionary` secret holding exactly five keys:
+    #   nextAuthSecret  — signs session tokens (openssl rand -base64 32)
+    #   encryptionKey   — encrypts the LLM provider API keys your users store in
+    #                     Langfuse; CANNOT be rotated without losing every one of
+    #                     them (openssl rand -hex 32, exactly 64 hex characters)
+    #   salt            — hashes Langfuse's own API keys (openssl rand -base64 32)
+    #   adminEmail      — first-run owner account, provisioned at boot
+    #   adminPassword   — its password (8 characters minimum)
+    # Use three DIFFERENT random values for the three key material entries.
+    # See README Prerequisites for the exact command.
+    secretName: my-langfuse-auth
 
-  firewall:
-    inboundAllowCIDR:
-      - 0.0.0.0/0  # Restrict to specific IPs in production
+    # Langfuse ships with email/password registration OPEN, so a public instance
+    # would let any stranger create an account AND their own organization. Closed
+    # here: the admin above is provisioned headlessly at boot, which bypasses the
+    # block. Set to false only if you want self-service registration.
+    disableSignup: true
+    organizationName: Langfuse # organization created for the first-run admin
 
-# PostgreSQL - stores users, projects, API keys, prompts, datasets, eval configs
+# ─── Access ───────────────────────────────────────────────────────────────────
+# Applies to the Langfuse web UI and public API. A firewall change takes up to
+# a couple of minutes to propagate.
+publicAccess:
+  enabled: true # false keeps the UI reachable only from inside the GVC
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # used with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+# ─── PostgreSQL ───────────────────────────────────────────────────────────────
+# Stores users, projects, API keys, prompts, datasets and eval configs.
+# Bundled plumbing: it serves Langfuse only and is unreachable from outside the
+# GVC — but the password is used AS-IS, so change it before installing.
 postgres:
   image: postgres:18
   resources:
@@ -189,12 +273,14 @@ postgres:
     maxMemory: 1Gi
   config:
     username: langfuse
-    password: mypassword
+    password: change-me-langfuse-db
     database: langfuse
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 
-# Redis - BullMQ ingestion queue and API key/prompt cache
+# ─── Redis ────────────────────────────────────────────────────────────────────
+# BullMQ ingestion queue and API key/prompt cache. Bundled plumbing — change the
+# password before installing.
 redis:
   image: redis:7.4
   resources:
@@ -203,10 +289,14 @@ redis:
     minMemory: 256Mi
     maxMemory: 512Mi
   auth:
-    password: mypassword
+    password: change-me-langfuse-redis
+  volumeset:
+    capacity: 10 # initial capacity in GiB (minimum is 10)
 
-# ClickHouse - stores all traces, observations, and scores; powers dashboards
-# Data files are stored in the object store above; volumeset holds local metadata only
+# ─── ClickHouse ───────────────────────────────────────────────────────────────
+# Stores all traces, observations and scores; powers the dashboards. Data parts
+# live in the object store above; the volumeset holds local metadata only.
+# Bundled plumbing — change the password before installing.
 clickhouse:
   image: clickhouse/clickhouse-server:25.10
   resources:
@@ -215,46 +305,63 @@ clickhouse:
     minMemory: 2Gi
     maxMemory: 4Gi
   config:
-    password: mypassword
+    password: change-me-langfuse-clickhouse
     database: langfuse
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 ```
 
-### Required Auth Secrets
+### Auth and the Admin Account
 
-Three auth values must be generated and set in `values.yaml` before deploying:
+All five auth keys are read from the dictionary secret named by `langfuse.auth.secretName` (see [Auth Secret](#auth-secret)). The web workload reads all five; the worker reads only `nextAuthSecret`, `encryptionKey`, and `salt`.
 
-```bash
-# nextAuthSecret and salt — any base64 string
-openssl rand -base64 32
+**`langfuse.auth.disableSignup` defaults to `true`, and the admin account is the only way in.** Langfuse OSS has no first-user exemption — its `AUTH_DISABLE_SIGNUP` flag is enforced in both the signup handler and the NextAuth adapter, so closing registration on its own would leave an instance nobody could enter. The template therefore provisions the owner headlessly at boot from `adminEmail` and `adminPassword`, using Langfuse's [headless initialization](https://langfuse.com/self-hosting/administration/headless-initialization). The bootstrap runs on every boot and leaves existing rows alone.
 
-# encryptionKey — must be exactly 64 hex characters (32 bytes)
-openssl rand -hex 32
-```
+With the defaults in place:
+
+- Signing in with `adminEmail` / `adminPassword` yields a session whose role is `OWNER`, and that account can create projects immediately.
+- Anyone else hitting `/api/auth/signup` is refused with `HTTP 422` and `{"message":"Sign up is disabled."}`, and the sign-up page reports registration as disabled.
+
+`langfuse.auth.organizationName` names the organization created for that owner. It is required and defaults to `Langfuse`.
+
+Set `langfuse.auth.disableSignup: false` if you want self-service registration instead — anyone who can reach the UI can then create their own account **and their own organization**.
 
 <Warning>
-`encryptionKey` encrypts LLM API keys and other sensitive project data stored in PostgreSQL. It must be generated with `openssl rand -hex 32` — a base64 value will fail validation on startup. Run each command separately and copy the output into the corresponding field.
+**Closing signup does not take effect the moment the upgrade returns.** The flag is a container environment variable, so it applies only once the web tier has finished rolling — about **93 seconds** in a measured run. Registrations kept succeeding for the whole of that window after `helm upgrade` reported success. Re-test after a couple of minutes before concluding the knob did not work.
 </Warning>
 
-### Passwords
+### Public URL and Session Cookies
 
-Change all component passwords before deploying to production:
+`langfuse.publicUrl` sets the origin the browser uses. Leave it empty and the template derives it: with `publicAccess.enabled: true` the web workload uses its own canonical `https://*.cpln.app` endpoint, and with public access off it falls back to the internal `cpln.local` address. Set it only for a custom domain, and **include the scheme** — a scheme-less value is rejected at render.
 
-- `postgres.config.password` — PostgreSQL admin password
-- `redis.auth.password` — Redis password
-- `clickhouse.config.password` — ClickHouse password
+This value does more than build redirect links:
 
-### Firewall
+- **The session cookie's `Secure` flag is derived from it.** NextAuth turns on `useSecureCookies` and the `__Secure-` cookie prefix only when the URL starts with `https:`. On a public instance the derived HTTPS endpoint gives you `__Secure-next-auth.session-token` with `secure=true`. On a private instance the origin genuinely is plain HTTP, so the flag is correctly left off — a `Secure` cookie there would simply be dropped.
+- **NextAuth's own server-rendered pages build their form actions from it.** The sign-out confirmation page at `/api/auth/signout` is one of them; a URL the browser cannot reach leaves that page's button dead-ending on a browser error interstitial.
 
-The Langfuse web UI and API are publicly accessible by default (`0.0.0.0/0`). To restrict access to specific IP ranges, update `langfuse.firewall.inboundAllowCIDR`:
+The interactive sign-in page is unaffected either way — it is a client-side React form that routes on its own `targetPath` parameter rather than following a redirect header.
 
-```yaml
-langfuse:
-  firewall:
-    inboundAllowCIDR:
-      - 203.0.113.0/24  # restrict to your office or application IPs
-```
+<Note>
+If you serve Langfuse on a custom domain, set `langfuse.publicUrl` to that domain. The derived value is the platform-assigned canonical endpoint, which is not your domain.
+</Note>
+
+### Access
+
+- `publicAccess.enabled` — Serve the UI and public API on the canonical `*.cpln.app` HTTPS endpoint (default `true`). Everything behind it is gated by Langfuse's own login. Set to `false` and external requests are refused at the edge with `403`, while in-GVC callers still reach it per `internalAccess`.
+- `internalAccess.type` — Internal firewall scope of the web workload:
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access. |
+| `same-gvc` | Allow access from all workloads in the same GVC (default). |
+| `same-org` | Allow access from all workloads in the same organization. |
+| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads`. |
+
+Firewall changes take up to a couple of minutes to propagate — measured transitions landed between 51 and 105 seconds. The old behavior keeps serving for the first minute or so after the upgrade returns, so re-poll instead of trusting the first response.
+
+<Warning>
+**With `publicAccess.enabled: false` there is currently no browser path to the UI.** `cpln port-forward` cannot reach the Langfuse web workload — it returns `{"code":502,"message":"Unable to connect to upstream workload"}` — because Next.js standalone binds the address in `HOSTNAME`, and Control Plane sets that to the replica name, so the app never listens on loopback. Service-mesh traffic is unaffected: other workloads in the GVC reach it normally, and its API is fully usable from inside the GVC. Only an operator's own browser has no route in.
+</Warning>
 
 ### Object Store
 
@@ -262,55 +369,143 @@ Both ClickHouse and Langfuse share one bucket with separate key prefixes:
 
 | Prefix | Used by |
 |--------|---------|
-| `clickhouse/` | ClickHouse data files (tables, parts, metadata) |
+| `clickhouse/` | ClickHouse data parts, tables, and metadata |
 | `events/` | Langfuse raw event ingestion buffer |
 | `media/` | Langfuse media uploads (screenshots, attachments) |
 
-Set `objectStore.provider` to `aws` or `gcp` and fill in the corresponding block. Leave the unused provider block empty.
+Set `objectStore.provider` to `aws` or `gcp` and fill in the matching block; the other block is ignored, and nothing from it is rendered into the workloads. On the GCS path the HMAC pair is read from your credentials secret at runtime — the ClickHouse storage configuration references it by environment variable, so the key never appears in a rendered file.
+
+### Datastores
+
+The three datastore passwords are internal plumbing: PostgreSQL, Redis, and ClickHouse serve Langfuse only and are unreachable from outside the GVC. They are still used exactly as written, so **change all three before installing** — they ship as obvious `change-me-` placeholders:
+
+- `postgres.config.password`
+- `redis.auth.password`
+- `clickhouse.config.password`
+
+Each datastore's `volumeset.capacity` is its initial size in GiB, with 10 the minimum.
 
 ## Accessing Langfuse
 
-Once deployed, the Langfuse UI is accessible via the Control Plane external endpoint for the `{release-name}-langfuse-web` workload. Navigate to the endpoint in your browser to create an account and log in.
+| What | Where |
+|---|---|
+| Web UI and public API | The canonical endpoint of the `{release}-langfuse-web` workload (`status.canonicalEndpoint`), when `publicAccess.enabled` is `true` |
+| Internal HTTP | `http://{release}-langfuse-web.{gvc}.cpln.local:3000` |
+| Health | `/api/public/health` on either address — returns `{"status":"OK","version":"..."}` |
+| First login | `adminEmail` / `adminPassword` from your auth secret |
+| Langfuse API keys | Created in the UI under **Settings → API Keys**, per project |
+| PostgreSQL, Redis, ClickHouse | Internal only; credentials are the values you set in `postgres.config`, `redis.auth`, and `clickhouse.config` |
 
-### Sending Traces via API
+A fresh install takes roughly two minutes to become usable: the datastores converge in about 45 seconds and the web tier follows.
 
-After creating a project and generating API keys (**Settings → API Keys**), send traces using the public API:
+### Sending Traces
+
+Create a project in the UI, generate a key pair under **Settings → API Keys**, then post to the public API:
 
 ```bash
-curl -X POST https://YOUR_LANGFUSE_ENDPOINT/api/public/traces \
+curl -X POST https://YOUR_LANGFUSE_ENDPOINT/api/public/ingestion \
   -H "Content-Type: application/json" \
   -u "YOUR_PUBLIC_KEY:YOUR_SECRET_KEY" \
   -d '{
-    "name": "my-first-trace",
-    "input": "Hello",
-    "output": "Hello back"
+    "batch": [{
+      "id": "event-1",
+      "type": "trace-create",
+      "timestamp": "2026-01-01T00:00:00.000Z",
+      "body": {
+        "id": "my-first-trace",
+        "name": "my-first-trace",
+        "input": "Hello",
+        "output": "Hello back"
+      }
+    }]
   }'
 ```
 
-Or integrate using the [Langfuse SDK](https://langfuse.com/docs/sdk) for Python, TypeScript, and other languages.
+Ingestion is asynchronous: the web app writes the raw event to the `events/` prefix in your bucket, the worker picks it up off the Redis queue and writes it into ClickHouse, and the trace becomes queryable at `GET /api/public/traces/{id}` a few seconds later. For application instrumentation, use a [Langfuse SDK](https://langfuse.com/docs/sdk/overview) instead of the raw API.
 
-### LLM Connections (Playground and Evaluations)
+### LLM Connections
 
-The Langfuse playground and LLM-as-a-Judge evaluations require LLM API keys configured through the UI. These keys are stored encrypted in PostgreSQL using your `encryptionKey`.
+The playground and LLM-as-a-Judge evaluations need provider API keys, added in the UI under **Settings → LLM Connections**. Those keys are stored in PostgreSQL encrypted with your `encryptionKey` — which is why that key can never be rotated, and why it belongs in a secret rather than in your Helm release.
 
-To configure:
+## Upgrades
 
-1. In the Langfuse UI, go to **Settings → LLM API Keys** (for the playground) or **Evaluation → Set up default model** (for automated evals).
-2. Click **Add LLM Connection**, choose your provider (OpenAI, Anthropic, etc.), and enter your API key.
+### Upgrading From 1.0.0 or 1.0.1
+
+<Warning>
+**Version 1.1.0 removed six values keys, and a values file that still carries any of them fails at render.** The upgrade is aborted before anything is applied, so a live release is untouched and no failed revision is created — but the upgrade does not proceed until you have created the prerequisite secrets and removed the old keys. There are deliberately no compatibility fallbacks.
+</Warning>
+
+| Removed in 1.1.0 | Replacement |
+|---|---|
+| `langfuse.auth.nextAuthSecret` | `nextAuthSecret` key in the secret named by `langfuse.auth.secretName` |
+| `langfuse.auth.encryptionKey` | `encryptionKey` key in the same secret |
+| `langfuse.auth.salt` | `salt` key in the same secret |
+| `objectStore.gcp.accessKeyId` | `accessKeyId` key in the secret named by `objectStore.gcp.credentialsSecretName` |
+| `objectStore.gcp.secretAccessKey` | `secretAccessKey` key in the same secret |
+| `langfuse.firewall.inboundAllowCIDR` | `publicAccess.enabled` and `internalAccess.type` |
+
+Each one fails with a message naming its own replacement, for example:
+
+```text
+langfuse.auth.nextAuthSecret was removed in 1.1.0. Put it in the prerequisite dictionary secret
+named by langfuse.auth.secretName (key: nextAuthSecret) — see the README.
+```
+
+<Steps>
+  <Step title="Back up PostgreSQL">
+    It holds your users, projects, API keys, prompts, and datasets. Take a volume set snapshot before you change anything.
+  </Step>
+  <Step title="Create the prerequisite secrets">
+    Create the auth secret with all five keys (see [Auth Secret](#auth-secret)), and on the GCS path the credentials secret as well. `adminEmail` and `adminPassword` have no 1.0.x equivalent — they are new, and they provision the owner account.
+  </Step>
+  <Step title="Remove the six keys and name the secrets">
+    Delete every removed key from your values file, then set `langfuse.auth.secretName` and, on GCS, `objectStore.gcp.credentialsSecretName`. Replace `langfuse.firewall.inboundAllowCIDR` with `publicAccess.enabled` and `internalAccess.type`.
+  </Step>
+  <Step title="Upgrade">
+    Run the upgrade, then confirm both `{release}-langfuse-web` and `{release}-langfuse-worker` reach `ready` with `cpln workload get-deployments`.
+  </Step>
+</Steps>
+
+<Warning>
+**Treat the 1.0.x auth defaults as compromised.** Versions 1.0.0 and 1.0.1 shipped working values for `nextAuthSecret`, `encryptionKey`, and `salt` as defaults in a public repository, so any install that did not override them shared one publicly known set. Generate fresh values for all three. Note the trade-off on `encryptionKey`: carrying the old one forward keeps existing LLM connections readable but leaves them encrypted under a published key, while a new one makes them undecryptable and they must be re-added under **Settings → LLM Connections**.
+</Warning>
+
+### The First Upgrade Interrupts Trace Ingestion
+
+<Warning>
+**The first `helm upgrade` after an install re-applies and restarts Redis — even when nothing in your values changed — and trace ingestion fails for up to about 94 seconds while `/api/public/health` keeps returning `200` the whole time.** Uptime monitors and health checks see nothing. Ingestion stayed broken for roughly 48 seconds after Redis itself was ready again, which is the web tier's reconnect backoff. Later upgrades caused no disruption at all.
+</Warning>
+
+Plan the first upgrade as a short ingestion outage, and check that traces are landing again afterwards rather than relying on the health endpoint.
+
+### Changes That Wait for the Web Tier
+
+Anything carried in the web container's environment — `langfuse.auth.disableSignup`, `langfuse.publicUrl`, values from the auth secret — only takes effect as replicas roll. Measured windows on a two-replica tier: about 93 seconds to close signup, about 152 seconds to open it, and 120 to 141 seconds for a `publicUrl` change to reach both replicas. During a rollout the old replicas still serve the old behavior.
 
 ## Backups
 
 <CardGroup cols={1}>
   <Card title="PostgreSQL" icon="database">
-    Stores all critical config: users, projects, API keys, prompts, datasets, and eval configs. **Most important to back up.** Enable snapshot policies on the PostgreSQL volume set via the Control Plane console — snapshots capture the full disk state and restore quickly.
+    Holds all configuration: users, projects, API keys, prompts, datasets, and evaluation configs. **Most important to back up.** Enable snapshot policies on the PostgreSQL volume set — snapshots capture the full disk state and restore quickly.
   </Card>
   <Card title="ClickHouse" icon="table-columns">
-    Data files are stored directly in your object store (S3 or GCS) and are inherently durable — the volume set only holds local metadata. A full restore is performed by redeploying and pointing ClickHouse at the existing bucket.
+    Trace data parts live in your own S3 or GCS bucket and are as durable as that bucket; the volume set holds local metadata only. Back up the bucket according to your provider's practice.
   </Card>
   <Card title="Redis" icon="bolt">
-    Holds only the transient BullMQ ingestion queue and short-lived cache. Backup is not required.
+    Holds only the transient BullMQ ingestion queue and short-lived cache. No backup required.
   </Card>
 </CardGroup>
+
+## Important Notes
+
+- **Create the auth secret before installing.** A missing one does not fail the install — Helm reports success and the web and worker workloads then sit waiting on a secret that does not exist.
+- **`encryptionKey` cannot be rotated.** It encrypts every provider key stored under **Settings → LLM Connections**; changing it makes all of them unreadable. Keep a copy outside Control Plane, and never delete the secret.
+- **Self-service signup is closed by default and the owner account comes from your secret.** Record `adminPassword` — it is displayed nowhere, and with signup closed there is no other way to create an account.
+- **Change the three datastore passwords before installing.** They ship as `change-me-` placeholders and are used exactly as written.
+- **Prerequisite secrets are not owned by the release.** The auth and GCS credentials secrets survive `helm uninstall` and must be deleted by hand if you no longer want them.
+- **Web and worker log database connection errors for the first ~40 seconds of a cold install** (`Can't reach database server`, `Applying database migrations failed`) while PostgreSQL is still starting. The retry succeeds and migrations then apply; this is startup ordering, not a fault.
+- **Access-knob changes take up to a couple of minutes** to propagate, and rollout-driven changes such as `disableSignup` take a minute or two more. Re-test before concluding a knob did not work.
+- **Uninstall deletes the volume sets**, including PostgreSQL's. Trace data already in your bucket is untouched, but users, projects, and API keys are not.
 
 ## External References
 
@@ -318,13 +513,19 @@ To configure:
   <Card title="Langfuse Documentation" href="https://langfuse.com/docs" icon="book">
     Full Langfuse product documentation
   </Card>
-  <Card title="Langfuse SDK Reference" href="https://langfuse.com/docs/sdk" icon="code">
+  <Card title="Langfuse SDKs" href="https://langfuse.com/docs/sdk/overview" icon="code">
     Python, TypeScript, and other language SDK guides
   </Card>
-  <Card title="Langfuse Self-Hosting Guide" href="https://langfuse.com/docs/deployment/self-host" icon="server">
-    Self-hosting architecture and configuration reference
+  <Card title="Self-Hosting Guide" href="https://langfuse.com/self-hosting" icon="server">
+    Self-hosting architecture and operations
+  </Card>
+  <Card title="Configuration Reference" href="https://langfuse.com/self-hosting/configuration" icon="gear">
+    Every Langfuse environment variable and what it controls
+  </Card>
+  <Card title="Headless Initialization" href="https://langfuse.com/self-hosting/administration/headless-initialization" icon="user-shield">
+    How the bootstrapped owner account is provisioned
   </Card>
   <Card title="Create a Cloud Account" href="https://docs.controlplane.com/guides/create-cloud-account" icon="cloud">
-    Set up a Control Plane Cloud Account for S3 access
+    Set up a Control Plane Cloud Account for keyless S3 access
   </Card>
 </CardGroup>
