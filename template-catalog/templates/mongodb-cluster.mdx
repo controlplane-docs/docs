@@ -1,12 +1,18 @@
 ---
 title: MongoDB Cluster
-description: Deploy a highly available MongoDB replica set cluster on Control Plane using Percona Server for MongoDB. Covers single and multi-location topologies, HAProxy write routing, logical and physical backups, and scaling.
-keywords: ['mongodb', 'percona', 'replica set', 'nosql', 'document database', 'haproxy', 'mongodump', 'pbm', 'percona backup', 'multi-location', 'mongo cluster', 'database template']
+description: Deploy a highly available MongoDB replica set on Control Plane using Percona Server for MongoDB. Covers the prerequisite credential and keyfile secrets, single and multi-location topologies, HAProxy write routing, failover, backups, and migrating from template version 1.0.0.
+keywords: ['mongodb', 'percona', 'replica set', 'nosql', 'document database', 'haproxy', 'mongodump', 'pbm', 'percona backup', 'multi-location', 'mongo cluster', 'keyfile', 'failover', 'database template']
 ---
 
 ## Overview
 
-MongoDB Cluster deploys a highly available MongoDB replica set using Percona Server for MongoDB 8.0. The cluster provides automatic leader election, self-healing replica membership, and seamless failover across one or more locations. An optional HAProxy sidecar provides a stable write endpoint that always routes to the current primary.
+MongoDB Cluster deploys a highly available MongoDB replica set using Percona Server for MongoDB 8.0. The cluster provides automatic leader election, self-healing replica membership, and failover across one or more locations. An optional HAProxy workload provides a stable write endpoint that always routes to the current primary.
+
+Neither the database credentials nor the replica set keyfile are template values. Both come from secrets you create before installing, so no credential passes through Helm or lands in the release.
+
+<Warning>
+**Template version 1.1.0 is a breaking security change.** `mongodb.username`, `mongodb.password`, `mongodb.database` and `mongodb.replicaSetKey` were removed, and an install or upgrade that still sets any of them now fails at render instead of silently falling back to a published default. If you are running 1.0.0, read [Upgrading From 1.0.0](#upgrading-from-1-0-0) before you touch the release.
+</Warning>
 
 ### Architecture
 
@@ -16,26 +22,158 @@ MongoDB Cluster deploys a highly available MongoDB replica set using Percona Ser
 
 ### What Gets Created
 
-- **Stateful MongoDB Workload** — A multi-replica MongoDB container per configured location with persistent storage per replica.
-- **Standard HAProxy Proxy Workload** *(optional, enabled by default)* — Routes write traffic to the current primary replica.
-- **Volume Set** — One persistent volume per MongoDB replica for data storage.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the credential secrets, and cloud storage access when backup is enabled.
-- **Secrets** — A dictionary secret holding admin credentials injected at startup.
-- **Cron Backup Workload** *(optional, logical mode)* — A scheduled `mongodump` job that writes compressed archives to AWS S3 or GCS.
-- **PBM Agent Sidecar + Cron Trigger** *(optional, physical mode)* — A continuously-running `pbm-agent` sidecar on each MongoDB replica, plus a lightweight cron workload that triggers the backup on schedule.
-- **GVC** — A GVC spanning all configured locations.
+- **GVC** — (`gvc.name`, default `mongodb-gvc`): a GVC spanning every location listed in `gvc.locations`. This template creates it; see the [GVC warning](#the-gvc-this-template-creates) below.
+- **Stateful MongoDB Workload** — (`RELEASE_NAME-mongo`): a MongoDB container per replica per configured location, serving TCP on port `27017` with per-replica DNS for peer discovery.
+- **Volume Set** — (`RELEASE_NAME-mongo-vs`): one persistent volume per replica, mounted at `/data/db`, with optional autoscaling.
+- **Identity & Policy** — (`RELEASE_NAME-mongo-identity`, `RELEASE_NAME-mongo-policy`): an identity bound to the MongoDB and backup workloads, and a policy granting it `reveal` on exactly the two secrets you created plus the chart's own startup-script secrets — nothing else. When backups are enabled, the identity also carries the Cloud Account binding the backup job uses to reach your bucket.
+- **Startup Secrets** — (`RELEASE_NAME-mongo-startup`, and `RELEASE_NAME-mongo-proxy-startup` / `RELEASE_NAME-mongo-pbm-startup` when those components are enabled): the chart's own boot scripts. They hold no credentials.
+- **HAProxy Workload** *(optional, enabled by default)* — (`RELEASE_NAME-mongo-proxy`): a standard workload routing writes to the current primary.
+- **Cron Backup Workload** *(optional, logical mode)* — (`RELEASE_NAME-mongo-backup`): a scheduled `mongodump` that writes compressed archives to AWS S3 or GCS.
+- **PBM Agent Sidecar + Cron Trigger** *(optional, physical mode)* — a `pbm-agent` sidecar on each MongoDB replica, plus a cron workload (`RELEASE_NAME-mongo-physical-backup`) that triggers the backup on schedule.
 
-<Note>
-This template creates its own GVC. Configure `gvc.locations` in `values.yaml` before installing.
-</Note>
+The template creates **no credential secret of its own**. The database password and the replica set keyfile live only in the prerequisite secrets described below.
+
+## Upgrading From 1.0.0
+
+Template version 1.0.0 took the database credentials as plain Helm values and shipped a working default password, and it shipped a **working replica set keyfile** as a default too. Both were published in the public template repository, which means every 1.0.0 install that kept the defaults shares one publicly known password and one publicly known keyfile. The keyfile is what replica set members authenticate to each other with, so anyone holding it can join a member to your cluster.
+
+| | 1.0.0 | 1.1.0 |
+|---|---|---|
+| Database credentials | `mongodb.username`, `mongodb.password`, `mongodb.database` values | `mongodb.credentialsSecretName` → a dictionary secret you create |
+| Replica set keyfile | `mongodb.replicaSetKey` value, with a working default | `mongodb.keyfileSecretName` → an opaque secret you create |
+| Where the secrets live | Rendered into the release by the chart | Created by you, referenced by name, never in the release |
+
+The two are deliberately **separate** secrets: granting an application `reveal` on the database credentials must not also hand it the key that lets a member join your replica set.
+
+<Warning>
+**Treat a 1.0.0 cluster's password and keyfile as compromised, not merely outdated.** Upgrading moves them out of Helm values, but it does not change the values themselves — an unchanged default password (`mypassword`) and the default `replicaSetKey` remain publicly known after the upgrade. Rotate both, as described in the steps below.
+</Warning>
+
+<Warning>
+**Carrying old values forward stops the upgrade.** All four removed keys are rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running rather than quietly restarting with different credentials:
+
+```text
+Error: execution error at (mongodb-cluster/templates/policy.yaml:1:4): mongodb-cluster:
+`mongodb.password` was removed in 1.1.0 — the database credentials are no longer values. Create a
+`dictionary` secret holding `username`, `password` and `database`, and set
+`mongodb.credentialsSecretName` to its name. See Prerequisites in the README.
+```
+
+```text
+Error: ... mongodb-cluster: `mongodb.replicaSetKey` was removed in 1.1.0 — the replica set keyfile
+is now an `opaque` secret you create, named by `mongodb.keyfileSecretName`. Create it with:
+openssl rand -base64 756 | cpln secret create-opaque --name my-mongodb-keyfile --encoding plain -f -
+```
+
+`mongodb.username` and `mongodb.database` fail the same way.
+</Warning>
+
+<Steps>
+  <Step title="Read the credentials the cluster already uses">
+    The admin user is created the first time the data directory is initialized, so an existing cluster keeps whatever it was bootstrapped with. Recover the username, password, database name and the `replicaSetKey` from the values file you installed 1.0.0 with.
+  </Step>
+  <Step title="Create the two prerequisite secrets with those same values">
+    Follow [Prerequisites](#prerequisites), using the existing username, password and database name, and putting the **existing** `replicaSetKey` into the keyfile secret. Different values here do not change the cluster — they just leave the members unable to authenticate.
+
+    The keyfile in particular cannot be changed as part of this upgrade: it is what members use to authenticate to each other, and rotating it needs the separate procedure in the last step.
+  </Step>
+  <Step title="Remove the old keys from your values">
+    Delete `mongodb.username`, `mongodb.password`, `mongodb.database` and `mongodb.replicaSetKey`, then set `mongodb.credentialsSecretName` and `mongodb.keyfileSecretName` to the two secret names.
+  </Step>
+  <Step title="Upgrade, then rotate the password">
+    Rotate any password that came from the 1.0.0 default. Connect through the proxy and change it inside MongoDB, then update the dictionary secret to match:
+
+    ```js
+    db.getSiblingDB("admin").changeUserPassword("admin", "NEW-STRONG-PASSWORD")
+    ```
+
+    ```bash
+    printf 'data:\n  password: NEW-STRONG-PASSWORD\n' | cpln secret patch my-mongodb-credentials -f -
+    ```
+  </Step>
+  <Step title="Rotate the keyfile">
+    A published keyfile lets anyone who has it join a member to your replica set, so a cluster that ran on the 1.0.0 default needs a new one. The keyfile cannot be changed on a running cluster — every member must restart with the same new key, which means planned downtime. Generate a new key, replace the contents of the opaque secret, and restart the MongoDB workload so all members pick it up at once.
+
+    Expect the restart to take time: a rolling restart of a three-replica tier was measured at roughly **7 minutes** end to end.
+  </Step>
+</Steps>
 
 ## Prerequisites
 
-- At least one Control Plane [location](/reference/location) to deploy into.
-- A unique `replicaSetKey` generated before deploying: `openssl rand -base64 32`
-- For backup: an AWS or GCP [cloud account](/guides/create-cloud-account) and a storage bucket.
+**Two secrets must exist before you install.** Neither value passes through Helm values, so neither lands in the release. Secrets are org-level, so no GVC flag is involved.
 
-### Installation
+<Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. MongoDB is bootstrapped with this user, and this is the credential your applications put in their connection strings:
+
+    ```bash
+    cpln secret create-dictionary --name my-mongodb-credentials \
+      --entry username=admin \
+      --entry password='YOUR-STRONG-PASSWORD' \
+      --entry database=mydatabase
+    ```
+
+    Set `mongodb.credentialsSecretName` to the name you used.
+  </Step>
+  <Step title="Create the replica set keyfile secret">
+    An [opaque secret](/guides/create-secret/opaque) with encoding `plain` holding the key that replica set members authenticate to each other with. **Generate it — do not invent a passphrase:**
+
+    ```bash
+    openssl rand -base64 756 | cpln secret create-opaque --name my-mongodb-keyfile --encoding plain -f -
+    ```
+
+    Set `mongodb.keyfileSecretName` to the name you used.
+  </Step>
+  <Step title="Read either secret back later">
+    ```bash
+    cpln secret reveal my-mongodb-credentials -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**The keyfile must be valid base64, or the cluster will not start.** MongoDB accepts **6–1024 characters from the base64 alphabet only** — `A-Z`, `a-z`, `0-9`, `+`, `/` and `=`. A hand-written passphrase such as `change-me-mongodb-key` **will not boot**, because hyphens are outside that alphabet. `openssl rand -base64 756` produces 1008 characters, which is the largest generator that still fits under the 1024 limit.
+
+The container checks the key at boot and fails with an explicit message naming your secret, before MongoDB is ever started:
+
+```text
+FATAL: the keyfile in secret 'my-mongodb-keyfile' contains characters outside the base64 alphabet
+(A-Z a-z 0-9 + / =). A passphrase with hyphens or punctuation will NOT work. Regenerate it with:
+openssl rand -base64 756
+```
+
+A key that is too short gets its own message: `the keyfile in secret 'my-mongodb-keyfile' is 3 characters; mongod requires 6-1024`. Both appear in `cpln logs` only — the workload status shows just `Error: exitCode: 1`.
+</Warning>
+
+<Warning>
+**Create both secrets before installing.** The template refuses to render when either name is blank, but a name pointing at a secret that does not exist installs "successfully" and then wedges: `cpln helm install` reports every resource created, the workload never becomes ready, and **`cpln logs` shows nothing at all** because no container ever starts. The only diagnostic is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-mongo --gvc GVC_NAME -o json
+```
+
+It names the missing secret: `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Creating the secret does recover the workload on its own — measured at about **6 minutes**, so a user who waits only five will wrongly conclude the install is broken.
+</Warning>
+
+### The GVC This Template Creates
+
+This template **creates its own GVC**, named by `gvc.name` (default `mongodb-gvc`), spanning every location in `gvc.locations`.
+
+<Warning>
+**Never set `gvc.name` to a GVC that already exists.** Helm adopts a GVC whose name matches, and `helm uninstall` then **deletes it**, taking every unrelated workload in it — and it does so even when the GVC carries a `helm.sh/resource-policy: keep` annotation. Adoption also permanently pins the release name: a later install under a different name is rejected. Always pick a GVC name no other release uses.
+</Warning>
+
+<Note>
+**Mind the default cost shape.** The shipped default is three locations × 3 replicas — **nine members across three regions** — and cross-region traffic is billed. Reduce `gvc.locations` to a single entry for a single-region deployment.
+</Note>
+
+### Other Prerequisites
+
+- At least one Control Plane [location](/reference/location) to deploy into.
+- For backups: an AWS or GCP [cloud account](/guides/create-cloud-account) and a storage bucket — see [AWS S3](#aws-s3) or [GCS](#gcs).
+
+## Installation
+
 
 To install, follow the instructions for your preferred method:
 
