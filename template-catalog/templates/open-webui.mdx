@@ -1,26 +1,28 @@
 ---
 title: Open WebUI
-description: Deploy Open WebUI on Control Plane using the Template Catalog. Self-hosted, ChatGPT-style chat interface for LLMs, backed by an in-GVC Ollama server and any OpenAI-compatible API, with users, RAG, and model management on a persistent volume served over HTTPS.
+description: Deploy Open WebUI on Control Plane using the Template Catalog. Self-hosted, ChatGPT-style chat interface for LLMs, backed by an in-GVC Ollama server and any OpenAI-compatible API, with users, RAG, and model management on a persistent volume. Private by default — you claim the admin account before publishing the UI.
 keywords: ['chatgpt alternative', 'self-hosted chatgpt', 'llm chat ui', 'ollama frontend', 'ollama web ui', 'openai compatible', 'rag', 'private ai', 'ai chat', 'llm frontend', 'chatbot ui', 'open webui template']
 ---
 
 ## Overview
 
-Open WebUI is a self-hosted, ChatGPT-style chat interface for large language models with user accounts, RAG (chat grounded in your uploaded documents), and model management. This template deploys a single stateful workload that keeps all of its state on a persistent volume and connects to your models through an in-GVC [Ollama](/template-catalog/templates/ollama) server and/or any OpenAI-compatible endpoint, served over HTTPS on the canonical `*.cpln.app` endpoint. Sign-ups are open on a fresh install so you can onboard immediately — the first account you register becomes the admin, and you [lock registration down](#important-notes) afterward.
+Open WebUI is a self-hosted, ChatGPT-style chat interface for large language models with user accounts, RAG (chat grounded in your uploaded documents), and model management. This template deploys a single stateful workload that keeps all of its state on a persistent volume and connects to your models through an in-GVC [Ollama](/template-catalog/templates/ollama) server and/or any OpenAI-compatible endpoint.
+
+The install is **private by default**: `publicAccess.enabled` is `false` and self-registration is closed, because the first account registered on a fresh install becomes the administrator. You reach the UI over a port-forward, claim that admin account, and then opt in to publishing it — see [First Run](#first-run).
 
 ### Architecture
 
-- **Open WebUI** — A single-replica stateful workload serving the web UI and API on port `8080`. Its public `WEBUI_URL` is derived from the canonical endpoint at boot, so links resolve correctly with no manual configuration.
+- **Open WebUI** — A single-replica stateful workload serving the web UI and API on port `8080`. A mounted start script sets its public `WEBUI_URL` from the canonical endpoint at boot, so links resolve correctly with no manual configuration.
 - **Embedded SQLite on a persistent volume** — All durable state (the `webui.db` database, uploaded files, the default Chroma vector store used for RAG, and cache) lives on the workload's volume set at `/app/backend/data`. SQLite is single-writer, so there is no external database dependency and the workload runs as exactly one replica.
 - **Model backends** — Chat completions are served by an existing Ollama workload in the same GVC (default), an OpenAI-compatible API (optional), or both. Neither backend is bundled by this template — you point it at model providers you run or subscribe to.
+- **No template-created credential** — The key that signs sessions and JWTs lives only in a secret you create yourself, so it never enters the Helm release.
 
 ### What Gets Created
 
 - **Stateful Open WebUI Workload** — A single replica serving the web UI and API on port `8080`.
 - **Volume Set** — A 10 GiB persistent volume mounted at `/app/backend/data` holding the SQLite database, uploaded files, the RAG vector store, and cache. Scheduled snapshots protect the data, and a final snapshot is kept on delete.
-- **Config Secret** — Holds the stable `WEBUI_SECRET_KEY` that signs sessions and JWTs.
 - **Start-Script Secret** — An opaque secret whose boot script sets `WEBUI_URL` from the canonical endpoint.
-- **Identity & Policy** — An identity bound to the workload with a least-privilege policy granting `reveal` access to exactly the secrets it mounts (the config and start-script secrets, plus your OpenAI-key secret only when you configure one).
+- **Identity & Policy** — An identity bound to the workload with a least-privilege policy granting `reveal` access to exactly the secrets it mounts: your session-key secret, the start-script secret, and your OpenAI-key secret only when you configure one.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
@@ -28,13 +30,38 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ## Prerequisites
 
-None for a default install — no secrets, cloud accounts, or external resources are required to bring the UI up. The items below are optional and only needed for the corresponding feature.
+**One [opaque secret](/guides/create-secret/opaque) must exist before you install.** The key that signs every session and JWT is a long-lived credential, so it is not a value — a value would sit in the Helm release for the life of the install.
 
-- **License awareness** — Open WebUI ships under the "Open WebUI License" (BSD-3-Clause plus a branding-protection clause). It is free to self-host and run in production at any scale, but you must keep the "Open WebUI" branding visible in the UI **unless** your deployment serves 50 or fewer users, or you obtain enterprise permission. See [Important Notes](#important-notes).
-- **Ollama backend (recommended)** — An existing [Ollama](/template-catalog/templates/ollama) workload in the same GVC. Deploy the Ollama template first, then set its workload name in `ollama.workloadName`. Enabled by default.
-- **OpenAI-compatible backend (optional)** — Create, **before installing**, an [opaque secret](https://docs.controlplane.com/reference/secret#opaque) (`encoding: plain`) in your org holding your API key, and set its name in `openai.apiKeySecretName`. An empty value leaves this backend off.
+<Steps>
+  <Step title="Create the session signing key secret">
+    Generate a random key and store it as the secret's payload:
 
-Install the template using your preferred method:
+    ```bash
+    printf '%s' "$(openssl rand -base64 32)" | cpln secret create-opaque --name my-openwebui-secret-key --encoding plain -f -
+    ```
+
+    Set `auth.secretKeyName` to the name you used.
+  </Step>
+  <Step title="Keep it forever">
+    Back the key up somewhere safe outside Control Plane. It is never rotated: replacing it invalidates every issued session and JWT, logging every user out.
+  </Step>
+</Steps>
+
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** `cpln helm install` still exits 0 and reports success, but the workload never starts: it sits at zero replicas with the message `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Create the secret first, and after installing confirm with `cpln workload get-deployments {release}-open-webui --gvc {gvc}` rather than trusting the Helm output.
+</Warning>
+
+These are optional and only needed for the corresponding feature:
+
+| Feature | What you must create first |
+|---|---|
+| Ollama models (enabled by default) | An existing [Ollama](/template-catalog/templates/ollama) workload in the same GVC. Set its workload name in `ollama.workloadName` |
+| OpenAI-compatible backend | An [opaque secret](/guides/create-secret/opaque) with encoding `plain` holding your API key, named in `openai.apiKeySecretName`. Empty (default) leaves this backend off |
+| Custom domain | A Control Plane [domain](/guides/configure-domain) and its DNS records. `customDomain` alone does not create one — see [Access](#access) |
+
+**License awareness** — Open WebUI ships under the "Open WebUI License" (BSD-3-Clause plus a branding-protection clause). It is free to self-host and run in production at any scale, but you must keep the "Open WebUI" branding visible in the UI **unless** your deployment serves 50 or fewer users, or you obtain enterprise permission. See [Important Notes](#important-notes).
+
+Once the secret exists, install the template using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -58,11 +85,53 @@ Install the template using your preferred method:
     </Card>
 </CardGroup>
 
+## First Run
+
+A default install is closed on every side: the canonical endpoint returns `403` to the internet, and `internalAccess.type: none` blocks other workloads in the GVC. Claim the admin account through a port-forward first, then publish the UI.
+
+<Steps>
+  <Step title="Install with the defaults">
+    Install with `auth.secretKeyName` pointing at the secret you created, and leave `publicAccess.enabled: false` and `auth.enableSignup: false` alone. Wait for the workload to report ready:
+
+    ```bash
+    cpln workload get-deployments {release}-open-webui --gvc {gvc}
+    ```
+  </Step>
+  <Step title="Register the admin account over a port-forward">
+    Forward the UI to your own machine:
+
+    ```bash
+    cpln port-forward {release}-open-webui 8080:8080 --gvc {gvc}
+    ```
+
+    Then open `http://localhost:8080`, which shows Open WebUI's "create admin account" screen. Port forwarding reaches the workload even though it is closed to both the internet and the GVC, and the account you create there is the administrator.
+
+    If you would rather not leave the terminal, the same registration works over the container's own loopback address:
+
+    ```bash
+    cpln workload exec {release}-open-webui --gvc {gvc} --container open-webui -- \
+      curl -sS -X POST http://localhost:8080/api/v1/auths/signup \
+      -H 'Content-Type: application/json' \
+      -d '{"name":"Admin","email":"admin@example.com","password":"YOUR-STRONG-PASSWORD"}'
+    ```
+
+    The response carries `"role":"admin"`. A second registration attempt returns `403`, because only the first account is exempt from `auth.enableSignup: false`.
+  </Step>
+  <Step title="Publish the UI">
+    Now that the admin account is claimed, upgrade the release with `publicAccess.enabled: true` and sign in at the canonical endpoint. Allow up to a couple of minutes for the firewall change to take effect — a measured toggle moved through `403` → `503` → `200` over about 143 seconds.
+  </Step>
+</Steps>
+
+<Warning>
+**Do not plan to close sign-ups later with an upgrade — it does nothing.** `auth.enableSignup` is read only while no account exists. Creating the first account writes the setting into `webui.db`, and from then on the stored value wins over the environment: an upgrade can neither open nor close self-registration. Add users, or re-open self-service sign-ups, from **Admin Settings → Users** in the UI.
+</Warning>
+
 ## Configuration
 
 The default `values.yaml` for this template:
 
 ```yaml
+# ─── Image & Resources ────────────────────────────────────────────────────────
 image: ghcr.io/open-webui/open-webui:v0.11.0
 
 resources:
@@ -79,6 +148,7 @@ volumeset:
 
 # ─── Backup ───────────────────────────────────────────────────────────────────
 # Platform-managed crash-consistent snapshots (no cloud account/bucket needed).
+# SQLite recovers cleanly from a snapshot. A final snapshot is taken on uninstall.
 backup:
   enabled: true
   schedule: "0 3 * * *" # cron in UTC — daily 03:00 (hourly is the platform max)
@@ -86,10 +156,15 @@ backup:
 
 # ─── Authentication ───────────────────────────────────────────────────────────
 auth:
-  # Signs sessions/JWTs. Override ONCE at install (openssl rand -base64 32).
-  # Must stay STABLE across upgrades — changing it logs every user out.
-  webuiSecretKey: "CHANGE-ME-openssl-rand-base64-32-abcdEFGH1234"
-  enableSignup: true # first registered user becomes ADMIN — turn OFF after onboarding
+  # REQUIRED opaque secret (encoding: plain) holding the session/JWT signing key.
+  # It must EXIST BEFORE INSTALL — the deployment wedges waiting on it otherwise —
+  # and must stay the same forever: replacing it logs every user out.
+  # Create it with: printf '%s' "$(openssl rand -base64 32)" | cpln secret create-opaque --name my-openwebui-secret-key --encoding plain -f -
+  secretKeyName: my-openwebui-secret-key
+  # false = nobody can create their own account. The FIRST account is exempt, so
+  # you can still register the admin on a fresh install (see the README first-run
+  # steps); invite everyone else from Admin Settings → Users.
+  enableSignup: false
 
 # ─── Model backends ───────────────────────────────────────────────────────────
 # Point at an existing `ollama` template deployment in this same GVC.
@@ -107,14 +182,22 @@ openai:
   apiKeySecretName: "" # e.g. my-openwebui-openai-key ; empty = OpenAI backend off
 
 # ─── Access ───────────────────────────────────────────────────────────────────
+# Sets WEBUI_URL only — it does NOT create a cpln domain. Create and verify the
+# domain separately, or the hostname will not resolve. Read at FIRST BOOT ONLY
+# (see Important Notes); set it at install, not in a later upgrade.
 customDomain: "" # full URL, e.g. https://chat.example.com ; empty = canonical *.cpln.app
 
 publicAccess:
-  enabled: true # serve the UI over public HTTPS on the canonical *.cpln.app endpoint
+  # false = not reachable from the internet. Turning this on publishes the chat
+  # UI, and its sign-in/sign-up form, to the whole internet — so register your
+  # admin account FIRST (see the README first-run steps), then turn it on.
+  enabled: false
 
 internalAccess: # inbound firewall scope for in-GVC callers of the Open WebUI API
   type: none # options: none, same-gvc, same-org, workload-list
   workloads: [] # used with workload-list
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
 ### Instance & Resources
@@ -125,7 +208,7 @@ internalAccess: # inbound firewall scope for in-GVC callers of the Open WebUI AP
 
 ### Backup
 
-Scheduled, crash-consistent snapshots of the data volume, managed by the platform — no cloud account or bucket is required. See [Backing Up](#backing-up) for how snapshots and restores work.
+Scheduled, crash-consistent snapshots of the data volume, managed by the platform — no cloud account or bucket is required. See [Backing Up](#backing-up) for how snapshots work and [Restoring a Backup](#restoring-a-backup) for the manual restore procedure.
 
 - `backup.enabled` — Take periodic snapshots of the data volume (default `true`).
 - `backup.schedule` — Cron expression in UTC (default `0 3 * * *`, daily at 03:00). The platform does not accept schedules more frequent than hourly.
@@ -133,27 +216,31 @@ Scheduled, crash-consistent snapshots of the data volume, managed by the platfor
 
 ### Authentication
 
-- `auth.webuiSecretKey` — Signs session tokens and JWTs. Override it **once** at install with `openssl rand -base64 32`, then keep it stable forever — see [Important Notes](#important-notes).
-- `auth.enableSignup` — Open registration on the public endpoint (default `true` so a fresh install is usable). The first account registered becomes the admin; **turn this off after onboarding** — see [Important Notes](#important-notes).
+- `auth.secretKeyName` — Name of the opaque secret holding the session and JWT signing key. It must exist **before** you install (see [Prerequisites](#prerequisites)) and must never change afterward.
+- `auth.enableSignup` — Whether users can create their own accounts (default `false`). The **first** account on a fresh install is exempt, so a default install is still usable — that is how you create the admin in [First Run](#first-run).
 
-### Model backends
+<Warning>
+`auth.enableSignup` only has an effect while no account exists. Once the first account is created the value is stored in `webui.db` and the stored setting wins permanently, so changing this knob in a later `helm upgrade` has no effect in either direction. Manage users and self-registration from **Admin Settings → Users**.
+</Warning>
+
+### Model Backends
 
 At least one backend is needed to actually chat. The Ollama backend is on by default; the OpenAI-compatible backend is off until you supply a key secret. You can enable both.
 
 - `ollama.enabled` — Connect to an existing Ollama workload in this GVC (default `true`).
 - `ollama.workloadName` — The Ollama workload's name in this GVC. The base URL is derived as `http://{workloadName}.{gvc}.cpln.local:{port}`.
 - `ollama.port` — The Ollama API port (default `11434`).
-- `openai.baseUrl` — Any OpenAI-compatible endpoint (default `https://api.openai.com/v1`).
-- `openai.apiKeySecretName` — Name of your pre-created opaque secret holding the API key (see [Prerequisites](#prerequisites)). Empty (default) leaves the OpenAI backend off.
+- `openai.baseUrl` — Any OpenAI-compatible endpoint (default `https://api.openai.com/v1`). The workload's outbound firewall is open, so hosted providers such as `api.openai.com` are reachable.
+- `openai.apiKeySecretName` — Name of your pre-created opaque secret holding the API key (see [Prerequisites](#prerequisites)). Empty (default) leaves the OpenAI backend off, and the policy grants no access to any key secret.
 
 <Warning>
-Model-backend settings are read from the environment only on the **first** boot and are then stored in the app database. Changing `ollama.workloadName` or `openai.*` via a later `helm upgrade` is ignored — update model connections afterward from the admin UI under **Settings → Connections**. See [Important Notes](#important-notes).
+**Backend settings apply on the first boot only, and a later change fails silently.** `ollama.*`, `openai.*` and `customDomain` are read from the environment the first time the workload starts and are then stored in `webui.db`; a later `helm upgrade` is ignored. The danger is that nothing looks wrong — the **original backend keeps working**, so a user who "retargets" their model provider by upgrade sees the upgrade succeed and keeps talking to the old provider. Set these at install, and change model connections afterward from the admin UI under **Settings → Connections**.
 </Warning>
 
 ### Access
 
-- `customDomain` — Full URL of a custom domain, e.g. `https://chat.example.com`. Empty (default) uses the canonical `*.cpln.app` endpoint.
-- `publicAccess.enabled` — Serve the UI over public HTTPS on the canonical `*.cpln.app` endpoint (default). When disabled, external requests are blocked at the edge and only in-GVC callers reach it per `internalAccess`.
+- `customDomain` — Full URL of a custom domain, e.g. `https://chat.example.com`. The scheme is required; the chart fails the render without it. Empty (default) uses the canonical `*.cpln.app` endpoint.
+- `publicAccess.enabled` — Serve the UI over public HTTPS on the canonical `*.cpln.app` endpoint (default `false`). While it is off, external requests are rejected at the edge with `403` and only in-GVC callers reach the workload, per `internalAccess`.
 - `internalAccess.type` — Internal firewall scope for in-GVC callers of the Open WebUI API:
 
 | Type | Description |
@@ -163,18 +250,28 @@ Model-backend settings are read from the environment only on the **first** boot 
 | `same-org` | Allow access from all workloads in the same organization. |
 | `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
 
+<Warning>
+**`customDomain` sets `WEBUI_URL` and nothing else.** It does not create a Control Plane [domain](/guides/configure-domain), and the install succeeds with no error or warning if none exists — the hostname simply never resolves, and the canonical endpoint remains the only way in. Create and verify the domain separately. Because it is also frozen after the first boot, set it at install rather than adding it to a running release.
+</Warning>
+
+An access change takes effect at the edge after a short propagation delay — allow up to a couple of minutes before concluding a firewall knob did not work.
+
 ## Connecting
 
 | What | Value |
 |---|---|
-| Web UI (public) | `https://<canonical>.cpln.app` — `status.canonicalEndpoint` of `{release}-open-webui` |
-| Internal (if opened) | `http://{release}-open-webui.{gvc}.cpln.local:8080` |
+| Web UI (public) | `https://<canonical>.cpln.app` — only with `publicAccess.enabled: true`; read `status.canonicalEndpoint` of `{release}-open-webui` |
+| From your machine, no public access | `cpln port-forward {release}-open-webui 8080:8080 --gvc {gvc}`, then `http://localhost:8080` — works regardless of both firewall settings |
+| Internal API | `http://{release}-open-webui.{gvc}.cpln.local:8080` — only when `internalAccess.type` allows the caller |
 | Ollama backend | `http://{ollama.workloadName}.{gvc}.cpln.local:11434` (the existing Ollama workload) |
-| Login | The account you register in the UI — the first registration becomes the admin |
+| Login | The account you register at first run — the first registration becomes the admin |
+| Session signing key | The payload of your `auth.secretKeyName` secret; never in the Helm release |
 
 ### Using a Model Backend
 
-Deploy the [Ollama](/template-catalog/templates/ollama) template into the same GVC and pull at least one model, then install Open WebUI with `ollama.workloadName` set to that workload's name — its models appear in the model picker automatically. To use a hosted provider instead, create the API-key secret (see [Prerequisites](#prerequisites)), set `openai.apiKeySecretName`, and Open WebUI lists that provider's models. If a configured Ollama backend is unreachable the UI still boots and simply shows no Ollama models — confirm `ollama.workloadName` names a `ready` Ollama workload in the same GVC.
+Deploy the [Ollama](/template-catalog/templates/ollama) template into the same GVC and pull at least one model, then install Open WebUI with `ollama.workloadName` set to that workload's name — its models appear in the model picker automatically. To use a hosted provider instead, create the API-key secret (see [Prerequisites](#prerequisites)), set `openai.apiKeySecretName`, and Open WebUI lists that provider's models.
+
+If a configured Ollama backend is unreachable the UI still boots and simply shows no Ollama models — an empty model list is the symptom of a wrong `ollama.workloadName`. Confirm it names a `ready` Ollama workload in the same GVC.
 
 ## Backing Up
 
@@ -195,10 +292,10 @@ Snapshots live in the platform storage layer alongside the volume, not off-site.
 
 ## Restoring a Backup
 
-Restore is **in-place** on the release's own volume set: the platform provisions a fresh volume from the chosen snapshot and swaps it in, then the workload restarts to remount it.
+**There is no automated restore.** `backup.enabled` only takes snapshots; recovering from one is a manual, deliberate operation you run yourself. Restore is **in-place** on the release's own volume set: the platform provisions a fresh volume from the chosen snapshot and swaps it in, then the workload restarts to remount it.
 
 <Warning>
-Restoring reverts the volume to the exact snapshot state — any changes made after that snapshot are lost — and restarts the single-replica workload, so the UI is briefly unavailable during the swap.
+Restoring reverts the volume to the exact snapshot state, so **everything written after the snapshot is gone — including user accounts**. A user who registered after the snapshot was taken can no longer sign in. It also restarts the single-replica workload, so the UI is unavailable during the swap.
 </Warning>
 
 <Steps>
@@ -219,21 +316,26 @@ Restoring reverts the volume to the exact snapshot state — any changes made af
       --volume-index 0 \
       --gvc {gvc}
     ```
+
+    A measured restore took about 2.5 minutes end to end, of which roughly 40 seconds was workload downtime.
   </Step>
   <Step title="Verify">
-    Once the workload is ready again, log in and confirm your chats and settings are present.
+    Once the workload is ready again, sign in and confirm your chats and settings are present.
   </Step>
 </Steps>
 
 ## Important Notes
 
+- **Create the session-key secret before installing, and never change it.** `auth.secretKeyName` only names the secret; the workload wedges waiting on one that does not exist. The key signs every session and JWT, so replacing it logs every user out.
+- **The first account registered becomes the administrator.** That is why the UI ships private with sign-ups closed — an unclaimed admin account on a public URL belongs to whoever finds it first. Claim it over a port-forward before turning `publicAccess.enabled` on; see [First Run](#first-run).
+- **`auth.enableSignup` is only read while no account exists.** After the first account it is stored in `webui.db` and the stored value wins, so a later `helm upgrade` can neither open nor close sign-ups. Use **Admin Settings → Users** instead.
+- **`ollama.*`, `openai.*` and `customDomain` apply at install, then persist in the app database.** A later `helm upgrade` is ignored and the old backend keeps working, so there is no symptom to warn you. Change model connections from the admin UI under **Settings → Connections**.
+- **`customDomain` does not create a domain.** It sets `WEBUI_URL` only; create the Control Plane domain and its DNS separately, or the hostname will not resolve while the install reports success.
+- **Restoring a snapshot is manual and loses post-snapshot data**, including accounts created after it was taken. See [Restoring a Backup](#restoring-a-backup).
+- **Single replica, by design.** The embedded SQLite is single-writer and the volume set is per-replica, so the workload is pinned to one replica with no `replicas` knob. A restart or upgrade is a brief full outage of about a minute — including the first `helm upgrade` after an install, which re-applies the workload even when nothing changed.
+- **Data lives only on the volume set.** Uninstall deletes it (a final snapshot is taken first); a reinstall starts empty, including the admin account. Your own prerequisite secrets are not deleted, since the chart does not own them.
+- **Ollama unreachable is non-fatal.** The UI boots and shows no Ollama models rather than failing, so check the model list after install.
 - **License / branding clause** — You must keep the "Open WebUI" branding visible in the UI **unless** your deployment serves 50 or fewer users, or you have enterprise permission. Removing the branding outside those cases violates the license; it is not a template setting.
-- **The first user to register becomes the admin.** Sign-ups are open by default so the install is immediately usable, which means anyone reaching the public endpoint can register while it is open. Register your admin account first, then set `auth.enableSignup=false` to lock it down.
-- **`auth.webuiSecretKey` must never change after first install.** It is the key that signs session tokens and JWTs. Rotating it — or letting a fresh volume regenerate one — logs every user out. Override it once with `openssl rand -base64 32` and keep it stable.
-- **Single replica, by design.** The embedded SQLite is single-writer and the volume set is per-replica, so the workload is pinned to one replica with no `replicas` knob. A restart or upgrade is a brief full outage (about a minute).
-- **Model-backend settings apply at install, then persist in the app database.** `ollama.workloadName` and `openai.*` are read from the environment only on the first boot and then stored in `webui.db`. Changing them via a later `helm upgrade` is silently ignored — update model connections afterward from the admin UI (**Settings → Connections**).
-- **Data lives only on the volume set.** Uninstall deletes it (a final snapshot is taken first); a reinstall starts empty. Changing the secret and redeploying does not re-key existing data.
-- **Backups are in-platform, not off-site.** Scheduled snapshots and the final snapshot on uninstall live in the platform storage layer next to the volume; losing the whole GVC would lose them too. See [Backing Up](#backing-up).
 
 ## External References
 
