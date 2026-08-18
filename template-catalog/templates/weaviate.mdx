@@ -340,3 +340,145 @@ The risk is the **inverse** of what the values comment suggests. Supplying a pro
 </Warning>
 
 `modules.enabled` still has a job — it is the documented upstream knob and it is how the backup modules are turned on, which the template does for you when `backup.enabled: true`. It is simply not a safety gate on provider access.
+
+## Connecting
+
+Weaviate is reachable from workloads inside Control Plane, subject to `internalAccess.type`. There is no public endpoint.
+
+| What | Where |
+|---|---|
+| Cluster (load balanced) | `{release}-weaviate.{gvc}.cpln.local` |
+| A specific replica | `{release}-weaviate-{n}.{gvc}.cpln.local` |
+| REST and GraphQL port | `8080` |
+| gRPC port | `50051` |
+| Credentials | The key in the secret named by `apiKeySecretName`; username `apiUser` |
+| Public endpoint | None |
+
+Authenticate with the key as a bearer token:
+
+```bash
+curl -H "Authorization: Bearer YOUR_API_KEY" \
+     http://{release}-weaviate.{gvc}.cpln.local:8080/v1/meta
+```
+
+<Note>
+The workload is assigned a canonical `*.cpln.app` hostname like any other, but `inboundAllowCIDR` is empty unconditionally, so every request from the internet is refused at the platform edge with `403 RBAC: access denied` — **a valid API key does not help**, because the request never reaches Weaviate. If you need browser or off-platform access, put your own authenticating proxy in front of it inside the GVC.
+</Note>
+
+## Backing Up
+
+With `backup.enabled: true`, a cron workload calls Weaviate's backup API on `backup.schedule` and writes a full snapshot of every collection to `{path}/{backup-id}/` in your bucket.
+
+<Warning>
+**The backup path has not been exercised end to end.** Rendering, the chart's validation of the backup settings, and the backup job's discovery of the cluster endpoint were all checked live, but no snapshot has been written to S3 or GCS from this template — a real run needs cloud resources outside the test environment. Treat backups as unverified: run one on your own bucket and confirm the objects land before you rely on it. A misconfigured cloud binding can report a successful install while the identity is unusable, so check the objects, not the install.
+</Warning>
+
+<Warning>
+**With `internalAccess.type: workload-list`, the backup job is denied.** The cron job is a separate workload and the template does not add it to the allow-list, so its calls to Weaviate are refused like any other unlisted workload. Add `//gvc/{gvc}/workload/{release}-weaviate-backup` to `internalAccess.workloads` yourself, or use `same-gvc` or `same-org`.
+</Warning>
+
+### AWS S3
+
+<Steps>
+  <Step title="Create a bucket">
+    Create an S3 bucket. Set `backup.aws.bucket` and `backup.aws.region` to match, and `backup.aws.path` to the prefix you want snapshots written under.
+  </Step>
+  <Step title="Set up a Cloud Account">
+    If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for the AWS account holding the bucket. Set `backup.aws.cloudAccountName` to its name.
+  </Step>
+  <Step title="Create an IAM policy">
+    Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`, and set `backup.aws.policyName` to its name:
+
+    ```json
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:ListBucket",
+                    "s3:GetObjectVersion",
+                    "s3:DeleteObjectVersion"
+                ],
+                "Resource": [
+                    "arn:aws:s3:::YOUR_BUCKET_NAME",
+                    "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+                ]
+            }
+        ]
+    }
+    ```
+  </Step>
+</Steps>
+
+### GCS
+
+<Steps>
+  <Step title="Create a bucket">
+    Create a GCS bucket. Set `backup.gcp.bucket` to its name and `backup.gcp.path` to the prefix.
+  </Step>
+  <Step title="Set up a Cloud Account">
+    If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for the GCP project. Set `backup.gcp.cloudAccountName` to its name.
+  </Step>
+  <Step title="Grant the bucket role">
+    Grant the Cloud Account's service account `roles/storage.objectAdmin` on that bucket. The template requests exactly that role on exactly that bucket, and nothing more.
+  </Step>
+</Steps>
+
+## Restoring a Backup
+
+Run the restore from inside any Weaviate replica. Use `gcs` in place of `s3` for GCP backups, and replace `BACKUP_ID` with the backup name from your bucket (they are written as `weaviate-backup-YYYYMMDD-HHMMSS`):
+
+```bash
+# Trigger the restore
+wget -qO- \
+  --header='Authorization: Bearer YOUR_API_KEY' \
+  --header='Content-Type: application/json' \
+  --post-data='{}' \
+  'http://localhost:8080/v1/backups/s3/BACKUP_ID/restore'
+
+# Poll for completion
+wget -qO- \
+  --header='Authorization: Bearer YOUR_API_KEY' \
+  'http://localhost:8080/v1/backups/s3/BACKUP_ID/restore'
+```
+
+<Warning>
+A restore is not a merge. It fails if a collection from the backup already exists on the cluster — drop the collection first, or restore into a fresh deployment.
+</Warning>
+
+## Important Notes
+
+- **Create the API key secret before you install.** Without it the install reports success and the deployment silently wedges, with no container and no logs. See [Prerequisites](#prerequisites).
+- **Verify cluster health after every restart.** A replica that fails to rejoin the Raft cluster still reports `ready` and still receives traffic. See [Rolling Restarts Can Split a Replica Out of the Cluster](#rolling-restarts-can-split-a-replica-out-of-the-cluster).
+- **A named provider secret is a live billable integration**, whether or not the module is listed in `modules.enabled`.
+- **Keep your own copy of the API key.** Rotating it means updating the secret and restarting the cluster; losing it locks you out of every collection.
+- **There is no public endpoint**, and that is not configurable in this template. Reachability is `internalAccess` only, and an access change takes up to a couple of minutes to settle.
+- **Size memory, not CPU.** Vector indexes are RAM-resident; an undersized cluster fails with out-of-memory restarts.
+- **Backups are unverified.** Confirm a snapshot lands in your bucket before depending on the schedule.
+
+## External References
+
+<CardGroup cols={2}>
+  <Card title="Weaviate Documentation" href="https://docs.weaviate.io/weaviate" icon="book">
+    Official Weaviate documentation
+  </Card>
+  <Card title="REST API Reference" href="https://docs.weaviate.io/weaviate/api/rest" icon="code">
+    REST API reference, including the backup and restore endpoints
+  </Card>
+  <Card title="Modules" href="https://docs.weaviate.io/weaviate/configuration/modules" icon="puzzle-piece">
+    Vectorizer and generative module configuration
+  </Card>
+  <Card title="Authentication and Authorization" href="https://docs.weaviate.io/deploy/configuration/authentication" icon="key">
+    How Weaviate API key authentication and the admin list work
+  </Card>
+  <Card title="Backups" href="https://docs.weaviate.io/deploy/configuration/backups" icon="box-archive">
+    Upstream documentation for the backup and restore API
+  </Card>
+  <Card title="Weaviate Template" href="https://github.com/controlplane-com/templates/tree/main/weaviate" icon="github">
+    View the source files, default values, and chart definition
+  </Card>
+</CardGroup>
