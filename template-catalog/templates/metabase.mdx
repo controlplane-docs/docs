@@ -1,6 +1,6 @@
 ---
 title: Metabase
-description: Deploy Metabase on Control Plane using the Template Catalog. Open-source BI with dashboards, a SQL editor, and scheduled reports, backed by a highly available PostgreSQL app database. Covers the encryption-key prerequisite, database modes, first-boot admin setup, and backups.
+description: Deploy Metabase on Control Plane using the Template Catalog. Open-source BI with dashboards, a SQL editor, and scheduled reports, backed by a highly available PostgreSQL app database. Covers the prerequisite admin and encryption-key secrets, database modes, first-boot admin setup, and backups.
 keywords: ['business intelligence', 'data visualization', 'looker alternative', 'tableau alternative', 'power bi alternative', 'superset alternative', 'redash alternative', 'self-hosted', 'reporting', 'charts', 'sql questions', 'metabase template']
 ---
 
@@ -19,7 +19,7 @@ Metabase is an open-source business intelligence platform — dashboards, a SQL 
 - **Standard Metabase Workload** — A single stateless replica serving the UI and API on port `3000`.
 - **Database Workloads** — HA mode: a stateful Patroni PostgreSQL workload, a stateful etcd workload, and a standard HAProxy leader-routing workload. Single mode: one stateful PostgreSQL workload.
 - **Volume Sets** — The database subchart's persistent volumes (10 GiB per replica by default). Metabase itself has none.
-- **Secrets** — Admin bootstrap credentials, the start script that creates the admin account on first boot, and the database credentials from the subchart.
+- **Secrets** — The start script that creates the admin account on first boot, plus the database credentials from the subchart. The admin login and the encryption key are **not** created by this template: you create both secrets yourself before installing and reference them by name (see [Prerequisites](#prerequisites)).
 - **Identity & Policy** — A least-privilege policy granting the Metabase identity `reveal` on exactly the secrets it uses, including your pre-created encryption-key secret.
 - **Cron Backup Workload** *(optional)* — When database backups are enabled.
 
@@ -29,31 +29,78 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ## Prerequisites
 
-Metabase encrypts the connection details of every data source you save with a key it reads from an [opaque secret](/guides/create-secret/opaque) that you create **before** installing. The key is never passed through values.
+**Two secrets must exist before you install.** Both hold credentials or long-lived key material, so neither passes through Helm values — a value would sit in plaintext in the release for the life of the install, and the admin login is on a public endpoint. The template creates neither of them.
 
 <Steps>
-  <Step title="Generate an encryption key">
-    Generate a random string of at least 16 characters, for example:
+  <Step title="Create the admin login secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `email` and `password`. Secrets are org-level, so no GVC flag is involved:
 
     ```bash
-    openssl rand -hex 24
+    cpln secret create-dictionary --name my-metabase-admin \
+      --entry email=admin@example.com \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `admin.secretName` to the name you used.
+  </Step>
+  <Step title="Create the encryption-key secret">
+    An [opaque secret](/guides/create-secret/opaque) with encoding `plain` whose entire payload is a random string of at least 16 characters:
+
+    ```bash
+    printf '%s' "$(openssl rand -hex 24)" | cpln secret create-opaque --name my-metabase-encryption-key --encoding plain -f -
+    ```
+
+    Set `encryptionKey.secretName` to the name you used, and store a copy of the key somewhere safe outside Control Plane.
+  </Step>
+  <Step title="Read either secret back later">
+    `-o yaml` is required; without it the command prints the secret's metadata table rather than its contents:
+
+    ```bash
+    cpln secret reveal my-metabase-admin -o yaml
     ```
   </Step>
-  <Step title="Create an opaque secret">
-    Create an [opaque secret](/guides/create-secret/opaque) in your org with encoding `plain` whose payload is the generated key. Set its name in `encryptionKey.secretName`.
-  </Step>
-  <Step title="Back up the key">
-    Store a copy of the key somewhere safe, outside Control Plane.
-  </Step>
 </Steps>
+
+| Key in the admin secret | What it is |
+|---|---|
+| `email` | The admin account's login email. |
+| `password` | Its password. It must pass Metabase's own check — letters **and** digits, 8+ characters (the `openssl rand -hex` value above satisfies this). |
+
+<Warning>
+**Neither the email nor the password may contain a double quote (`"`) or a backslash (`\`).** Both values are embedded in the JSON body of the first-boot setup call, and either character breaks it. The container checks this at startup and refuses to run setup instead of sending a malformed request — measured firing **32 seconds** after install, with a log line that names the offending secret:
+
+```text
+cpln-bootstrap: ERROR: the email and password in the my-metabase-admin secret must not contain a
+double quote or a backslash — they are embedded in the first-boot setup API JSON body
+```
+
+The workload then stays unready and its public endpoint answers `503`, so a bad credential never results in a reachable, half-configured instance. Fix the secret's contents and redeploy.
+</Warning>
 
 <Warning>
 Losing or changing the encryption key means re-entering every saved database connection — Metabase can no longer decrypt them. Rotation is only possible offline, using Metabase's `rotate-encryption-key` command. Back the key up before installing.
 </Warning>
 
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** The install still exits 0 and reports success, every resource is created, and the workload then never starts. Because the container never ran, `cpln logs` returns **zero lines**, which reads as a broken platform rather than a missing prerequisite.
+
+The only diagnostic is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-metabase --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-metabase-admin no longer exists. Workload updates are paused until
+the secret is added or the reference to the secret removed.
+```
+
+It is **`get-deployments`** — plain `cpln workload get` has no `versions` key at all. Creating the missing secret clears the wedge on its own, but slowly: recovery has measured between 5.5 and 10.5 minutes across the catalog, so poll rather than giving up. `cpln workload force-redeployment RELEASE_NAME-metabase --gvc GVC_NAME` shortcuts it to roughly 90 seconds.
+</Warning>
+
 For optional database backups, you also need a bucket and access setup for one of the supported providers — see [Backing Up](#backing-up).
 
-Once your encryption-key secret exists, install the template using your preferred method:
+Once both secrets exist, install the template using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -88,7 +135,11 @@ Exactly one of the two database modes must be enabled — the chart enforces thi
 | Footprint | 8 replicas across 3 workloads (3× Patroni, 3× etcd, 2× HAProxy) | 1 workload |
 | Best for | Production | Development and lightweight installs |
 
-A fresh HA-mode install takes roughly 10–15 minutes to fully converge; single mode is ready in about 2 minutes.
+A fresh HA-mode install takes roughly 10–15 minutes to fully converge; single mode is ready in about 2 minutes. Metabase itself reached ready **261 seconds** after a default HA install.
+
+<Note>
+For the first few minutes of an HA-mode install, the Metabase container may log Java stack traces (`An attempt by a client to checkout a Connection has timed out`) and restart while the Patroni cluster elects a leader. It resolves itself once the database is routable — the traces are not a failed install.
+</Note>
 
 ## Configuration
 
@@ -104,13 +155,18 @@ resources:
   minMemory: 1Gi
 
 encryptionKey:
-  secretName: my-metabase-encryption-key # name of your pre-created opaque secret (see Prerequisites)
+  secretName: my-metabase-encryption-key # name of your pre-created opaque secret
 
-admin: # admin account, created automatically on first boot
-  email: admin@example.com # admin login email
+# Admin account, created automatically on first boot (no public /setup window).
+# REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL. A `dictionary`
+# secret holding exactly two keys, `email` and `password`; the login form it
+# guards sits on the public endpoint. The password must satisfy Metabase's own
+# check (letters + digits, 8+ chars), and neither value may contain a double
+# quote or a backslash — both are embedded in the first-boot setup API call.
+admin:
+  secretName: my-metabase-admin # name of your pre-created dictionary secret
   firstName: Metabase
   lastName: Admin
-  password: change-me-metabase-1 # change before installing; letters + digits, 8+ chars
 
 siteName: Metabase # instance name shown in the UI and emails
 
@@ -198,12 +254,14 @@ postgres: # dev/lightweight: single-instance PostgreSQL (disable postgresHA firs
 - `image` — The Metabase open-source container image.
 - `resources` — CPU and memory for the Metabase container. The template caps the JVM at 75% of the container memory limit (`JAVA_OPTS: -XX:MaxRAMPercentage=75.0`), so raising `resources.memory` also raises the Java heap. The 2 GiB default is sized for the JVM — lowering it is not recommended.
 - `encryptionKey.secretName` — Name of your pre-created opaque secret holding the key that encrypts saved data-source credentials. See [Prerequisites](#prerequisites).
-- `admin.*` — The admin account, created automatically on first boot against the local setup API. There is no unauthenticated setup page at any point: the workload only becomes ready — and only starts receiving traffic — once setup is complete, and if setup fails it never becomes ready at all (fail-closed). **Change `admin.password` before installing** — it must pass Metabase's complexity check (letters + digits, 8+ characters), and none of the `admin.*` values may contain double quotes or backslashes (enforced at render). The account is created exactly once, on first boot — changing these values later does not modify the existing account.
+- `admin.secretName` — Name of the dictionary secret you created in [Prerequisites](#prerequisites), holding the `email` and `password` of the admin account. The credentials never pass through values; the template references your secret and grants the workload `reveal` on exactly it.
+- `admin.firstName` / `admin.lastName` — The admin's display name. These are ordinary values (not credentials) and, like the secret's contents, may not contain double quotes or backslashes — these two are checked at render.
+- The account is created automatically on first boot against the local setup API, so there is no unauthenticated setup page at any point: the workload only becomes ready — and only starts receiving traffic — once setup is complete, and if setup fails it never becomes ready at all (fail-closed). Setup runs exactly once; editing the secret afterwards does not modify the existing account, so change the password in the Metabase UI instead.
 - `siteName` — The instance name shown in the UI and in emails Metabase sends.
 
 ### Access
 
-- `publicAccess.enabled` — Serve the UI and API on the canonical `*.cpln.app` HTTPS endpoint (default). Everything behind the endpoint is gated by Metabase's own login. Set to `false` for an internal-only instance (external requests are blocked at the edge; in-GVC callers still reach it per `internalAccess`).
+- `publicAccess.enabled` — Serve the UI and API on the canonical `*.cpln.app` HTTPS endpoint. It is **deliberately on by default**: Metabase is a browser tool people open directly, everything behind the endpoint is gated by its own login, and that login is now a credential you created rather than a published default. Set to `false` for an internal-only instance (external requests are blocked at the edge; in-GVC callers still reach it per `internalAccess`). A firewall change takes roughly 30 seconds to a few minutes to propagate, so re-test rather than trusting the first response.
 - `internalAccess.type` — Internal firewall scope of the Metabase workload:
 
 | Type | Description |
@@ -221,13 +279,55 @@ Enable exactly one of `postgresHA` (production, default) or `postgres` (dev/ligh
 **Template version `1.0.0` did not compact the etcd cluster inside the bundled highly available database**, so etcd's backend grows with time alone and goes read-only once it reaches its 2 GiB quota — after roughly 110 days — taking PostgreSQL failover with it. Only installs running the HA database are affected (`postgresHA.enabled`, the default here); see [etcd History Compaction](/template-catalog/templates/postgres-highly-available#etcd-history-compaction) for the mechanism and the symptoms. Upgrade to `1.0.1` or later to turn compaction on: that stops further growth but cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade.
 </Warning>
 
+## Upgrading From 1.0.x
+
+Version `1.1.0` moved the admin login out of Helm values. Earlier versions shipped an email and a working password as values, used exactly as written — a published default guarding a login form on the public endpoint, sitting in the Helm release for the life of the install.
+
+| | `1.0.x` | `1.1.0` |
+|---|---|---|
+| Admin login | `admin.email` and `admin.password` values | `admin.secretName` — a dictionary secret you create, holding `email` and `password` |
+| Chart-created admin secret | Held the admin credentials | None; the template creates no admin secret at all |
+| `admin.firstName` / `admin.lastName` / `siteName` | Values | Unchanged |
+| `encryptionKey.secretName` | Prerequisite opaque secret | Unchanged |
+| Database password | A value (`postgresHA.postgres.password` / `postgres.config.password`) | Unchanged — still a value, because it is bundled plumbing nobody logs in with |
+
+<Warning>
+**An upgrade that still carries either removed key is rejected at render, before anything is applied.** Each guard names its replacement, and there is no compatibility fallback — the version bump is the migration path. A real upgrade carrying an old key failed at render, created no Helm revision, and left the running release healthy and untouched:
+
+```text
+metabase: admin.password was REMOVED in 1.1.0. Put it in a `dictionary` secret (key: `password`)
+together with `email`, and set admin.secretName to that secret's name. Create the secret BEFORE
+installing; see Prerequisites in the README.
+```
+
+Leaving `admin.secretName` empty is refused the same way.
+</Warning>
+
+<Note>
+**An existing install's admin password does not change on upgrade.** The account already lives in the app database and first-boot setup never runs again, so the secret's contents only matter to a fresh install. Change the password in the Metabase UI (account settings). If the install is still carrying the published `1.0.x` default (`change-me-metabase-1`), treat that password as compromised and change it now.
+</Note>
+
+To upgrade an existing install:
+
+<Steps>
+  <Step title="Create the admin login secret">
+    Follow [Prerequisites](#prerequisites). Your existing encryption-key secret stays exactly as it is.
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `admin.email` and `admin.password`, and set `admin.secretName` instead. Leave `admin.firstName`, `admin.lastName`, and `siteName` alone.
+  </Step>
+  <Step title="Upgrade">
+    The single Metabase replica restarts; questions, dashboards, and users are in the app database and are untouched.
+  </Step>
+</Steps>
+
 ## Connecting
 
 | What | Value |
 |---|---|
 | UI / API (public) | `https://<canonical>.cpln.app` — `status.canonicalEndpoint` of `{release}-metabase` |
 | Internal (same GVC) | `http://{release}-metabase.{gvc}.cpln.local:3000` |
-| Login | `admin.email` / `admin.password` |
+| Login | The `email` / `password` in your `admin.secretName` secret — `cpln secret reveal my-metabase-admin -o yaml` |
 | App database (internal, HA mode) | `{release}-postgres-ha-proxy.{gvc}.cpln.local:5432`, credentials in the `{release}-postgres-config` secret |
 | App database (internal, single mode) | `{release}-postgres.{gvc}.cpln.local:5432`, credentials in the `{release}-pg-config` secret |
 
@@ -304,7 +404,9 @@ In HA mode, `backup.mode` selects `logical` (scheduled `pg_dump` via a cron work
 ## Important Notes
 
 - **Back up the encryption-key secret** — losing or changing it means re-entering every saved database connection; rotation is only possible offline via Metabase's `rotate-encryption-key` command.
-- **Change `admin.password` and the database password** (`postgresHA.postgres.password` / `postgres.config.password`) before installing. An admin password that fails Metabase's complexity check (letters + digits, 8+ characters) keeps the workload unready by design.
+- **Create both prerequisite secrets before installing** — a missing one leaves the workload waiting on something that does not exist, with zero log lines. See [Prerequisites](#prerequisites) for how to diagnose it.
+- **Change the database password before installing** (`postgresHA.postgres.password` / `postgres.config.password`) — it is bundled plumbing, used exactly as given, and it remains a value by design.
+- **A weak or malformed admin password keeps the workload unready by design** — Metabase's own check requires letters and digits, 8+ characters, and the container refuses to run setup if the email or password contains a double quote or a backslash. A failed bootstrap is fail-closed rather than exposing an open setup page.
 - **Metabase is single-replica in this template** — the default HA PostgreSQL backend removes the database as a failure point.
 - **Upgrades restart the single replica** — expect a few minutes of UI downtime per Helm upgrade; the HA app database keeps running and no data is lost.
 - **Uninstall deletes the app-database volume sets** — all questions, dashboards, and users. Enable backups if the data matters.
