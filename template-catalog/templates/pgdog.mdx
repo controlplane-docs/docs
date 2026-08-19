@@ -1,26 +1,38 @@
 ---
 title: PgDog
-description: Deploy PgDog on Control Plane — a high-performance PostgreSQL connection pooler, load balancer, and sharding proxy written in Rust. Sits transparently in front of any PostgreSQL deployment and provides transaction or session pooling, automatic read/write splitting, and multi-replica load balancing.
-keywords: ['pgdog', 'postgresql proxy', 'connection pooler', 'pgbouncer alternative', 'read write splitting', 'postgres load balancer', 'postgres sharding', 'rust postgres proxy', 'scram authentication']
+description: Deploy PgDog on Control Plane using the Template Catalog — a high-performance PostgreSQL connection pooler, load balancer, and query router written in Rust. Covers the prerequisite credential secrets, transaction and session pooling, automatic read/write splitting, and the admin database.
+keywords: ['pgdog', 'postgresql proxy', 'connection pooler', 'pgbouncer alternative', 'read write splitting', 'postgres load balancer', 'postgres sharding', 'rust postgres proxy', 'scram authentication', 'prerequisite secret', 'connection pooling']
 ---
 
 ## Overview
 
-PgDog is a high-performance PostgreSQL connection pooler, load balancer, and sharding proxy written in Rust. It sits transparently in front of one or more PostgreSQL instances and appears to clients as a standard PostgreSQL server — no application code changes required, only a connection string update.
+PgDog is a high-performance PostgreSQL connection pooler, load balancer, and query router written in Rust. It sits transparently in front of one or more PostgreSQL instances and appears to clients as a standard PostgreSQL server — no application code changes required, only a connection string update.
 
-PgDog parses SQL queries to automatically route writes (`INSERT`, `UPDATE`, `DELETE`, DDL) to a primary backend and distribute `SELECT` queries across replicas. Works with any PostgreSQL-compatible backend including the Control Plane [PostgreSQL](/template-catalog/templates/postgres) and [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) templates, or any external PostgreSQL endpoint.
+PgDog parses SQL queries to automatically route writes (`INSERT`, `UPDATE`, `DELETE`, DDL) to a primary backend and distribute `SELECT` queries across replicas. It works with any PostgreSQL-compatible backend, including the Control Plane [PostgreSQL](/template-catalog/templates/postgres) and [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) templates, or any external PostgreSQL endpoint.
+
+Every credential comes from a secret you create **before** installing. Nothing sensitive passes through Helm values, so no password lands in the release, the rendered manifest, the stored workload spec, or the logs.
+
+<Warning>
+**Upgrading an install created with `1.0.0` is a breaking change.** `users[].name`, `users[].password` and `admin.password` no longer exist, and an upgrade that still sets any of them stops with an error naming its replacement rather than silently falling back to a default password. See [Upgrading From 1.0.0](#upgrading-from-1-0-0).
+</Warning>
 
 ### Architecture
 
-- **PgDog workload** — Stateless proxy that multiplexes client connections into a smaller pool of real backend connections. Scales horizontally; each replica maintains its own connection pool.
-- **pgdog.toml** — Main configuration rendered as a secret and mounted at startup. Defines backend databases, pool settings, timeouts, and load balancing strategy.
-- **users.toml** — Credentials configuration rendered as a separate secret. Defines which users can connect to PgDog and which backend databases they map to.
+- **PgDog workload** — Stateless proxy that multiplexes client connections into a smaller pool of real backend connections, routes writes to a primary, and distributes reads across replicas. Listens on port `6432`.
+- **Config secret** — The static half of `pgdog.toml`: general settings and the `[[databases]]` backends, rendered by the chart and mounted read-only. It holds no credentials.
+- **Startup script secret** — PgDog reads credentials only from files on disk and has no environment-variable interpolation, so a startup script assembles the final `pgdog.toml` and `users.toml` inside the container at boot from your prerequisite secrets, then execs PgDog. That is what keeps the credentials out of the Helm release.
+- **Identity & policy** — Grants the workload `reveal` on exactly the secrets it needs: the two chart-created ones, the admin password secret, and each pooled user's credentials secret.
 
 ### What Gets Created
 
-- **Standard PgDog Workload** — Stateless proxy workload listening on port 6432.
-- **Identity & Policy** — Identity for the workload with access to credential secrets.
-- **Secrets** — Two opaque secrets: one for `pgdog.toml` (database and pooling config) and one for `users.toml` (user credentials).
+- **Standard PgDog Workload** — `RELEASE_NAME-pgdog`, a stateless proxy serving TCP on port `6432`.
+- **Config Secret** — `RELEASE_NAME-pgdog-config`, an opaque secret holding the credential-free base `pgdog.toml`.
+- **Startup Script Secret** — `RELEASE_NAME-pgdog-startup`, an opaque secret holding the script that assembles the config at container start.
+- **Identity & Policy** — `RELEASE_NAME-pgdog-identity` and `RELEASE_NAME-pgdog-policy`, granting `reveal` on the two chart secrets plus every prerequisite secret you referenced, and nothing else.
+
+<Note>
+This template creates no secret that contains a credential. Your pooled-user and admin secrets are yours, which means uninstalling the release never destroys them.
+</Note>
 
 <Note>
 This template does not create a GVC or a PostgreSQL instance. Deploy it into an existing GVC and point it at an existing PostgreSQL backend.
@@ -28,7 +40,59 @@ This template does not create a GVC or a PostgreSQL instance. Deploy it into an 
 
 ## Prerequisites
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+**Every secret you reference must exist before you install.** Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create one credentials secret per pooled user">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly two keys — `username` and `password`. PgDog authenticates incoming clients with this pair *and* opens backend connections with it, so it must be a real PostgreSQL role on the backend:
+
+    ```bash
+    cpln secret create-dictionary --name my-pgdog-user-credentials \
+      --entry username=appuser \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `users[0].credentialsSecretName` to the name you used. Because the username travels inside the secret, you can point this straight at the secret your backend already uses — see [Pooled Users](#pooled-users).
+  </Step>
+  <Step title="Create the admin password secret">
+    An [opaque secret](/guides/create-secret/opaque) with encoding `plain`, whose payload is the password for PgDog's admin database:
+
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name my-pgdog-admin-password --encoding plain -f -
+    ```
+
+    Set `admin.passwordSecretName` to the name you used. Use `printf`, not `echo` — `echo` appends a newline, which cannot be carried in a TOML value. The startup script detects a trailing newline and fails at boot with that message rather than starting a proxy that rejects every admin login.
+  </Step>
+  <Step title="Read a secret back later">
+    `-o yaml` is required. Without it the command prints the secret's metadata table rather than its contents:
+
+    ```bash
+    cpln secret reveal my-pgdog-admin-password -o yaml
+    cpln secret reveal my-pgdog-user-credentials -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** `cpln helm install` still exits 0 and reports success, every resource is created, and the workload then never starts — it sits at zero replicas. Because the container never ran, `cpln logs` returns **zero lines**, which reads as a broken platform rather than a missing prerequisite.
+
+The only diagnostic is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-pgdog --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-pgdog-admin-password no longer exists. Workload updates are paused
+until the secret is added or the reference to the secret removed.
+```
+
+It is **`get-deployments`** — plain `cpln workload get` has no `versions` key at all. Creating the missing secret clears the wedge on its own, but slowly: recovery was measured at **7 minutes 37 seconds** here, inside the 5.5–8.5 minute range seen across the catalog. A forced redeployment shortcuts it to roughly 90 seconds.
+</Warning>
+
+## Installation
+
+To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -52,6 +116,51 @@ This template has no external prerequisites. To install, follow the instructions
     </Card>
 </CardGroup>
 
+The proxy reaches `ready` roughly 25 seconds after install, once the startup script has assembled the config from your secrets and PgDog is listening on port `6432`.
+
+## Upgrading From 1.0.0
+
+Version `1.1.0` moved every credential out of Helm values. `1.0.0` shipped working defaults — a pooled-user password and an admin password published in the public template repository — and PgDog is precisely the thing applications put in their connection strings, so those values were the product rather than internal plumbing.
+
+| | `1.0.0` | `1.1.0` |
+|---|---|---|
+| Pooled-user name | `users[].name` value | `username` key of a dictionary secret you create |
+| Pooled-user password | `users[].password` value | `password` key of that same secret |
+| Which secret | — | `users[].credentialsSecretName`, one per entry |
+| Admin password | `admin.password` value | `admin.passwordSecretName` — an opaque secret you create |
+| Rendered `users.toml` | Chart-rendered secret containing every password | Assembled in-container at boot; no credential in the release |
+| CPU and memory limits | `resources.cpu`, `resources.memory` | `resources.maxCpu`, `resources.maxMemory` |
+
+<Warning>
+**A `helm upgrade` that still carries the old values is rejected before anything is applied.** Seven guard conditions stop the render, each naming its replacement. All of them were exercised against a real `cpln helm upgrade`, which failed client-side and left the running release untouched and healthy — no failed revision was created.
+
+| Value you still set | What the render says |
+|---|---|
+| `users[].password` | `users[0].password was REMOVED in pgdog 1.1.0. Pooled-user credentials are no longer values: create a dictionary secret holding the keys username and password, and set users[0].credentialsSecretName to its name.` |
+| `users[].name` | `users[0].name was REMOVED in pgdog 1.1.0. The username now comes from the username key of the dictionary secret named by users[0].credentialsSecretName, so that it travels with the password it belongs to.` |
+| `admin.password` | `admin.password was REMOVED in pgdog 1.1.0. The admin password is no longer a value: create an opaque secret (encoding: plain) holding it, and set admin.passwordSecretName to its name.` |
+| `resources.cpu` | `resources.cpu was RENAMED to resources.maxCpu in pgdog 1.1.0.` |
+| `resources.memory` | `resources.memory was RENAMED to resources.maxMemory in pgdog 1.1.0.` |
+| `users[].credentialsSecretName` empty | `users[0].credentialsSecretName is required - it names the dictionary secret holding that pooled user's username and password keys. Create that secret BEFORE installing.` |
+| `admin.passwordSecretName` empty | `admin.passwordSecretName is required - it names the opaque secret holding the PgDog admin password. Create that secret BEFORE installing.` |
+
+This is deliberate: a silently ignored `admin.password` would leave you believing you had set a password you had not.
+</Warning>
+
+To upgrade an existing install:
+
+<Steps>
+  <Step title="Create the secrets">
+    Follow [Prerequisites](#prerequisites). Put the credentials your applications **already use** into the pooled-user secret so existing connection strings keep working, and pick a fresh admin password — the old one was a published default.
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `users[].name`, `users[].password` and `admin.password`. Set `users[].credentialsSecretName` and `admin.passwordSecretName` instead, and rename `resources.cpu` and `resources.memory` to `resources.maxCpu` and `resources.maxMemory` if you had overridden them.
+  </Step>
+  <Step title="Upgrade">
+    The upgrade replaces the single stateless replica. Client connections are dropped and reconnect against the new one; there is no data to migrate.
+  </Step>
+</Steps>
+
 ## Configuration
 
 The default `values.yaml` for this template:
@@ -60,10 +169,10 @@ The default `values.yaml` for this template:
 image: ghcr.io/pgdogdev/pgdog:v0.1.45
 
 resources:
-  cpu: 500m
-  memory: 256Mi
   minCpu: 100m
   minMemory: 128Mi
+  maxCpu: 500m
+  maxMemory: 256Mi
 
 replicas: 1
 
@@ -71,12 +180,12 @@ pooling:
   mode: transaction          # options: transaction, session
   defaultPoolSize: 10        # max server connections per pool
   minPoolSize: 1             # minimum idle connections kept open
-  workers: 2                 # async threads; recommend 2× vCPU count
+  workers: 2                 # tokio async threads; recommend 2× vCPU count
 
-timeouts:
-  connect: 5000              # time to establish a backend connection (ms)
-  checkout: 5000             # max time a client waits for a free connection (ms)
-  idle: 60000                # idle server connections closed after this (ms)
+timeouts:                    # milliseconds
+  connect: 5000              # time to establish a backend connection
+  checkout: 5000             # max time a client waits for a free connection
+  idle: 60000                # idle server connections closed after this
   query: 0                   # per-query timeout; 0 = disabled
 
 loadBalancing:
@@ -84,35 +193,40 @@ loadBalancing:
   readWriteSplit: include_primary
 
 databases:
-  - name: mydb
-    host: postgres.example.com
+  - name: my-pgdog-database  # logical name clients connect to; must be a real database on the backend
+    host: my-postgres-workload  # e.g. WORKLOAD_NAME for an in-GVC Postgres, or an external hostname
     port: 5432
     role: primary            # options: primary, replica, auto
 
+# Each entry needs ITS OWN prerequisite `dictionary` secret holding `username`
+# and `password`. THE SECRET MUST EXIST BEFORE YOU INSTALL.
 users:
-  - name: myuser
-    password: mypassword
-    database: mydb
+  - credentialsSecretName: my-pgdog-user-credentials
+    database: my-pgdog-database   # must match a `name` from the databases list above
 
 admin:
   database: admin
   user: admin
-  password: changeme
+  # REQUIRED PREREQUISITE SECRET — an `opaque` secret (encoding: plain) whose
+  # payload is the admin password. Kept SEPARATE from the pooled-user credentials.
+  passwordSecretName: my-pgdog-admin-password
 
 auth:
   type: scram
 
 logging:
   format: text               # options: text, json, json_flattened
-  level: info
+  level: info                # RUST_LOG syntax; e.g. info, debug, pgdog=debug
 
 publicAccess:
   enabled: false
-  # address: pgdog.example.com
+  # address: my-pgdog-domain.example.com  # name of an existing cpln domain resource
 
 internalAccess:
   type: same-gvc             # options: none, same-gvc, same-org, workload-list
   workloads: []
+  # workloads:
+  #   - //gvc/my-gvc/workload/my-app
 ```
 
 ### Backend Databases
@@ -121,18 +235,13 @@ The `databases` list defines the PostgreSQL backends PgDog proxies. Each entry m
 
 ```yaml
 databases:
-  - name: mydb
-    host: my-postgres.my-gvc.cpln.local
+  - name: appdb
+    host: my-postgres-postgres.GVC_NAME.cpln.local
     port: 5432
     role: primary
 
-  - name: mydb
-    host: replica-1.my-patroni-postgres.aws-us-east-1.my-gvc.cpln.local
-    port: 5432
-    role: replica
-
-  - name: mydb
-    host: replica-2.my-patroni-postgres.aws-us-east-1.my-gvc.cpln.local
+  - name: appdb
+    host: replica-1.my-patroni-postgres.aws-us-east-1.GVC_NAME.cpln.local
     port: 5432
     role: replica
 ```
@@ -143,46 +252,61 @@ databases:
 | `replica` | Receives read queries (`SELECT`) distributed by the load balancing strategy |
 | `auto` | PgDog detects the role via `pg_is_in_recovery()` at connection time |
 
-**Using with the PostgreSQL template** — Set `host` to `{release-name}-postgres.{gvc}.cpln.local`.
+**Using with the PostgreSQL template** — Set `host` to `RELEASE_NAME-postgres`. That workload is `stateful`, so its short name resolves inside the GVC; the fully qualified `RELEASE_NAME-postgres.GVC_NAME.cpln.local` works too.
 
-**Using with the PostgreSQL Highly Available template** — Point the `primary` entry at the HA proxy (`{release-name}-postgres-ha-proxy.{gvc}.cpln.local`) and add `replica` entries using the replicaDirect hostnames (`replica-{n}.{release-name}-postgres-ha.{location}.{gvc}.cpln.local`).
+**Using with the PostgreSQL Highly Available template** — Point the `primary` entry at the HA proxy (`RELEASE_NAME-postgres-ha-proxy`) and add `replica` entries using the replicaDirect hostnames (`replica-N.RELEASE_NAME-postgres-ha.LOCATION.GVC_NAME.cpln.local`).
 
-### Users
+### Pooled Users
 
-The `users` list defines which clients can connect to PgDog. Each entry maps to a `[[users]]` block in `users.toml`. The `database` field must match a `name` from the `databases` list.
+Each entry in `users` maps to a `[[users]]` block in `users.toml`. Only the routing target is a value — the username and password both come from the dictionary secret named by `credentialsSecretName`:
 
 ```yaml
 users:
-  - name: myuser
-    password: mypassword
-    database: mydb
+  - credentialsSecretName: my-pgdog-user-credentials
+    database: appdb   # must match a `name` from the databases list
 ```
 
-PgDog uses the `name` and `password` to authenticate incoming clients, then uses the same credentials to connect to the backend PostgreSQL server.
+Because the username lives inside the secret rather than beside it, **a user entry can point at the secret your PostgreSQL install already uses.** PgDog authenticates the client with that pair and then opens its backend connections with the same pair, so it has to be a real PostgreSQL role — which is exactly what the [PostgreSQL](/template-catalog/templates/postgres) template's own `credentialsSecretName` secret holds. Pointing both templates at one secret was tested end to end: PgDog reads only the `username` and `password` keys and ignores the extra `database` key that PostgreSQL stores alongside them.
+
+**To pool a second user**, create a second dictionary secret and add a second entry — one secret per entry:
+
+```bash
+cpln secret create-dictionary --name my-pgdog-reporting-credentials \
+  --entry username=reporting \
+  --entry password="$(openssl rand -hex 24)"
+```
+
+```yaml
+users:
+  - credentialsSecretName: my-pgdog-user-credentials
+    database: appdb
+  - credentialsSecretName: my-pgdog-reporting-credentials
+    database: reporting
+```
+
+The chart adds a policy target for each secret automatically, so nothing else needs changing.
+
+<Note>
+**Two entries may name the same secret**, which is how you route one PostgreSQL role to two backend databases. The duplicate is deduplicated in the policy, so the secret appears as a single `reveal` target. There is deliberately no way to put two users in one secret — a secret holds one `username`/`password` pair.
+</Note>
 
 ### Connection Pooling
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `pooling.mode` | `transaction` | Pool mode: `transaction` or `session` |
-| `pooling.defaultPoolSize` | `10` | Maximum real Postgres connections per pool |
+| `pooling.defaultPoolSize` | `10` | Maximum real PostgreSQL connections per pool |
 | `pooling.minPoolSize` | `1` | Minimum idle connections kept open |
 | `pooling.workers` | `2` | Async threads; recommended value is 2× vCPU count |
 
 | Pool Mode | Description |
 |-----------|-------------|
 | `transaction` | Backend connection held only for the duration of a transaction, then returned to the pool. Best for most web and API workloads. Not compatible with `SET` variables, temporary tables, or advisory locks. |
-| `session` | Backend connection held for the entire client session. Compatible with all Postgres features. Increase `defaultPoolSize` to match expected concurrent client count. |
+| `session` | Backend connection held for the entire client session. Compatible with all PostgreSQL features, and reuses connections less — raise `defaultPoolSize` to match expected concurrent client count. |
 
-### Load Balancing
-
-| Strategy | Description |
-|----------|-------------|
-| `least_active_connections` | Routes reads to the replica with the fewest active connections. Recommended for most workloads. |
-| `round_robin` | Distributes reads evenly across all replicas in rotation. |
-| `random` | Selects a replica at random for each read query. |
-
-`readWriteSplit: include_primary` allows the primary to also serve reads when no replicas are available.
+<Note>
+The chart's validation also accepts a third value, `statement`, which upstream PgDog documents but which has not been verified end to end on this platform. Stay on `transaction` or `session` unless you are prepared to test it yourself.
+</Note>
 
 ### Timeouts
 
@@ -195,40 +319,51 @@ All timeout values are in milliseconds.
 | `timeouts.idle` | `60000` | Idle backend connections closed after this duration |
 | `timeouts.query` | `0` | Per-query timeout; `0` disables it |
 
+### Load Balancing
+
+| Strategy | Description |
+|----------|-------------|
+| `least_active_connections` | Routes reads to the replica with the fewest active connections. Recommended for most workloads. |
+| `round_robin` | Distributes reads evenly across all replicas in rotation. |
+| `random` | Selects a replica at random for each read query. |
+
+`readWriteSplit: include_primary` allows the primary to also serve reads.
+
 ### Admin Database
 
-PgDog exposes an internal admin database for stats and introspection.
+PgDog exposes an internal admin database for stats and introspection. The names are ordinary values; the password is a prerequisite secret:
 
 ```yaml
 admin:
   database: admin
   user: admin
-  password: changeme
+  passwordSecretName: my-pgdog-admin-password
 ```
 
-<Warning>
-Always set `admin.password` explicitly. If omitted, PgDog generates a random password at each startup, making the admin database inaccessible across restarts.
-</Warning>
+Keeping it in its own secret is the point of the split: an application granted `reveal` on a pooled user's credentials cannot also reach the admin database. Both directions were verified — the pooled user's password is refused on the `admin` database, and the admin password is refused on a pooled database.
 
-Connect to the admin database with any PostgreSQL client:
+Connect from a workload inside the GVC with any PostgreSQL client:
 
 ```bash
-PGPASSWORD=<admin.password> psql \
-  -h {release-name}-pgdog.{gvc}.cpln.local \
-  -p 6432 \
-  -U admin \
-  -d admin
+PGPASSWORD="$(cpln secret reveal my-pgdog-admin-password -o yaml | awk '/^  payload:/ {print $2}')" \
+  psql -h RELEASE_NAME-pgdog.GVC_NAME.cpln.local -p 6432 -U admin -d admin
 ```
+
+`SHOW CLIENTS`, `SHOW POOLS` and the other PgDog admin commands are available on that session.
 
 ### Access
 
-- `internalAccess.type` — Controls which workloads can reach PgDog internally: `same-gvc`, `same-org`, `workload-list`, or `none`.
-- `publicAccess.enabled` — When `true`, Control Plane provisions a public TCP load balancer. The assigned hostname (e.g. `pgdog-name-hash.cpln.app:6432`) is visible in the Control Plane console or via `cpln workload get <name> -o yaml`.
-- `publicAccess.address` — Optional custom domain to attach when public access is enabled.
+- `internalAccess.type` — Controls which workloads can reach PgDog internally: `same-gvc` (default), `same-org`, `workload-list`, or `none`. With `workload-list`, name each caller in `internalAccess.workloads` as `//gvc/GVC_NAME/workload/WORKLOAD_NAME`.
+- `publicAccess.enabled` — When `true`, Control Plane provisions a public TCP load balancer on port `6432` and assigns a canonical `*.cpln.app` hostname automatically. Read it from `status.canonicalEndpoint` in `cpln workload get RELEASE_NAME-pgdog --gvc GVC_NAME -o yaml`.
+- `publicAccess.address` — Optional custom domain to attach when public access is enabled. It names an existing Control Plane domain resource.
+
+<Note>
+**Give the public endpoint time to come up.** Flipping `publicAccess.enabled` on took **255 seconds** to accept its first external connection in testing — longer than the 30–150 seconds most templates take. Budget anywhere from 30 seconds to about 5 minutes, and do not read a refused connection in the first few minutes as a broken setting.
+</Note>
 
 ### Scaling
 
-PgDog is stateless and scales horizontally by increasing `replicas`. Each replica maintains its own connection pool — scale `pooling.defaultPoolSize` down proportionally when adding replicas to avoid overloading the backend with too many open connections.
+PgDog is stateless and scales horizontally by raising `replicas`. Each replica keeps its own connection pool, so reduce `pooling.defaultPoolSize` proportionally when adding replicas — otherwise the backend sees `replicas × defaultPoolSize` connections. The template ships and was tested at a single replica.
 
 ### Logging
 
@@ -244,25 +379,35 @@ Applications connect to PgDog exactly as they would connect to PostgreSQL — Pg
 
 | Setting | Value |
 |---------|-------|
-| Host | `{release-name}-pgdog.{gvc}.cpln.local` |
+| Host (in-GVC) | `RELEASE_NAME-pgdog.GVC_NAME.cpln.local` |
+| Host (public) | The workload's `status.canonicalEndpoint`, when `publicAccess.enabled` is `true` |
 | Port | `6432` |
 | Database | A `name` from your `databases` list |
-| Username | A `name` from your `users` list |
-| Password | The matching `password` from your `users` list |
+| Username | The `username` key of that user's credentials secret |
+| Password | The `password` key of that user's credentials secret |
+| Admin database | `admin.database` on the same host and port, as `admin.user`, with the payload of `admin.passwordSecretName` |
 
-Example connection string:
+<Warning>
+**The in-GVC host must be fully qualified.** The bare short name `RELEASE_NAME-pgdog` does **not** resolve — that shortcut only applies to `stateful` workloads, and PgDog runs as a `standard` one. A client using the short name fails with `could not translate host name "RELEASE_NAME-pgdog" to address: Name or service not known`, from anywhere in the GVC. Always use `RELEASE_NAME-pgdog.GVC_NAME.cpln.local`.
+</Warning>
 
-```
-postgresql://myuser:mypassword@{release-name}-pgdog.{gvc}.cpln.local:6432/mydb
+Example connection string, with the username and password taken from your credentials secret:
+
+```text
+postgresql://USERNAME:PASSWORD@RELEASE_NAME-pgdog.GVC_NAME.cpln.local:6432/DATABASE
 ```
 
 ## Important Notes
 
-- **PgDog does not manage PostgreSQL** — it is a proxy only. Deploy a PostgreSQL backend separately before pointing PgDog at it.
-- **Port 6432, not 5432** — PgDog listens on port 6432. Update application connection strings accordingly.
-- **Transaction mode and session features** — If your application uses `SET` variables, prepared statements, temporary tables, or advisory locks, use `pooling.mode: session` instead of `transaction`.
-- **Admin password** — Always set `admin.password` explicitly. Omitting it causes PgDog to generate a random password at each restart, making the admin database unreachable across restarts.
-- **Scaling and pool sizing** — Each PgDog replica maintains its own pool. When scaling `replicas`, reduce `pooling.defaultPoolSize` proportionally to avoid opening too many total connections to the backend.
+- **Create the prerequisite secrets before installing.** A missing one wedges the deployment with no log output at all — [Prerequisites](#prerequisites) gives the one command that diagnoses it.
+- **PgDog does not manage PostgreSQL** — it is a proxy only. Deploy a backend before pointing PgDog at it.
+- **Port 6432, not 5432** — update application connection strings accordingly.
+- **The in-GVC hostname must be fully qualified** — `RELEASE_NAME-pgdog.GVC_NAME.cpln.local`. The short name does not resolve for this workload.
+- **Transaction mode drops session state** — if your application relies on `SET` variables, temporary tables, or advisory locks, use `pooling.mode: session`.
+- **Each replica keeps its own pool** — when raising `replicas`, lower `pooling.defaultPoolSize` proportionally, or the backend sees `replicas × defaultPoolSize` connections.
+- **Rotating a credential needs a restart** — the config files are assembled once at container start, so run `cpln workload force-redeployment RELEASE_NAME-pgdog --gvc GVC_NAME` after changing a secret's contents.
+- **Enabling public access can take several minutes to take effect** — measured at 255 seconds. Re-test before concluding the knob is broken.
+- **Uninstall leaves your secrets in place** — they are yours, created outside the release. Only the two chart-created config secrets are removed.
 
 ## External References
 
@@ -270,13 +415,19 @@ postgresql://myuser:mypassword@{release-name}-pgdog.{gvc}.cpln.local:6432/mydb
   <Card title="PgDog Documentation" href="https://docs.pgdog.dev/" icon="dog">
     Official PgDog configuration and architecture reference
   </Card>
+  <Card title="users.toml Reference" href="https://docs.pgdog.dev/configuration/users.toml/users/" icon="users">
+    How PgDog maps pooled users onto backend databases
+  </Card>
   <Card title="PgDog GitHub" href="https://github.com/pgdogdev/pgdog" icon="github">
     Source code and issue tracker
+  </Card>
+  <Card title="PgDog Template" href="https://github.com/controlplane-com/templates/tree/main/pgdog" icon="github">
+    View the source files, default values, and chart definition
   </Card>
   <Card title="PostgreSQL Template" href="/template-catalog/templates/postgres" icon="database">
     Single-instance PostgreSQL template for use with PgDog
   </Card>
   <Card title="PostgreSQL Highly Available Template" href="/template-catalog/templates/postgres-highly-available" icon="database">
-    HA PostgreSQL with Patroni — primary + replicas for PgDog read/write splitting
+    HA PostgreSQL with Patroni — primary and replicas for PgDog read/write splitting
   </Card>
 </CardGroup>
