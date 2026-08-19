@@ -1,6 +1,6 @@
 ---
 title: Listmonk
-description: Deploy listmonk on Control Plane using the Template Catalog. Self-hosted newsletter and mailing list manager — a Mailchimp alternative — with automatic schema install and admin bootstrap on first boot, persistent media uploads, public subscription pages, and a single-instance or highly available PostgreSQL backing store.
+description: Deploy listmonk on Control Plane using the Template Catalog. Self-hosted newsletter and mailing list manager — a Mailchimp alternative — with a prerequisite Super Admin secret, automatic schema install and admin bootstrap on first boot, persistent media uploads, public subscription pages, and a single-instance or highly available PostgreSQL backing store.
 keywords: ['listmonk', 'newsletter', 'mailing list manager', 'email marketing', 'mailchimp alternative', 'sendy alternative', 'mautic alternative', 'campaign management', 'subscriber lists', 'opt-in signup form', 'transactional email', 'smtp relay', 'self-hosted email']
 ---
 
@@ -19,8 +19,8 @@ Listmonk is a high-performance, self-hosted newsletter and mailing list manager 
 - **Stateful Listmonk Workload** — The listmonk server on port `9000`, one replica, with configurable CPU and memory.
 - **Database Workloads** — Single mode: one stateful PostgreSQL workload. HA mode: a stateful Patroni PostgreSQL workload, a stateful etcd workload, and a standard HAProxy leader-routing workload.
 - **Volume Sets** — A persistent uploads volume set mounted at `/listmonk/uploads` for media uploaded through the admin UI, plus the database subchart's data volumes (10 GiB by default; per replica in HA mode).
-- **Secret** — A dictionary secret holding the admin bootstrap username and password. The database credentials secret is created by the backing store subchart.
-- **Identity & Policy** — An identity bound to the listmonk workload, with a policy granting `reveal` on exactly two secrets: the admin bootstrap secret and the active backing store's credentials secret.
+- **Secrets** — The database credentials secret created by the backing store subchart. The Super Admin credentials are **not** created by this template: you create that dictionary secret yourself before installing and reference it by name (see [Prerequisites](#prerequisites)).
+- **Identity & Policy** — An identity bound to the listmonk workload, with a policy granting `reveal` on exactly two secrets: your admin credentials secret and the active backing store's credentials secret.
 - **Cron Backup Workload** *(optional)* — Created in the backing PostgreSQL store when database backups are enabled.
 
 <Note>
@@ -29,12 +29,66 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ## Prerequisites
 
-None for a default install — it deploys with a working PostgreSQL backend, an installed schema, a bootstrapped admin account, and an auto-assigned HTTPS endpoint. Two things are configured after install rather than at install time:
+**One dictionary secret must exist before you install.** The Super Admin guards a login form on the public endpoint, so its credentials are a prerequisite secret rather than template values — a value would sit in plaintext in the Helm release for the life of the install. The template creates no admin secret of its own.
+
+<Steps>
+  <Step title="Create the admin credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `username` and `password`. Secrets are org-level, so no GVC flag is involved:
+
+    ```bash
+    cpln secret create-dictionary --name my-listmonk-admin \
+      --entry username=admin \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `admin.secretName` to the name you used.
+  </Step>
+  <Step title="Read the password back later">
+    `-o yaml` is required; without it the command prints the secret's metadata table rather than its contents:
+
+    ```bash
+    cpln secret reveal my-listmonk-admin -o yaml
+    ```
+  </Step>
+</Steps>
+
+| Key | What it is |
+|---|---|
+| `username` | The Super Admin's login name. **Minimum 3 characters** — an upstream requirement. |
+| `password` | Its password. **Minimum 8 characters.** The login form it guards is on the public endpoint. |
+
+<Warning>
+**A username or password below the minimum length is caught at startup, by design.** listmonk's own `--install` step fails on every attempt when either value is too short, and that step runs inside the container's database-wait loop — so before this check existed the only symptom was `waiting for database...` repeating forever, which sends you to debug a database that is perfectly healthy. The container now checks both lengths first and exits immediately with a message that names the secret to fix — measured firing **33 seconds** after install, with zero `waiting for database` lines:
+
+```text
+listmonk: the my-listmonk-admin secret must hold a username of at least 3 characters and a password
+of at least 8 (upstream install requirement)
+```
+</Warning>
+
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** The install still exits 0 and reports success, every resource is created, and the workload then never starts. Because the container never ran, `cpln logs` returns **zero lines**, which reads as a broken platform rather than a missing prerequisite.
+
+The only diagnostic is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-listmonk --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-listmonk-admin no longer exists. Workload updates are paused until
+the secret is added or the reference to the secret removed.
+```
+
+It is **`get-deployments`** — plain `cpln workload get` has no `versions` key at all. Creating the missing secret clears the wedge on its own, but slowly: recovery measured **9 minutes 31 seconds** here, within the 5.5 to 10.5 minute range seen across the catalog, so poll rather than giving up. `cpln workload force-redeployment RELEASE_NAME-listmonk --gvc GVC_NAME` shortcuts it to roughly 90 seconds.
+</Warning>
+
+Two more things are configured after install rather than at install time:
 
 - **SMTP** — required before any mail is delivered. Configured in listmonk's own admin UI (see [Post-Install Setup](#post-install-setup)).
 - **Database backups** *(optional)* — need a bucket and provider access set up beforehand (see [Backing Up](#backing-up)).
 
-Install the template using your preferred method:
+Once the admin secret exists, install the template using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -87,9 +141,13 @@ resources: # single Go binary — light footprint
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
 
+# REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL. A `dictionary`
+# secret holding exactly two keys, `username` (min 3 chars) and `password`
+# (min 8 chars); the login form it guards sits on the public endpoint. The
+# Super Admin is created on FIRST install only — editing the secret later does
+# NOT update the account.
 admin:
-  username: admin                    # min 3 chars
-  password: change-me-listmonk-admin # min 8 chars — change before installing
+  secretName: my-listmonk-admin # name of your pre-created dictionary secret
 
 timezone: Etc/UTC # container TZ — governs campaign scheduling times
 
@@ -152,19 +210,19 @@ postgresHA: # durable HA: 3-replica Patroni store with an HAProxy leader endpoin
 
 ```yaml
 admin:
-  username: admin                    # min 3 chars
-  password: change-me-listmonk-admin # min 8 chars — change before installing
+  secretName: my-listmonk-admin # your pre-created dictionary secret (see Prerequisites)
 ```
 
-These become the Super Admin account created during the first boot's schema install, and are stored in the template-managed `{release}-listmonk-admin` dictionary secret. The chart rejects a username shorter than 3 characters or a password shorter than 8 at render time, before anything is deployed.
+- `admin.secretName` — Name of the dictionary secret you created in [Prerequisites](#prerequisites), holding the `username` and `password` of the Super Admin. The credentials never pass through values, and the template creates no secret of its own — it references yours and grants the workload `reveal` on exactly that one secret.
+- The account is created during the first boot's schema install, from the secret's contents. Because the values are no longer visible when the chart renders, the container enforces upstream's minimum lengths at startup instead — see the length warning in [Prerequisites](#prerequisites).
 
 <Warning>
-The Super Admin is created on the **first install only**. Afterwards the account lives in the database, and changing `admin.username` / `admin.password` in values does not update it. Set a strong password before you install; manage users afterwards in **Admin → Settings → Users**.
+The Super Admin is created on the **first install only**. Afterwards the account lives in the database, and editing the secret does not update it. Manage users afterwards in **Admin → Settings → Users**.
 </Warning>
 
 ### Access
 
-- `publicAccess.enabled` — Serve listmonk on the auto-assigned `*.cpln.app` HTTPS canonical endpoint (default). This is what makes the subscriber-facing pages — subscription forms, unsubscribe links, and tracking pixels — reachable from the internet. The admin UI and admin API on the same endpoint remain authentication-gated. Set to `false` for an internal-only instance: external requests are then refused at the edge, and in-GVC callers still reach it per `internalAccess`.
+- `publicAccess.enabled` — Serve listmonk on the auto-assigned `*.cpln.app` HTTPS canonical endpoint. It is **deliberately on by default** and load-bearing: the subscriber-facing pages — subscription forms, unsubscribe links, and tracking pixels — are served to your subscribers on the open internet, so a private instance cannot do the job. The admin UI and admin API on the same endpoint remain authentication-gated, behind a credential you created rather than a published default. Set to `false` for an internal-only instance: external requests are then refused at the edge, and in-GVC callers still reach it per `internalAccess`.
 - `internalAccess.type` — Controls which workloads can reach listmonk over the internal network:
 
 | Type | Description |
@@ -175,7 +233,7 @@ The Super Admin is created on the **first install only**. Afterwards the account
 | `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
 
 <Note>
-Firewall changes take up to a couple of minutes to propagate after a `helm upgrade` reports success.
+Firewall changes take roughly 30 seconds to a few minutes to propagate after an upgrade reports success — re-test rather than trusting the first response.
 </Note>
 
 ### Backing Store
@@ -188,6 +246,47 @@ The database holds everything except uploaded media: lists, subscribers, campaig
 **Template version `1.0.0` did not compact the etcd cluster inside the bundled highly available database**, so etcd's backend grows with time alone and goes read-only once it reaches its 2 GiB quota — after roughly 110 days — taking PostgreSQL failover with it. Only installs running the HA database are affected (`postgresHA.enabled`, which is off by default here); see [etcd History Compaction](/template-catalog/templates/postgres-highly-available#etcd-history-compaction) for the mechanism and the symptoms. Upgrade to `1.0.1` or later to turn compaction on: that stops further growth but cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade.
 </Warning>
 
+## Upgrading From 1.0.x
+
+Version `1.1.0` moved the Super Admin login out of Helm values. Earlier versions shipped a username and a working password as values, used exactly as written — a published default guarding a login form on the public endpoint, sitting in the Helm release for the life of the install.
+
+| | `1.0.x` | `1.1.0` |
+|---|---|---|
+| Super Admin login | `admin.username` and `admin.password` values | `admin.secretName` — a dictionary secret you create, holding `username` and `password` |
+| Chart-created admin secret | Held the admin credentials | None; the template creates no admin secret at all |
+| Minimum-length check | At render, from the values | At container startup, from the secret — with a message naming the secret |
+| Database password | A value (`postgres.config.password` / `postgresHA.postgres.password`) | Unchanged — still a value, because it is bundled plumbing nobody logs in with |
+
+<Warning>
+**An upgrade that still carries either removed key is rejected at render, before anything is applied.** Each guard names its replacement, and there is no compatibility fallback — the version bump is the migration path. A real upgrade carrying an old key failed at render, created no Helm revision, and left the running release healthy and untouched:
+
+```text
+listmonk: admin.password was REMOVED in 1.1.0. Put it in a `dictionary` secret (key: `password`)
+together with `username`, and set admin.secretName to that secret's name. Create the secret BEFORE
+installing; see Prerequisites in the README.
+```
+
+Leaving `admin.secretName` empty is refused the same way.
+</Warning>
+
+<Note>
+**An existing install's Super Admin password does not change on upgrade.** The account was written to the database on the first install and `LISTMONK_ADMIN_*` is never read again, so the secret's contents only matter to a fresh install. Change the password in **Admin → Settings → Users**. If the install is still carrying the published `1.0.x` default (`change-me-listmonk-admin`), treat that password as compromised and change it now.
+</Note>
+
+To upgrade an existing install:
+
+<Steps>
+  <Step title="Create the admin credentials secret">
+    Follow [Prerequisites](#prerequisites). Putting your current credentials in it keeps your values file honest, but it does not re-seed the account.
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `admin.username` and `admin.password`, and set `admin.secretName` instead.
+  </Step>
+  <Step title="Upgrade">
+    The single replica stops before the new one starts, so expect a brief gap. Lists, subscribers, campaigns, and uploaded media are on the database and the uploads volume set, and are untouched.
+  </Step>
+</Steps>
+
 ## Connecting
 
 | What | Value |
@@ -198,11 +297,11 @@ The database holds everything except uploaded media: lists, subscribers, campaig
 | Health check | `https://<canonical>.cpln.app/health` — public and unauthenticated (`/api/health` requires a session) |
 | HTTP API | `https://<canonical>.cpln.app/api/...` — authenticated; lists, subscribers, campaigns, transactional mail |
 | Internal (same GVC) | `http://{release}-listmonk.{gvc}.cpln.local:9000` |
-| Admin credentials | The `admin.username` / `admin.password` values, stored in the `{release}-listmonk-admin` secret |
+| Admin credentials | The `username` / `password` in your `admin.secretName` secret — `cpln secret reveal my-listmonk-admin -o yaml` |
 | Database (single mode) | `{release}-postgres.{gvc}.cpln.local:5432` |
 | Database (HA mode) | `{release}-postgres-ha-proxy.{gvc}.cpln.local:5432` (HAProxy leader endpoint) |
 
-Once the workload reports ready, open `https://<canonical>.cpln.app/admin` and sign in with the bootstrap credentials — the schema is already installed and the Super Admin already exists, so there is no setup wizard and no manual install step.
+A default install reaches ready in about a minute (**62 seconds** measured). Once the workload reports ready, open `https://<canonical>.cpln.app/admin` and sign in with the credentials from your admin secret — the schema is already installed and the Super Admin already exists, so there is no setup wizard and no manual install step.
 
 ## Post-Install Setup
 
@@ -275,7 +374,9 @@ In HA mode, `postgresHA.backup.mode` selects `logical` (scheduled `pg_dump`) or 
 ## Important Notes
 
 - **Single instance by design — there is no `replicas` knob.** Listmonk runs its campaign workers in-process, so two instances against one database would send every campaign twice. The workload is pinned to one replica and rolls out without surge: the old replica stops before the new one starts, which means an upgrade or restart causes a brief gap in availability instead of overlapping senders. Durability comes from PostgreSQL and the uploads volume set.
-- **Change `admin.password` and the database password before installing.** Both are applied on the first boot only; editing them afterwards does not change the existing account or database.
+- **Create the admin secret before installing** — a missing prerequisite secret leaves the workload waiting on something that does not exist, with zero log lines. See [Prerequisites](#prerequisites) for how to diagnose it.
+- **Mind the minimum credential lengths** — a username under 3 characters or a password under 8 makes upstream's install step fail; the container catches this at startup and names the secret instead of looping on a misleading database message.
+- **Change the database password before installing** (`postgres.config.password` / `postgresHA.postgres.password`) — it is bundled plumbing, used exactly as given, and it remains a value by design. Both the admin account and the database are seeded on first boot only.
 - **No mail is delivered until SMTP is configured** in **Admin → Settings → SMTP**. Before that, starting a campaign is not an error — it runs and finishes with zero messages sent.
 - **Keep `publicAccess` enabled for subscriber-facing pages to work.** Subscription forms, unsubscribe links, and tracking pixels must be reachable from the internet; the admin UI and API stay authentication-gated either way.
 - **Use `/health` for external health checks**, not `/api/health` — the latter requires an authenticated session.
