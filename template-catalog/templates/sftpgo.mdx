@@ -1,31 +1,91 @@
 ---
 title: SFTPGo
-description: Deploy SFTPGo on Control Plane using the Template Catalog. An SFTP server backed by S3, GCS, or S3-compatible object storage, with a scale-to-zero mode that suspends the server when idle.
-keywords: ['sftp server', 'sftp gateway', 'sftp to s3', 'secure file transfer', 'ftp alternative', 'managed file transfer', 's3 sftp', 'gcs sftp', 'minio sftp', 'scale to zero', 'object storage sftp', 'sftpgo template']
+description: Deploy SFTPGo on Control Plane using the Template Catalog. An SFTP server backed by S3, GCS, or S3-compatible object storage, with a scale-to-zero mode that suspends the server when idle. Covers the prerequisite admin credentials secret and the web admin reached over a port-forward.
+keywords: ['sftp server', 'sftp gateway', 'sftp to s3', 'secure file transfer', 'ftp alternative', 'managed file transfer', 's3 sftp', 'gcs sftp', 'minio sftp', 'scale to zero', 'object storage sftp', 'sftpgo template', 'prerequisite secret', 'port forward', 'ssh public key auth']
 ---
 
 ## Overview
 
 SFTPGo is an SFTP server backed by object storage. Clients speak standard SFTP; files land in your bucket, with per-user folder isolation and declarative user management. This template offers a choice between an always-on server and a **scale-to-zero mode** that suspends the server when idle behind a tiny always-on proxy.
 
+The SFTPGo administrator login — which guards the REST API and the web admin — comes from a secret you create **before** installing, so it never passes through Helm values.
+
+<Warning>
+**Upgrading an install created with `1.0.0` is a breaking change.** `admin.username` and `admin.password` no longer exist, and an upgrade that still sets either one stops with an error naming its replacement. Your existing admin login is unaffected — the secret only seeds a fresh install. See [Upgrading From 1.0.0](#upgrading-from-1-0-0).
+</Warning>
+
 ### Architecture
 
 - **SFTPGo** — A single-replica stateful workload serving SFTP on port `2022`. An embedded bolt database and the SSH host keys persist on a volume set so host keys stay stable across restarts and wakes.
 - **Scale-to-zero proxy** *(scale_to_zero mode only)* — An always-on activator workload that accepts client connections while SFTPGo sleeps, wakes it via the platform API, splices traffic through, and suspends it again after an idle window.
+- **Admin login from a secret** — The administrator username and password come from a dictionary secret you create. SFTPGo consumes them only when the embedded database has no admin yet, i.e. on first boot.
 
 ### What Gets Created
 
 - **Stateful SFTPGo Workload** — Serves SFTP on port `2022`; holds the embedded database and SSH host keys.
 - **Standard Scale-to-Zero Proxy Workload** *(scale_to_zero mode only)* — Always-on TCP activator that fronts SFTPGo and manages suspend/wake.
 - **Volume Set** — 10 GiB persistent storage for the embedded database and SSH host keys.
-- **Secrets** — A dictionary secret with the admin bootstrap credentials and an opaque secret with the declared-users file.
-- **Identity & Policy** — An identity bound to the workloads with `reveal` access to the secrets, keyless cloud storage access for AWS and GCP backends, and a least-privilege policy letting the proxy's identity suspend and wake exactly the SFTPGo workload — nothing else.
+- **Secret** — An opaque secret holding the declared-users file. The admin credentials are **not** created here — they live in the secret you create.
+- **Identity & Policy** — An identity bound to the workloads with `reveal` access to the secrets it mounts, including your admin credentials secret; keyless cloud storage access for AWS and GCP backends; and a least-privilege policy letting the proxy's identity suspend and wake exactly the SFTPGo workload — nothing else.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
 </Note>
 
 ## Prerequisites
+
+### Admin Credentials
+
+**This secret must exist before you install.** It is the SFTPGo administrator login for the REST API and web admin. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the admin credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `username` and `password`:
+
+    ```bash
+    cpln secret create-dictionary --name my-sftpgo-admin \
+      --entry username=admin \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `admin.secretName` to the name you used.
+
+    | Key | What it is |
+    |---|---|
+    | `username` | The administrator login. |
+    | `password` | Its password. Used only when the embedded database has no admin yet, i.e. on first boot. |
+  </Step>
+  <Step title="Read it back later">
+    `-o yaml` is required; without it the command prints the secret's metadata table rather than its contents:
+
+    ```bash
+    cpln secret reveal my-sftpgo-admin -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Note>
+**The admin secret seeds the first boot only.** SFTPGo applies it when the embedded database has no administrator yet, so on an existing install editing the secret does not change the admin password — rotate that through the REST API or web admin instead. This is also why an upgrade from `1.0.0` leaves your current login working.
+</Note>
+
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** `cpln helm install` still exits 0 and reports success, the resources are created, and the workload then never starts. Because the container never ran, `cpln logs` returns **zero lines**, which reads as a broken platform rather than a missing prerequisite.
+
+The only diagnostic is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-sftpgo --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-sftpgo-admin no longer exists. Workload updates are
+paused until the secret is added or the reference to the secret removed.
+```
+
+It is **`get-deployments`** — plain `cpln workload get` has no `versions` key at all. Creating the missing secret clears the wedge on its own, but slowly: recovery across the catalog has been measured between **5.5 and 10.5 minutes**, so poll rather than time-boxing it. A forced redeployment shortcuts it to roughly 90 seconds.
+</Warning>
+
+### Object Storage
 
 SFTPGo requires an existing bucket in one of the supported backends and the access setup for it. Complete the steps for your chosen backend before installing.
 
@@ -92,13 +152,13 @@ SFTPGo requires an existing bucket in one of the supported backends and the acce
         Set `storage.minio.endpoint` to the S3 API address including port. For the `minio` marketplace template deployed in the same GVC, this is `http://WORKLOAD_NAME:9000`.
       </Step>
       <Step title="Set credentials">
-        Set `storage.minio.accessKey` and `storage.minio.accessSecret` to credentials with access to the bucket. For the MinIO template, these are its `admin.username` and `admin.password`.
+        Set `storage.minio.accessKey` and `storage.minio.accessSecret` to credentials with access to the bucket. For the [minio](/template-catalog/templates/minio) template, these are the `username` and `password` in the dictionary secret named by its `admin.credentialsSecretName`.
       </Step>
     </Steps>
   </Tab>
 </Tabs>
 
-Once your backend is ready, install the template using your preferred method:
+Once the admin secret exists and your backend is ready, install the template using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -121,6 +181,54 @@ Once your backend is ready, install the template using your preferred method:
     Declare templates in your Pulumi programs
     </Card>
 </CardGroup>
+
+## Upgrading From 1.0.0
+
+Version `1.1.0` moved the SFTPGo administrator login out of Helm values. `1.0.0` shipped a working username and password as values, used exactly as written, guarding the REST API and web admin.
+
+| | `1.0.0` | `1.1.0` |
+|---|---|---|
+| Admin login | `admin.username` and `admin.password` values | `admin.secretName` — a dictionary secret you create with `username` and `password` |
+| Chart-created secret | Held the admin credentials | Only the declared-users file |
+| SFTP user credentials | `users[]` values | Unchanged — see [What Stays a Value](#what-stays-a-value) |
+
+<Warning>
+**A `helm upgrade` that still carries either removed key is rejected before anything is applied.** A real `cpln helm upgrade` carrying the old keys failed at render, created no Helm revision, and left the running release healthy and untouched:
+
+```text
+sftpgo: admin.password was removed in 1.1.0. Put it in the prerequisite dictionary secret named by
+admin.secretName (key: password) — the secret only seeds a fresh data provider.
+```
+
+Leaving `admin.secretName` empty is refused the same way.
+</Warning>
+
+To upgrade an existing install:
+
+<Steps>
+  <Step title="Create the admin credentials secret">
+    Follow [Prerequisites](#prerequisites), putting the username and password you already use into it. Your existing login keeps working either way — the secret only seeds an install whose database has no admin yet.
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `admin.username` and `admin.password`, and set `admin.secretName` instead. Leave `users[]` and the storage block exactly as they are.
+  </Step>
+  <Step title="Upgrade">
+    In `scale_to_zero` mode an upgrade while suspended wakes the server; it re-suspends after the next connection comes and goes.
+  </Step>
+</Steps>
+
+## What Stays a Value
+
+Two things are deliberately **not** prerequisite secrets, and this is a limitation rather than a preference:
+
+- `users[].password` — the passwords of the declared SFTP users
+- `storage.minio.accessKey` / `storage.minio.accessSecret` — static keys for an S3-compatible backend
+
+SFTPGo reads both from its LOADDATA file, a literal JSON document it does no variable substitution in, so a `cpln://secret/...` reference placed there would be stored verbatim as the credential rather than resolved. The usual workaround — a startup script that substitutes the value — is unavailable too: the shipped image is `distroless-slim` and has **no shell at all** (`/bin/sh`, `sh`, `/bin/bash`, `/bin/busybox`, and even `/bin/ls` are all absent, verified in the running container). Whatever string sits in those fields is the credential.
+
+<Tip>
+**Prefer public-key users.** Setting `users[].publicKeys` and omitting `password` needs no secret at all, is better practice for SFTP regardless, and sidesteps the limitation entirely. The AWS and GCP storage backends are keyless already — only the `minio` backend takes static keys.
+</Tip>
 
 ## Choosing a Mode
 
@@ -147,20 +255,19 @@ scaleToZero: # only used when mode is scale_to_zero
   proxy:
     image: ghcr.io/controlplane-com/scale-to-zero-proxy:0.1.0
     resources: # all SFTP traffic flows through the proxy
-      cpu: 500m
-      memory: 256Mi
       minCpu: 100m
       minMemory: 128Mi
+      maxCpu: 500m
+      maxMemory: 256Mi
 
 resources: # SFTPGo container; CPU governs transfer throughput and wake speed
-  cpu: 1000m
-  memory: 512Mi
   minCpu: 250m
   minMemory: 256Mi
+  maxCpu: 1000m
+  maxMemory: 512Mi
 
-admin: # SFTPGo administrator (REST API / optional web admin), created on first boot
-  username: admin
-  password: change-me-sftpgo-admin # change before installing
+admin: # SFTPGo administrator (REST API / web admin), seeded on first boot only
+  secretName: my-sftpgo-admin # name of your pre-created dictionary secret (see Prerequisites)
 
 storage:
   type: aws # options: aws, gcp, minio
@@ -214,10 +321,10 @@ webAdmin:
 ### SFTPGo
 
 - `image` — The SFTPGo container image.
-- `resources` — CPU and memory for the SFTPGo container. CPU governs transfer throughput and wake speed.
-- `admin.username` / `admin.password` — The SFTPGo administrator, created on first boot for the REST API and optional web admin. **Change the password before installing.**
+- `resources` — CPU and memory for the SFTPGo container. CPU governs transfer throughput and wake speed; `minCpu` / `minMemory` are the reservation and `maxCpu` / `maxMemory` the limit.
+- `admin.secretName` — Name of your pre-created dictionary secret holding `username` and `password`. It seeds the administrator on first boot only. See [Prerequisites](#prerequisites).
 - `volumeset.capacity` — Volume size in GiB (minimum 10) for the embedded database and SSH host keys.
-- `webAdmin.enabled` — Declare SFTPGo's web admin / REST API on port `8080`. Reachable via the canonical endpoint in `always_warm` mode when `publicAccess` is enabled.
+- `webAdmin.enabled` — Declare SFTPGo's web admin / REST API on port `8080`. Reach it with a port-forward — **not** the canonical endpoint; see [Reaching the Web Admin](#reaching-the-web-admin).
 
 ### Storage Backend
 
@@ -235,10 +342,10 @@ Set `storage.type` to `aws`, `gcp`, or `minio`, and configure that block. AWS an
 
 ### Users
 
-Declared users are re-applied on every start; each is isolated to the bucket folder `{keyPrefix}{username}/` unless overridden per user. Provide a `password`, one or more `publicKeys`, or both.
+Declared users are re-applied on every start; each is isolated to the bucket folder `{keyPrefix}{username}/` unless overridden per user. Provide a `password`, one or more `publicKeys`, or both — **prefer `publicKeys`**, which needs no credential in your values at all (see [What Stays a Value](#what-stays-a-value)).
 
 - `users[].username` — Login name.
-- `users[].password` — Password. Omit when `publicKeys` is set.
+- `users[].password` — Password. Used exactly as written and cannot be moved into a secret ([why](#what-stays-a-value)) — omit it when `publicKeys` is set.
 - `users[].publicKeys` — SSH public keys, e.g. `["ssh-ed25519 AAAA... user@laptop"]`.
 - `users[].keyPrefix` — Optional per-user bucket folder override.
 
@@ -261,8 +368,18 @@ Declared users are re-applied on every start; each is isolated to the bucket fol
 | Public SFTP endpoint | `tcp://...cpln.app:2022` — `status.endpoint` of `{release}-sftpgo-proxy` (scale_to_zero) or `{release}-sftpgo` (always_warm) |
 | Connect | `sftp -P 2022 {username}@{endpoint-host}` |
 | In-GVC (internal) | `{release}-sftpgo-proxy:2022` (scale_to_zero) or `{release}-sftpgo:2022` (always_warm) |
-| Web admin (if enabled) | Canonical `*.cpln.app` endpoint of `{release}-sftpgo` (always_warm + publicAccess) |
-| Credentials | `users[]` entries; admin per `admin.*` |
+| Web admin (if enabled) | A port-forward to `{release}-sftpgo` on port `8080` — **not** the canonical endpoint. See [Reaching the Web Admin](#reaching-the-web-admin). |
+| Credentials | SFTP logins from `users[]`; the administrator from your `admin.secretName` secret |
+
+### Reaching the Web Admin
+
+**The web admin is not served on the canonical endpoint.** Public access uses `loadBalancer.direct` on port `2022`, which makes the workload's canonical endpoint a raw TCP address of the form `tcp://....cpln.app:2022`; an HTTPS request to that host reaches nothing at all. Reach the web admin and REST API through a port-forward instead, which tunnels through Control Plane infrastructure and needs no public exposure:
+
+```bash
+cpln port-forward RELEASE_NAME-sftpgo 8080:8080 --gvc GVC_NAME
+```
+
+Then open `http://localhost:8080` and sign in with the credentials from your `admin.secretName` secret. This requires `webAdmin.enabled: true`, which declares port `8080` on the container.
 
 ## Cold Starts and Client Configuration
 
@@ -278,7 +395,11 @@ For third-party clients you cannot configure, use `always_warm`.
 
 ## Important Notes
 
-- **Change the default admin and user passwords before installing.** The admin bootstrap only applies on first boot; changing `admin.*` later requires the REST API.
+- **Create the admin credentials secret before installing.** A missing prerequisite secret wedges the deployment with no log output at all; [Prerequisites](#prerequisites) gives the one command that diagnoses it.
+- **Change the default `users[]` passwords before installing** — they are used exactly as written, and cannot be moved into a secret. Prefer `publicKeys`; see [What Stays a Value](#what-stays-a-value).
+- **The admin secret seeds first boot only.** Rotate an existing administrator's password through the REST API or web admin, not by editing the secret.
+- **The web admin is reached by port-forward, not the canonical endpoint** — see [Reaching the Web Admin](#reaching-the-web-admin).
+- **Access changes take time to propagate** — after toggling `publicAccess` or `internalAccess`, re-test over roughly 30 seconds to 5 minutes before concluding the knob is broken.
 - **Declared users are authoritative** — edits made to them via the admin API/UI are overwritten on the next restart or wake. Users *created* via the API are untouched.
 - **Upgrading while suspended wakes the server**; it re-suspends after the next connection comes and goes.
 - **First install: the public endpoint's DNS takes a few minutes** to propagate after the load balancer is created.

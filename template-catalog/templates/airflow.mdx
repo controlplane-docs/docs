@@ -1,39 +1,117 @@
 ---
 title: Airflow
-description: Deploy Apache Airflow on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and Celery workers with Redis broker and PostgreSQL metadata store.
-keywords: ['apache airflow', 'dag scheduler', 'etl orchestrator', 'workflow engine', 'prefect alternative', 'dagster alternative', 'airflow webserver', 'celeryexecutor', 'keda autoscaling', 'fernet key', 'task queue']
+description: Deploy Apache Airflow on Control Plane using the Template Catalog. Covers the prerequisite auth secret, the Fernet key that cannot be rotated, the closed-by-default web UI reached over a port-forward, Celery workers with KEDA autoscaling, git-sync DAG delivery, and upgrading from template version 1.4.x.
+keywords: ['apache airflow', 'dag scheduler', 'etl orchestrator', 'workflow engine', 'prefect alternative', 'dagster alternative', 'airflow webserver', 'celeryexecutor', 'keda autoscaling', 'fernet key', 'task queue', 'git-sync', 'port forward']
 ---
 
 ## Overview
 
-Apache Airflow is an open-source platform for programmatically authoring, scheduling, and monitoring workflows. This template deploys a full Airflow stack using CeleryExecutor, with Redis as the task queue broker and PostgreSQL as the metadata database. Celery workers can optionally be autoscaled using KEDA based on queue depth.
+Apache Airflow is an open-source platform for programmatically authoring, scheduling, and monitoring workflows. This template deploys a full Airflow 3.x stack using the CeleryExecutor, with Redis as the task broker, PostgreSQL as the metadata database, KEDA autoscaling for the Celery workers, and optional git-sync DAG delivery.
+
+The admin login and both signing keys are not template values. They come from a dictionary secret you create before installing, so they never pass through Helm and never land in the release. The web UI ships **closed to the internet**, because it can trigger arbitrary code and decrypt every credential stored in an Airflow Connection.
+
+<Warning>
+**Template version 1.5.0 is a breaking change.** `airflow.auth.jwtSecret`, `airflow.auth.fernetKey`, `airflow.admin.password` and `gitSync.auth.token` were removed, `airflow.auth.jwtExpirationDelta` and `airflow.auth.jwtRefreshThreshold` were removed because Airflow 3.x ignores them, and the public web UI became closed by default. An install that still sets any removed key fails at render. If you are running 1.4.x or earlier, read [Upgrading From Earlier Versions](#upgrading-from-earlier-versions) first — the Fernet key change is a data migration, not an upgrade.
+</Warning>
 
 ### What Gets Created
 
-- **GVC** — A dedicated GVC across the specified locations.
-- **Airflow Webserver** — The Airflow web UI for managing DAGs, monitoring task execution, and viewing logs.
-- **Celery Workers** — Distributed task execution workers that process DAG tasks.
-- **Redis** — A Redis broker for the Celery task queue, with persistent storage.
-- **PostgreSQL** — A PostgreSQL database for Airflow metadata storage.
-- **Volume Sets** — Persistent storage for Airflow DAG data, PostgreSQL, and Redis.
-- **KEDA ScaledObject** (optional) — Automatically scales Celery workers up or down based on Redis queue length.
-- **Secret** — A dictionary secret containing the PostgreSQL credentials, JWT signing key, Fernet encryption key, and admin password, shared across all Airflow workloads.
-- **Identity & Policy** — An identity bound to the workloads with `reveal` access to the Airflow configuration secret.
+- **GVC** — This template **creates its own GVC**, named by `gvc.name`, because KEDA is a GVC-level setting.
+- **Airflow Webserver** — (`RELEASE_NAME-airflow-webserver`): a stateful, single-replica workload running the API server, scheduler, dag-processor and triggerer in one container, serving the UI and REST API on port `8080`.
+- **Celery Workers** — (`RELEASE_NAME-airflow-celery-worker`): a stateful workload executing DAG tasks, scaled by KEDA on the Redis queue length.
+- **Redis** — (`RELEASE_NAME-airflow-redis`): the Celery broker, on its own persistent volume set.
+- **PostgreSQL** — (`RELEASE_NAME-airflow-postgres`): the Airflow metadata database, on its own persistent volume set.
+- **Airflow Volume Set** — (`RELEASE_NAME-airflow-vs`): a shared-filesystem volume mounted as the Airflow home by the webserver and every worker, so they all see the same DAGs and logs.
+- **Config Secret** — (`RELEASE_NAME-airflow-config`): a dictionary secret holding the metadata database username and password. It carries no key material.
+- **Identity & Policy** — An identity bound to the workloads and a policy granting it `reveal` on exactly the secrets they mount: the database config secret, your auth secret, and your git token secret when git-sync uses one.
+- **git-sync Sidecar** *(optional)* — Polls a Git repository and syncs DAGs onto the shared volume.
 
-## Pre-Deployment Checklist
+<Warning>
+**This template creates a GVC, so point `gvc.name` at a new name.** Helm adopts a GVC that already exists, and `helm uninstall` then deletes it along with every unrelated workload in it. Never point it at a GVC that already holds other workloads.
+</Warning>
 
-Before deploying, generate and set the following required values in `values.yaml`:
+## Upgrading From Earlier Versions
 
-| Value | How to generate |
-|-------|----------------|
-| `airflow.auth.jwtSecret` | `openssl rand -base64 48` |
-| `airflow.auth.fernetKey` | `python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'` |
-| `airflow.admin.password` | Choose a strong password |
-| `postgres.config.password` | Choose a strong password |
+Template version 1.4.x and earlier carried the JWT signing secret, the Fernet key, the admin password and the git token as plain Helm values, and shipped a working `CHANGE_ME` default for the first three. All four were removed with no compatibility fallback; a values file that still sets one fails at render with a message naming its replacement.
+
+| 1.4.x and earlier | 1.5.0 |
+|---|---|
+| `airflow.auth.jwtSecret` | `jwtSecret` key in the prerequisite auth secret |
+| `airflow.auth.fernetKey` | `fernetKey` key in the same secret |
+| `airflow.admin.password` | `adminPassword` key in the same secret |
+| `gitSync.auth.token` | `gitSync.auth.secretName` — an opaque secret you create |
+| `airflow.auth.jwtExpirationDelta` | `airflow.auth.jwtExpirationTime` (seconds) |
+| `airflow.auth.jwtRefreshThreshold` | removed — Airflow 3.x has no equivalent |
+| `firewallConfig.inboundAllowCIDR` defaulting to `0.0.0.0/0` | `firewallConfig.inboundAllowCIDR: []`, closed |
+
+<Warning>
+**The Fernet key cannot be rotated, so this is a migration rather than an upgrade.** That key encrypts every Airflow Connection and Variable in the metadata database — the database passwords, cloud keys and API tokens your DAGs use. Changing it does not re-encrypt anything: it makes all of them permanently unreadable.
+
+If your 1.4.x install ran on the shipped `CHANGE_ME` default, every one of those credentials is encrypted under a value published in a public repository. There is no in-place fix. Export what you need, install 1.5.0 with a freshly generated key, re-enter the Connections and Variables by hand, and **rotate every credential they held at its source** — treat them as compromised.
+</Warning>
+
+- **The metadata database password cannot be changed in place either.** `POSTGRES_PASSWORD` is read only when the data directory is initialized, so pointing `postgres.config.password` at a new value on an existing volume leaves the database on the old one and Airflow can no longer connect. Set it at first install.
+- **The web UI now ships closed.** If you were relying on the old `0.0.0.0/0` default, put your own CIDRs in `firewallConfig.inboundAllowCIDR`.
+- **Two JWT knobs were removed because they did nothing.** `jwtExpirationDelta` and `jwtRefreshThreshold` rendered `AIRFLOW__API_AUTH__JWT_EXPIRATION_DELTA` and `AIRFLOW__API_AUTH__JWT_REFRESH_THRESHOLD`, neither of which is an option in Airflow 3.x — tokens were issued with Airflow's own 86400-second lifetime regardless of what those values said. The live knob is `airflow.auth.jwtExpirationTime`; there is no refresh-threshold equivalent.
+
+## Prerequisites
+
+**One secret must exist before you install.** Its values never pass through Helm, so they never land in the release. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the auth secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `jwtSecret`, `fernetKey` and `adminPassword`:
+
+    ```bash
+    cpln secret create-dictionary --name my-airflow-auth \
+      --entry jwtSecret="$(openssl rand -base64 48)" \
+      --entry fernetKey="$(openssl rand -base64 32 | tr '+/' '-_')" \
+      --entry adminPassword="$(openssl rand -base64 18)"
+    ```
+
+    Set `airflow.auth.secretName` to the name you used.
+
+    | Key | What it is |
+    |---|---|
+    | `jwtSecret` | Signs Airflow API access tokens — anyone holding it can mint one. |
+    | `fernetKey` | Encrypts the Connections and Variables your DAGs use: database passwords, cloud keys, API tokens. Must be 32 random bytes in URL-safe base64, which is what the command above produces. **It cannot be rotated** — see the warning below. |
+    | `adminPassword` | The web UI and API password for the `airflow.admin.username` login. Record it; it is not displayed anywhere. |
+  </Step>
+  <Step title="Read the secret back later">
+    The `-o yaml` is required — plain `cpln secret reveal` prints only a summary table, not the values:
+
+    ```bash
+    cpln secret reveal my-airflow-auth -o yaml
+    ```
+  </Step>
+  <Step title="Optional: create a git token secret for a private DAG repository">
+    Only needed when `gitSync.enabled` is `true` and the repository is private. Create an [opaque secret](/guides/create-secret/opaque) with encoding `plain` whose payload is a personal access token, and set `gitSync.auth.secretName` to its name — the sidecar receives the payload as its Git password.
+
+    ```bash
+    printf '%s' "MY_GIT_TOKEN" | cpln secret create-opaque --name my-airflow-git-token --encoding plain -f -
+    ```
+
+    Leave `gitSync.auth.secretName` empty for a public repository or when git-sync is off. Empty turns the credential off entirely, including its policy grant, and setting it while git-sync is disabled is rejected at render.
+  </Step>
+</Steps>
+
+<Warning>
+**Generate the Fernet key once and keep it for the life of the install.** It encrypts every Connection and Variable Airflow stores. A different key does not fail loudly — it simply makes all of them unreadable, and there is no way back short of re-entering each one by hand.
+</Warning>
+
+<Warning>
+**Create the auth secret before installing.** A name pointing at a secret that does not exist installs "successfully" and then wedges: every resource reports created, the workload never becomes ready, and **`cpln logs` returns zero lines** because no container ever starts. The only diagnostic is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-airflow-webserver --gvc GVC_NAME -o yaml
+```
+
+It names the missing secret: `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` The command is `get-deployments` — plain `cpln workload get` has no `versions` key at all. Creating the secret recovers the workload on its own, but slowly: **poll for 5.5 to 10.5 minutes rather than time-boxing it** (10 minutes 17 seconds measured here). `cpln workload force-redeployment RELEASE_NAME-airflow-webserver --gvc GVC_NAME` cuts that to roughly 90 seconds.
+</Warning>
 
 ## Installation
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -62,13 +140,18 @@ This template has no external prerequisites. To install, follow the instructions
 The default `values.yaml` for this template:
 
 ```yaml
-# Global Virtual Cloud (GVC) settings
+# ─── Global Virtual Cloud (GVC) ───────────────────────────────────────────────
+# This template CREATES its GVC (KEDA is a GVC-level setting). Point it at a NEW
+# name — never at a GVC that already holds other workloads, because uninstalling
+# the release deletes the GVC it adopted along with everything in it.
 gvc:
   name: airflow
   locations:
     - name: aws-eu-central-1
 
-# Postgres database configuration
+# ─── Postgres (Airflow metadata database) ─────────────────────────────────────
+# Bundled plumbing: it serves Airflow only, is unreachable from outside the GVC,
+# and nobody ever types this password into a client — so it stays a value.
 postgres:
   image: postgres:18
   resources:
@@ -78,12 +161,12 @@ postgres:
     maxMemory: 1024Mi
   config:
     username: username
-    password: password
+    password: change-me-airflow-db # set at FIRST install; see Upgrading in the README
     database: airflow
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 
-# Redis cache configuration
+# ─── Redis (Celery broker) ────────────────────────────────────────────────────
 redis:
   image: redis:7.4
   resources:
@@ -92,7 +175,7 @@ redis:
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 
-# Apache Airflow configuration
+# ─── Apache Airflow ───────────────────────────────────────────────────────────
 airflow:
   webserver:
     image: apache/airflow:3.0.3
@@ -104,202 +187,222 @@ airflow:
     resources:
       cpu: 256m
       memory: 512Mi
-  webPort: 8080 # Port for accessing the Airflow web interface
+  webPort: 8080 # port serving the Airflow UI and REST API
 
   auth:
-    jwtSecret: CHANGE_ME # REQUIRED: generate with "openssl rand -base64 48"
-    jwtExpirationDelta: 3600 # JWT token expiration time in seconds
-    jwtRefreshThreshold: 300 # Threshold before token expires to allow refresh (seconds)
-    fernetKey: CHANGE_ME # REQUIRED: generate with "python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'"
+    # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL. If it does not
+    # exist at install time the deployment WEDGES silently and `cpln logs` returns
+    # nothing at all. A `dictionary` secret holding exactly three keys:
+    #   jwtSecret     — signs API access tokens
+    #   fernetKey     — encrypts the Connections and Variables your DAGs use
+    #                   (database passwords, cloud keys, API tokens). It CANNOT be
+    #                   rotated without making every stored one unreadable.
+    #   adminPassword — the Airflow UI login for `admin.username` below
+    # See Prerequisites in the README for the exact command.
+    secretName: my-airflow-auth
+    jwtExpirationTime: 86400 # API token lifetime in seconds (Airflow's own default)
 
   admin:
-    username: admin
-    password: CHANGE_ME # REQUIRED: change before deploying to production
+    username: admin # its password is `adminPassword` in the secret above
 
   scheduler:
-    dagDirListInterval: 10 # How often to check DAG folder (seconds)
-    minFileProcessInterval: 10 # Minimum interval to process DAG files (seconds)
+    dagDirListInterval: 10 # how often to rescan the DAG folder (seconds)
+    minFileProcessInterval: 10 # minimum interval between processing a DAG file (seconds)
 
   celery:
-    workerConcurrency: 1 # Number of tasks each worker can run concurrently
+    workerConcurrency: 1 # tasks each worker runs concurrently, when KEDA is enabled
 
 volumeset:
   airflow:
-    capacity: 10 # initial capacity in GiB (minimum is 10)
+    capacity: 10 # shared Airflow home (DAGs + logs), GiB (minimum is 10)
 
-# Firewall configuration
+# ─── Access ───────────────────────────────────────────────────────────────────
+# The Airflow UI can trigger arbitrary code and decrypt every stored Connection,
+# so it ships CLOSED to the internet. Reach it with `cpln port-forward`, or add
+# your own CIDRs here (e.g. - 203.0.113.0/24) to expose it. A firewall change
+# takes up to a couple of minutes to propagate.
 firewallConfig:
-  inboundAllowCIDR:
-    - 0.0.0.0/0 # Restrict to specific IPs in production (e.g. - 203.0.113.0/24)
+  inboundAllowCIDR: []
 
-# Git-sync configuration for DAG delivery
+# ─── DAG delivery (git-sync) ──────────────────────────────────────────────────
 gitSync:
   enabled: false
-  repo: "" # Git repository URL (e.g. https://github.com/org/dags)
-  branch: main # Branch to sync
-  period: 60s # How often to sync
-  subPath: "" # Optional subfolder within the repo containing DAGs
+  repo: "" # git repository URL (e.g. https://github.com/YOUR_ORG/dags)
+  branch: main
+  period: 60s # how often to sync
+  subPath: "" # optional subfolder within the repo containing DAGs
   auth:
-    token: "" # Personal access token for private repos (leave empty for public repos)
+    # OPTIONAL PREREQUISITE SECRET, private repos only. An `opaque` secret
+    # (encoding `plain`) whose payload is a personal access token, e.g.
+    # `my-airflow-git-token`. Empty = public repo, no credentials sent.
+    secretName: ""
 
-# KEDA (Kubernetes Event-driven Autoscaling) configuration
-# NOT SUPPORTED in gcp/us-central1
+# ─── KEDA autoscaling (Celery workers) ────────────────────────────────────────
 keda:
-  enabled: true # Enable or disable KEDA autoscaling
-  minScale: 1 # Minimum number of Celery workers
-  maxScale: 3 # Maximum number of Celery workers
-  scaleToZeroDelay: 300 # Time before scaling to zero (seconds)
-  listLength: 3 # Queue length threshold to trigger scaling
-  cooldownPeriod: 1 # Cooldown between scaling events (seconds)
-  initialCooldownPeriod: 1 # Cooldown after startup before scaling (seconds)
-  pollingInterval: 4 # Interval at which KEDA queries metrics (seconds)
+  enabled: true
+  minScale: 1 # minimum number of Celery workers
+  maxScale: 3 # maximum number of Celery workers
+  scaleToZeroDelay: 300 # idle time before scaling to zero (seconds)
+  listLength: 3 # Redis queue length that triggers a scale-up
+  cooldownPeriod: 1 # cooldown between scaling events (seconds)
+  initialCooldownPeriod: 1 # cooldown after startup before scaling begins (seconds)
+  pollingInterval: 4 # how often KEDA queries Redis (seconds)
 ```
 
 ### GVC
 
-- `gvc.name` — The name of the GVC. Must be unique per deployment.
-- `gvc.locations` — List of cloud locations to deploy to (e.g., `aws-eu-central-1`).
+- `gvc.name` — The name of the GVC this template creates. It must not name an existing GVC.
+- `gvc.locations` — The locations the GVC spans.
 
-### PostgreSQL
+### PostgreSQL Metadata Database
 
-- `postgres.image` — PostgreSQL Docker image.
-- `postgres.resources` — CPU and memory bounds for the PostgreSQL workload (`minCpu`, `maxCpu`, `minMemory`, `maxMemory`).
-- `postgres.config.username` / `postgres.config.password` — Database credentials. **Change the default password before deploying to production.**
-- `postgres.config.database` — Name of the Airflow metadata database (default: `airflow`).
-- `postgres.volumeset.capacity` — Persistent storage for PostgreSQL data (GiB, minimum 10).
+- `postgres.image` — The PostgreSQL image.
+- `postgres.resources` — Reservation and limit for the database container (`minCpu` / `maxCpu` / `minMemory` / `maxMemory`).
+- `postgres.config.username` / `postgres.config.password` / `postgres.config.database` — The metadata database credentials. This is bundled plumbing: it serves Airflow only, is unreachable from outside the GVC, and no human ever types it, so it stays a value. **Set the password at first install** — the shipped `change-me-airflow-db` is a published placeholder, and PostgreSQL only reads it when the data directory is initialized.
+- `postgres.volumeset.capacity` — Database volume size in GiB (minimum 10).
 
-### Redis
+### Redis Broker
 
-- `redis.image` — Redis Docker image.
-- `redis.resources` — CPU and memory allocated to Redis.
-- `redis.volumeset.capacity` — Persistent storage for Redis data (GiB, minimum 10).
+- `redis.image` — The Redis image.
+- `redis.resources` — CPU and memory limit for the broker (this block exposes only a limit).
+- `redis.volumeset.capacity` — Broker volume size in GiB (minimum 10).
 
-### Airflow Webserver and Workers
+### Airflow
 
-- `airflow.webserver.image` / `airflow.celeryWorker.image` — Docker images for the webserver and Celery workers.
-- `airflow.webserver.resources` / `airflow.celeryWorker.resources` — CPU and memory per component.
-- `airflow.webPort` — Port the Airflow web UI listens on (default `8080`).
+- `airflow.webserver.image` / `airflow.celeryWorker.image` — Images for the webserver and the Celery workers.
+- `airflow.webserver.resources` / `airflow.celeryWorker.resources` — CPU and memory limits for each tier.
+- `airflow.webPort` — The port serving the UI and the REST API.
+- `airflow.auth.secretName` — Name of the prerequisite dictionary secret holding `jwtSecret`, `fernetKey` and `adminPassword`. It must exist before you install.
+- `airflow.auth.jwtExpirationTime` — API access-token lifetime in seconds, applied as `AIRFLOW__API_AUTH__JWT_EXPIRATION_TIME`. The shipped `86400` is Airflow's own default.
+- `airflow.admin.username` — The admin login paired with the `adminPassword` key of your auth secret.
+- `airflow.scheduler.dagDirListInterval` — How often the DAG folder is rescanned, in seconds.
+- `airflow.scheduler.minFileProcessInterval` — Minimum interval between processing the same DAG file, in seconds.
+- `airflow.celery.workerConcurrency` — Tasks each Celery worker runs concurrently.
 
-### Authentication
-
-Airflow 3.x requires three security credentials, all of which **must be changed before deploying to production**:
-
-- `airflow.auth.jwtSecret` — Secret key used to sign JWT tokens for API authentication. Generate a secure value with:
-  ```bash
-  openssl rand -base64 48
-  ```
-- `airflow.auth.fernetKey` — Key used to encrypt stored connections and variables. Generate with:
-  ```bash
-  python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
-  ```
-- `airflow.auth.jwtExpirationDelta` — Token lifetime in seconds (default `3600`).
-- `airflow.auth.jwtRefreshThreshold` — Seconds before expiry at which a token refresh is allowed (default `300`).
-
-### Admin Account
-
-- `airflow.admin.username` — Username for the initial Airflow admin account (default: `admin`).
-- `airflow.admin.password` — Password for the initial admin account. **Change before deploying to production.**
-
-The admin user is created on first startup using Airflow's `SimpleAuthManager`. Credentials are written to a password file on the shared volume and re-applied on every container restart, so the password always reflects the current value in `values.yaml`.
+The admin account is provisioned by Airflow's `SimpleAuthManager`: the container writes a password file from the secret on every start, so the login always matches the current secret contents.
 
 <Note>
-`SimpleAuthManager` is the default auth manager in Airflow 3.x and is suitable for development and internal deployments. For production deployments requiring SSO or LDAP, consider integrating an external auth provider via OAuth/OIDC.
+`SimpleAuthManager` is Airflow 3.x's default auth manager and has no SSO or LDAP support. Front the UI with an OAuth/OIDC auth manager if you need one.
 </Note>
-
-### Scheduler
-
-- `airflow.scheduler.dagDirListInterval` — How often the scheduler scans the DAG folder for new or modified files (seconds).
-- `airflow.scheduler.minFileProcessInterval` — Minimum interval between processing the same DAG file (seconds).
-
-### Celery
-
-- `airflow.celery.workerConcurrency` — Number of tasks a single Celery worker can execute concurrently.
 
 ### Storage
 
-- `volumeset.airflow.capacity` — Persistent storage for the Airflow home directory shared across workloads (GiB, minimum 10).
+- `volumeset.airflow.capacity` — Size in GiB of the shared Airflow home holding DAGs and logs (minimum 10).
 
-PostgreSQL and Redis storage are configured under their respective sections (`postgres.volumeset.capacity` and `redis.volumeset.capacity`).
+The database and broker volumes are configured separately under `postgres.volumeset.capacity` and `redis.volumeset.capacity`.
 
 <Note>
-The Airflow volume uses a shared (NFS-style) filesystem, allowing both the webserver and Celery workers to read DAGs and write logs to the same volume.
+The Airflow home uses a shared (NFS-style) filesystem so the webserver and every Celery worker read the same DAGs and write to the same log directory.
 </Note>
 
-### Firewall
+### Access
 
-- `firewallConfig.inboundAllowCIDR` — List of CIDR ranges allowed to reach the Airflow webserver. Defaults to `0.0.0.0/0` (public). **Restrict to specific IP ranges in production.**
+- `firewallConfig.inboundAllowCIDR` — CIDR ranges allowed to reach the webserver from the internet. The shipped `[]` means closed: the canonical endpoint returns `403` and the UI is reachable only over a port-forward. Add your own ranges (for example `203.0.113.0/24`) to expose it.
 
-### Git-Sync
+<Warning>
+**The Airflow UI is effectively remote code execution.** It triggers DAGs and can decrypt every stored Connection, and its only authentication is a single `SimpleAuthManager` password. That is why the closed default exists — prefer `cpln port-forward` over `0.0.0.0/0`.
+</Warning>
 
-Git-sync runs as a sidecar container on the webserver and Celery worker workloads, continuously pulling DAGs from a Git repository into the shared Airflow volume. This is the recommended approach for managing DAGs in production.
+<Note>
+A firewall change takes roughly **30 seconds to 5 minutes** to propagate (measured 20–85 seconds here). During the transition the endpoint can return `503` before it settles on `200` or `403`, so re-poll rather than trusting the first response.
+</Note>
+
+### DAG Delivery With git-sync
+
+git-sync runs as a sidecar on the webserver and worker workloads, pulling a Git repository onto the shared Airflow volume and pointing `AIRFLOW__CORE__DAGS_FOLDER` at the synced checkout on both tiers.
 
 | Property | Description |
-|----------|-------------|
-| `gitSync.enabled` | Enable or disable the git-sync sidecar |
-| `gitSync.repo` | Git repository URL (e.g. `https://github.com/org/dags`) |
-| `gitSync.branch` | Branch to sync (default: `main`) |
-| `gitSync.period` | Sync interval (default: `60s`) |
-| `gitSync.subPath` | Optional subfolder within the repo containing DAG files |
-| `gitSync.auth.token` | Personal access token for private repositories (leave empty for public repos) |
+|---|---|
+| `gitSync.enabled` | Enable the git-sync sidecar. Required together with `gitSync.repo` and `gitSync.branch`. |
+| `gitSync.repo` | Git repository URL. Required when git-sync is enabled. |
+| `gitSync.branch` | Branch to sync. Required when git-sync is enabled. |
+| `gitSync.period` | How often to sync. |
+| `gitSync.subPath` | Subfolder within the repository containing the DAGs. It is appended to the DAGs folder on both tiers. |
+| `gitSync.auth.secretName` | Opaque secret holding a personal access token, for a private repository. Empty means no credential is sent; setting it while git-sync is off is rejected at render. |
 
-When git-sync is disabled, DAGs can be placed manually in the `/opt/airflow/dags` directory on the Airflow volume.
+With git-sync off, put DAG files directly in `/opt/airflow/dags` on the shared volume — the dag-processor picks up a new file within seconds at the shipped `dagDirListInterval: 10`.
 
 ### KEDA Autoscaling
 
-KEDA scales Celery workers automatically based on the Redis queue length.
-
-<Note>
-KEDA is not supported in `gcp/us-central1`.
-</Note>
+KEDA scales the Celery workers on the Redis queue length. Scaling from one to three workers under a burst, and back down again, is proven on this template.
 
 | Property | Description |
-|----------|-------------|
-| `keda.enabled` | Enable or disable KEDA autoscaling |
-| `keda.minScale` | Minimum number of Celery workers |
-| `keda.maxScale` | Maximum number of Celery workers |
-| `keda.scaleToZeroDelay` | Seconds of inactivity before scaling to zero |
-| `keda.listLength` | Redis queue length that triggers a scale-up |
-| `keda.cooldownPeriod` | Seconds to wait between scaling events |
-| `keda.initialCooldownPeriod` | Seconds after startup before autoscaling activates |
-| `keda.pollingInterval` | Interval at which KEDA queries Redis for metrics (seconds) |
+|---|---|
+| `keda.enabled` | Enable KEDA autoscaling of the Celery workers. |
+| `keda.minScale` | Minimum number of workers. |
+| `keda.maxScale` | Maximum number of workers. |
+| `keda.scaleToZeroDelay` | Idle time in seconds before scaling to zero. |
+| `keda.listLength` | Redis queue length that triggers a scale-up. |
+| `keda.cooldownPeriod` | Seconds between scaling events. |
+| `keda.initialCooldownPeriod` | Seconds after startup before scaling begins. |
+| `keda.pollingInterval` | How often KEDA queries Redis, in seconds. |
 
-### Connecting to Airflow
+## Wide Fan Outs Can Silently Lose Tasks
 
-Once deployed, the Airflow web UI is available at the workload's canonical endpoint:
+A DAG that dispatches many tasks at the same instant loses roughly a third of them, and **nothing surfaces in the UI as an error** — the tasks are simply marked failed, with no hostname, no start time and an empty log. A measured 24-task burst finished 7 failed and 9 succeeded, with the failures never starting at all.
 
-```text
-https://<gvc-name>-airflow-webserver.<gvc-name>.cpln.app
-```
+The cause is upstream, not anything this template configures: the Celery executor's Redis transport is imported lazily and concurrently by several task-sending threads, and one of them observes a half-initialized module — `module 'redis' has no attribute 'client'` from `kombu/transport/redis.py`. The scheduler then marks those queued tasks failed.
 
-Log in with the `airflow.admin.username` and `airflow.admin.password` set in `values.yaml`.
+Until it is fixed upstream, **stagger task submission** rather than fanning out wide simultaneously, and count completed task instances rather than trusting the UI to flag a problem. A single task, and tasks arriving at a normal rate, are unaffected.
 
-<Note>
-This template creates a GVC with a default name defined in the values file. If you plan to deploy multiple instances, you **must assign a unique GVC name** for each deployment.
-</Note>
+## Connecting to Airflow
+
+| What | Where | Credentials |
+|---|---|---|
+| UI and REST API, no public access | `cpln port-forward RELEASE_NAME-airflow-webserver 8080:8080 --gvc GVC_NAME`, then `http://localhost:8080` | admin login |
+| UI and REST API, public | `status.canonicalEndpoint` of `RELEASE_NAME-airflow-webserver` — `cpln workload get RELEASE_NAME-airflow-webserver --gvc GVC_NAME -o yaml`. Returns `403` until you add a CIDR. | admin login |
+| Metadata database (in-GVC) | `RELEASE_NAME-airflow-postgres.GVC_NAME.cpln.local:5432` | `postgres.config.*` |
+| Redis broker (in-GVC) | `RELEASE_NAME-airflow-redis.GVC_NAME.cpln.local:6379` | none |
+| Admin login | `airflow.admin.username` plus the `adminPassword` key of your auth secret | — |
+
+The port-forward tunnel goes through Control Plane infrastructure and is independent of the firewall, so it works while the canonical endpoint is returning `403`.
+
+### First Run Sequence
+
+<Steps>
+  <Step title="Install with the UI closed">
+    Keep the shipped `firewallConfig.inboundAllowCIDR: []`.
+  </Step>
+  <Step title="Tunnel to the UI and sign in">
+    ```bash
+    cpln port-forward RELEASE_NAME-airflow-webserver 8080:8080 --gvc GVC_NAME
+    ```
+
+    Open `http://localhost:8080` and log in with `airflow.admin.username` and the `adminPassword` from your auth secret.
+  </Step>
+  <Step title="Expose it only if you need to">
+    Run a Helm upgrade with your own CIDR ranges in `firewallConfig.inboundAllowCIDR`, then allow up to a few minutes for the firewall to propagate before testing.
+  </Step>
+</Steps>
 
 ### API Access
 
-Airflow 3.x uses JWT-based authentication for API access. To obtain a token:
+Airflow 3.x issues JWT access tokens signed with your `jwtSecret`. Request one with the same admin credentials:
 
 ```bash
-curl -X POST https://<your-airflow-url>/auth/token \
+curl -X POST http://localhost:8080/auth/token \
   -H "Content-Type: application/json" \
-  -d '{"username": "admin", "password": "your-password"}'
+  -d '{"username": "admin", "password": "ADMIN_PASSWORD"}'
 ```
 
-Use the returned token for subsequent API requests:
+Then pass it on the v2 API:
 
 ```bash
-curl https://<your-airflow-url>/api/v2/dags \
-  -H "Authorization: Bearer <token>"
+curl http://localhost:8080/api/v2/dags \
+  -H "Authorization: Bearer ACCESS_TOKEN"
 ```
 
-## Production Considerations
+## Important Notes
 
-- **Change all `CHANGE_ME` values** before deploying — `jwtSecret`, `fernetKey`, `admin.password`, and `postgres.config.password` are all required.
-- **Restrict `firewallConfig.inboundAllowCIDR`** to trusted IP ranges to limit access to the Airflow UI.
-- **Enable git-sync** for reliable, version-controlled DAG delivery.
-- **Auth**: `SimpleAuthManager` is not recommended for deployments requiring enterprise SSO. Evaluate an OAuth/OIDC integration for those use cases.
+- The auth secret must exist **before** you install. Without it the deployment wedges with no log output at all; see [Prerequisites](#prerequisites) for the one diagnostic that names it, and expect recovery to take up to about ten and a half minutes after you create it.
+- **The Fernet key can never be rotated** — every stored Connection and Variable is encrypted under it. Generate it once, keep it, and back it up somewhere you will still have it later.
+- **A wide simultaneous fan-out silently loses roughly a third of its tasks** — see [Wide Fan Outs Can Silently Lose Tasks](#wide-fan-outs-can-silently-lose-tasks).
+- **This template creates its GVC**, so `gvc.name` must be a new name — uninstalling deletes the GVC it adopted along with everything in it.
+- Set `postgres.config.password` at first install. It is bundled plumbing, but the shipped placeholder is published and the value cannot be changed once the data directory exists.
+- The UI is closed by default and a firewall change takes up to a few minutes to apply, so an endpoint still returning `403` right after an upgrade is not necessarily broken.
+- The first Helm upgrade after an install re-applies resources even with identical values, restarting the webserver and the database — the UI was unavailable for about three minutes in testing. Later upgrades are clean.
+- Changing the admin password means editing the auth secret and restarting the webserver; the password file is rewritten from the secret on every container start.
+- **Uninstalling deletes all three volume sets**, including the DAGs and logs on the shared Airflow home. Export anything you need first.
 
 ## External References
 
@@ -307,17 +410,20 @@ curl https://<your-airflow-url>/api/v2/dags \
     <Card title="Apache Airflow Documentation" icon="book" href="https://airflow.apache.org/docs/">
     Official Apache Airflow documentation
     </Card>
+    <Card title="Fernet Key and Encryption at Rest" icon="lock" href="https://airflow.apache.org/docs/apache-airflow/stable/security/secrets/fernet.html">
+    How Airflow encrypts Connections and Variables
+    </Card>
+    <Card title="Airflow Security Model" icon="shield" href="https://airflow.apache.org/docs/apache-airflow/stable/security/index.html">
+    What the Airflow UI and API can do, and who should reach them
+    </Card>
     <Card title="CeleryExecutor" icon="layer-group" href="https://airflow.apache.org/docs/apache-airflow-providers-celery/stable/celery_executor.html">
-    Learn about the CeleryExecutor and distributed task execution
+    The CeleryExecutor and distributed task execution
     </Card>
     <Card title="KEDA Documentation" icon="chart-line" href="https://keda.sh/docs/">
-    Kubernetes Event-driven Autoscaling documentation
-    </Card>
-    <Card title="Redis Documentation" icon="database" href="https://redis.io/docs/latest/">
-    Official Redis documentation
+    Event-driven autoscaling documentation
     </Card>
     <Card title="git-sync" icon="github" href="https://github.com/kubernetes/git-sync">
-    git-sync sidecar documentation
+    The git-sync sidecar
     </Card>
     <Card title="Airflow Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/airflow">
     View the source files, default values, and chart definition

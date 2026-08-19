@@ -1,6 +1,6 @@
 ---
 title: Unleash
-description: Deploy Unleash on Control Plane using the Template Catalog. Open-source feature-flag server with an admin UI and SDK APIs, backed by a highly available PostgreSQL cluster. Covers replicas, first-boot API token seeding, database modes, and backups.
+description: Deploy Unleash on Control Plane using the Template Catalog. Open-source feature-flag server with an admin UI and SDK APIs, backed by a highly available PostgreSQL cluster. Covers the prerequisite admin secret, replicas, first-boot API token seeding, database modes, and backups.
 keywords: ['launchdarkly alternative', 'flagsmith alternative', 'split alternative', 'feature toggles', 'gradual rollout', 'kill switch', 'a/b testing', 'canary release', 'self-hosted', 'getunleash', 'client sdk', 'unleash template']
 ---
 
@@ -19,7 +19,7 @@ Unleash is an open-source feature-flag server — toggle features on and off, ro
 - **Standard Unleash Workload** — One or more stateless replicas serving the admin UI and the Admin, Client, and Frontend APIs on port `4242`.
 - **Database Workloads** — HA mode: a stateful Patroni PostgreSQL workload, a stateful etcd workload, and a standard HAProxy leader-routing workload. Single mode: one stateful PostgreSQL workload.
 - **Volume Sets** — The database subchart's persistent volumes (10 GiB per replica by default). Unleash itself has none.
-- **Secrets** — Admin bootstrap credentials, the start script that derives the public URL at runtime, and the database credentials from the subchart.
+- **Secrets** — The start script that derives the public URL and waits for the database at startup, plus the database credentials from the subchart. The admin login is **not** created by this template: you create that dictionary secret yourself before installing and reference it by name (see [Prerequisites](#prerequisites)).
 - **Identity & Policy** — A least-privilege policy granting the Unleash identity `reveal` on exactly the secrets it uses, including your pre-created API-token secret when one is configured.
 - **Cron Backup Workload** *(optional)* — When database backups are enabled.
 
@@ -29,9 +29,52 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ## Prerequisites
 
-None for a default install — install, log in with `admin.username` / `admin.password`, and create SDK API tokens in the admin UI.
+**One dictionary secret must exist before you install.** The initial admin guards a login form on the public endpoint, so its credentials are a prerequisite secret rather than template values — a value would sit in plaintext in the Helm release for the life of the install. The template creates no admin secret of its own.
 
-Optionally, the template can seed a backend and a frontend SDK API token on first boot from a [dictionary secret](/guides/create-secret/dictionary) that you create **before** installing. The token strings are never passed through values.
+<Steps>
+  <Step title="Create the admin credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `username` and `password`. Secrets are org-level, so no GVC flag is involved:
+
+    ```bash
+    cpln secret create-dictionary --name my-unleash-admin \
+      --entry username=admin \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `admin.secretName` to the name you used.
+  </Step>
+  <Step title="Read the password back later">
+    `-o yaml` is required; without it the command prints the secret's metadata table rather than its contents:
+
+    ```bash
+    cpln secret reveal my-unleash-admin -o yaml
+    ```
+  </Step>
+</Steps>
+
+| Key | What it is |
+|---|---|
+| `username` | The initial admin's login name. |
+| `password` | Its password. The login form it guards is on the public endpoint. |
+
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** The install still exits 0 and reports success, every resource is created, and the workload then never starts. Because the container never ran, `cpln logs` returns **zero lines**, which reads as a broken platform rather than a missing prerequisite.
+
+The only diagnostic is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-unleash --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-unleash-admin no longer exists. Workload updates are paused until
+the secret is added or the reference to the secret removed.
+```
+
+It is **`get-deployments`** — plain `cpln workload get` has no `versions` key at all. Creating the missing secret clears the wedge on its own, but slowly: recovery has measured between 5.5 and 10.5 minutes across the catalog, so poll rather than giving up. `cpln workload force-redeployment RELEASE_NAME-unleash --gvc GVC_NAME` shortcuts it to roughly 90 seconds.
+</Warning>
+
+Optionally, the template can also seed a backend and a frontend SDK API token on first boot from a second [dictionary secret](/guides/create-secret/dictionary) that you create **before** installing. This one is unchanged from earlier versions, and the token strings are never passed through values.
 
 <Steps>
   <Step title="Generate token strings">
@@ -44,7 +87,13 @@ Optionally, the template can seed a backend and a frontend SDK API token on firs
     Generate one token string for backend SDKs and one for frontend SDKs.
   </Step>
   <Step title="Create a dictionary secret">
-    Create a [dictionary secret](/guides/create-secret/dictionary) in your org with exactly two keys, `backend` and `frontend`, each holding a full token string.
+    Create a [dictionary secret](/guides/create-secret/dictionary) with exactly two keys, `backend` and `frontend`, each holding a full token string:
+
+    ```bash
+    cpln secret create-dictionary --name my-unleash-api-tokens \
+      --entry backend="default:production.$(openssl rand -hex 24)" \
+      --entry frontend="default:production.$(openssl rand -hex 24)"
+    ```
   </Step>
   <Step title="Reference it in values">
     Set `apiTokens.secretName` to the secret's name. Leave it empty to skip seeding and create tokens in the admin UI instead.
@@ -53,7 +102,7 @@ Optionally, the template can seed a backend and a frontend SDK API token on firs
 
 For optional database backups, you also need a bucket and access setup for one of the supported providers — see [Backing Up](#backing-up).
 
-Install the template using your preferred method:
+Once the admin secret exists, install the template using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -88,7 +137,11 @@ Exactly one of the two database modes must be enabled — the chart enforces thi
 | Footprint | 8 replicas across 3 workloads (3× Patroni, 3× etcd, 2× HAProxy) | 1 workload |
 | Best for | Production | Development and lightweight installs |
 
-A fresh HA-mode install takes roughly 5–7 minutes to fully converge; transient `Failed to migrate db` log errors while the database cluster starts are expected and self-heal, at any replica count. Single mode is ready in about a minute.
+A fresh HA-mode install takes several minutes to fully converge while the Patroni and etcd replicas come up; single mode is ready in about a minute.
+
+<Note>
+**Unleash waits for its database before starting.** Version `1.1.0` added that wait to the start script. Earlier versions ran their schema migrations immediately at boot and did not retry, so on the default HA database they raced Patroni's leader election and crash-looped for roughly six minutes with `Failed to migrate db Error: read ECONNRESET` — long enough that the install looked broken and, in one measured run, missed a five-minute readiness expectation. The database itself was healthy throughout; only the startup ordering was wrong.
+</Note>
 
 ## Configuration
 
@@ -105,9 +158,13 @@ resources:
 
 replicas: 1 # stateless server — set 2+ for high availability (all state lives in PostgreSQL)
 
-admin: # initial admin login, seeded on first boot only
-  username: admin
-  password: change-me-unleash-admin # change before installing
+# Initial admin login, seeded on first boot only.
+# REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL. A `dictionary`
+# secret holding exactly two keys, `username` and `password`; the login form it
+# guards sits on the public endpoint. The account then lives in the database —
+# change it later in the UI, not here.
+admin:
+  secretName: my-unleash-admin # name of your pre-created dictionary secret
 
 apiTokens:
   secretName: "" # your pre-created dictionary secret (see Prerequisites); empty = create tokens in the UI
@@ -196,12 +253,12 @@ postgres: # dev/lightweight: single-instance PostgreSQL (disable postgresHA firs
 - `image` — The Unleash open-source server image.
 - `resources` — CPU and memory for the Unleash container.
 - `replicas` — Number of Unleash replicas behind the platform load balancer. The server is stateless, so scaling is a single value change; `2+` is recommended for production. At 2 replicas, rolling redeploys and a killed replica were both verified to serve every request with zero failures.
-- `admin.*` — The initial admin login, seeded into the database on first boot only. **Change `admin.password` before installing** — the upstream default password is rejected once your own is set. Changing these values later does not modify the existing account; change the password in the admin UI instead.
+- `admin.secretName` — Name of the dictionary secret you created in [Prerequisites](#prerequisites), holding the `username` and `password` of the initial admin. The credentials never pass through values, and the template creates no secret of its own — it references yours and grants the workload `reveal` on exactly that one secret. The account is seeded into the database on first boot only, so editing the secret later does not modify it; change the password in the admin UI instead.
 - `apiTokens.secretName` — Name of your pre-created dictionary secret with keys `backend` and `frontend` (see [Prerequisites](#prerequisites)). When set, both tokens are seeded on first boot; when empty (default), create tokens in the admin UI after install. Like the admin account, tokens are seeded on first boot only.
 
 ### Access
 
-- `publicAccess.enabled` — Serve the admin UI and SDK APIs on the canonical `*.cpln.app` HTTPS endpoint (default). Every surface is authenticated — the UI and Admin API by login, the Client and Frontend APIs by tokens. Set to `false` for an internal-only instance (external requests are blocked at the edge; in-GVC callers still reach it per `internalAccess`). The public URL Unleash embeds in password-reset and invite links (`UNLEASH_URL`) is derived at startup — from the canonical endpoint when public, or the internal `cpln.local` address when not — and re-derived on every restart.
+- `publicAccess.enabled` — Serve the admin UI and SDK APIs on the canonical `*.cpln.app` HTTPS endpoint. It is **deliberately on by default** and load-bearing: SDKs running in browsers and in applications outside the GVC call `/api/frontend` and `/api/client` directly, so a private instance cannot serve them. Every surface is authenticated — the UI and Admin API by login, the Client and Frontend APIs by tokens — and the login is now a credential you created rather than a published default. A firewall change takes roughly 30 seconds to a few minutes to propagate, so re-test rather than trusting the first response. Set to `false` for an internal-only instance (external requests are blocked at the edge; in-GVC callers still reach it per `internalAccess`). The public URL Unleash embeds in password-reset and invite links (`UNLEASH_URL`) is derived at startup — from the canonical endpoint when public, or the internal `cpln.local` address when not — and re-derived on every restart.
 - `internalAccess.type` — Internal firewall scope of the Unleash workload:
 
 | Type | Description |
@@ -219,6 +276,48 @@ Enable exactly one of `postgresHA` (production, default) or `postgres` (dev/ligh
 **Template version `1.0.0` did not compact the etcd cluster inside the bundled highly available database**, so etcd's backend grows with time alone and goes read-only once it reaches its 2 GiB quota — after roughly 110 days — taking PostgreSQL failover with it. Only installs running the HA database are affected (`postgresHA.enabled`, the default here); see [etcd History Compaction](/template-catalog/templates/postgres-highly-available#etcd-history-compaction) for the mechanism and the symptoms. Upgrade to `1.0.1` or later to turn compaction on: that stops further growth but cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade.
 </Warning>
 
+## Upgrading From 1.0.x
+
+Version `1.1.0` moved the initial admin login out of Helm values. Earlier versions shipped a username and a working password as values, used exactly as written — a published default guarding a login form on the public endpoint, sitting in the Helm release for the life of the install.
+
+| | `1.0.x` | `1.1.0` |
+|---|---|---|
+| Initial admin login | `admin.username` and `admin.password` values | `admin.secretName` — a dictionary secret you create, holding `username` and `password` |
+| Chart-created admin secret | Held the admin credentials | None; the template creates no admin secret at all |
+| `apiTokens.secretName` | Prerequisite dictionary secret | Unchanged |
+| Database startup | Migrations ran immediately at boot | The start script waits for the database first |
+| Database password | A value (`postgresHA.postgres.password` / `postgres.config.password`) | Unchanged — still a value, because it is bundled plumbing nobody logs in with |
+
+<Warning>
+**An upgrade that still carries either removed key is rejected at render, before anything is applied.** Each guard names its replacement, and there is no compatibility fallback — the version bump is the migration path. A real upgrade carrying an old key failed at render, created no Helm revision, and left the running release healthy and untouched:
+
+```text
+unleash: admin.password was REMOVED in 1.1.0. Put it in a `dictionary` secret (key: `password`)
+together with `username`, and set admin.secretName to that secret's name. Create the secret BEFORE
+installing; see Prerequisites in the README.
+```
+
+Leaving `admin.secretName` empty is refused the same way.
+</Warning>
+
+<Note>
+**An existing install's admin password does not change on upgrade.** `UNLEASH_DEFAULT_ADMIN_*` is read on first boot only; the account then lives in the database, so the secret's contents only matter to a fresh install. Change the password in the admin UI. If the install is still carrying the published `1.0.x` default (`change-me-unleash-admin`), treat that password as compromised and change it now.
+</Note>
+
+To upgrade an existing install:
+
+<Steps>
+  <Step title="Create the admin credentials secret">
+    Follow [Prerequisites](#prerequisites). An existing `apiTokens.secretName` secret stays exactly as it is.
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `admin.username` and `admin.password`, and set `admin.secretName` instead.
+  </Step>
+  <Step title="Upgrade">
+    The Unleash replicas restart; flags, users, and tokens are in PostgreSQL and are untouched.
+  </Step>
+</Steps>
+
 ## Connecting
 
 | What | Value |
@@ -227,7 +326,7 @@ Enable exactly one of `postgresHA` (production, default) or `postgres` (dev/ligh
 | Client API (backend SDKs) | `https://<canonical>.cpln.app/api/client` — `Authorization: <backend token>` |
 | Frontend API (browser/mobile SDKs) | `https://<canonical>.cpln.app/api/frontend` — `Authorization: <frontend token>` |
 | Internal (same GVC) | `http://{release}-unleash.{gvc}.cpln.local:4242` |
-| Login | `admin.username` / `admin.password` |
+| Login | The `username` / `password` in your `admin.secretName` secret — `cpln secret reveal my-unleash-admin -o yaml` |
 | PostgreSQL (internal, HA mode) | `{release}-postgres-ha-proxy.{gvc}.cpln.local:5432`, credentials in the `{release}-postgres-config` secret |
 | PostgreSQL (internal, single mode) | `{release}-postgres.{gvc}.cpln.local:5432`, credentials in the `{release}-pg-config` secret |
 
@@ -313,11 +412,12 @@ In HA mode, `backup.mode` selects `logical` (scheduled `pg_dump` via a cron work
 
 ## Important Notes
 
-- **Change `admin.password` and the database password** (`postgresHA.postgres.password` / `postgres.config.password`) before installing.
-- **Admin credentials and API tokens are seeded on first boot only** — they live in the database afterwards; change the password or manage tokens in the admin UI, not by upgrading values.
+- **Create the admin secret before installing** — a missing prerequisite secret leaves the workload waiting on something that does not exist, with zero log lines. See [Prerequisites](#prerequisites) for how to diagnose it.
+- **Change the database password before installing** (`postgresHA.postgres.password` / `postgres.config.password`) — it is bundled plumbing, used exactly as given, and it remains a value by design.
+- **Admin credentials and API tokens are seeded on first boot only** — they live in the database afterwards; change the password or manage tokens in the admin UI, not by editing the secrets.
 - **Backend tokens must stay secret** (server-side SDKs, `/api/client`); frontend tokens are safe to embed in browsers (`/api/frontend`). A `401` usually means the wrong token type or environment.
 - **The free edition ships exactly two environments** (`development`, `production`) — SSO, role-based access control, multiple projects, change requests, and audit logs require an Unleash Enterprise license and are not available in this template.
-- **HA-mode first boot takes ~5–7 minutes** — transient `Failed to migrate db` log errors while the database cluster starts are expected and self-heal, at any replica count.
+- **HA-mode first boot takes several minutes** while the database cluster converges. Since `1.1.0` the start script waits for the database before running migrations, which is what earlier versions crash-looped on.
 - **Uninstall deletes the database volume sets** — all flags, users, and tokens. Enable backups if the data matters.
 
 ## External References

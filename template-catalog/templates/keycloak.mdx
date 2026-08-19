@@ -1,6 +1,6 @@
 ---
 title: Keycloak
-description: Deploy Keycloak on Control Plane using the Template Catalog. Covers clustering, PostgreSQL backing stores, access configuration, and optional database backups.
+description: Deploy Keycloak on Control Plane using the Template Catalog. Covers the prerequisite admin credentials secret, clustering, PostgreSQL backing stores, access configuration, and optional database backups.
 keywords: ['auth server', 'oauth2', 'oidc', 'saml', 'sso', 'iam', 'idp', 'auth0 alternative', 'okta alternative', 'single sign-on', 'user federation', 'infinispan', 'realm']
 ---
 
@@ -15,7 +15,7 @@ Keycloak is an open-source identity and access management platform that provides
 - **Single-Instance PostgreSQL Workload** (optional) — The [PostgreSQL template](/template-catalog/templates/postgres) instead, for lighter dev/test deployments.
 - **Volume Sets** — Persistent storage for the PostgreSQL (and etcd) data.
 - **Backup Cron Workload** (optional) — Created by the backing store subchart when its backup pass-through is enabled.
-- **Secrets** — A dictionary secret with the bootstrap admin credentials, an opaque startup script secret, and the database credentials secret created by the PostgreSQL subchart.
+- **Secrets** — An opaque startup script secret, plus the database credentials secret created by the PostgreSQL subchart. The bootstrap admin credentials are **not** created by this template: you create that dictionary secret yourself before installing and reference it by name (see [Prerequisites](#prerequisites)).
 - **Identity & Policy** — An identity bound to the Keycloak workload with a least-privilege policy granting `reveal` access to exactly the secrets it mounts.
 
 All durable state — realms, users, and active sessions — lives in PostgreSQL; the Keycloak tier is stateless on disk.
@@ -26,7 +26,50 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ## Prerequisites
 
-None for a default install.
+**One dictionary secret must exist before you install.** The bootstrap admin guards a login form on the public endpoint, so its credentials are a prerequisite secret rather than template values — a value would sit in plaintext in the Helm release for the life of the install. The template creates no admin secret of its own.
+
+<Steps>
+  <Step title="Create the admin credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `username` and `password`. Secrets are org-level, so no GVC flag is involved:
+
+    ```bash
+    cpln secret create-dictionary --name my-keycloak-admin \
+      --entry username=admin \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `admin.secretName` to the name you used.
+  </Step>
+  <Step title="Read the password back later">
+    `-o yaml` is required; without it the command prints the secret's metadata table rather than its contents:
+
+    ```bash
+    cpln secret reveal my-keycloak-admin -o yaml
+    ```
+  </Step>
+</Steps>
+
+| Key | What it is |
+|---|---|
+| `username` | The temporary bootstrap admin's login name. |
+| `password` | Its password. The login form it guards is on the public endpoint. |
+
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** The install still exits 0 and reports success, every resource is created, and the workload then never starts. Because the container never ran, `cpln logs` returns **zero lines**, which reads as a broken platform rather than a missing prerequisite.
+
+The only diagnostic is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-keycloak --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-keycloak-admin no longer exists. Workload updates are paused until
+the secret is added or the reference to the secret removed.
+```
+
+It is **`get-deployments`** — plain `cpln workload get` has no `versions` key at all. Creating the missing secret clears the wedge on its own, but slowly: recovery has measured between 5.5 and 10.5 minutes across the catalog, so poll rather than giving up. `cpln workload force-redeployment RELEASE_NAME-keycloak --gvc GVC_NAME` shortcuts it to roughly 90 seconds.
+</Warning>
 
 If you enable the optional database backups, you need a cloud account and a bucket for the backing store's backup job. The backup configuration is a pass-through to the backing PostgreSQL template — follow the [PostgreSQL Highly Available backup prerequisites](/template-catalog/templates/postgres-highly-available#backup-prerequisites) (default store) or the [PostgreSQL backup prerequisites](/template-catalog/templates/postgres#backup-prerequisites) (dev/test store).
 
@@ -56,6 +99,46 @@ To install, follow the instructions for your preferred method:
     </Card>
 </CardGroup>
 
+## Upgrading From 1.0.x
+
+Version `1.1.0` moved the bootstrap admin login out of Helm values. Earlier versions shipped a username and a working password as values, used exactly as written — a published default guarding a login form on the public endpoint, sitting in the Helm release for the life of the install.
+
+| | `1.0.x` | `1.1.0` |
+|---|---|---|
+| Bootstrap admin login | `admin.username` and `admin.password` values | `admin.secretName` — a dictionary secret you create, holding `username` and `password` |
+| Chart-created admin secret | Held the admin credentials | None; the template creates no admin secret at all |
+| Database password | A value (`postgresHA.postgres.password` / `postgres.config.password`) | Unchanged — still a value, because it is bundled plumbing nobody logs in with |
+
+<Warning>
+**An upgrade that still carries either removed key is rejected at render, before anything is applied.** Each guard names its replacement, and there is no compatibility fallback — the version bump is the migration path. A real upgrade carrying an old key failed at render, created no Helm revision, and left the running release healthy and untouched:
+
+```text
+keycloak: admin.password was REMOVED in 1.1.0. Put it in a `dictionary` secret (key: `password`)
+together with `username`, and set admin.secretName to that secret's name. Create the secret BEFORE
+installing; see Prerequisites in the README.
+```
+
+Leaving `admin.secretName` empty is refused the same way.
+</Warning>
+
+<Note>
+**An existing install's admin password does not change on upgrade.** Keycloak consults `KC_BOOTSTRAP_ADMIN_*` only when no admin account exists yet, so the account already in the database is untouched by whatever the secret holds. Create the secret so the release renders, then change the password in the Keycloak admin console. If the install is still carrying the published `1.0.x` default (`change-me-keycloak-admin`), treat that password as compromised and change it in the console now.
+</Note>
+
+To upgrade an existing install:
+
+<Steps>
+  <Step title="Create the admin credentials secret">
+    Follow [Prerequisites](#prerequisites). Putting your current credentials in it keeps your values file honest, but it does not re-seed the account.
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `admin.username` and `admin.password`, and set `admin.secretName` instead.
+  </Step>
+  <Step title="Upgrade">
+    Realms, users, and sessions are in PostgreSQL and are untouched. The Keycloak replicas restart — see [Replicas and Clustering](#replicas-and-clustering).
+  </Step>
+</Steps>
+
 ## Configuration
 
 The default `values.yaml` for this template:
@@ -74,11 +157,14 @@ resources: # per replica
   minMemory: 1Gi
 
 # ─── Admin Bootstrap ──────────────────────────────────────────────────────────
-# Creates a temporary admin on first boot. Log in and create a permanent admin,
-# then remove the temporary one (Keycloak warns until you do).
+# REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL. A `dictionary`
+# secret holding exactly two keys, `username` and `password`; it is the
+# temporary admin Keycloak creates on first boot, and its login form sits on the
+# public endpoint. If the secret does not exist at install time the deployment
+# WEDGES silently — `cpln logs` returns nothing at all. See Prerequisites in the
+# README for the exact `cpln secret create-dictionary` command.
 admin:
-  username: admin
-  password: change-me-keycloak-admin # change before installing
+  secretName: my-keycloak-admin
 
 # ─── Backing Store: Highly Available PostgreSQL (default) ────────────────────
 # Deploys the postgres-highly-available template: 3 Patroni replicas, 3 etcd
@@ -175,13 +261,19 @@ internalAccess:
 - Clustered replicas must be able to reach each other on ports 7800/57800, so `replicas > 1` requires `internalAccess.type` other than `none` — the chart enforces this at render.
 - Scaling is operator-driven: change `replicas` via a template upgrade. There is deliberately no autoscaling, so cluster membership only changes intentionally.
 
+<Note>
+**A rolling upgrade is not constrained to one replica at a time.** Control Plane silently discards `maxUnavailableReplicas` on stateful workloads, so version `1.1.0` stopped declaring it and now renders only what the platform actually applies — nothing limits how many replicas restart together. Realms, users, and sessions live in PostgreSQL and survive regardless, but plan for a brief gap in availability during an upgrade rather than assuming a strictly serialized rollout.
+</Note>
+
 ### Keycloak Resources
 
 - `resources` — CPU and memory per replica. The JVM heap is sized to 70% of the memory limit; do not set `memory` below `1.5Gi`.
 
 ### Admin Bootstrap
 
-- `admin.username` / `admin.password` — Credentials for a temporary bootstrap admin created on first boot. **Change the password before installing.** After the first login, create a permanent admin account and remove the temporary one — Keycloak warns until you do.
+- `admin.secretName` — Name of the dictionary secret you created in [Prerequisites](#prerequisites), holding the `username` and `password` of a temporary bootstrap admin. The credentials never pass through values, and the template creates no secret of its own — it references yours and grants the workload `reveal` on exactly that one secret.
+- The account is created on **first boot only**. Keycloak reads those credentials when no admin exists yet, so editing the secret on a running install changes nothing — change the password in the admin console instead.
+- After the first login, create a permanent admin account and remove the temporary one — Keycloak warns until you do.
 
 ### Backing Store
 
@@ -198,7 +290,7 @@ Exactly one of the two stores must be enabled — the chart enforces this at ren
 
 ### Access
 
-- `publicAccess.enabled` — Exposes Keycloak over HTTPS at the automatically assigned canonical `*.cpln.app` endpoint. Keep it enabled for browser-based SSO — end-user browsers must reach Keycloak's login endpoints. Disable it only for pure service-to-service deployments; internal access keeps working.
+- `publicAccess.enabled` — Exposes Keycloak over HTTPS at the automatically assigned canonical `*.cpln.app` endpoint. It is **deliberately on by default**: Keycloak is the identity provider your applications and their users authenticate against, so browsers must reach its login and OIDC endpoints for SSO to work at all, and the admin login is now a credential you created rather than a published default. Disable it only for pure service-to-service deployments; internal access keeps working. A firewall change takes roughly 30 seconds to a few minutes to propagate, so re-test rather than trusting the first response.
 - `internalAccess.type` — Controls which workloads can reach Keycloak inside Control Plane (`none`, `same-gvc`, `same-org`, or `workload-list`). With `workload-list`, list the allowed workloads in `internalAccess.workloads`.
 
 ### Backup
@@ -218,15 +310,17 @@ For provider setup, backup modes, and restore procedures, see the backing store'
 | Admin console | `https://{canonical-endpoint}/admin` |
 | OIDC discovery | `https://{canonical-endpoint}/realms/{realm}/.well-known/openid-configuration` |
 | In-GVC (internal) | `http://{release}-keycloak.{gvc}.cpln.local:8080` |
-| Admin credentials | `admin.username` / `admin.password` values |
+| Admin credentials | The `username` / `password` in your `admin.secretName` secret — `cpln secret reveal my-keycloak-admin -o yaml` |
 
 <Note>
-On a first install of the default HA stack, the Keycloak container waits for the PostgreSQL cluster to come up (logging `Waiting for PostgreSQL...`) before starting. Expect the Keycloak workload to become ready roughly 4–5 minutes after install; the dev-mode store (`postgres` with `replicas: 1`) is ready in about 2 minutes.
+On a first install of the default HA stack, the Keycloak container waits for the PostgreSQL cluster to come up (logging `Waiting for PostgreSQL...`) before starting. A default install measured **303 seconds** from install to a ready workload, most of that spent waiting on the Patroni and etcd replicas; the dev-mode store (`postgres` with `replicas: 1`) is ready in about 2 minutes.
 </Note>
 
 ## Important Notes
 
-- **Change both default passwords before installing** — the admin bootstrap password and the database password. The bootstrap admin is temporary by design: log in, create a permanent admin, then remove it.
+- **Create the admin secret before installing** — a missing prerequisite secret leaves the workload waiting on something that does not exist, with zero log lines. See [Prerequisites](#prerequisites) for how to diagnose it.
+- **Change the database password before installing** (`postgresHA.postgres.password` / `postgres.config.password`) — it is bundled plumbing, used exactly as given, and it remains a value by design.
+- **The bootstrap admin is temporary by design** — log in, create a permanent admin, then remove it. Its credentials are seeded on first boot only; change the password in the admin console, not by editing the secret.
 - **Keep `publicAccess` enabled for browser SSO** — end-user browsers must reach Keycloak's login endpoints; disable it only for pure service-to-service deployments.
 - **Do not disable the HA proxy** (`postgresHA.proxy.enabled`) — Keycloak connects through the HAProxy leader endpoint for writes; the chart enforces this at render.
 - **Scaling is operator-driven** — change `replicas` via a template upgrade; there is deliberately no autoscaling, so cluster membership only changes intentionally.
