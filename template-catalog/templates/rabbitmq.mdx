@@ -1,23 +1,107 @@
 ---
 title: RabbitMQ
-description: Deploy RabbitMQ on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and single-replica message broker with built-in management UI.
-keywords: ['amqp', 'message queue', 'mq', 'task queue', 'kafka alternative', 'sqs alternative', 'pubsub', 'work queue', 'erlang broker', 'exchange', 'binding']
+description: Deploy RabbitMQ on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, AMQP connections, the management UI over a port-forward, storage, internal firewall scope, and upgrading from template version 1.1.1.
+keywords: ['amqp', 'message queue', 'mq', 'task queue', 'kafka alternative', 'sqs alternative', 'pubsub', 'work queue', 'erlang broker', 'exchange', 'binding', 'rabbitmqctl', 'management plugin']
 ---
 
 ## Overview
 
-RabbitMQ is a widely-used open-source message broker supporting AMQP and other messaging protocols. This template deploys a single-replica RabbitMQ instance with persistent storage and a built-in management UI.
+RabbitMQ is a widely-used open-source message broker supporting AMQP 0-9-1 and other messaging protocols. This template deploys a single-replica broker with the management plugin enabled, backed by a persistent volume so queues, messages and the user database survive a restart.
+
+The broker's default user is not a template value. It comes from a secret you create before installing, so the credentials your producers and consumers connect with never pass through Helm and never land in the release.
+
+<Warning>
+**Template version 1.2.0 is a breaking change.** `rabbitmq_conf.default_user`, `rabbitmq_conf.default_pass`, the `firewall` block and `diskCapacity` were all removed or replaced, and an install or upgrade that still sets any of them now fails at render. If you are running 1.1.1 or earlier, read [Upgrading From Earlier Versions](#upgrading-from-earlier-versions) before you touch the release.
+</Warning>
+
+### What Gets Created
+
+- **Stateful Workload** — (`RELEASE_NAME-rabbitmq`): a single-replica RabbitMQ container running the official `rabbitmq:3-management` image, serving AMQP on `5672`, the management UI on `15672` and Prometheus metrics on `15692`.
+- **Volume Set** — (`RELEASE_NAME-rabbitmq-vs`): persistent storage mounted at `/var/lib/rabbitmq` holding the message store, queue definitions, the user database and the Erlang cookie.
+- **Config Secret** — (`RELEASE_NAME-rabbitmq-config`): an opaque secret rendered into `/etc/rabbitmq/rabbitmq.conf`. It carries the AMQP listener port and nothing else.
+- **Identity & Policy** — (`RELEASE_NAME-rabbitmq-identity`, `RELEASE_NAME-rabbitmq-policy`): an identity bound to the workload, and a policy granting it `reveal` on exactly two secrets — the config secret and the credentials secret you created.
+
+The template creates **no credential secret of its own**, and the Erlang cookie is never a value either: the broker generates it on first boot onto the volume set.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
 </Note>
 
-### What Gets Created
+## Upgrading From Earlier Versions
 
-- **Stateful Workload** — A single-replica RabbitMQ container with the management plugin enabled.
-- **Volume Set** — Persistent storage for RabbitMQ node data at `/var/lib/rabbitmq`.
-- **Secret** — An opaque secret containing the `rabbitmq.conf` configuration file, mounted into the container at startup.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the config secret.
+Template version 1.1.1 and earlier took the RabbitMQ default user as plain Helm values and shipped a working default username and password, published in the public template repository. Those are not merely a management-UI login: they are the **AMQP credentials every producer and consumer puts in its connection string**. In 1.1.1 they were also written in plaintext into the mounted `rabbitmq.conf` secret, so the credential was readable from the release and from the config secret alike.
+
+| | 1.1.1 and earlier | 1.2.0 |
+|---|---|---|
+| Default user | `rabbitmq_conf.default_user` and `rabbitmq_conf.default_pass` values | `credentialsSecretName` → a dictionary secret you create |
+| How it reaches the broker | Written into the mounted `rabbitmq.conf` | `RABBITMQ_DEFAULT_USER` and `RABBITMQ_DEFAULT_PASS` environment variables, resolved from the secret |
+| Internal firewall | `firewall.internal_inboundAllowType` | `internalAccess.type` |
+| Volume size | `diskCapacity` — read by nothing, so setting it had no effect | `volumeset.volume.initialCapacity` |
+| Request timeout | `timeoutSeconds` — read by nothing; the workload was hardcoded to 5 | `timeoutSeconds`, now actually applied |
+
+The delivery path changed because a `cpln://secret/...` reference is only interpolated in an environment variable. Inside a mounted config-file secret it lands as that literal string, and the broker would boot with a username of `cpln://secret/...`. RabbitMQ reads `RABBITMQ_DEFAULT_USER` and `RABBITMQ_DEFAULT_PASS` natively, so 1.2.0 passes them that way and leaves only the listener port in `rabbitmq.conf`.
+
+<Warning>
+**Treat a pre-1.2.0 broker's credentials as compromised, not merely outdated.** Upgrading moves them out of Helm values but does not change the values themselves, and it does not change the broker either: the default user is written into the RabbitMQ database on **first boot only**. An existing broker keeps whatever user it was bootstrapped with. Rotate it in place with `rabbitmqctl change_password`, or uninstall and reinstall — which deletes the volume set and every message on it.
+</Warning>
+
+<Warning>
+**Carrying old values forward stops the upgrade.** Seven conditions are rejected at render time, so the upgrade fails and the existing release is left untouched and running:
+
+| Value you set | Result |
+|---|---|
+| `rabbitmq_conf.default_user` | `was REMOVED in rabbitmq 1.2.0 … create a dictionary secret holding the keys username and password, and set credentialsSecretName to its name` |
+| `rabbitmq_conf.default_pass` | the same message |
+| `credentialsSecretName` empty | `credentialsSecretName is required — it names the dictionary secret holding the username and password keys` |
+| any `firewall.*` key | `The firewall block was REPLACED in rabbitmq 1.2.0 by internalAccess. Set internalAccess.type to none, same-gvc or same-org` |
+| `diskCapacity` | `was REMOVED in rabbitmq 1.2.0 — it was never read by any template and setting it had no effect on disk size. Use volumeset.volume.initialCapacity instead` |
+| `internalAccess.type` unset | `internalAccess.type is required — set it to none, same-gvc or same-org` |
+| `internalAccess.type` not one of the three | `internalAccess.type must be one of: none, same-gvc, same-org` |
+</Warning>
+
+<Note>
+**The replaced `firewall` block is a clarity fix, not the closing of an open door.** The `external_*` keys in 1.1.1 were commented out, so the chart rendered no external firewall block at all — and a live 1.1.1 broker probed from the internet returned `403` on every attempt, with no external block backfilled by the API. External inbound was already closed. Version 1.2.0 states the closed configuration explicitly so the rendered and stored specs agree; the security fix in this release is the credential move.
+</Note>
+
+### Two Settings That Previously Did Nothing
+
+- **`diskCapacity` was ignored.** No template read it, so a user who asked for 100 GiB silently got a 10 GiB volume. It is removed and guarded; the live knob is `volumeset.volume.initialCapacity`, and a non-default value there provisions a volume of that size.
+- **`timeoutSeconds` was ignored.** The value existed but the workload hardcoded a 5-second request timeout. In 1.2.0 the knob reaches the API as you set it, so the shipped default of 30 is genuinely 30. Raising it does not disturb AMQP connections — an idle connection held for three minutes stayed open and still published and consumed afterwards.
+
+## Prerequisites
+
+**One secret must exist before you install.** Its value never passes through Helm values, so it never lands in the release. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly two keys — `username` and `password`. These become the RabbitMQ default user: the management-UI login **and** the AMQP credentials in every producer's and consumer's connection string.
+
+    ```bash
+    cpln secret create-dictionary --name my-rabbitmq-credentials \
+      --entry username=rabbitmq \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `credentialsSecretName` to the name you used. Nothing else is required for a default install.
+  </Step>
+  <Step title="Read the secret back later">
+    The `-o yaml` is required — plain `cpln secret reveal` prints only a summary table, not the values:
+
+    ```bash
+    cpln secret reveal my-rabbitmq-credentials -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**Create the secret before installing.** The template refuses to render when the name is blank, but a name pointing at a secret that does not exist installs "successfully" and then wedges: the install reports every resource created, the workload never becomes ready, and **`cpln logs` returns zero lines** because no container ever starts. The only diagnostic is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-rabbitmq --gvc GVC_NAME -o yaml
+```
+
+It names the missing secret: `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` The command is `get-deployments` — plain `cpln workload get` has no `versions` key at all. Creating the secret recovers the workload on its own in about **5.5 to 8.5 minutes** (measured 8 minutes 16 seconds), or in roughly 90 seconds if you force a redeployment of the workload.
+</Warning>
 
 ## Installation
 
@@ -53,84 +137,137 @@ The default `values.yaml` for this template:
 image:
   repository: rabbitmq:3-management
 
+# ─── Credentials ──────────────────────────────────────────────────────────────
+# REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+# A `dictionary` secret holding exactly two keys: `username` and `password`.
+# These are the RabbitMQ default user: the management-UI login AND the AMQP
+# credentials every producer and consumer puts in its connection string.
+# If the secret does not exist at install time the deployment WEDGES silently —
+# `cpln logs` returns nothing at all. See Prerequisites in the README for the
+# exact `cpln secret create-dictionary` command.
+credentialsSecretName: my-rabbitmq-credentials
+
+# ─── Resources ────────────────────────────────────────────────────────────────
 memory: 250Mi
 cpu: 200m
 
-firewall:
-  internal_inboundAllowType: same-gvc # Options: same-gvc, same-org
-  # external_inboundAllowCIDR: 0.0.0.0/0
-  # external_outboundAllowCIDR: 0.0.0.0/0
+timeoutSeconds: 30 # inbound request timeout in seconds
 
+# ─── Networking ───────────────────────────────────────────────────────────────
+# External inbound is always closed: RabbitMQ is reachable from inside the GVC
+# only. Use `cpln port-forward` to reach the management UI from a browser.
+internalAccess:
+  type: same-gvc # options: none, same-gvc (recommended), same-org
+
+# ─── RabbitMQ configuration ───────────────────────────────────────────────────
 rabbitmq_conf:
-  listeners_tcp_default: 5672
-  default_user: user
-  default_pass: changeMe
+  listeners_tcp_default: 5672 # AMQP listener port
 
 env:
   RABBITMQ_CONFIG_FILE: /etc/rabbitmq/rabbitmq.conf
 
+# ─── Storage ──────────────────────────────────────────────────────────────────
 volumeset:
   volume:
-    initialCapacity: 10 # In GiB. For high-throughput-ssd minimum is 1000
-    fileSystemType: ext4 # ext4 / xfs
-    performanceClass: general-purpose-ssd # general-purpose-ssd / high-throughput-ssd
+      initialCapacity: 10 # In Gigabytes. For high-throughput-ssd minimum is '1000'
+      fileSystemType: ext4 # ext4 / xfs
+      performanceClass: general-purpose-ssd # high-throughput-ssd / general-purpose-ssd
 ```
 
 ### Credentials
 
-- `rabbitmq_conf.default_user` — RabbitMQ admin username. **Change before deploying to production.**
-- `rabbitmq_conf.default_pass` — RabbitMQ admin password. **Change before deploying to production.**
+- `credentialsSecretName` — Name of the dictionary secret holding the `username` and `password` keys. The secret must exist before you install; see [Prerequisites](#prerequisites).
 
 <Note>
-These values are only applied on first startup when there is no existing node data. Updating them after the initial deployment will have no effect on the running instance. To change credentials on an existing instance, use RabbitMQ's management commands (e.g. `rabbitmqctl change_password`).
+The default user is written into the RabbitMQ database on **first boot only**. Changing the secret afterwards does not change the broker's credentials — rotate with `rabbitmqctl change_password`, or uninstall (which deletes the volume set and all messages) and reinstall.
 </Note>
+
+### Image
+
+- `image.repository` — The broker image, tag included. The shipped value tracks the floating `3-management` tag, so a fresh install picks up the current 3.x management-enabled image rather than a pinned patch release.
 
 ### Resources
 
-- `cpu` — CPU allocated to the RabbitMQ workload.
-- `memory` — Memory allocated to the RabbitMQ workload.
+- `cpu` — CPU limit for the broker.
+- `memory` — Memory limit for the broker.
+- `timeoutSeconds` — Inbound request timeout in seconds, applied to the workload. This value was ignored before 1.2.0; it is now applied as set.
 
-### Storage
+### Internal Access
 
-- `volumeset.volume.initialCapacity` — Initial volume size in GiB. For `high-throughput-ssd`, the minimum is 1000 GiB.
-- `volumeset.volume.fileSystemType` — `ext4` or `xfs`.
-- `volumeset.volume.performanceClass` — `general-purpose-ssd` or `high-throughput-ssd`.
-
-### Firewall
-
-- `firewall.internal_inboundAllowType` — Controls which workloads can connect to RabbitMQ internally:
+- `internalAccess.type` — Controls which workloads can reach the broker. External inbound is always closed; there is no public-access knob.
 
 | Value | Description |
 |-------|-------------|
+| `none` | No workload may connect |
 | `same-gvc` | Allow access from all workloads in the same GVC (recommended) |
-| `same-org` | Allow access from all workloads in the same organization |
+| `same-org` | Allow access from all workloads in the same org |
 
-- `firewall.external_inboundAllowCIDR` — Optional. Comma-separated list of CIDR ranges allowed to reach RabbitMQ from the internet (e.g. `0.0.0.0/0`).
-- `firewall.external_outboundAllowCIDR` — Optional. Comma-separated list of CIDR ranges RabbitMQ is allowed to reach externally.
+<Note>
+A change to `internalAccess.type` takes roughly **30 seconds to 5 minutes** to propagate — closing access settles faster than reopening it, and every transition passes through a blocked window first. Re-test rather than concluding the change did not apply.
 
-### Connecting to RabbitMQ
+Under `none`, a raw TCP connection to `5672` still appears to succeed while the AMQP handshake is reset, so a `nc -z` style check will wrongly suggest the setting does nothing. Test with a real client connection.
+</Note>
 
-Once deployed, connect to RabbitMQ from within the same GVC using:
+### RabbitMQ Configuration
 
-```text
-RELEASE_NAME-rabbitmq.GVC_NAME.cpln.local:5672
+- `rabbitmq_conf.listeners_tcp_default` — The AMQP listener port, rendered into `/etc/rabbitmq/rabbitmq.conf`. It is the only setting that file carries.
+- `env.RABBITMQ_CONFIG_FILE` — Path the broker reads that config file from. The credentials are delivered separately, as `RABBITMQ_DEFAULT_USER` and `RABBITMQ_DEFAULT_PASS` environment variables resolved from your secret.
+
+### Storage
+
+- `volumeset.volume.initialCapacity` — Volume size in GiB backing `/var/lib/rabbitmq`. For `high-throughput-ssd` the minimum is 1000.
+- `volumeset.volume.fileSystemType` — `ext4` or `xfs`.
+- `volumeset.volume.performanceClass` — `general-purpose-ssd` or `high-throughput-ssd`.
+
+## Connecting to RabbitMQ
+
+The broker is reachable from inside the GVC only. There is no public-access knob, and the workload's canonical endpoint returns `403`.
+
+| What | Where | Credentials |
+|---|---|---|
+| AMQP | `amqp://USERNAME:PASSWORD@RELEASE_NAME-rabbitmq.GVC_NAME.cpln.local:5672/` | `username` / `password` from your credentials secret |
+| Management UI | `http://RELEASE_NAME-rabbitmq.GVC_NAME.cpln.local:15672` | same |
+| Prometheus metrics | `http://RELEASE_NAME-rabbitmq.GVC_NAME.cpln.local:15692/metrics` | none |
+
+The short name `RELEASE_NAME-rabbitmq` also resolves inside the same GVC.
+
+To open the management UI in a browser from your laptop, tunnel to it — no public exposure required:
+
+```bash
+cpln port-forward RELEASE_NAME-rabbitmq 15672:15672 --gvc GVC_NAME
+# then browse http://localhost:15672
 ```
 
-The management UI is available on port `15672` via the workload's external endpoint (requires `firewall.external_inboundAllowCIDR` to be set).
+Log in with the `username` and `password` from your credentials secret; the management API rejects any other password with `401`.
 
 ### Ports
 
 | Port | Protocol | Description |
 |------|----------|-------------|
 | `5672` | AMQP | Primary messaging port (configurable via `rabbitmq_conf.listeners_tcp_default`) |
-| `15672` | HTTP | Management UI |
+| `15672` | HTTP | Management UI and HTTP API |
 | `15692` | HTTP | Prometheus metrics |
+
+## Important Notes
+
+- The credentials secret must exist **before** you install. Without it the workload wedges with no log output at all; see [Prerequisites](#prerequisites) for the one diagnostic that shows it.
+- The default user is created on first boot only, so changing the secret on a running broker does not change its credentials.
+- Single node, single replica: an upgrade or a reschedule is a short outage for every connected client, so give your producers and consumers a reconnect policy.
+- The first upgrade after an install re-applies resources even when values are identical, which bounces the broker. Later upgrades are clean.
+- Queues, messages and the user database live on the volume set and survive a redeploy; uninstalling the release deletes them.
+- The broker is GVC-internal only — use `cpln port-forward` for the management UI rather than looking for a public endpoint.
 
 ## External References
 
 <CardGroup cols={2}>
     <Card title="RabbitMQ Documentation" icon="book" href="https://www.rabbitmq.com/docs">
     Official RabbitMQ documentation
+    </Card>
+    <Card title="Configuration Reference" icon="sliders" href="https://www.rabbitmq.com/docs/configure">
+    How rabbitmq.conf and the environment variables are read
+    </Card>
+    <Card title="Management Plugin" icon="gauge" href="https://www.rabbitmq.com/docs/management">
+    The management UI and HTTP API
     </Card>
     <Card title="RabbitMQ Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/rabbitmq">
     View the source files, default values, and chart definition
