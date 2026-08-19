@@ -1,26 +1,33 @@
 ---
 title: n8n
-description: Deploy n8n on Control Plane using the Template Catalog. Workflow automation backed by a highly available PostgreSQL cluster. Covers the encryption-key prerequisite, database modes, webhooks on the canonical endpoint, and database backups.
-keywords: ['zapier alternative', 'make alternative', 'ipaas', 'no-code', 'low-code', 'self-hosted', 'fair-code', 'integration platform', 'api orchestration', 'scheduled triggers', 'webhook automation', 'n8n template']
+description: Deploy n8n on Control Plane using the Template Catalog. Workflow automation backed by a highly available PostgreSQL cluster. Covers the two prerequisite secrets — the owner login as a bcrypt hash and the credential-encryption key — plus database modes, webhooks on the canonical endpoint, and database backups.
+keywords: ['zapier alternative', 'make alternative', 'ipaas', 'no-code', 'low-code', 'self-hosted', 'fair-code', 'integration platform', 'api orchestration', 'scheduled triggers', 'webhook automation', 'n8n template', 'prerequisite secret', 'bcrypt hash', 'htpasswd']
 ---
 
 ## Overview
 
 n8n is a workflow automation platform (fair-code, distributed under the [Sustainable Use License](https://docs.n8n.io/sustainable-use-license/)). This template deploys an n8n instance backed by a highly available PostgreSQL cluster by default. The editor, REST API, and webhook endpoints are served on one public HTTPS endpoint, and the instance owner account is pre-provisioned at install — there is never an unauthenticated setup page.
 
+Both the owner login and the credential-encryption key come from secrets you create **before** installing. Neither passes through Helm values, which matters here because the n8n login form sits on a public endpoint by default.
+
+<Warning>
+**Upgrading an install created with `1.0.0` or `1.0.1` is a breaking change, and it can change the password you log in with.** `owner.email` and `owner.password` no longer exist; the owner now comes from a dictionary secret holding `email` and a **bcrypt hash** of the password. Because n8n re-applies the owner from that secret on **every start**, hashing a *new* password during the upgrade silently replaces your current login. Hash the password you are already using. See [Upgrading From 1.0.x](#upgrading-from-1-0-x).
+</Warning>
+
 ### Architecture
 
 - **n8n** — A single-replica stateful workload serving the editor, REST API, and webhooks on port `5678`. Public URLs are derived from the canonical endpoint at start, so webhook URLs work out of the box.
 - **PostgreSQL (HA, default)** — The [postgres-highly-available](/template-catalog/templates/postgres-highly-available) template as a subchart: 3× Patroni PostgreSQL, 3× etcd, and a HAProxy leader-routing endpoint n8n connects through.
 - **PostgreSQL (dev/lightweight, optional)** — The single-instance [postgres](/template-catalog/templates/postgres) template instead, for lighter non-HA deployments.
+- **Owner managed from a secret** — The owner account is applied from your prerequisite secret at every start, so n8n never opens an unauthenticated setup page and the account cannot be edited from inside the app.
 
 ### What Gets Created
 
 - **Stateful n8n Workload** — Single replica serving the editor, API, and webhooks on port `5678`.
 - **Database Workloads** — HA mode: a stateful Patroni PostgreSQL workload, a stateful etcd workload, and a standard HAProxy leader-routing workload. Single mode: one stateful PostgreSQL workload.
 - **Volume Sets** — 10 GiB persistent storage for n8n instance config and binary execution data (`/home/node/.n8n`), plus the database subchart's own volume sets.
-- **Secrets** — Owner bootstrap credentials (bcrypt-hashed), a start script that derives public URLs at runtime, and the database credentials from the subchart.
-- **Identity & Policy** — A least-privilege policy granting the n8n identity `reveal` on exactly the secrets it uses, including your pre-created encryption-key secret.
+- **Secrets** — A start-script secret that derives public URLs at runtime, plus the database credentials created by the subchart. The owner login and the encryption key are **not** created here — they live in the two secrets you create.
+- **Identity & Policy** — A least-privilege policy granting the n8n identity `reveal` on exactly the secrets it uses, including your two pre-created secrets.
 - **Cron Backup Workload** *(optional)* — When database backups are enabled.
 
 <Note>
@@ -29,31 +36,84 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ## Prerequisites
 
-n8n encrypts every credential it stores with a key it reads from an [opaque secret](/guides/create-secret/opaque) that you create **before** installing. The key is never passed through values.
+**Two secrets must exist before you install.** Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
-  <Step title="Generate an encryption key">
-    Generate a long random string, for example:
+  <Step title="Create the encryption key secret">
+    An [opaque secret](/guides/create-secret/opaque) with encoding `plain` whose payload is a long random key. n8n encrypts every credential it stores with it:
 
     ```bash
-    openssl rand -hex 24
+    printf '%s' "$(openssl rand -hex 24)" | \
+      cpln secret create-opaque --name my-n8n-encryption-key --encoding plain -f -
+    ```
+
+    Set `encryptionKey.secretName` to the name you used, and store a copy of the key somewhere safe outside Control Plane.
+  </Step>
+  <Step title="Hash the owner password">
+    n8n accepts only a **bcrypt hash** for the owner password, never plaintext, so hash it first. `htpasswd -B` emits the `$2y$` form, which n8n accepts:
+
+    ```bash
+    OWNER_HASH=$(htpasswd -bnBC 10 "" 'your-owner-password' | tr -d ':\n')
     ```
   </Step>
-  <Step title="Create an opaque secret">
-    Create an [opaque secret](/guides/create-secret/opaque) in your org with encoding `plain` whose payload is the generated key. Set its name in `encryptionKey.secretName`.
+  <Step title="Create the owner secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `email` and `passwordHash`:
+
+    ```bash
+    cpln secret create-dictionary --name my-n8n-owner \
+      --entry email=admin@example.com \
+      --entry passwordHash="$OWNER_HASH"
+    ```
+
+    Set `owner.secretName` to the name you used.
+
+    | Key | What it is |
+    |---|---|
+    | `email` | The instance owner's login email. |
+    | `passwordHash` | A bcrypt hash of the owner password. Its `$` characters survive the round trip into the container intact — verified byte for byte on a live deployment. |
   </Step>
-  <Step title="Back up the key">
-    Store a copy of the key somewhere safe, outside Control Plane.
+  <Step title="Read a secret back later">
+    `-o yaml` is required; without it the command prints the secret's metadata table rather than its contents:
+
+    ```bash
+    cpln secret reveal my-n8n-owner -o yaml
+    ```
   </Step>
 </Steps>
+
+<Warning>
+**The owner is re-applied from the secret on every start** (`N8N_INSTANCE_OWNER_MANAGED_BY_ENV`). Two consequences, both measured on a live instance:
+
+- **Editing the secret and restarting the workload is how you rotate the password.** After a rotation, the old password returned `401` and the new one `200`.
+- **The account cannot be changed from inside n8n.** A password change through the API is refused with `403 This account is managed via environment variables and cannot be modified through the API`.
+
+So whatever is in the secret *is* the login, at every restart. Put the password you actually want there.
+</Warning>
 
 <Warning>
 Losing the encryption key makes every credential n8n has stored permanently undecryptable, and the key must never change after first boot — n8n fails to start on a key mismatch. Back it up before installing.
 </Warning>
 
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** `cpln helm install` still exits 0 and reports success, the resources are created, and the workload then never starts. Because the container never ran, `cpln logs` returns **zero lines**, which reads as a broken platform rather than a missing prerequisite.
+
+The only diagnostic is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-n8n --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-n8n-owner no longer exists. Workload updates are
+paused until the secret is added or the reference to the secret removed.
+```
+
+It is **`get-deployments`** — plain `cpln workload get` has no `versions` key at all. Creating the missing secret clears the wedge on its own, but slowly: recovery across the catalog has been measured between **5.5 and 10.5 minutes**, so poll rather than time-boxing it. A forced redeployment shortcuts it to roughly 90 seconds.
+</Warning>
+
 For optional database backups, you also need a bucket and access setup for one of the supported providers — see [Backing Up](#backing-up).
 
-Once your encryption-key secret exists, install the template using your preferred method:
+Once both secrets exist, install the template using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -77,6 +137,47 @@ Once your encryption-key secret exists, install the template using your preferre
     </Card>
 </CardGroup>
 
+## Upgrading From 1.0.x
+
+Version `1.1.0` moved the instance owner out of Helm values. `1.0.0` and `1.0.1` shipped the owner's email and password as values, used exactly as written, guarding a login form that is public by default.
+
+| | `1.0.0` / `1.0.1` | `1.1.0` |
+|---|---|---|
+| Owner login | `owner.email` and `owner.password` values | `owner.secretName` — a dictionary secret you create with `email` and `passwordHash` |
+| Password format | Plaintext | **Bcrypt hash** — n8n rejects plaintext |
+| Encryption key | `encryptionKey.secretName` prerequisite secret | Unchanged |
+| `owner.firstName` / `owner.lastName` | Values | Unchanged; still values |
+
+<Warning>
+**This is the one upgrade in this batch that can change your password.** Everywhere else, an existing credential keeps working untouched. Here it does not: n8n re-applies the owner from the secret at every start, so the hash you put in the secret becomes the login the moment the workload restarts. **Hash the password you are using today**, not a new one — unless changing it is what you intend.
+</Warning>
+
+<Warning>
+**A `helm upgrade` that still carries either removed key is rejected before anything is applied.** A real `cpln helm upgrade` carrying the old keys failed at render, created no Helm revision, and left the running release healthy and untouched:
+
+```text
+n8n: owner.password was removed in 1.1.0. Put a BCRYPT HASH of it in the prerequisite dictionary
+secret named by owner.secretName (key: passwordHash) — hash the password you are using today to
+keep the same login.
+```
+
+Leaving `owner.secretName` empty is refused the same way.
+</Warning>
+
+To upgrade an existing install:
+
+<Steps>
+  <Step title="Create the owner secret">
+    Follow [Prerequisites](#prerequisites), hashing **the password you log in with today** so the login does not change.
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `owner.email` and `owner.password`, and set `owner.secretName` instead. Leave `encryptionKey.secretName`, `owner.firstName`, and `owner.lastName` exactly as they are.
+  </Step>
+  <Step title="Upgrade">
+    The single replica restarts and the editor and webhooks are briefly unavailable — see [Important Notes](#important-notes). Workflows, credentials, and execution data on the volume set are untouched.
+  </Step>
+</Steps>
+
 ## Choosing a Database Mode
 
 Exactly one of the two database modes must be enabled — the chart enforces this at render and fails the install with a clear message otherwise.
@@ -96,19 +197,18 @@ The default `values.yaml` for this template:
 image: n8nio/n8n:2.29.8
 
 resources:
-  cpu: 1000m
-  memory: 1Gi
   minCpu: 250m
   minMemory: 512Mi
+  maxCpu: 1000m
+  maxMemory: 1Gi
 
 encryptionKey:
   secretName: my-n8n-encryption-key # name of your pre-created opaque secret (see Prerequisites)
 
-owner: # instance owner, created automatically on first boot
-  email: admin@example.com # owner login email
+owner: # instance owner, re-applied from the secret on every start
+  secretName: my-n8n-owner # name of your pre-created dictionary secret (see Prerequisites)
   firstName: Instance
   lastName: Owner
-  password: change-me-n8n-owner # change before installing
 
 timezone: UTC # IANA timezone for Schedule triggers and $now
 
@@ -197,9 +297,10 @@ postgres: # dev/lightweight: single-instance PostgreSQL (disable postgresHA firs
 ### n8n Instance
 
 - `image` — The n8n container image.
-- `resources` — CPU and memory for the n8n container.
+- `resources` — CPU and memory for the n8n container. `minCpu` / `minMemory` are the reservation; `maxCpu` / `maxMemory` are the limit.
 - `encryptionKey.secretName` — Name of your pre-created opaque secret holding the credential-encryption key. See [Prerequisites](#prerequisites).
-- `owner.*` — The instance owner account, created automatically on first boot. Because the owner is managed through the environment, there is no unauthenticated setup page at any point. **Change `owner.password` before installing.** To rotate it later, change the value and run a Helm upgrade — the new password takes effect on the restart.
+- `owner.secretName` — Name of your pre-created dictionary secret holding `email` and `passwordHash`. The owner is re-applied from it on every start, so editing the secret and restarting the workload is how you rotate the login — and the account cannot be edited from inside n8n. See [Prerequisites](#prerequisites).
+- `owner.firstName` / `owner.lastName` — Display name for the owner account. These remain ordinary values; only the email and password moved into the secret.
 - `timezone` — IANA timezone applied to Schedule triggers and `$now` expressions (e.g. `America/Chicago`).
 - `volumeset.capacity` — Volume size in GiB (minimum 10) for instance config and binary execution data.
 
@@ -231,7 +332,7 @@ Enable exactly one of `postgresHA` (production, default) or `postgres` (dev/ligh
 | Production webhooks | `https://<canonical>.cpln.app/webhook/<path>` |
 | Test webhooks | `https://<canonical>.cpln.app/webhook-test/<path>` |
 | Internal (same GVC) | `http://{release}-n8n.{gvc}.cpln.local:5678` |
-| Login | `owner.email` / `owner.password` |
+| Login | The `email` and the password behind `passwordHash` in your `owner.secretName` secret |
 | PostgreSQL (internal, HA mode) | `{release}-postgres-ha-proxy.{gvc}.cpln.local:5432`, credentials in the `{release}-postgres-config` secret |
 | PostgreSQL (internal, single mode) | `{release}-postgres.{gvc}.cpln.local:5432`, credentials in the `{release}-pg-config` secret |
 
@@ -312,9 +413,12 @@ In HA mode, `backup.mode` selects `logical` (scheduled `pg_dump` via a cron work
 ## Important Notes
 
 - **Back up the encryption-key secret** — losing it permanently bricks every credential n8n has stored; never change it after first boot (n8n fails to start on a key mismatch).
-- **Change `owner.password` and the database password** (`postgresHA.postgres.password` / `postgres.config.password`) before installing.
+- **Create both prerequisite secrets before installing.** A missing one wedges the deployment with no log output at all; [Prerequisites](#prerequisites) gives the one command that diagnoses it.
+- **The owner secret is authoritative at every restart** — it is not a one-time bootstrap. Changing it changes the login; see [Upgrading From 1.0.x](#upgrading-from-1-0-x).
+- **Change the bundled database password** (`postgresHA.postgres.password` / `postgres.config.password`) before installing — it is used exactly as written. It stays a value deliberately: it is internal plumbing between n8n and its own database that nobody types.
 - **The n8n main instance is single-replica by upstream design** — the default HA PostgreSQL backend removes the database as a failure point.
-- **Upgrades restart the single replica** — expect roughly a minute of editor/webhook downtime per Helm upgrade.
+- **Upgrades restart the single replica** — expect roughly a minute of editor/webhook downtime per Helm upgrade. The first upgrade after an install also re-applies the bundled database, which can add a couple of minutes.
+- **Access changes take time to propagate** — after toggling `publicAccess` or `internalAccess`, re-test over roughly 30 seconds to 5 minutes before concluding the knob is broken.
 - **Synchronous webhook responses must finish within 30 seconds** — see [Webhooks](#webhooks).
 - **Uninstall deletes the database and n8n volume sets** — all workflows, credentials, and execution data. Enable backups if the data matters.
 - **n8n is fair-code under the Sustainable Use License** — free to self-host, but not OSI open source.
