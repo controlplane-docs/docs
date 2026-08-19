@@ -1,32 +1,95 @@
 ---
 title: CPLN Task Runner
-description: Deploy CPLN Task Runner on Control Plane using the Template Catalog. Covers configuration, scaling, and HTTP-based task queuing with retry, scheduling, and rate limiting.
-keywords: ['job runner', 'cloud tasks alternative', 'sidekiq alternative', 'celery alternative', 'background worker', 'delayed job', 'work queue', 'job processor', 'cron alternative', 'priority queue']
+description: Deploy CPLN Task Runner on Control Plane using the Template Catalog. HTTP-based task queuing with retry, scheduling, and per-client rate limiting. Covers the prerequisite admin API key secret and why public access is off by default.
+keywords: ['job runner', 'cloud tasks alternative', 'sidekiq alternative', 'celery alternative', 'background worker', 'delayed job', 'work queue', 'job processor', 'cron alternative', 'priority queue', 'prerequisite secret', 'admin api key', 'redis sentinel', 'ssrf']
 ---
 
 ## Overview
 
 Control Plane Task Runner is a self-hosted task queue and scheduler service similar to Google Cloud Tasks. It provides HTTP-based task enqueuing with automatic retry, delayed and scheduled execution, per-client rate limiting, and multi-queue support with priority levels.
 
+The admin API key comes from a secret you create **before** installing, and the API is **not** exposed to the internet by default.
+
+<Warning>
+**`/v1/enqueue` has no authentication of any kind, and this is the reason `api.public.enabled` defaults to `false`.** The endpoint does not merely accept registered clients: an **unknown `client_id` is accepted and auto-registered** rather than rejected — measured against the running image, where posting a never-seen ID returned `status: enqueued` and created that client. So a client ID is not a credential in any sense.
+
+With public access on, anyone who finds the endpoint can make a worker issue arbitrary outbound HTTP requests with a method, headers, and body of their choosing. **No setting closes this** — the application has no client authentication. If you need to accept task submissions from outside the GVC, front the API with an authenticating proxy of your own.
+</Warning>
+
+<Warning>
+**Upgrading an install created with `1.2.x` is a breaking change.** `api.env.adminApiKey` — which disabled admin authentication entirely when left at its shipped empty default — is replaced by `api.admin.apiKeySecretName`, a required prerequisite secret. `api.public.enabled` also flips from `true` to `false`. See [Upgrading From 1.2.x](#upgrading-from-1-2-x).
+</Warning>
+
 ### What Gets Created
 
-- **API Workload** — HTTP endpoint for enqueuing tasks, managing clients, and health checks. Scales between 1 and 3 replicas by default.
-- **Worker Workload** — Background processor that picks tasks off the queue and executes them. Scales between 1 and 5 replicas by default.
+- **API Workload** — HTTP endpoint for enqueuing tasks, managing clients, and health checks. Scales between 1 and 3 replicas by default. Internal-only unless you turn public access on.
+- **Worker Workload** — Background processor that picks tasks off the queue and executes them. Scales between 1 and 5 replicas by default. Always internal-only.
 - **Redis with Sentinel** — A Redis instance with Redis Sentinel for high-availability task persistence and coordination. Sentinel monitors the Redis primary and handles automatic failover.
-- **Secret** — An opaque secret containing Redis and Sentinel passwords and the admin API key (when `createSecret` is `true`).
-- **Identity & Policy** — An identity bound to the workloads with `reveal` access to the task runner secrets.
+- **Secret** *(optional, on by default)* — A dictionary secret holding the bundled Redis and Sentinel passwords. The admin API key is **not** created here — it lives in the secret you create.
+- **Identity & Policy** — An identity bound to the workloads with `reveal` on exactly the secrets they read: the Redis secret and your admin key secret.
 
 ### Architecture
 
-The API workload receives task submissions over HTTP and pushes them into Redis. The Worker workload polls Redis and executes tasks by making outbound HTTP requests to the configured target URLs. Both workloads connect to Redis via Sentinel for failover resilience.
+The API workload receives task submissions over HTTP and pushes them into Redis. The Worker workload polls Redis and executes tasks by making outbound HTTP requests to the configured target URLs. Both workloads connect to Redis via Sentinel for failover resilience. A fresh install reached all four workloads ready in about 58 seconds, and enqueue-to-delivery latency was under 5 seconds.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
 </Note>
 
+## Prerequisites
+
+**The admin API key secret must exist before you install.** The `/admin/*` endpoints create, edit, and delete clients and rate-limit tiers, and they are guarded by the `X-Admin-Key` header. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the admin key secret">
+    An [opaque secret](/guides/create-secret/opaque) with encoding `plain` whose payload *is* the key:
+
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | \
+      cpln secret create-opaque --name my-cpln-task-runner-admin-key --encoding plain -f -
+    ```
+
+    Set `api.admin.apiKeySecretName` to the name you used. Use `printf`, not `echo` — `echo` appends a newline, which becomes part of the key and then has to be sent in every admin request.
+  </Step>
+  <Step title="Read it back later">
+    `-o yaml` is required; without it the command prints the secret's metadata table rather than its payload:
+
+    ```bash
+    cpln secret reveal my-cpln-task-runner-admin-key -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Note>
+**Admin authentication is enforced, and it is enforced on the internal path too.** Verified on a live deployment: `/admin/clients` returned `401` with no header and `401` with a wrong key, and `200` with the correct one — both over the public endpoint and over in-GVC service DNS.
+</Note>
+
+<Warning>
+**Setting `api.admin.apiKeySecretName` to `""` disables admin authentication completely**, and the chart therefore **refuses to render** while `api.public.enabled` is `true`. An empty name is permitted only for an internal-only deployment, and it is a deliberate act: measured through a port-forward with the name empty, `/admin/clients` returned the full client list with no header at all, and again with a nonsense key.
+</Warning>
+
+<Warning>
+**A missing prerequisite secret wedges the install rather than failing it.** `cpln helm install` still exits 0 and reports success, the resources are created, and the API workload then never starts — while the other three come up normally. Because the container never ran, `cpln logs` returns **zero lines**, which reads as a broken platform rather than a missing prerequisite.
+
+The only diagnostic is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-task-runner-api --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-cpln-task-runner-admin-key no longer exists. Workload updates are
+paused until the secret is added or the reference to the secret removed.
+```
+
+It is **`get-deployments`** — plain `cpln workload get` has no `versions` key at all. Creating the missing secret clears the wedge on its own, but slowly: recovery here was measured at **8 minutes 43 seconds**, inside the 5.5–10.5 minute range seen across the catalog, so poll rather than time-boxing it. A forced redeployment shortcuts it to roughly 90 seconds.
+</Warning>
+
+Nothing else is required. The bundled Redis and Sentinel passwords are ordinary values — they are internal plumbing between the workloads and their own datastore, and nobody types them — but they are used exactly as written, so change them from their `change-me-…` defaults before installing.
+
 ## Installation
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+Once the admin key secret exists, install the template using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -66,14 +129,18 @@ api:
     max: 3
   port: 8080
   public:
-    enabled: true
+    enabled: false # DEFAULTS TO FALSE — /v1/enqueue has no authentication at all
     pathPrefix: "" # Path prefix for public endpoint (empty for root)
+  admin:
+    # REQUIRED prerequisite secret — an `opaque` secret (encoding: plain) whose
+    # payload is the admin API key. "" disables admin auth and is rejected while
+    # public.enabled is true.
+    apiKeySecretName: my-cpln-task-runner-admin-key
   resources:
     cpu: 500m
     memory: 512Mi
   env:
     logLevel: info # debug, info, warn, error
-    adminApiKey: "" # Admin API key for protected endpoints (leave empty to disable)
     otelEndpoint: "" # OpenTelemetry endpoint (leave empty to disable tracing)
     connectRetries: 30
     retryIntervalSec: 2
@@ -100,18 +167,16 @@ worker:
     retryIntervalSec: 2
     otelEndpoint: ""
 
-# Creates a secret for Redis + Sentinel passwords and admin API key
+# Creates a secret holding the bundled Redis + Sentinel passwords.
+# Set to false to bring your own secret; see redis.*.auth.fromSecret below.
 createSecret: true
 secretName: task-runner-secrets # Must match names below if createSecret is true
 
 # Redis configuration
 redis:
-  redisPassword: mypassword # Change before deploying to production
-  sentinelPassword: mypassword # Change before deploying to production
-  admin:
-    fromSecret:
-      name: task-runner-secrets
-      apiKeyKey: admin-api-key
+  # Used as written when createSecret is true, so change them.
+  redisPassword: change-me-cpln-task-runner-redis
+  sentinelPassword: change-me-cpln-task-runner-sentinel
   redis:
     auth:
       fromSecret:
@@ -135,11 +200,11 @@ redis:
 - `api.enabled` — Enable or disable the API workload.
 - `api.replicas` — Min/max replica count for autoscaling (default: 1–3).
 - `api.port` — Container port (default `8080`).
-- `api.public.enabled` — Expose the API to the public internet.
+- `api.public.enabled` — Expose the API to the public internet. **Defaults to `false`**; read [Public Access and the Open Queue](#public-access-and-the-open-queue) before turning it on.
 - `api.public.pathPrefix` — Optional path prefix for the public endpoint. Leave empty to serve from the root.
+- `api.admin.apiKeySecretName` — Name of your pre-created opaque secret whose payload is the admin API key, sent as the `X-Admin-Key` header. Required; `""` disables admin authentication and is rejected while public access is on. See [Prerequisites](#prerequisites).
 - `api.resources` — CPU and memory allocated to each API replica.
 - `api.env.logLevel` — Log verbosity: `debug`, `info`, `warn`, or `error`.
-- `api.env.adminApiKey` — API key for admin-protected endpoints. Leave empty to disable admin authentication.
 - `api.env.connectRetries` / `api.env.retryIntervalSec` — Redis connection retry behavior on startup.
 
 ### Worker Workload
@@ -150,22 +215,26 @@ redis:
 - `worker.env.concurrency` — Number of tasks a single Worker replica can execute concurrently.
 - `worker.env.taskTimeoutSec` — Maximum duration in seconds before a task execution is considered failed (default `1800`).
 - `worker.env.maxRetry` — Maximum number of retry attempts for a failed task.
-- `worker.env.allowPrivateUrls` — When `true`, allows tasks to target internal/private URLs.
+- `worker.env.allowPrivateUrls` — When `true`, allows tasks to target internal/private URLs. Workers fetch whatever URL a task carries, so leaving this `false` is the only bound on where an enqueued task can reach.
 - `worker.env.cbFailureThreshold` / `worker.env.cbTimeoutSec` — Circuit breaker settings to stop hammering failing endpoints.
 
 ### Secrets and Redis
 
-When `createSecret` is `true`, the template automatically creates a secret named by `secretName` containing the Redis password, Sentinel password, and admin API key. The `redis.*.fromSecret` fields are pre-wired to reference this secret.
+When `createSecret` is `true`, the template creates a dictionary secret named by `secretName` holding the Redis and Sentinel passwords. The `redis.*.fromSecret` fields are pre-wired to reference it. The admin API key is **not** in this secret — it is always your own opaque secret, independent of `createSecret`.
 
-When using an existing secret (`createSecret: false`), update the `redis.*.fromSecret` fields to point to your secret name and the correct keys.
+When bringing your own secret (`createSecret: false`), create a dictionary secret holding the keys named by the `passwordKey` fields and point both `fromSecret.name` values at it. This path was verified end to end alongside the admin secret, including non-default key names.
 
 <Note>
-Change the default `redis.redisPassword` and `redis.sentinelPassword` values before deploying to production.
+**Change `redis.redisPassword` and `redis.sentinelPassword` before the first install** — they are used exactly as written. They stay ordinary values deliberately: they are internal plumbing for a datastore bundled with this one app, which nobody connects to by hand. Once the volumes are initialised, changing them requires uninstalling (which deletes the volume sets) and reinstalling.
 </Note>
 
 ### Enqueuing Tasks
 
-Once deployed, submit tasks to the API workload's public endpoint:
+Submit tasks to the API. With the default `api.public.enabled: false` the endpoint below is the in-GVC address `RELEASE_NAME-task-runner-api.GVC_NAME.cpln.local:8080`; it is a public `*.cpln.app` hostname only if you turned public access on.
+
+<Warning>
+This request carries no credential, and none exists — see [Public Access and the Open Queue](#public-access-and-the-open-queue).
+</Warning>
 
 ```bash
 curl -X POST https://your-api-endpoint/v1/enqueue \
@@ -184,7 +253,7 @@ curl -X POST https://your-api-endpoint/v1/enqueue \
 
 ### Admin Endpoints
 
-When `api.env.adminApiKey` is set, admin endpoints require the `X-Admin-Key` header:
+Every `/admin/*` request requires the `X-Admin-Key` header, whose value is the payload of your `api.admin.apiKeySecretName` secret:
 
 ```bash
 # List clients
@@ -220,6 +289,92 @@ To enable distributed tracing, set `otelEndpoint` in both `api.env` and `worker.
 ```text
 tracing.controlplane:4318
 ```
+
+## Connecting
+
+| What | Address | Credentials |
+|---|---|---|
+| API (internal, default) | `RELEASE_NAME-task-runner-api.GVC_NAME.cpln.local:8080` | none for `/v1/*`; `X-Admin-Key` for `/admin/*` |
+| API (public, opt-in) | the workload's `*.cpln.app` canonical endpoint | same |
+| Redis Sentinel | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | the Sentinel password |
+| Admin key | your opaque secret | `cpln secret reveal my-cpln-task-runner-admin-key -o yaml` |
+
+Find the public endpoint under `status.canonicalEndpoint` of `cpln workload get RELEASE_NAME-task-runner-api --gvc GVC_NAME -o yaml`.
+
+## Upgrading From 1.2.x
+
+Two behaviours change, and both will break an existing workflow if you relied on the old defaults.
+
+| | `1.2.x` | `1.3.0` |
+|---|---|---|
+| Admin API key | `api.env.adminApiKey` — a value, shipped empty, which **disabled admin authentication** | `api.admin.apiKeySecretName` — a required opaque secret you create |
+| Public access | `api.public.enabled: true` | `api.public.enabled: false` |
+| Bundled Redis passwords | A working published value | `change-me-…` placeholders |
+| `redis.admin.fromSecret` | Present | Removed — the admin key is its own secret regardless of `createSecret` |
+
+<Warning>
+**Admin authentication is now enforced.** `1.2.x` shipped `api.env.adminApiKey: ""`, which left `/admin/*` unauthenticated **on a public API** — anyone who found the endpoint could create clients and change rate-limit tiers. Create the secret with the *same* key you were using and your admin scripts keep working; create a new one and every caller must be updated.
+</Warning>
+
+<Warning>
+**A `helm upgrade` that still carries either removed key is rejected before anything is applied**, and so is an empty `apiKeySecretName` while public access is on. A real `cpln helm upgrade` carrying the old keys failed at render, created no Helm revision, and left the running release healthy and untouched:
+
+```text
+api.admin.apiKeySecretName is empty while api.public.enabled is true. An empty key disables admin
+authentication entirely, which would publish /admin/* — create, edit and delete clients and
+rate-limit tiers — to the internet.
+```
+
+```text
+api.env.adminApiKey was REMOVED in cpln-task-runner 1.3.0. ... set api.admin.apiKeySecretName to
+its name.
+```
+</Warning>
+
+To upgrade an existing install:
+
+<Steps>
+  <Step title="Create the admin key secret">
+    Follow [Prerequisites](#prerequisites), putting the key you use today into it so existing admin callers keep working.
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `api.env.adminApiKey` and `redis.admin.fromSecret`, and set `api.admin.apiKeySecretName` instead.
+  </Step>
+  <Step title="Decide about public access">
+    `api.public.enabled` now defaults to `false`. Leaving it at the new default closes the unauthenticated `/v1/enqueue` endpoint to the internet — read [Public Access and the Open Queue](#public-access-and-the-open-queue) before setting it back to `true`.
+  </Step>
+  <Step title="Upgrade">
+    The first upgrade after an install also re-applies the bundled Redis even with identical values, restarting it; the API returns errors for a minute or two while Redis comes back. Later upgrades are clean.
+  </Step>
+</Steps>
+
+<Note>
+The bundled Redis and Sentinel passwords keep whatever you already set. Only their *defaults* changed, which affects fresh installs.
+</Note>
+
+## Public Access and the Open Queue
+
+`api.public.enabled` is `false` by default. Understand exactly what turning it on exposes:
+
+- **`/v1/enqueue` requires no credential whatsoever.** There is no header, token, or signature to supply.
+- **An unknown `client_id` is auto-registered, not rejected.** Posting a never-before-seen ID returns `status: enqueued` and creates the client with the default tier. A client ID is therefore not a secret and not a control.
+- **The consequence is a request relay.** Anyone reaching the endpoint can make a worker issue outbound HTTP with the method, headers, and body they choose. `worker.env.allowPrivateUrls: false` keeps those requests off internal addresses, which is the only bound.
+- **`/metrics` is served on the same port, unauthenticated, and its labels enumerate every `client_id`.**
+
+No setting fixes this; the application has no client authentication. If you need submissions from outside the GVC, put an authenticating proxy in front of the API and leave `api.public.enabled` at `false`.
+
+<Note>
+**Disabling public access surfaces as `421 Misdirected Request`, not `403`.** After the change the public hostname stops routing entirely — a `421` here means the knob worked, not that something is broken. Access changes take roughly 30 seconds to a few minutes to propagate, so re-test over that window before concluding otherwise.
+</Note>
+
+## Important Notes
+
+- **Create the admin key secret before installing.** A missing prerequisite secret wedges the deployment with no log output at all; [Prerequisites](#prerequisites) gives the one command that diagnoses it.
+- **`/v1/enqueue` is unauthenticated and auto-registers unknown client IDs** — this is why public access is off by default. See [Public Access and the Open Queue](#public-access-and-the-open-queue).
+- **`/metrics` is unauthenticated** and its labels enumerate every `client_id`.
+- **Change the `change-me-…` Redis and Sentinel passwords before the first install.** Changing them later requires uninstalling and reinstalling.
+- **The first Helm upgrade after an install re-applies the bundled Redis** even with identical values, which restarts it; the API returns errors for a minute or two while Redis comes back. Later upgrades are clean.
+- **Access changes take roughly 30 seconds to a few minutes to propagate**, so a freshly toggled `api.public.enabled` looks unchanged at first — and once disabled, the public hostname returns `421`, not `403`.
 
 ## External References
 
