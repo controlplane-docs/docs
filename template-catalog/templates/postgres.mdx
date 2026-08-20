@@ -1,33 +1,153 @@
 ---
 title: PostgreSQL
-description: Deploy PostgreSQL on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and single-replica setup with optional scheduled S3, GCS, or MinIO backups.
-keywords: ['pg', 'postgres', 'rdbms', 'oltp', 'sql database', 'pgbouncer', 'connection pooler', 'pg_dump', 'wal', 'psql', 'pgadmin', 'rds alternative']
+description: Deploy PostgreSQL on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, volumes, internal access, PgBouncer pooling, scheduled S3, GCS and MinIO backups, and upgrading from template version 3.3.0.
+keywords: ['pg', 'postgres', 'rdbms', 'oltp', 'sql database', 'pgbouncer', 'connection pooler', 'pg_dump', 'psql', 'pgadmin', 'rds alternative', 'dictionary secret', 'alter role', 'database template']
 ---
 
 ## Overview
 
-PostgreSQL is a powerful open-source relational database. This template deploys a single-replica PostgreSQL instance with persistent storage and optional scheduled backups to AWS S3, GCS, or a self-hosted MinIO instance.
+PostgreSQL is a powerful open-source relational database. This template deploys a single-replica PostgreSQL instance with persistent storage, an optional PgBouncer connection pooler, and optional scheduled backups to AWS S3, GCS, or a self-hosted MinIO instance.
+
+Database credentials are **not** template values. PostgreSQL reads its username, password and database name from a dictionary secret you create before installing, so no password passes through Helm or lands in the release.
+
+<Warning>
+**Template version 3.4.0 is a breaking security change.** `config.username`, `config.password` and `config.database` were removed, and an install or upgrade that still sets any of them now fails at render instead of silently falling back to a published default password. If you are running 3.3.0 or earlier, read [Upgrading From 3.3.0 or Earlier](#upgrading-from-3-3-0-or-earlier) before you touch the release.
+</Warning>
 
 <Note>
-PostgreSQL on Control Plane operates as a single-replica deployment. Do not scale up the replica count, as this would result in multiple isolated instances rather than a replicated cluster. For a highly available setup, use the [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) template instead.
+PostgreSQL on Control Plane operates as a single-replica deployment. Do not scale up the replica count, as this would result in multiple isolated instances rather than a replicated cluster. For a highly available setup, use the [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) template instead, or [Postgres Multi Location](/template-catalog/templates/postgres-multi-location) to span regions.
 </Note>
 
 ### What Gets Created
 
-- **Stateful Postgres Workload** — A single-replica PostgreSQL container with configurable resources.
-- **Volume Set** — Persistent storage for database data, with optional autoscaling.
-- **Secret** — A dictionary secret storing the database username and password, injected into the container at startup.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the database credentials secret, and cloud storage access when backup is enabled.
-- **PgBouncer Workload** *(optional)* — A PgBouncer connection pooler deployed as a separate workload in front of PostgreSQL.
-- **Backup Cron Workload** *(optional)* — A scheduled `pg_dump` backup job that writes compressed SQL dumps to AWS S3, GCS, or MinIO.
+- **Stateful Postgres Workload** — (`RELEASE_NAME-postgres`): a single-replica PostgreSQL container serving TCP on port `5432`, with configurable resources.
+- **Volume Set** — (`RELEASE_NAME-pg-vs`): an `ext4` volume holding `PGDATA`, on general-purpose SSD with daily snapshots and 7-day retention, with optional autoscaling.
+- **Identity & Policy** — (`RELEASE_NAME-pg-identity`, `RELEASE_NAME-pg-policy`): an identity bound to the database, pooler and backup workloads, and a policy granting it `reveal` on exactly the credential secrets you created — nothing else. When backups are enabled, the identity also carries the Cloud Account binding the backup job uses to reach your bucket.
+- **PgBouncer Workload** *(optional)* — (`RELEASE_NAME-pgbouncer`): a connection pooler deployed as a separate workload in front of PostgreSQL, created when `pgbouncer.enabled: true`.
+- **Backup Cron Workload** *(optional)* — (`RELEASE_NAME-postgres-backup`): a scheduled `pg_dump` that writes compressed SQL dumps to AWS S3, GCS or MinIO, created when `backup.enabled: true`.
+
+The template creates **no credential secret of its own**. Every password lives in the prerequisite secrets described below.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
 </Note>
 
+## Upgrading From 3.3.0 or Earlier
+
+Template versions up to 3.3.0 took the database credentials as plain Helm values and shipped a working default password for them, and wrote those credentials into a chart-owned secret named after the release. Version 3.4.0 removes both.
+
+| | 3.3.0 and earlier | 3.4.0 |
+|---|---|---|
+| Database credentials | `config.username`, `config.password`, `config.database` values | `config.credentialsSecretName` → a dictionary secret you create |
+| Credential secret | `RELEASE_NAME-pg-config`, created by the chart | Not created — credentials live only in your secret |
+| MinIO backup credentials | `backup.minio.accessKey`, `backup.minio.secretKey` values | `backup.minio.credentialsSecretName` → a dictionary secret you create |
+| Backup identity permissions | Bucket-scoped policy plus `aws::ReadOnlyAccess` | Bucket-scoped policy only |
+| `backup.schedule` | Any cron beginning with `*` failed to render | Accepts every cron form, including `*/15 * * * *` |
+
+<Warning>
+**Carrying old values forward stops the upgrade.** Each removed key is rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running rather than quietly restarting against a different password:
+
+```text
+Error: execution error at (postgres/templates/workload-postgres.yaml:1:4): config.username was
+REMOVED in postgres 3.4.0. Database credentials are no longer values: create a `dictionary` secret
+holding the keys `username`, `password` and `database`, and set config.credentialsSecretName to its
+name. See Prerequisites in the README.
+```
+
+`config.password` and `config.database` each produce the same message under their own name, and MinIO backups produce:
+
+```text
+Error: ... backup.minio.accessKey and backup.minio.secretKey were REMOVED in postgres 3.4.0. Create a
+`dictionary` secret holding the keys `accessKey` and `secretKey`, and set
+backup.minio.credentialsSecretName to its name. See Storage setup in the README.
+```
+</Warning>
+
+<Steps>
+  <Step title="Read the credentials the database already uses">
+    Credentials are written into the data directory the first time the volume is initialized, so an existing database keeps whatever it was created with. Recover them from your current values file, or from the secret the old version created — do this **before** upgrading:
+
+    ```bash
+    cpln secret reveal RELEASE_NAME-pg-config -o yaml
+    ```
+
+    The keys are `username`, `password` and `database`.
+  </Step>
+  <Step title="Create the prerequisite secret with those same values">
+    Follow [Prerequisites](#prerequisites), using the existing username, password and database name. Using different values here does not change the database — it just leaves the workload unable to authenticate.
+  </Step>
+  <Step title="Remove the old keys from your values">
+    Delete `config.username`, `config.password` and `config.database`, and set `config.credentialsSecretName` to your secret's name. If you back up to MinIO, replace `backup.minio.accessKey` and `backup.minio.secretKey` with `backup.minio.credentialsSecretName`.
+  </Step>
+  <Step title="Upgrade, then rotate the password">
+    After the upgrade succeeds, change any password that came from a 3.3.x default — those defaults were published in the public template repository, so treat them as compromised. Rotate inside PostgreSQL and update the secret to match:
+
+    ```sql
+    ALTER ROLE appuser WITH PASSWORD 'NEW-STRONG-PASSWORD';
+    ```
+
+    Use your own username in place of `appuser`, then update the secret so the workload can still authenticate after a restart.
+  </Step>
+</Steps>
+
+<Warning>
+**The chart no longer creates `RELEASE_NAME-pg-config`.** Anything outside this release that referenced that secret by name — another workload's environment, a policy, or a parent chart that bundles PostgreSQL as a subchart — must be pointed at the secret you created instead. A reference to a secret that no longer exists does not fail loudly; it wedges the referring workload silently.
+</Warning>
+
+<Note>
+**`aws::ReadOnlyAccess` was removed from the backup identity, and no action is required from you.** Control Plane attaches each policy reference as a managed policy on a per-identity derived IAM role, so the identity's permissions are the union of those references. `ReadOnlyAccess` contains no write actions at all — its S3 portion is `Get*` and `List*` on `*` — so it was never carrying the backup upload; what it granted was read access to every bucket in the account. Backups continue to work without it. **Existing bucket policies are also unaffected:** a 30.9 MB multipart upload succeeded under the six-action policy documented by earlier template versions, because a multipart upload authorizes under `s3:PutObject`. The four additional actions in the [AWS S3](#aws-s3) policy below are defensive — they let a failed upload abort its own parts instead of leaving them to bill silently — not required.
+</Note>
+
+<Note>
+**`backup.schedule` now accepts every cron form.** In 3.3.0 and earlier, any schedule beginning with `*` — such as `*/15 * * * *` — failed to render with a raw YAML parse error naming a template file, because an unquoted YAML scalar starting with `*` is an alias indicator. If you worked around this with a digit-leading schedule, you can now use the interval form directly.
+</Note>
+
+## Prerequisites
+
+**One secret must exist before you install.** It holds the credentials your applications put in their connection strings. The values never pass through Helm, so they do not land in the release. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. PostgreSQL creates that user and that database on first boot:
+
+    ```bash
+    cpln secret create-dictionary --name my-postgres-credentials \
+      --entry username=postgres \
+      --entry password='YOUR-STRONG-PASSWORD' \
+      --entry database=mydb
+    ```
+
+    Set `config.credentialsSecretName` to the name you used.
+  </Step>
+  <Step title="Read the secret back later">
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values:
+
+    ```bash
+    cpln secret reveal my-postgres-credentials -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `config.credentialsSecretName` is blank, but a name that points at a secret which does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines** — there is nothing to log, and every summary surface just looks like a slow deploy. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-postgres --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-postgres-credentials no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action, in roughly **5.5 to 10.5 minutes** measured across five templates, or run `cpln workload force-redeployment RELEASE_NAME-postgres --gvc GVC_NAME` to clear it in about 90 seconds.
+</Warning>
+
+Backups need a bucket, and for AWS or GCP a Control Plane Cloud Account, before they can be enabled — see [Backup Prerequisites](#backup-prerequisites). MinIO backups need a second dictionary secret holding `accessKey` and `secretKey`. Nothing else is required.
+
 ## Installation
 
-This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
+To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -56,7 +176,7 @@ This template has no external prerequisites unless backup is enabled. To install
 The default `values.yaml` for this template:
 
 ```yaml
-image: postgres:18  # versions before postgres:17 do not support the backup feature
+image: postgres:18  # versions before postgres:17 are compatible but do not support backup feature
 
 resources:
   minCpu: 200m
@@ -65,21 +185,25 @@ resources:
   maxMemory: 256Mi
 
 config:
-  username: username
-  password: password
-  database: test
+  # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+  # A `dictionary` secret holding exactly three keys: `username`, `password` and
+  # `database`. If it does not exist at install time the deployment WEDGES
+  # silently — `cpln logs` returns nothing at all. See Prerequisites in the README
+  # for the exact `cpln secret create-dictionary` command.
+  credentialsSecretName: my-postgres-credentials
 
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
   autoscaling:
-    enabled: false
-    maxCapacity: 100 # Maximum capacity in GiB
-    minFreePercentage: 10 # Trigger scaling when free space drops below this percentage
-    scalingFactor: 1.2 # Multiply current capacity by this factor when scaling up
+    enabled: false # Set to true to enable autoscaling
+    maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
+    minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
+    scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
 
-internalAccess:
+internalAccess: # Sets the internal firewall scope - if set to none, replicas will not be able to reach each other
   type: same-gvc # options: none, same-gvc, same-org, workload-list
-  workloads: # Note: can only be used if type is same-gvc or workload-list
+  workloads:  # Note: can only be used if type is same-gvc or workload-list
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
 pgbouncer:
@@ -94,10 +218,10 @@ pgbouncer:
     cpu: 200m
     memory: 128Mi
 
-backup: # compatible with Postgres 17+ only
+backup: # compatible with Postgres 17+
   enabled: false
   image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0 # tag 18.1.0 = Postgres 18, 17.1.0 = Postgres 17
-  schedule: "0 2 * * *" # cron schedule, default is daily at 2am UTC
+  schedule: "0 2 * * *"   # daily at 2am UTC
 
   resources:
     cpu: 100m
@@ -106,33 +230,34 @@ backup: # compatible with Postgres 17+ only
   provider: aws # Options: aws, gcp, or minio
 
   aws:
-    bucket: my-backup-bucket
+    bucket: my-postgres-bucket
     region: us-east-1
-    cloudAccountName: my-backup-cloudaccount
-    policyName: my-backup-policy
-    prefix: postgres/backups
+    cloudAccountName: my-s3-cloud-account
+    policyName: my-postgres-backup-policy # bucket-scoped IAM policy, see README
+    prefix: postgres/backups # folder name where your backups will be stored
 
   gcp:
-    bucket: my-backup-bucket
-    cloudAccountName: my-backup-cloudaccount
-    prefix: postgres/backups
+    bucket: my-postgres-bucket
+    cloudAccountName: my-gcs-cloud-account
+    prefix: postgres/backups # folder name where your backups will be stored
 
   minio: # Backup to a self-hosted MinIO workload (or any S3-compatible endpoint)
     endpoint: http://my-minio-workload:9000 # e.g. http://WORKLOAD_NAME:9000 for an internal MinIO template deployment
-    bucket: my-backup-bucket
-    accessKey: my-minio-username # matches the MinIO template's admin.username
-    secretKey: my-minio-password # matches the MinIO template's admin.password
-    prefix: postgres/backups
+    bucket: my-postgres-bucket
+    # REQUIRED PREREQUISITE SECRET when provider is `minio` — a `dictionary`
+    # secret holding `accessKey` and `secretKey`. See Storage setup in the README.
+    credentialsSecretName: my-postgres-minio-credentials
+    prefix: postgres/backups # folder name where your backups will be stored
 ```
 
 ### Credentials
 
-- `config.username` — PostgreSQL username. **Change before deploying to production.**
-- `config.password` — PostgreSQL password. **Change before deploying to production.**
-- `config.database` — Name of the database created on startup.
+- `config.credentialsSecretName` — Name of the dictionary secret holding `username`, `password` and `database`. PostgreSQL creates that user and that database on first boot, and this is the credential your applications put in their connection strings.
+
+The secret must exist before installing — see [Prerequisites](#prerequisites). The workload reads it through `cpln://secret/...` references, so the values appear in neither the Helm release nor the stored workload spec.
 
 <Note>
-These values are only applied on first startup when the data directory is empty. Updating them after the initial deployment will have no effect on the running database. To change credentials or the database name on an existing instance, use PostgreSQL's native commands (e.g. `ALTER USER`, `ALTER DATABASE`).
+These credentials are only applied on first startup when the data directory is empty. Rotating the secret afterwards does not change the stored password; change it inside PostgreSQL with `ALTER ROLE ... WITH PASSWORD` (and `ALTER DATABASE ... RENAME` for the database name) and update the secret to match.
 </Note>
 
 ### Resources
@@ -140,10 +265,14 @@ These values are only applied on first startup when the data directory is empty.
 - `resources.minCpu` / `resources.minMemory` — Minimum CPU and memory guaranteed to the workload.
 - `resources.maxCpu` / `resources.maxMemory` — Maximum CPU and memory the workload can use.
 
+<Note>
+On a stateful workload the ratio of `maxCpu` to `minCpu` may not exceed 4:1. The shipped `500m` / `200m` is 2.5:1; raising `maxCpu` without raising `minCpu` can cross the limit and is rejected when the workload is applied.
+</Note>
+
 ### Storage
 
 - `volumeset.capacity` — Initial volume size in GiB (minimum 10).
-- `volumeset.autoscaling.enabled` — Automatically expand the volume as it fills. When enabled:
+- `volumeset.autoscaling.enabled` — Allow the volume to grow as it fills. When enabled:
   - `maxCapacity` — Maximum volume size in GiB.
   - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
   - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
@@ -159,13 +288,7 @@ These values are only applied on first startup when the data directory is empty.
 | `same-org` | Allow access from all workloads in the same organization |
 | `workload-list` | Allow access only from specific workloads listed in `workloads` |
 
-### Connecting to PostgreSQL
-
-Once deployed, connect to the database from within the same GVC using:
-
-```text
-RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432
-```
+Firewall changes take 30 to 150 seconds to propagate. After changing `internalAccess`, re-test rather than trusting the first response.
 
 ### PgBouncer Connection Pooling
 
@@ -173,11 +296,12 @@ PgBouncer is an optional connection pooler that sits in front of PostgreSQL and 
 
 When enabled, PgBouncer is deployed as a separate workload and becomes the primary connection endpoint for your applications:
 
-```
+```text
 RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432
 ```
 
 - `pgbouncer.enabled` — Enable or disable PgBouncer.
+- `pgbouncer.image` — PgBouncer container image.
 - `pgbouncer.poolMode` — Controls how connections are reused:
 
 | Mode | Description |
@@ -192,30 +316,40 @@ RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432
 - `pgbouncer.resources.cpu` / `pgbouncer.resources.memory` — Resources allocated to each PgBouncer replica.
 
 <Note>
-PgBouncer shares the same credentials and identity as the PostgreSQL workload — no additional secrets or IAM configuration is required. The `userlist.txt` and `pgbouncer.ini` are generated automatically from your `config.username`, `config.password`, and `config.database` values at startup.
+PgBouncer reads the same credentials secret and identity as the PostgreSQL workload — no additional secrets or IAM configuration is required. Its `userlist.txt` and `pgbouncer.ini` are generated at startup from the `username`, `password` and `database` keys in that secret.
+</Note>
+
+<Note>
+PgBouncer's own admin console (`-d pgbouncer`) rejects the database user with `FATAL: not allowed`. The image restricts admin access to the `postgres` user; this is upstream behavior, not a template setting.
 </Note>
 
 ### Backup
 
-Backup is disabled by default. When enabled, a cron workload runs `pg_dump` on the configured schedule and uploads compressed SQL dumps to AWS S3 or GCS.
+Backup is disabled by default. When enabled, a cron workload runs `pg_dump` on the configured schedule and uploads compressed SQL dumps to AWS S3, GCS or MinIO. The job authenticates with the username and password from your credentials secret and dumps the database named in it.
 
 <Note>
 Backup requires PostgreSQL 17 or later. Set `backup.image` to match your PostgreSQL version: `ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0` for Postgres 18, or `ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0` for Postgres 17.
 </Note>
 
 - `backup.enabled` — Enable scheduled backups.
-- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
+- `backup.image` — Backup container image, matched to your PostgreSQL major version.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC). Interval forms such as `*/15 * * * *` are accepted.
 - `backup.provider` — `aws`, `gcp`, or `minio`.
 - `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+- `backup.PROVIDER.prefix` — Folder path within the bucket where backups are stored.
+
+The **AWS S3** and **MinIO** paths were exercised end to end at the shipped settings, with the resulting objects confirmed from outside the cluster and a dump downloaded and restored to verify its contents; the AWS path was also exercised at 30.9 MB to force a multipart upload. **GCS** renders and binds correctly but was not exercised in the same run — rehearse it before relying on it.
 
 ## Backup Prerequisites
 
+Only needed when `backup.enabled: true`.
+
 ### AWS S3
 
-Before enabling backup with `provider: aws`, complete the following in your AWS account:
-
 1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
+
+2. If you do not have a Control Plane Cloud Account set up, follow the [Create a Cloud Account](/guides/create-cloud-account) guide. Set `backup.aws.cloudAccountName` to its name.
+
 3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
 
 ```json
@@ -230,7 +364,11 @@ Before enabling backup with `provider: aws`, complete the following in your AWS 
                 "s3:DeleteObject",
                 "s3:ListBucket",
                 "s3:GetObjectVersion",
-                "s3:DeleteObjectVersion"
+                "s3:DeleteObjectVersion",
+                "s3:GetBucketLocation",
+                "s3:AbortMultipartUpload",
+                "s3:ListBucketMultipartUploads",
+                "s3:ListMultipartUploadParts"
             ],
             "Resource": [
                 "arn:aws:s3:::YOUR_BUCKET_NAME",
@@ -241,34 +379,45 @@ Before enabling backup with `provider: aws`, complete the following in your AWS 
 }
 ```
 
-4. Set `backup.aws.policyName` to the name of the policy created in step 3.
+4. Set `backup.aws.policyName` to the name of the policy created in step 3. The template attaches it to the workload's identity, and attaches nothing else — the bucket in your policy is the only storage the backup job can reach.
+
 5. Set `backup.aws.prefix` to the folder path where backups will be stored.
 
 ### GCS
 
-Before enabling backup with `provider: gcp`, complete the following in your GCP account:
-
 1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
-3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+
+2. If you do not have a Control Plane Cloud Account set up, follow the [Create a Cloud Account](/guides/create-cloud-account) guide. Set `backup.gcp.cloudAccountName` to its name.
+
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account. The template additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket in `backup.gcp.bucket`.
+
 4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
 
 ### MinIO
 
-Before enabling backup with `provider: minio`, ensure your MinIO instance is accessible:
+No Cloud Account is needed — credentials are supplied as a secret.
 
 1. Create a bucket in MinIO. Set `backup.minio.bucket` to its name.
-2. Set `backup.minio.endpoint` to the MinIO S3 API address including the port. For the `minio` marketplace template deployed in the same GVC, use `http://WORKLOAD_NAME:9000`.
-3. Set `backup.minio.accessKey` and `backup.minio.secretKey` to the MinIO root credentials — these match the `admin.username` and `admin.password` values from the MinIO template installation.
+
+2. Set `backup.minio.endpoint` to the MinIO S3 API address including the port. For the [minio](/template-catalog/templates/minio) template deployed in the same GVC, use `http://WORKLOAD_NAME:9000`.
+
+3. Create a [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `accessKey` and `secretKey`, and set `backup.minio.credentialsSecretName` to its name. For the `minio` template these are its `admin.username` and `admin.password`:
+
+```bash
+cpln secret create-dictionary --name my-postgres-minio-credentials \
+  --entry accessKey=MINIO_ACCESS_KEY \
+  --entry secretKey=MINIO_SECRET_KEY
+```
+
 4. Set `backup.minio.prefix` to the folder path where backups will be stored.
 
 <Note>
-MinIO backup requires no Control Plane Cloud Account — credentials are passed directly to the backup job.
+The policy this template creates grants the workload `reveal` on both the database credentials secret and the MinIO credentials secret, and on nothing else.
 </Note>
 
 ## Restoring a Backup
 
-Run the following from a client with access to the backup bucket:
+Run the following from a client with access to the backup bucket, using the username and password from your credentials secret.
 
 **AWS S3:**
 
@@ -321,14 +470,39 @@ aws s3 cp "s3://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - --endpoint-url "http://
 unset PGPASSWORD AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 ```
 
+## Connecting
+
+This template exposes no public endpoint. Everything below is reachable from inside the GVC only.
+
+| Path | Address | Notes |
+|---|---|---|
+| PostgreSQL, pooled | `RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432` | Only when `pgbouncer.enabled: true`. Prefer this endpoint when the pooler is on. |
+| PostgreSQL, direct | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | Subject to `internalAccess.type`. |
+| Credentials | `cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml` | Never stored in the Helm release. |
+
+## Important Notes
+
+- **Create the credentials secret before installing.** A reference to a secret that does not exist wedges the workload with no log output at all; see [Prerequisites](#prerequisites) for the one command that shows the reason.
+- **Credentials are read only when the volume is first initialized.** Rotating the secret afterwards does not change the stored password — use `ALTER ROLE` inside PostgreSQL and update the secret to match.
+- **Do not scale past one replica.** This is a single instance on a single volume, not a replicated cluster.
+- **Data lives on the volume set** and survives redeploys; `cpln helm uninstall` deletes it, taking the database with it. Your credentials secret is yours and is left alone.
+- **A `cpln helm upgrade` restarts the server.** Nothing serializes the rollout on a stateful workload, so treat every upgrade as a short planned write outage. The first upgrade after an install re-applies resources even when the values are byte-identical.
+- **Upgrading from 3.3.0 or earlier is a breaking change** — the removed keys stop the upgrade rather than resetting a password. See [Upgrading From 3.3.0 or Earlier](#upgrading-from-3-3-0-or-earlier).
+
 ## External References
 
 <CardGroup cols={2}>
     <Card title="PostgreSQL Documentation" icon="database" href="https://www.postgresql.org/docs/">
     Official PostgreSQL documentation
     </Card>
+    <Card title="PostgreSQL Backup and Restore" icon="book" href="https://www.postgresql.org/docs/current/backup-dump.html">
+    Upstream guidance on logical dumps and restores
+    </Card>
     <Card title="PgBouncer Documentation" icon="database" href="https://www.pgbouncer.org/config.html">
     PgBouncer configuration reference
+    </Card>
+    <Card title="Cloud Accounts" icon="cloud" href="https://docs.controlplane.com/guides/create-cloud-account">
+    Create a Control Plane Cloud Account for backup storage access
     </Card>
     <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/postgres-backup">
     Source code for the PostgreSQL backup container image
