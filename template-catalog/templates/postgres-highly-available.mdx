@@ -26,9 +26,48 @@ For production use, maintain at least 3 PostgreSQL replicas and 3 etcd replicas.
 This template does not create a GVC. You must deploy it into an existing GVC.
 </Note>
 
+## Prerequisites
+
+<Warning>
+**Version `2.5.0` is a breaking change.** The `postgres` block was removed: `postgres.username`, `postgres.password` and `postgres.database` are now a prerequisite secret. An install or upgrade that still sets any of them **fails at render**, before anything is applied, and the error names the replacement. If you are running `2.4.x`, read [Upgrading From 2.4.x](#upgrading-from-24x) first.
+</Warning>
+
+**One `dictionary` secret must exist before you install.** These are the credentials your applications put in their connection strings, so they are not values — putting them in values would land them in the Helm release.
+
+```bash
+cpln secret create-dictionary --name my-postgres-ha-credentials \
+  --entry username=myuser \
+  --entry password='YOUR-STRONG-PASSWORD' \
+  --entry database=mydb
+```
+
+Set `config.credentialsSecretName` to the name you used. Secret names are organization-wide, so give each release its own.
+
+<Warning>
+**If the secret does not exist at install time, the deployment wedges silently.** `cpln logs` returns **zero lines** — the container never starts, so it has nothing to log. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-postgres-ha --gvc GVC_NAME -o yaml
+```
+
+Note this is `get-deployments` — plain `cpln workload get` has no `versions` field. Creating the secret repairs the deployment on its own in roughly 5.5 to 10.5 minutes, or force a redeployment to skip the wait.
+</Warning>
+
+Enabling backups to MinIO needs a second `dictionary` secret — see [Backup Prerequisites](#backup-prerequisites).
+
+## Upgrading From 2.4.x
+
+Delete the `postgres:` block from your values, create the credentials secret above, and set `config.credentialsSecretName`.
+
+<Warning>
+**Use the credentials your cluster already has.** They were applied when the data directory was first initialised and are still what PostgreSQL enforces. Putting *new* values in the secret does not change the running database — it just gives your applications a password that no longer works.
+</Warning>
+
+Versions `2.4.2` and earlier shipped `username: username` and `password: password` as defaults. If your cluster is still running those, treat them as compromised: they are published in a public repository. Change them inside PostgreSQL with `ALTER ROLE ... WITH PASSWORD` and put the new value in the secret.
+
 ## Installation
 
-This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
+To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -67,10 +106,10 @@ resources:
 
 image: controlplanecorporation/patroni-postgres:0.7
 
-postgres:
-  username: username
-  password: password
-  database: test
+config:
+  # REQUIRED prerequisite `dictionary` secret holding `username`, `password`
+  # and `database`. It must EXIST BEFORE INSTALL.
+  credentialsSecretName: my-postgres-ha-credentials
 
 multiZone: false
 
@@ -162,19 +201,20 @@ backup:
   minio: # Backup to a self-hosted MinIO workload (or any S3-compatible endpoint)
     endpoint: http://my-minio-workload:9000 # e.g. http://WORKLOAD_NAME:9000 for an internal MinIO template deployment
     bucket: pg-ha-backup-bucket
-    accessKey: my-minio-username # matches the MinIO template's admin.username
-    secretKey: my-minio-password # matches the MinIO template's admin.password
+    # REQUIRED prerequisite `dictionary` secret holding `accessKey` and
+    # `secretKey`, only when backups are enabled with provider: minio
+    credentialsSecretName: my-postgres-ha-minio-credentials
     prefix: postgres/backups
 ```
 
 ### Credentials
 
-- `postgres.username` — PostgreSQL superuser username. **Change before deploying to production.**
-- `postgres.password` — PostgreSQL superuser password. **Change before deploying to production.**
-- `postgres.database` — Name of the database created on first startup.
+- `config.credentialsSecretName` — Name of the `dictionary` secret holding `username`, `password` and `database`. PostgreSQL creates that user and that database on first boot, and this is the credential your applications put in their connection strings.
+
+The secret must exist before you install — see [Prerequisites](#prerequisites). The cluster reads it through `cpln://secret/...` references, so the values appear in neither the Helm release nor the stored workload spec.
 
 <Note>
-These values are only applied on first startup when the data directory is empty. Updating them after the initial deployment will have no effect on the running database. To change credentials or the database name on an existing instance, use PostgreSQL's native commands (e.g. `ALTER USER`, `ALTER DATABASE`).
+These credentials are only applied on first startup, when the data directory is empty. Rotating the secret afterwards does not change the stored password; change it inside PostgreSQL with `ALTER ROLE ... WITH PASSWORD` and update the secret to match.
 </Note>
 
 ### PostgreSQL Cluster
@@ -353,7 +393,13 @@ Before enabling backup with `provider: minio`, ensure your MinIO instance is acc
 
 1. Create a bucket in MinIO. Set `backup.minio.bucket` to its name.
 2. Set `backup.minio.endpoint` to the MinIO S3 API address including the port. For the `minio` marketplace template deployed in the same GVC, use `http://WORKLOAD_NAME:9000`.
-3. Set `backup.minio.accessKey` and `backup.minio.secretKey` to the MinIO root credentials — these match the `admin.username` and `admin.password` values from the MinIO template installation.
+3. Create a [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `accessKey` and `secretKey`, and set `backup.minio.credentialsSecretName` to its name. For the `minio` template these are its `admin.username` and `admin.password`:
+
+```bash
+cpln secret create-dictionary --name my-postgres-ha-minio-credentials \
+  --entry accessKey=MINIO_ACCESS_KEY \
+  --entry secretKey=MINIO_SECRET_KEY
+```
 4. Set `backup.minio.prefix` to the folder path where backups will be stored.
 
 <Note>
