@@ -1,12 +1,18 @@
 ---
 title: ClickHouse
-description: Deploy ClickHouse on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and ClickHouse Keeper coordination with S3, GCS, Azure Blob Storage, or Hetzner Object Storage.
-keywords: ['column store', 'olap', 'analytics db', 'duckdb alternative', 'redshift alternative', 'snowflake alternative', 'time series', 'click house template', 'data warehouse', 'columnar database', 'real-time analytics', 'azure blob storage', 'hetzner object storage']
+description: Deploy ClickHouse on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, deployment modes, ClickHouse Keeper coordination, and S3, GCS, Azure Blob Storage, or Hetzner Object Storage.
+keywords: ['column store', 'olap', 'analytics db', 'duckdb alternative', 'redshift alternative', 'snowflake alternative', 'time series', 'click house template', 'data warehouse', 'columnar database', 'real-time analytics', 'azure blob storage', 'hetzner object storage', 'dictionary secret', 'clickhouse-client']
 ---
 
 ## Overview
 
 ClickHouse is a high-performance, column-oriented analytical database designed for real-time querying and data warehousing at scale. This template deploys ClickHouse in either **single-node** or **cluster** mode depending on how locations are configured, backed by object storage (AWS S3, GCS, Azure Blob Storage, or Hetzner Object Storage) for long-term scalable storage and a local volume for fast read caching.
+
+The database password is **not** a template value. ClickHouse reads it from a dictionary secret you create before installing, so it never passes through Helm or lands in the release.
+
+<Warning>
+**Template version 2.6.0 is a breaking security change.** `database.password` and `database.name` were removed, and an install or upgrade that still sets either one now fails at render instead of silently falling back to a published default password. If you are running 2.5.0 or earlier, read [Upgrading From 2.5.0 or Earlier](#upgrading-from-2-5-0-or-earlier) before you touch the release.
+</Warning>
 
 ### Deployment Modes
 
@@ -24,8 +30,8 @@ ClickHouse is a high-performance, column-oriented analytical database designed f
 - **Stateful ClickHouse Server Workload** — The main analytical database workload with configurable replicas per location.
 - **Stateful ClickHouse Keeper Workload** *(cluster mode only)* — The coordination service workload (1 replica per location, always 3 total).
 - **Volume Sets** — Persistent storage for the server (metadata, state, and system files), and for Keeper in cluster mode.
-- **Secrets** — A database config secret with credentials and cluster name, startup script secrets for ClickHouse Server and Keeper, and a storage configuration secret for the selected provider (AWS S3, GCS, Azure Blob Storage, or Hetzner Object Storage).
-- **Identity & Policy** — An identity bound to the workloads with `reveal` access to the template secrets, and cloud access for reading and writing to object storage.
+- **Secrets** — Startup script secrets for ClickHouse Server and Keeper, and a storage configuration secret for the selected provider (AWS S3, GCS, Azure Blob Storage, or Hetzner Object Storage). **No credential secret** — the password lives only in the prerequisite secret you create.
+- **Identity & Policy** — An identity bound to the workloads, and a policy granting it `reveal` on the template's own secrets plus exactly the credentials secret you created, with cloud access for reading and writing to object storage.
 
 ### Architecture
 
@@ -35,9 +41,106 @@ In cluster mode, each location maps to one ClickHouse Keeper replica, forming a 
 To minimize network egress costs, deploy all locations in the same cloud provider and keep your object storage bucket in the same region(s). Using 1 replica per location for the ClickHouse server workload is sufficient for most cluster deployments.
 </Note>
 
+## Upgrading From 2.5.0 or Earlier
+
+Template versions up to 2.5.0 took the database password as a plain Helm value, shipped a working default for it, and wrote it into a chart-owned secret named after the release. Version 2.6.0 removes all of that.
+
+| | 2.5.0 and earlier | 2.6.0 |
+|---|---|---|
+| Database credentials | `database.password` and `database.name` values | `database.credentialsSecretName` → a dictionary secret you create |
+| Where the password lives | Chart-created secret `RELEASE_NAME-clickhouse-db-config`, and the Helm release | Only the secret you create |
+
+<Warning>
+**Carrying the old values forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running, rather than quietly restarting against a different password:
+
+```text
+Error: execution error at (clickhouse/templates/identity.yaml:1:4): clickhouse: database.password
+and database.name were REMOVED — they are now a `dictionary` secret you create, named by
+database.credentialsSecretName, holding the keys `password` and `database`. Delete them from
+your values. See Prerequisites in the README.
+```
+</Warning>
+
+<Steps>
+  <Step title="Read the password the cluster already uses">
+    The password is applied the first time the data directory is initialized, so an existing cluster keeps whatever it was created with. Recover it from your current values file, or from the secret the old version created — do this **before** upgrading:
+
+    ```bash
+    cpln secret reveal RELEASE_NAME-clickhouse-db-config -o yaml
+    ```
+
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values.
+  </Step>
+  <Step title="Create the prerequisite secret with those same values">
+    Follow [Database Credentials](#database-credentials), using the existing password and database name. Different values here do not change the cluster — they just leave the workload unable to authenticate.
+  </Step>
+  <Step title="Remove the old keys from your values">
+    Delete `database.password` and `database.name`, and set `database.credentialsSecretName` to your secret's name.
+  </Step>
+  <Step title="Upgrade, then rotate the password">
+    After the upgrade succeeds, change any password that came from a 2.5.0 default — those defaults were published in the public template repository, so treat them as compromised. Rotate inside ClickHouse, then update the secret to match:
+
+    ```sql
+    ALTER USER default IDENTIFIED WITH sha256_password BY 'NEW-STRONG-PASSWORD';
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**`RELEASE_NAME-clickhouse-db-config` is no longer created at all.** Anything outside this release that read the password or database name from it by name must be pointed at the secret you create instead. A reference to a secret that no longer exists does not fail loudly; it wedges the referring workload silently.
+</Warning>
+
 ## Prerequisites
 
-Before installing this template, configure object storage access for your chosen provider.
+Two things must be in place before you install: a credentials secret, and object storage access for your chosen provider.
+
+### Database Credentials
+
+**One secret must exist before you install.** It holds the password every ClickHouse client connection uses, so it is not a value — a value would leave it in the Helm release.
+
+<Steps>
+  <Step title="Create the credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly two keys — `password` and `database`:
+
+    ```bash
+    cpln secret create-dictionary --name my-clickhouse-credentials \
+      --entry password='YOUR-STRONG-PASSWORD' \
+      --entry database=mydatabase
+    ```
+
+    Set `database.credentialsSecretName` to the name you used. Secret names are org-wide, so give each release its own.
+  </Step>
+  <Step title="Read the secret back later">
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values:
+
+    ```bash
+    cpln secret reveal my-clickhouse-credentials -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Note>
+**There is no `username` key.** ClickHouse authenticates as its built-in `default` user here, so the secret holds only the password and the database name.
+</Note>
+
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `database.credentialsSecretName` is blank, but a name pointing at a secret that does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines** — there is nothing to log, and every summary surface just looks like a slow deploy. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-clickhouse-server --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-clickhouse-credentials no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action, in roughly **5.5 to 10.5 minutes** measured across five templates, or run `cpln workload force-redeployment RELEASE_NAME-clickhouse-server --gvc GVC_NAME` to clear it in about 90 seconds.
+</Warning>
+
+<Note>
+This template creates its own GVC, named by `gvc.name` (default `clickhouse-gvc`). Use that name for `--gvc` in the commands above, not the GVC you ran `cpln helm install` against.
+</Note>
 
 ### AWS S3
 
@@ -227,8 +330,12 @@ hetzner: # If enabled, all fields below are required - See prerequisites for gui
 clusterName: my_cluster # Used in cluster mode only
 
 database: # Automatically create a database on initialization using the default user
-  name: mydatabase
-  password: mypassword
+  # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+  # A `dictionary` secret holding exactly two keys: `password` and `database`.
+  # ClickHouse has no separate username here — it uses the built-in `default`
+  # user, so there is no `username` key. If the secret does not exist at install
+  # time the deployment WEDGES silently.
+  credentialsSecretName: my-clickhouse-credentials
 
 volumeset:
   server:
@@ -302,11 +409,12 @@ Set `provider` to `aws`, `gcp`, `azure`, or `hetzner`, then fill in the correspo
 ### Cluster and Database
 
 - `clusterName` — The name used for distributed DDL queries. Only relevant in cluster mode.
-- `database.name` — Database created automatically on first initialization.
-- `database.password` — Password for the default ClickHouse user. **Change before deploying to production.**
+- `database.credentialsSecretName` — Name of the dictionary secret holding `password` and `database`. ClickHouse creates that database on first initialization, and the password is the one every client connection uses.
+
+The secret must exist before installing — see [Database Credentials](#database-credentials). The workloads read it through `cpln://secret/...` references, so the password appears in neither the Helm release nor the stored workload spec.
 
 <Note>
-These values are only applied on first initialization when the data directory is empty. Updating them after the initial deployment will have no effect on the running cluster. To change credentials or the database name on an existing instance, use ClickHouse's native commands (e.g. `ALTER USER`, `RENAME DATABASE`).
+These are applied only on first initialization, when the data directory is empty. Changing the secret afterwards does **not** change the running cluster — it only changes what the workload presents when it authenticates, which will then fail. To rotate on an existing cluster, run `ALTER USER default IDENTIFIED WITH sha256_password BY '...'` first, then update the secret to match.
 </Note>
 
 ### Images
@@ -338,6 +446,8 @@ Once deployed, connect using the ClickHouse client from a workload in the same G
 clickhouse-client --host $WORKLOAD_NAME --password $PASSWORD
 ```
 
+`$PASSWORD` is the `password` entry of the secret named by `database.credentialsSecretName`, and the user is ClickHouse's built-in `default`.
+
 ## External References
 
 <CardGroup cols={2}>
@@ -350,7 +460,7 @@ clickhouse-client --host $WORKLOAD_NAME --password $PASSWORD
     <Card title="ClickHouse with GCS" icon="google" href="https://clickhouse.com/docs/integrations/gcs">
     Integrating ClickHouse with Google Cloud Storage
     </Card>
-    <Card title="ClickHouse with Azure Blob Storage" icon="microsoft" href="https://clickhouse.com/docs/integrations/azure-data-lake-storage">
+    <Card title="ClickHouse with Azure Blob Storage" icon="microsoft" href="https://clickhouse.com/docs/engines/table-engines/integrations/azureBlobStorage">
     Integrating ClickHouse with Azure Blob Storage
     </Card>
     <Card title="ClickHouse with S3-Compatible Storage" icon="database" href="https://clickhouse.com/docs/integrations/s3#s3-compatible-storage">
