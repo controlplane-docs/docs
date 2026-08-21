@@ -1,12 +1,18 @@
 ---
 title: TimescaleDB
-description: Deploy TimescaleDB — the PostgreSQL 18 time-series database — on Control Plane. Covers hypertables, compression, continuous aggregates, retention, PgBouncer pooling, and scheduled S3, GCS, or MinIO backups.
-keywords: ['timescale', 'tsdb', 'time-series database', 'hypertables', 'continuous aggregates', 'columnar compression', 'retention policy', 'pg', 'postgres extension', 'iot telemetry', 'metrics store', 'pgbouncer', 'influxdb alternative']
+description: Deploy TimescaleDB — the PostgreSQL 18 time-series database — on Control Plane. Covers the prerequisite credentials secret, hypertables, compression, continuous aggregates, retention, PgBouncer pooling, and scheduled S3, GCS, or MinIO backups.
+keywords: ['timescale', 'tsdb', 'time-series database', 'hypertables', 'continuous aggregates', 'columnar compression', 'retention policy', 'pg', 'postgres extension', 'iot telemetry', 'metrics store', 'pgbouncer', 'influxdb alternative', 'dictionary secret', 'pg_dumpall']
 ---
 
 ## Overview
 
 TimescaleDB is a time-series database built as a PostgreSQL extension. This template deploys a single-instance PostgreSQL 18 server with the TimescaleDB Community extension preloaded and auto-created, giving you hypertables, columnar compression, continuous aggregates, and retention policies alongside regular relational tables — all through any PostgreSQL client or ORM. Optional PgBouncer connection pooling and scheduled backups to AWS S3, GCS, or a self-hosted MinIO instance are included.
+
+Database credentials are **not** template values. TimescaleDB reads its username, password and database name from a dictionary secret you create before installing, so no password passes through Helm or lands in the release.
+
+<Warning>
+**Template version 1.1.0 is a breaking security change.** `config.username` and `config.password` were removed, and an install or upgrade that still sets either one now fails at render instead of silently falling back to a published default password. If you are running 1.0.0, read [Upgrading From 1.0.0 or Earlier](#upgrading-from-1-0-0-or-earlier) before you touch the release.
+</Warning>
 
 <Info>
 TimescaleDB is licensed under the Timescale License (TSL). It is free to self-host, including all Community features (compression, continuous aggregates, retention); the license only forbids reselling TimescaleDB itself as a managed database service.
@@ -20,18 +26,111 @@ TimescaleDB on Control Plane operates as a single-instance deployment, pinned to
 
 - **Stateful TimescaleDB Workload** — A single-replica PostgreSQL 18 + TimescaleDB 2.28.3 container on port `5432`. The extension is preloaded, created automatically in your database, and auto-tuned to the container's resources at first boot.
 - **Volume Set** — Persistent storage for the database data directory, with optional autoscaling and 7-day snapshots.
-- **Secret** — A dictionary secret storing the database username and password, injected into the container at startup.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the credentials secret, and scoped cloud storage access when backup is enabled.
+- **Backup Config Secret** *(optional)* — A dictionary secret holding the backup destination. Created only when `backup.enabled: true`, and it holds no database credentials.
+- **Identity & Policy** — An identity bound to the TimescaleDB, PgBouncer and backup workloads, and a policy granting it `reveal` on exactly the credentials secret you created — plus the backup config secret and Cloud Account binding when backup is enabled.
 - **PgBouncer Workload** *(optional)* — A PgBouncer connection pooler deployed as a separate workload in front of TimescaleDB.
 - **Backup Cron Workload** *(optional)* — A scheduled `pg_dumpall` backup job that writes compressed SQL dumps to AWS S3, GCS, or MinIO.
+
+The template creates **no credential secret of its own.** The username, password and database name live only in the prerequisite secret described below.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
 </Note>
 
+## Upgrading From 1.0.0 or Earlier
+
+Template versions up to 1.0.0 took the database credentials as plain Helm values, shipped working defaults for them, and wrote those credentials into a chart-owned secret named after the release. Version 1.1.0 removes all of that.
+
+| | 1.0.0 and earlier | 1.1.0 |
+|---|---|---|
+| Database credentials | `config.username`, `config.password`, `config.database` values | `config.credentialsSecretName` → a dictionary secret you create |
+| Where the password lives | Chart-created secret `RELEASE_NAME-tsdb-config`, and the Helm release | Only the secret you create |
+
+<Warning>
+**Carrying the old values forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running, rather than quietly restarting against a different password:
+
+```text
+Error: execution error at (timescaledb/templates/identity.yaml:1:4): timescaledb: config.username
+and config.password were REMOVED — they are now a `dictionary` secret you create, named by
+config.credentialsSecretName, holding the keys `username`, `password` and `database`. Delete
+them from your values. See Prerequisites in the README.
+```
+</Warning>
+
+<Steps>
+  <Step title="Read the credentials the database already uses">
+    Credentials are written into the data directory the first time the volume is initialized, so an existing database keeps whatever it was created with. Recover them from your current values file, or from the secret the old version created — do this **before** upgrading:
+
+    ```bash
+    cpln secret reveal RELEASE_NAME-tsdb-config -o yaml
+    ```
+
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values.
+  </Step>
+  <Step title="Create the prerequisite secret with those same values">
+    Follow [Prerequisites](#prerequisites), using the existing username, password and database name. Different values here do not change the database — they just leave the workload unable to authenticate.
+  </Step>
+  <Step title="Remove the old keys from your values">
+    Delete `config.username`, `config.password` and `config.database`, and set `config.credentialsSecretName` to your secret's name.
+  </Step>
+  <Step title="Upgrade, then rotate the password">
+    After the upgrade succeeds, change any password that came from a 1.0.0 default — those defaults were published in the public template repository, so treat them as compromised. Rotate inside TimescaleDB, then update the secret to match:
+
+    ```sql
+    ALTER ROLE myuser WITH PASSWORD 'NEW-STRONG-PASSWORD';
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**`RELEASE_NAME-tsdb-config` no longer holds credentials.** It is now created only when `backup.enabled: true`, and holds nothing but the backup destination. Anything outside this release that read the username or password from it by name — another workload's environment, a policy, or a parent chart bundling TimescaleDB as a subchart — must be pointed at the secret you create instead. A reference to a key that no longer exists does not fail loudly; it wedges the referring workload silently.
+</Warning>
+
+## Prerequisites
+
+**One secret must exist before you install.** It holds the credentials your applications put in their connection strings. The values never pass through Helm, so they do not land in the release. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. TimescaleDB creates that role and that database on first boot, and creates the TimescaleDB extension inside that database:
+
+    ```bash
+    cpln secret create-dictionary --name my-timescaledb-credentials \
+      --entry username=myuser \
+      --entry password='YOUR-STRONG-PASSWORD' \
+      --entry database=mydb
+    ```
+
+    Set `config.credentialsSecretName` to the name you used. Secret names are org-wide, so give each release its own.
+  </Step>
+  <Step title="Read the secret back later">
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values:
+
+    ```bash
+    cpln secret reveal my-timescaledb-credentials -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `config.credentialsSecretName` is blank, but a name pointing at a secret that does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines** — there is nothing to log, and every summary surface just looks like a slow deploy. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-timescaledb --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-timescaledb-credentials no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action, in roughly **5.5 to 10.5 minutes** measured across five templates, or run `cpln workload force-redeployment RELEASE_NAME-timescaledb --gvc GVC_NAME` to clear it in about 90 seconds.
+</Warning>
+
+Backups need a bucket, and for AWS or GCP a Control Plane Cloud Account, before they can be enabled — see [Backup Prerequisites](#backup-prerequisites). Nothing else is required.
 ## Installation
 
-This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
+Create the [prerequisite secret](#prerequisites) first, then install by whichever method you prefer:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -69,9 +168,12 @@ resources:
   maxMemory: 1024Mi # timescaledb-tune sizes shared_buffers/workers from this at first boot
 
 config:
-  username: username
-  password: password
-  database: test # TimescaleDB extension is created automatically in this database
+  # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+  # A `dictionary` secret holding exactly three keys: `username`, `password`
+  # and `database`. The TimescaleDB extension is created automatically in the
+  # database that secret names. If the secret does not exist at install time
+  # the deployment WEDGES silently — `cpln logs` returns nothing at all.
+  credentialsSecretName: my-timescaledb-credentials
 
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
@@ -144,12 +246,12 @@ Auto-tuning is captured only at first boot, when the data volume is empty. Raisi
 
 ### Credentials
 
-- `config.username` — Database username. **Change before deploying to production.**
-- `config.password` — Database password. **Change before deploying to production.**
-- `config.database` — Name of the database created on startup. The TimescaleDB extension is created automatically inside it.
+- `config.credentialsSecretName` — Name of the dictionary secret holding `username`, `password` and `database`. TimescaleDB creates that role and that database on first boot, and creates the TimescaleDB extension inside that database. These are the credentials your applications put in their connection strings.
+
+The secret must exist before installing — see [Prerequisites](#prerequisites). The workload reads it through `cpln://secret/...` references, so the values appear in neither the Helm release nor the stored workload spec.
 
 <Note>
-These values are only applied on first startup when the data directory is empty. Updating them after the initial deployment has no effect on the running database. To change credentials or the database name on an existing instance, use PostgreSQL's native commands (e.g. `ALTER USER`, `ALTER DATABASE`).
+The credentials are applied only on first startup, when the data directory is empty. Changing the secret afterwards does **not** change the running database — it only changes what the workload presents when it authenticates, which will then fail. To rotate on an existing instance, run `ALTER ROLE ... WITH PASSWORD` inside PostgreSQL first, then update the secret to match.
 </Note>
 
 ### Storage
@@ -206,7 +308,7 @@ RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432
 - `pgbouncer.resources.cpu` / `pgbouncer.resources.memory` — Resources allocated to each PgBouncer replica.
 
 <Note>
-PgBouncer shares the same credentials and identity as the TimescaleDB workload — no additional secrets or IAM configuration is required. The `userlist.txt` and `pgbouncer.ini` are generated automatically from your `config.username`, `config.password`, and `config.database` values at startup.
+PgBouncer shares the same credentials and identity as the TimescaleDB workload — no additional secrets or IAM configuration is required. Its `userlist.txt` and `pgbouncer.ini` are generated at container start from the same credentials secret, so PgBouncer stays in step with the database automatically.
 </Note>
 
 ### Backup
@@ -228,7 +330,7 @@ Complete the [backup prerequisites](#backup-prerequisites) for your provider bef
 | Internal (same GVC) | `RELEASE_NAME-timescaledb.GVC_NAME.cpln.local:5432` |
 | Via PgBouncer *(when enabled)* | `RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432` — use this as your application endpoint |
 | Public *(when enabled)* | The `status.canonicalEndpoint` of the `RELEASE_NAME-timescaledb` workload, port `5432` (unencrypted) |
-| Credentials | `config.username` / `config.password` |
+| Credentials | The `username` and `password` entries of the secret named by `config.credentialsSecretName` |
 
 ## Using TimescaleDB
 
@@ -358,7 +460,7 @@ For **GCS**, replace the download with `gsutil cp "gs://BUCKET_NAME/PREFIX/BACKU
 
 ## Important Notes
 
-- **Change `config.password` before installing.** Credentials are written into the data directory at first boot; changing the value later does not change the database password.
+- **Create the credentials secret before installing.** The deployment wedges silently without it, and `cpln logs` returns zero lines — see [Prerequisites](#prerequisites) for the one command that names the missing secret.
 - **Do not scale this workload.** It is single-writer PostgreSQL, pinned to one replica. Additional replicas would run as isolated instances, not a cluster.
 - **Auto-tuning is captured at first boot only.** `timescaledb-tune` sizes memory settings from the container limit when the volume is empty; raising `resources.maxMemory` later does not retune.
 - **Public access is unencrypted.** The image ships no TLS certificates — keep `publicAccess.enabled: false` unless you accept plaintext connections.

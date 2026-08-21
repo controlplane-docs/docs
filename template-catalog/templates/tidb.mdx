@@ -1,7 +1,7 @@
 ---
 title: TiDB
-description: Deploy TiDB on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and distributed MySQL-compatible clustering with TiKV storage and PD coordination.
-keywords: ['htap', 'newsql', 'cockroachdb alternative', 'spanner alternative', 'horizontally scalable mysql', 'pingcap', 'tidb cluster', 'tikv', 'placement driver', 'tiflash']
+description: Deploy TiDB on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, distributed MySQL-compatible clustering with TiKV storage and PD coordination, and scheduled S3 and GCS backups.
+keywords: ['htap', 'newsql', 'cockroachdb alternative', 'spanner alternative', 'horizontally scalable mysql', 'pingcap', 'tidb cluster', 'tikv', 'placement driver', 'tiflash', 'dictionary secret', 'br backup']
 ---
 
 ## Overview
@@ -9,6 +9,12 @@ keywords: ['htap', 'newsql', 'cockroachdb alternative', 'spanner alternative', '
 TiDB is a distributed, MySQL-compatible database designed for horizontal scalability and high availability. It separates compute from storage across three components: a SQL processing layer (TiDB Server), a distributed key-value store (TiKV), and a placement driver (PD) that manages cluster metadata and scheduling.
 
 This template deploys a production-ready TiDB cluster across multiple Control Plane locations using PingCAP's official images.
+
+Database credentials are **not** template values. The init job and TiDB Server read the root password, application user, password and database name from a dictionary secret you create before installing, so none of them pass through Helm or land in the release.
+
+<Warning>
+**Template version 1.8.0 is a breaking security change.** The whole `autoCreateDatabase.database` block was removed, and an install or upgrade that still sets it now fails at render instead of silently falling back to published default passwords. If you are running 1.7.0 or earlier, read [Upgrading From 1.7.0 or Earlier](#upgrading-from-1-7-0-or-earlier) before you touch the release.
+</Warning>
 
 ### What Gets Created
 
@@ -20,12 +26,110 @@ This template deploys a production-ready TiDB cluster across multiple Control Pl
 - **Backup Cron Workload** *(optional)* — A scheduled backup job that uses TiDB's `br` tool to write a full cluster snapshot to AWS S3 or GCS.
 - **Volume Set** — PD storage (`RELEASE_NAME-tidb-pd-vs`): 10 GiB fixed, ext4, general-purpose-ssd, with 7-day snapshot retention.
 - **Volume Set** — TiKV storage (`RELEASE_NAME-tidb-tikv-vs`): configurable capacity with optional autoscaling, ext4, general-purpose-ssd, with 7-day snapshot retention.
-- **Secrets** — Opaque secrets containing startup scripts for PD, TiKV, and TiDB Server, plus an optional dictionary secret with database credentials.
-- **Identity & Policy** — A shared identity bound to all workloads with `reveal` access to all secrets, and cloud storage access when backup is enabled.
+- **Secrets** — Opaque secrets containing startup scripts for PD, TiKV, TiDB Server, and the database init job. **No credential secret** — the passwords live only in the prerequisite secret you create.
+- **Identity & Policy** — A shared identity bound to all workloads, and a policy granting it `reveal` on the template's own secrets plus exactly the credentials secret you created, with cloud storage access when backup is enabled.
+
+## Upgrading From 1.7.0 or Earlier
+
+Template versions up to 1.7.0 took the database credentials as plain Helm values, shipped working defaults for them, and wrote them into a chart-owned secret named after the release. Version 1.8.0 removes all of that.
+
+| | 1.7.0 and earlier | 1.8.0 |
+|---|---|---|
+| Database credentials | `autoCreateDatabase.database.rootPassword`, `.user`, `.password`, `.db` values | `autoCreateDatabase.credentialsSecretName` → a dictionary secret you create |
+| Where the passwords live | Chart-created secret `RELEASE_NAME-tidb-user`, and the Helm release | Only the secret you create |
+
+<Warning>
+**Carrying the old block forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running, rather than quietly restarting against different credentials:
+
+```text
+Error: execution error at (tidb/templates/identity.yaml:1:4): tidb: autoCreateDatabase.database
+was REMOVED — rootPassword, user, password and db are now a `dictionary` secret you create,
+named by autoCreateDatabase.credentialsSecretName. Delete the block from your values.
+See Prerequisites in the README.
+```
+</Warning>
+
+<Steps>
+  <Step title="Read the credentials the cluster already uses">
+    The init job applies these once, on first initialization, so an existing cluster keeps whatever it was created with. Recover them from your current values file, or from the secret the old version created — do this **before** upgrading:
+
+    ```bash
+    cpln secret reveal RELEASE_NAME-tidb-user -o yaml
+    ```
+
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values.
+  </Step>
+  <Step title="Create the prerequisite secret with those same values">
+    Follow [Prerequisites](#prerequisites), using the existing root password, user, password and database name. Different values here do not change the cluster — the init job exits early once the database exists, so they would just leave clients unable to authenticate.
+  </Step>
+  <Step title="Remove the old block from your values">
+    Delete the whole `autoCreateDatabase.database` block, and set `autoCreateDatabase.credentialsSecretName` to your secret's name.
+  </Step>
+  <Step title="Upgrade, then rotate the passwords">
+    After the upgrade succeeds, change any password that came from a 1.7.0 default — those defaults were published in the public template repository, so treat them as compromised. Rotate inside TiDB, then update the secret to match:
+
+    ```sql
+    ALTER USER 'root'@'%' IDENTIFIED BY 'NEW-ROOT-PASSWORD';
+    ALTER USER 'myuser'@'%' IDENTIFIED BY 'NEW-STRONG-PASSWORD';
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**`RELEASE_NAME-tidb-user` is no longer created.** Anything outside this release that read credentials from it by name must be pointed at the secret you create instead. A reference to a secret that no longer exists does not fail loudly; it wedges the referring workload silently.
+</Warning>
+
+## Prerequisites
+
+**One secret must exist before you install**, when `autoCreateDatabase.enabled` is `true` (the default). It holds the credentials your applications put in their connection strings, plus the cluster's root password. The values never pass through Helm, so they do not land in the release. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly four keys — `rootPassword`, `user`, `password` and `db`. The init job sets the root password, then creates that user and that database:
+
+    ```bash
+    cpln secret create-dictionary --name my-tidb-credentials \
+      --entry rootPassword='YOUR-ROOT-PASSWORD' \
+      --entry user=myuser \
+      --entry password='YOUR-STRONG-PASSWORD' \
+      --entry db=mydb
+    ```
+
+    Set `autoCreateDatabase.credentialsSecretName` to the name you used. Secret names are org-wide, so give each release its own.
+  </Step>
+  <Step title="Read the secret back later">
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values:
+
+    ```bash
+    cpln secret reveal my-tidb-credentials -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `autoCreateDatabase.credentialsSecretName` is blank, but a name pointing at a secret that does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines** — there is nothing to log, and every summary surface just looks like a slow deploy. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-server --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-tidb-credentials no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action, in roughly **5.5 to 10.5 minutes** measured across five templates, or run `cpln workload force-redeployment RELEASE_NAME-server --gvc GVC_NAME` to clear it in about 90 seconds.
+</Warning>
+
+<Note>
+This template creates its own GVC, named by `gvc.name` (default `tidb-gvc`). Use that name for `--gvc` in the commands above, not the GVC you ran `cpln helm install` against. The wedge affects `RELEASE_NAME-server` and `RELEASE_NAME-tidb-db-init`, which are the workloads that read the secret.
+</Note>
+
+Backups need a bucket and a Control Plane Cloud Account before they can be enabled — see [AWS S3](#aws-s3) or [GCS](#gcs). Nothing else is required.
 
 ## Installation
 
-This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
+Create the [prerequisite secret](#prerequisites) first, then install by whichever method you prefer:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -58,19 +162,20 @@ devMode: false # WARNING: For development/testing only. Bypasses the 3-location 
 
 gvc:
   name: tidb-gvc
-  locations: # Replica count applies to TiKV and TiDB Server workloads; PD uses pdReplicas
+  locations:
+  # Location's replica count will only affect storage (tikv) and server workloads
     - name: aws-us-east-2
       replicas: 1
-    - name: aws-us-west-2
+    - name: aws-eu-central-1
       replicas: 1
     - name: aws-us-east-1
       replicas: 1
   pdReplicas: 3 # options: 3, 5, 7
 
 images:
-  server: pingcap/tidb:v8.5.3
-  tikv: pingcap/tikv:v8.5.3
-  pd: pingcap/pd:v8.5.3
+  server: pingcap/tidb:v8.5.7
+  tikv: pingcap/tikv:v8.5.7
+  pd: pingcap/pd:v8.5.7
 
 resources:
   pd:
@@ -86,11 +191,12 @@ resources:
 autoCreateDatabase: # Enable to automatically create the database on initialization
   enabled: true
   deployInitWorkload: true # Set to false after the DB has been initialized to remove the init workload and save resources
-  database: # Set database values
-    rootPassword: myrootpw
-    user: myuser
-    password: mypw
-    db: mydb
+  # REQUIRED PREREQUISITE SECRET when autoCreateDatabase.enabled — CREATE IT
+  # BEFORE YOU INSTALL. A `dictionary` secret holding exactly four keys:
+  # `rootPassword`, `user`, `password` and `db`. If it does not exist at install
+  # time the deployment WEDGES silently — `cpln logs` returns nothing at all.
+  # See Prerequisites in the README for the create-dictionary command.
+  credentialsSecretName: my-tidb-credentials
 
 volumeset:
   tikv:
@@ -103,7 +209,7 @@ volumeset:
   pd:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 
-exposeServer: true # Set to true to expose TiDB server publicly
+exposeServer: false # Set to true to expose TIDB server publicly
 
 external_access: # Set if client is outside the GVC or in another location
   server_outboundAllowCIDR: []
@@ -115,18 +221,21 @@ internal_access:
     type: same-gvc # options: same-gvc, same-org, workload-list
     workloads:  # Note: can only be used if type is same-gvc or workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
   tikv:
     type: same-gvc # options: same-gvc, same-org, workload-list
     workloads:  # Note: can only be used if type is same-gvc or workload-list
+      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
   pd:
     type: same-gvc # options: same-gvc, same-org, workload-list
     workloads:  # Note: can only be used if type is same-gvc or workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
 backup:
   enabled: false
-  image: controlplanecorporation/tidb-backup:v8.5.3
+  image: ghcr.io/controlplane-com/backup-images/tidb-backup:8.5.7
   schedule: "0 2 * * *"  # daily at 2am UTC
   activeDeadlineSeconds: 14400  # 4 hours max per backup job
   location: aws-us-east-1  # Run backup in the location closest to your storage bucket/region
@@ -191,7 +300,7 @@ gvc:
 
 ### Database Initialization
 
-- `autoCreateDatabase.enabled` — Creates a dictionary secret with database credentials used by the TiDB Server and init workload.
+- `autoCreateDatabase.enabled` — Wires the credentials secret into the TiDB Server and init workload, and grants the identity `reveal` on it.
 - `autoCreateDatabase.deployInitWorkload` — Deploys a one-time init job that sets the root password and creates the application database and user. The job checks whether the database already exists before running — if it does, it exits immediately.
 
 <Note>
@@ -200,13 +309,12 @@ After the cluster is initialized, set `autoCreateDatabase.deployInitWorkload` to
 
 ### Credentials
 
-- `autoCreateDatabase.database.rootPassword` — MySQL root password. **Change before deploying to production.**
-- `autoCreateDatabase.database.user` — Application database username.
-- `autoCreateDatabase.database.password` — Application database password.
-- `autoCreateDatabase.database.db` — Name of the application database to create.
+- `autoCreateDatabase.credentialsSecretName` — Name of the dictionary secret holding `rootPassword`, `user`, `password` and `db`. The init job sets the root password, then creates that user and that database.
+
+The secret must exist before installing — see [Prerequisites](#prerequisites). The workloads read it through `cpln://secret/...` references, so the passwords appear in neither the Helm release nor the stored workload spec.
 
 <Note>
-These values are only applied on first initialization. If the database already exists, the init workload exits without making changes. To modify credentials on an existing cluster, use MySQL's native commands (e.g. `ALTER USER`, `ALTER DATABASE`).
+These are applied only on first initialization. If the database already exists, the init workload exits without making changes — so changing the secret afterwards does **not** change the cluster, it only changes what clients present when they authenticate. To rotate on an existing cluster, run `ALTER USER` inside TiDB first, then update the secret to match.
 </Note>
 
 ### Resources
@@ -254,7 +362,7 @@ TiDB Server is MySQL-compatible. Connect using any MySQL client from within the 
 RELEASE_NAME-server.GVC_NAME.cpln.local:4000
 ```
 
-Use the `user` / `password` credentials from `autoCreateDatabase.database`, or connect as `root` with `rootPassword`.
+Use the `user` and `password` entries of the secret named by `autoCreateDatabase.credentialsSecretName`, or connect as `root` with its `rootPassword` entry.
 
 ### Ports
 
