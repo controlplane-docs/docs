@@ -6,6 +6,12 @@ title: pgEdge Distributed PostgreSQL
 
 pgEdge is an active-active distributed PostgreSQL cluster using Spock multi-master replication. Every node accepts both reads and writes simultaneously, and data written to any node replicates to all others automatically. The cluster spans multiple geographic locations with configurable replicas per location, providing a globally distributed, fault-tolerant database with no single point of failure.
 
+Database credentials are **not** template values. pgEdge reads its username, password and database name from a dictionary secret you create before installing, so no password passes through Helm or lands in the release.
+
+<Warning>
+**Template version 1.1.0 is a breaking security change.** `postgres.username`, `postgres.password` and `postgres.database` were removed, and an install or upgrade that still sets any of them now fails at render instead of silently falling back to a published default password. If you are running 1.0.2 or earlier, read [Upgrading From 1.0.x](#upgrading-from-1-0-x) before you touch the release.
+</Warning>
+
 ### Architecture
 
 - **pgEdge** — Stateful workload running PostgreSQL 17 with the Spock extension. All nodes are active writers connected in a full-mesh replication ring. Each replica gets its own persistent volume.
@@ -26,6 +32,28 @@ pgEdge is an active-active distributed PostgreSQL cluster using Spock multi-mast
 
 - At least one Control Plane [location](/reference/location) to deploy into.
 - For backup: an AWS or GCP [cloud account](/guides/create-cloud-account) and a storage bucket.
+
+**One `dictionary` secret must exist before you install.** These are the credentials you type into every connection string, so they are not values — a value would leave them in the Helm release.
+
+```bash
+cpln secret create-dictionary --name my-pgedge-credentials \
+  --entry username=myuser \
+  --entry password='YOUR-STRONG-PASSWORD' \
+  --entry database=mydb
+```
+
+Set `postgres.credentialsSecretName` to the name you used. Secret names are org-wide, so give each release its own. pgcat uses the same password for its admin console, replacing the fixed `pgcat_admin` password earlier versions shipped.
+
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `postgres.credentialsSecretName` is blank, but a name pointing at a secret that does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines** — there is nothing to log. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-pgedge --gvc GVC_NAME -o yaml
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the missing secret repairs it on its own in roughly **5.5 to 10.5 minutes**, or run `cpln workload force-redeployment RELEASE_NAME-pgedge --gvc GVC_NAME` to clear it in about 90 seconds.
+</Warning>
+
 
 ### Installation
 
@@ -53,6 +81,37 @@ To install, follow the instructions for your preferred method:
     </Card>
 </CardGroup>
 
+## Upgrading From 1.0.x
+
+Template versions up to 1.0.2 took the database credentials as plain Helm values and shipped a working default password. Version 1.1.0 removes them.
+
+<Warning>
+**Carrying the old values forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing cluster is left untouched and running:
+
+```text
+Error: execution error at (pgedge/templates/identity.yaml:3:4): pgedge: postgres.username,
+postgres.password and postgres.database were REMOVED — they are now a `dictionary` secret you
+create, named by postgres.credentialsSecretName, holding the keys `username`, `password` and
+`database`. Delete them from your values. See Prerequisites in the README.
+```
+</Warning>
+
+<Steps>
+  <Step title="Create the secret with the credentials the cluster already has">
+    Credentials were applied when the data directory was first initialized, so a new value does not change the cluster — it just leaves clients unable to authenticate. Follow [Prerequisites](#prerequisites) using your existing values.
+  </Step>
+  <Step title="Remove the old keys and upgrade">
+    Delete `postgres.username`, `postgres.password` and `postgres.database`, and set `postgres.credentialsSecretName`.
+  </Step>
+  <Step title="Rotate a default password">
+    `password` was published in the public template repository. Rotate with `ALTER ROLE myuser WITH PASSWORD '...'` on any node, then update the secret to match.
+  </Step>
+</Steps>
+
+<Note>
+**pgcat now builds its configuration at container start.** Its config is a TOML *file*, and a `cpln://` reference inside a file is never resolved — the platform only resolves them for environment variables. So rather than rendering the password into the file, 1.1.0 mounts a startup script that assembles the config from the secret at boot. Nothing changes in how you configure pgcat; the `pgcat.*` values are unchanged.
+</Note>
+
 ## Configuration
 
 The default `values.yaml` for this template:
@@ -77,9 +136,7 @@ resources:
   maxMemory: 4Gi
 
 postgres:
-  username: postgres
-  password: password
-  database: mydb
+  credentialsSecretName: my-pgedge-credentials # see Prerequisites — must exist before install
 
 multiZone: false  # Set to true to spread replicas across availability zones within each location
 
@@ -92,7 +149,7 @@ volumeset:
     scalingFactor: 1.2  # How much to scale up when triggered
 
 pgcat:
-  image: ghcr.io/postgresml/pgcat:latest
+  image: ghcr.io/postgresml/pgcat:v1.2.0 # pinned: `latest` makes installs non-reproducible
   poolMode: transaction  # options: session, transaction, statement
   defaultPoolSize: 25    # Real Postgres connections pgcat maintains per pool
   maxClientConn: 1000    # Maximum client connections pgcat accepts
@@ -109,7 +166,7 @@ internal_access: # Sets both pgedge and pgcat workloads
 
 backup:
   enabled: false
-  image: controlplanecorporation/pg-backup:17.1.0
+  image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
   schedule: "0 2 * * *"   # daily at 2am UTC
 
   resources:

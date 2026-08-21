@@ -8,6 +8,12 @@ keywords: ['ess', 'secret sync', 'aws secrets manager', 'azure key vault', 'gcp 
 
 The External Secret Syncer (ESS) continuously syncs secrets and parameters from external providers into Control Plane secrets. This template deploys ESS as a workload that polls your configured providers on a set interval and creates or updates Control Plane secrets to match.
 
+The sync configuration is **not** a template value. It carries provider credentials — a Vault token, AWS access keys, a 1Password service-account token — so you supply it as an opaque secret holding your whole `sync.yaml`.
+
+<Warning>
+**Template version 2.1.0 is a breaking security change.** `essConfig` was removed, and an install or upgrade that still sets it now fails at render. If you are running 2.0.x, read [Upgrading From 2.0.x](#upgrading-from-2-0-x) before you touch the release.
+</Warning>
+
 ### How It Works
 
 ESS runs as a workload on Control Plane. Your provider configuration and secrets list are stored in a Control Plane secret and mounted into the workload as `sync.yaml`. On startup, ESS schedules a polling loop for each configured secret. At each interval, it fetches the latest value from the external provider and creates or updates the corresponding Control Plane secret via the API.
@@ -42,6 +48,51 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 1. A secret or parameter stored in one of the [supported providers](#supported-providers).
 2. Credentials with read access to the desired secret (API token, IAM keys, etc.). Alternatively, you can use a cloud access [identity](/reference/identity) instead of supplying keys directly.
 
+**Your sync configuration must exist as an `opaque` secret before you install.** It carries those provider
+credentials, so it is not a template value — a value would put every one of them in the Helm release. It is
+also a configuration *file*, and a `cpln://secret` reference inside a file is never resolved, so individual
+keys cannot be swapped out either. The whole file is therefore yours.
+
+<Steps>
+  <Step title="Write your sync.yaml">
+    The `providers` and `secrets` schema is documented under [Configuration](#configuration).
+
+    ```yaml
+    # sync.yaml
+    providers:
+      - name: my-vault
+        vault:
+          address: https://my-vault.com:8200
+          token: YOUR-VAULT-TOKEN
+        syncInterval: 1m
+    secrets:
+      - name: my-app-secret
+        provider: my-vault
+        type: opaque
+        path: secret/data/my-app
+        key: password
+    ```
+  </Step>
+  <Step title="Create the secret and point the chart at it">
+    ```bash
+    cpln secret create-opaque --name my-ess-config --encoding plain -f sync.yaml
+    ```
+
+    Set `configSecretName` to the name you used. Secret names are org-wide, so give each release its own.
+  </Step>
+</Steps>
+
+<Warning>
+**If the secret does not exist at install time, the deployment wedges silently.** `cpln logs` returns **zero
+lines** — the container never starts, so it has nothing to log. Read `status.versions[].message` instead:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-ess --gvc GVC_NAME -o yaml
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key.
+</Warning>
+
 ### Installation
 
 To install, follow the instructions for your preferred method:
@@ -68,12 +119,47 @@ To install, follow the instructions for your preferred method:
     </Card>
 </CardGroup>
 
+## Upgrading From 2.0.x
+
+Version 2.1.0 removes `essConfig`. The **schema is unchanged** — migrating is a verbatim lift of that block into a file, minus the top-level `essConfig:` wrapper.
+
+<Warning>
+**Carrying `essConfig` forward stops the upgrade.** It is rejected at render, so `cpln helm upgrade` fails and your existing syncer is left untouched and running:
+
+```text
+Error: execution error at (ess/templates/identity.yaml:1:4): ess: essConfig was REMOVED — it holds
+provider credentials (Vault token, AWS keys, 1Password token), so it is now an `opaque` secret you
+create, named by configSecretName, whose entire value is your sync.yaml. Delete essConfig from your
+values. See Prerequisites in the README.
+```
+</Warning>
+
+<Steps>
+  <Step title="Move your essConfig block into sync.yaml">
+    Copy it verbatim and drop the `essConfig:` wrapper, so `providers:` and `secrets:` become top-level keys.
+  </Step>
+  <Step title="Create the secret and point the chart at it">
+    ```bash
+    cpln secret create-opaque --name my-ess-config --encoding plain -f sync.yaml
+    ```
+
+    Delete `essConfig` from your values and set `configSecretName`.
+  </Step>
+  <Step title="Rotate every credential that was in your values file">
+    They were stored in the Helm release, so treat them as exposed — reissue the Vault token, AWS keys or 1Password service-account token, then update `sync.yaml` and the secret.
+  </Step>
+</Steps>
+
+<Note>
+**Why the whole file, and not individual keys.** A `cpln://secret` reference is resolved only for environment variables. Inside a mounted configuration file it stays literal text, so there is no way to swap out just the token — the file itself has to be the secret.
+</Note>
+
 ## Configuration
 
 The default `values.yaml` for this template:
 
 ```yaml
-image: ghcr.io/controlplane-com/cpln-build/external-secret-syncer:v1.3.4
+image: ghcr.io/controlplane-com/cpln-build/external-secret-syncer:v2.0.0
 
 resources:
   cpu: 200m
@@ -181,11 +267,11 @@ essConfig:
 - `resources.cpu` / `resources.memory` — Resource limits for the workload container.
 - `port` — Port for the ESS HTTP admin API (default: `3004`). Used for health checks and manual sync triggers.
 - `allowedIp` — List of CIDRs allowed to reach the ESS admin API externally. Replace the placeholder with your IP, or use `0.0.0.0/0` to allow all.
-- `essConfig` — The full sync configuration — providers and secrets (see below).
+- `configSecretName` — Name of the opaque secret holding your `sync.yaml`, the full sync configuration. See [Prerequisites](#prerequisites).
 
 ### Providers
 
-Each entry in `essConfig.providers` defines a connection to an external secret store. Every provider must have a unique `name`. An optional `syncInterval` sets the default polling interval for all secrets using that provider.
+Each entry in `providers` defines a connection to an external secret store. Every provider must have a unique `name`. An optional `syncInterval` sets the default polling interval for all secrets using that provider.
 
 | Provider | Required Fields |
 |----------|----------------|
@@ -263,7 +349,7 @@ GCP Secret Manager optionally accepts `credentials.clientEmail` and `credentials
 
 ### Secrets
 
-Each entry in `essConfig.secrets` maps an external secret to a Control Plane secret. Each secret must specify a `name`, a `provider`, and exactly one sync type.
+Each entry in `secrets` maps an external secret to a Control Plane secret. Each secret must specify a `name`, a `provider`, and exactly one sync type.
 
 #### `opaque` — Single value
 
