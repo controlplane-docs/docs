@@ -6,6 +6,12 @@ title: Cassandra
 
 Apache Cassandra is a distributed NoSQL database designed for high availability and linear scalability. This template deploys a Cassandra 5.0 cluster in a single location where each node owns a slice of the token ring and replicates data to peers according to the configured replication factor. Optional scheduled backups and periodic anti-entropy repair are included.
 
+Cluster credentials are **not** template values. Cassandra reads its superuser password, application role and keyspace from a dictionary secret you create before installing, so no password passes through Helm or lands in the release.
+
+<Warning>
+**Template version 1.1.0 is a breaking security change.** `superuserPassword`, `username`, `password` and `keyspaceName` were removed, and an install or upgrade that still sets any of them now fails at render instead of silently falling back to a published default password. If you are running 1.0.1 or earlier, read [Upgrading From 1.0.x](#upgrading-from-1-0-x) before you touch the release.
+</Warning>
+
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
 </Note>
@@ -21,6 +27,47 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 - **Repair Cron Workload** *(optional, enabled by default)* — Runs `nodetool repair` on a schedule to keep data consistent across replicas.
 
 ## Prerequisites
+
+**One `dictionary` secret must exist before you install.** These are the credentials you type into every client and connection string, so they are not values — a value would leave them in the Helm release.
+
+<Steps>
+  <Step title="Create the credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly four keys. `superuserPassword` is the built-in `cassandra` role, used for JMX and by the repair cron; `username`, `password` and `keyspace` are the application role and its keyspace, created on first boot:
+
+    ```bash
+    cpln secret create-dictionary --name my-cassandra-credentials \
+      --entry superuserPassword='YOUR-SUPERUSER-PASSWORD' \
+      --entry username=myuser \
+      --entry password='YOUR-STRONG-PASSWORD' \
+      --entry keyspace=mykeyspace
+    ```
+
+    Set `credentialsSecretName` to the name you used. Secret names are org-wide, so give each release its own.
+  </Step>
+  <Step title="Read the secret back later">
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values:
+
+    ```bash
+    cpln secret reveal my-cassandra-credentials -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `credentialsSecretName` is blank, but a name pointing at a secret that does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines** — there is nothing to log, and every summary surface just looks like a slow deploy. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-cassandra --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-cassandra-credentials no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own in roughly **5.5 to 10.5 minutes**, or run `cpln workload force-redeployment RELEASE_NAME-cassandra --gvc GVC_NAME` to clear it in about 90 seconds.
+</Warning>
+
 
 This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
 
@@ -46,6 +93,48 @@ This template has no external prerequisites unless backup is enabled. To install
     </Card>
 </CardGroup>
 
+## Upgrading From 1.0.x
+
+Template versions up to 1.0.1 took the cluster credentials as plain Helm values and shipped working defaults for them — `supersecretpassword` for the built-in `cassandra` role and `password` for the application role. Version 1.1.0 removes all four keys.
+
+| | 1.0.x | 1.1.0 |
+|---|---|---|
+| Credentials | `superuserPassword`, `username`, `password`, `keyspaceName` values | `credentialsSecretName` → a dictionary secret you create |
+| Where the passwords live | The Helm release | Only the secret you create |
+
+<Warning>
+**Carrying the old values forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running:
+
+```text
+Error: execution error at (cassandra/templates/identity.yaml:1:4): cassandra: superuserPassword,
+username, password and keyspaceName were REMOVED — they are now a `dictionary` secret you create,
+named by credentialsSecretName, holding the keys `superuserPassword`, `username`, `password` and
+`keyspace`. Delete them from your values. See Prerequisites in the README.
+```
+</Warning>
+
+<Steps>
+  <Step title="Recover the credentials the cluster already uses">
+    Bootstrap runs once and is flagged on disk, so an existing cluster keeps whatever it was created with. Take the values from your current values file.
+  </Step>
+  <Step title="Create the secret with those same values">
+    Follow [Prerequisites](#prerequisites). `keyspaceName` becomes the `keyspace` entry. Different values here do not change the cluster — they just leave clients unable to authenticate.
+  </Step>
+  <Step title="Remove the old keys and upgrade">
+    Delete all four, set `credentialsSecretName`, then upgrade.
+  </Step>
+  <Step title="Rotate anything that came from a default">
+    `supersecretpassword` and `password` were published in the public template repository, so treat them as compromised:
+
+    ```sql
+    ALTER USER cassandra WITH PASSWORD 'NEW-SUPERUSER-PASSWORD';
+    ALTER ROLE myuser WITH PASSWORD 'NEW-STRONG-PASSWORD';
+    ```
+
+    Then update the secret so the workloads still authenticate on restart.
+  </Step>
+</Steps>
+
 ## Configuration
 
 The default `values.yaml` for this template:
@@ -56,10 +145,7 @@ replicas: 3
 replicationFactor: 1
 
 # IMPORTANT: Change all credentials before deploying to production
-superuserPassword: supersecretpassword
-username: username
-password: password
-keyspaceName: mydatabase
+credentialsSecretName: my-cassandra-credentials # see Prerequisites — must exist before install
 
 image: cassandra:5.0
 cpu: 1
@@ -164,7 +250,7 @@ Host:     {release-name}-cassandra-0.{gvc-name}.cpln.local
 Port:     9042
 Username: {username}
 Password: {password}
-Keyspace: {keyspaceName}
+Keyspace: the `keyspace` entry of your credentials secret
 ```
 
 ### Repair
@@ -197,6 +283,12 @@ Set `backup.enabled: true`, set `backup.type`, and fill in the cloud storage blo
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
 3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
 
+<Warning>
+**Version 1.1.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
+
+**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
+</Warning>
+
 ```json
 {
     "Version": "2012-10-17",
@@ -209,7 +301,11 @@ Set `backup.enabled: true`, set `backup.type`, and fill in the cloud storage blo
                 "s3:DeleteObject",
                 "s3:ListBucket",
                 "s3:GetObjectVersion",
-                "s3:DeleteObjectVersion"
+                "s3:DeleteObjectVersion",
+                "s3:GetBucketLocation",
+                "s3:AbortMultipartUpload",
+                "s3:ListBucketMultipartUploads",
+                "s3:ListMultipartUploadParts"
             ],
             "Resource": [
                 "arn:aws:s3:::YOUR_BUCKET_NAME",
