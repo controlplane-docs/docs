@@ -27,6 +27,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Validate Slack channel
+        env:
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SLACK_CHANNEL_ID}" ]; then
+            echo "::error::SLACK_CHANNEL_ID repository or organization variable is not set."
+            exit 1
+          fi
+
+          case "$SLACK_CHANNEL_ID" in
+            C*|G*|D*) ;;
+            *)
+              echo "::warning::SLACK_CHANNEL_ID should normally be a Slack channel ID, such as C... for public channels or G... for private channels, not a channel name."
+              ;;
+          esac
+
       - name: Escape the title
         id: meta
         run: |
@@ -48,6 +66,34 @@ jobs:
           else
             echo "fork=" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Post to Slack
+        id: post
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            text: "Ready for review: ${{ steps.meta.outputs.title }}"
+            unfurl_links: false
+            blocks:
+              - type: section
+                text:
+                  type: mrkdwn
+                  text: ":eyes: *<${{ github.event.pull_request.html_url }}|${{ steps.meta.outputs.title }}>*"
+              - type: context
+                elements:
+                  - type: mrkdwn
+                    text: "opened by *${{ github.event.pull_request.user.login }}* · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}${{ steps.meta.outputs.fork }}"
+
+      - name: Stash the thread ts on the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            -f body="<!-- slack-thread-ts:${{ steps.post.outputs.ts }} -->"
 
       - name: Wait for the Mintlify preview
         id: preview
@@ -86,15 +132,15 @@ jobs:
             echo "line=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Post to Slack
-        id: post
+      - name: Add preview to Slack message
+        if: steps.preview.outputs.line != ''
         uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
         with:
-          method: chat.postMessage
+          method: chat.update
           token: ${{ secrets.SLACK_BOT_TOKEN }}
-          errors: true
           payload: |
-            channel: ${{ vars.SLACK_CHANNEL_ID }}
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            ts: "${{ steps.post.outputs.ts }}"
             text: "Ready for review: ${{ steps.meta.outputs.title }}"
             unfurl_links: false
             blocks:
@@ -105,14 +151,7 @@ jobs:
               - type: context
                 elements:
                   - type: mrkdwn
-                    text: "opened by *${{ github.event.pull_request.user.login }}* · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}${{ steps.preview.outputs.line }}${{ steps.meta.outputs.fork }}"
-
-      - name: Stash the thread ts on the PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
-            -f body="<!-- slack-thread-ts:${{ steps.post.outputs.ts }} -->"
+                    text: "opened by *${{ github.event.pull_request.user.login }}* · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}${{ steps.preview.outputs.line }}"
 
   # ── Threaded replies: review activity and close ──
   reply:
@@ -123,6 +162,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Validate Slack channel
+        env:
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SLACK_CHANNEL_ID}" ]; then
+            echo "::error::SLACK_CHANNEL_ID repository or organization variable is not set."
+            exit 1
+          fi
+
+          case "$SLACK_CHANNEL_ID" in
+            C*|G*|D*) ;;
+            *)
+              echo "::warning::SLACK_CHANNEL_ID should normally be a Slack channel ID, such as C... for public channels or G... for private channels, not a channel name."
+              ;;
+          esac
+
       - name: Find the thread and build the message
         id: msg
         env:
@@ -145,10 +202,9 @@ jobs:
             sleep 10
           done
 
-          # No parent message yet (draft PR, or a race at creation) — nothing to thread onto
+          # If the workflow first sees a reply event, create the parent message below.
           if [ -z "$ts" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "parent_missing=true" >> "$GITHUB_OUTPUT"
           fi
 
           title=$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH" \
@@ -189,6 +245,36 @@ jobs:
             echo "text=$text"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Post missing parent message
+        id: post_missing_parent
+        if: steps.msg.outputs.parent_missing == 'true'
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            text: "Ready for review: ${{ steps.msg.outputs.title }}"
+            unfurl_links: false
+            blocks:
+              - type: section
+                text:
+                  type: mrkdwn
+                  text: ":eyes: *<${{ github.event.pull_request.html_url }}|${{ steps.msg.outputs.title }}>*"
+              - type: context
+                elements:
+                  - type: mrkdwn
+                    text: "opened by *${{ github.event.pull_request.user.login }}* · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}"
+
+      - name: Stash missing thread ts on the PR
+        if: steps.msg.outputs.parent_missing == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            -f body="<!-- slack-thread-ts:${{ steps.post_missing_parent.outputs.ts }} -->"
+
       - name: Reply in thread
         if: steps.msg.outputs.skip != 'true'
         uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
@@ -197,8 +283,8 @@ jobs:
           token: ${{ secrets.SLACK_BOT_TOKEN }}
           errors: true
           payload: |
-            channel: ${{ vars.SLACK_CHANNEL_ID }}
-            thread_ts: "${{ steps.msg.outputs.ts }}"
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            thread_ts: "${{ steps.msg.outputs.ts || steps.post_missing_parent.outputs.ts }}"
             text: "${{ steps.msg.outputs.text }}"
             reply_broadcast: ${{ steps.msg.outputs.closed == 'true' }}
 
@@ -209,8 +295,8 @@ jobs:
           method: chat.update
           token: ${{ secrets.SLACK_BOT_TOKEN }}
           payload: |
-            channel: ${{ vars.SLACK_CHANNEL_ID }}
-            ts: "${{ steps.msg.outputs.ts }}"
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            ts: "${{ steps.msg.outputs.ts || steps.post_missing_parent.outputs.ts }}"
             text: "${{ steps.msg.outputs.title }}"
             blocks:
               - type: section
