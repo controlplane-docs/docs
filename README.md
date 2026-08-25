@@ -34,5 +34,3 @@ make publish
 ```
 
 This replaces `cli-reference/commands/`, `cli-reference/installation.mdx`, `cli-reference/using-cli/help.mdx`, and `cli-reference/ci-cd-development/container-image.mdx`, then creates a PR. Do not manually edit these files.
-
-This is a test of the slack notification.
