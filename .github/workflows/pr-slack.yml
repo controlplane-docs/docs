@@ -1,0 +1,223 @@
+name: PR Slack Notification
+
+# pull_request_target runs the version of this file on the DEFAULT BRANCH,
+# in the base repo's context, with secrets available — which is what makes
+# fork PRs work. It is only safe because nothing below checks out or runs
+# code from the PR. Never add actions/checkout to this file.
+on:
+  pull_request_target:
+    types: [opened, ready_for_review, review_requested, closed]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  pull-requests: write
+  deployments: read
+
+concurrency:
+  group: pr-slack-${{ github.event.pull_request.number }}-${{ github.event.action }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Parent message: posted once, when the PR becomes reviewable ──
+  root:
+    if: >-
+      github.event.action == 'ready_for_review' ||
+      (github.event.action == 'opened' && github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Escape the title
+        id: meta
+        run: |
+          set -euo pipefail
+
+          slack_escape() {
+            sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/\\/\\\\/g; s/"/\\"/g'
+          }
+
+          # Read from the event file, never interpolate the title into shell
+          title=$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH" \
+            | tr -d '\r\n' | slack_escape)
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+          # Label fork PRs — Mintlify doesn't build previews from forks
+          if [ "$(jq -r '.pull_request.head.repo.fork' "$GITHUB_EVENT_PATH")" = "true" ]; then
+            src=$(jq -r '.pull_request.head.repo.full_name' "$GITHUB_EVENT_PATH" | slack_escape)
+            echo "fork= · :fork_and_knife: fork \`${src}\` — no preview" >> "$GITHUB_OUTPUT"
+          else
+            echo "fork=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for the Mintlify preview
+        id: preview
+        if: github.event.pull_request.head.repo.fork == false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          url=""
+
+          # Mintlify deploys to the "staging" environment; poll up to ~3 min
+          for _ in $(seq 1 12); do
+            dep=$(gh api "repos/$REPO/deployments?environment=staging&per_page=100" \
+              | jq -r --arg sha "$HEAD_SHA" '[.[] | select(.sha == $sha)] | first | .id // empty')
+            if [ -n "$dep" ]; then
+              url=$(gh api "repos/$REPO/deployments/$dep/statuses" \
+                | jq -r '[.[] | select(.state == "success")] | first | .environment_url // empty')
+              [ -n "$url" ] && break
+            fi
+            sleep 15
+          done
+
+          # Fallback: pull the link out of the bot's comment
+          if [ -z "$url" ]; then
+            url=$(gh api "repos/$REPO/issues/$NUM/comments" --paginate \
+              | jq -r '[.[] | select(.user.login == "mintlify[bot]") | .body] | last // ""' \
+              | grep -oE 'https://[a-z0-9.-]+\.mintlify\.(app|site)' | head -n1 || true)
+          fi
+
+          if [ -n "$url" ]; then
+            echo "line= · <${url}|:mag: Preview>" >> "$GITHUB_OUTPUT"
+          else
+            echo "line=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post to Slack
+        id: post
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel: ${{ vars.SLACK_CHANNEL_ID }}
+            text: "Ready for review: ${{ steps.meta.outputs.title }}"
+            unfurl_links: false
+            blocks:
+              - type: section
+                text:
+                  type: mrkdwn
+                  text: ":eyes: *<${{ github.event.pull_request.html_url }}|${{ steps.meta.outputs.title }}>*"
+              - type: context
+                elements:
+                  - type: mrkdwn
+                    text: "opened by *${{ github.event.pull_request.user.login }}* · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}${{ steps.preview.outputs.line }}${{ steps.meta.outputs.fork }}"
+
+      - name: Stash the thread ts on the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            -f body="<!-- slack-thread-ts:${{ steps.post.outputs.ts }} -->"
+
+  # ── Threaded replies: review activity and close ──
+  reply:
+    if: >-
+      github.event.action == 'review_requested' ||
+      github.event.action == 'submitted' ||
+      github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Find the thread and build the message
+        id: msg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          slack_escape() {
+            sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/\\/\\\\/g; s/"/\\"/g'
+          }
+
+          ts=""
+          for _ in $(seq 1 6); do
+            ts=$(gh api "repos/$REPO/issues/$NUM/comments" --paginate \
+              --jq '.[].body | try capture("slack-thread-ts:(?<ts>[0-9.]+)") catch empty | .ts' \
+              | head -n1 || true)
+            [ -n "$ts" ] && break
+            sleep 10
+          done
+
+          # No parent message yet (draft PR, or a race at creation) — nothing to thread onto
+          if [ -z "$ts" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          title=$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH" \
+            | tr -d '\r\n' | slack_escape)
+          action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
+
+          case "$action" in
+            review_requested)
+              who=$(jq -r '.requested_reviewer.login // .requested_team.slug' "$GITHUB_EVENT_PATH" | slack_escape)
+              text=":raising_hand: Review requested from *${who}*"
+              ;;
+            submitted)
+              who=$(jq -r '.review.user.login' "$GITHUB_EVENT_PATH" | slack_escape)
+              case "$(jq -r '.review.state' "$GITHUB_EVENT_PATH")" in
+                approved)          text=":white_check_mark: *${who}* approved" ;;
+                changes_requested) text=":warning: *${who}* requested changes" ;;
+                *)                 echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+              esac
+              ;;
+            closed)
+              approvers=$(gh api "repos/$REPO/pulls/$NUM/reviews" --paginate \
+                --jq '[.[] | select(.state=="APPROVED") | .user.login] | unique | join(", ")' \
+                | slack_escape)
+              if [ "$(jq -r '.pull_request.merged' "$GITHUB_EVENT_PATH")" = "true" ]; then
+                by=$(jq -r '.pull_request.merged_by.login' "$GITHUB_EVENT_PATH" | slack_escape)
+                text=":large_green_circle: *Merged* by *${by}*"
+              else
+                text=":red_circle: *Closed without merging*"
+              fi
+              [ -n "$approvers" ] && text="${text} · approved by ${approvers}"
+              echo "closed=true" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+          {
+            echo "ts=$ts"
+            echo "title=$title"
+            echo "text=$text"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reply in thread
+        if: steps.msg.outputs.skip != 'true'
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel: ${{ vars.SLACK_CHANNEL_ID }}
+            thread_ts: "${{ steps.msg.outputs.ts }}"
+            text: "${{ steps.msg.outputs.text }}"
+            reply_broadcast: ${{ steps.msg.outputs.closed == 'true' }}
+
+      - name: Strike through the parent message
+        if: steps.msg.outputs.closed == 'true'
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.update
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            channel: ${{ vars.SLACK_CHANNEL_ID }}
+            ts: "${{ steps.msg.outputs.ts }}"
+            text: "${{ steps.msg.outputs.title }}"
+            blocks:
+              - type: section
+                text:
+                  type: mrkdwn
+                  text: "~<${{ github.event.pull_request.html_url }}|${{ steps.msg.outputs.title }}>~"
+              - type: context
+                elements:
+                  - type: mrkdwn
+                    text: "${{ steps.msg.outputs.text }} · `${{ github.repository }}` #${{ github.event.pull_request.number }}"
