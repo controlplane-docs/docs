@@ -30,6 +30,7 @@ jobs:
       - name: Validate Slack channel
         env:
           SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          SLACK_USER_MAP: ${{ vars.SLACK_USER_MAP }}
         run: |
           set -euo pipefail
 
@@ -45,8 +46,15 @@ jobs:
               ;;
           esac
 
+          if [ -n "${SLACK_USER_MAP}" ] && ! jq -e 'type == "object"' >/dev/null <<< "$SLACK_USER_MAP"; then
+            echo "::error::SLACK_USER_MAP must be a valid JSON object."
+            exit 1
+          fi
+
       - name: Escape the title
         id: meta
+        env:
+          SLACK_USER_MAP: ${{ vars.SLACK_USER_MAP }}
         run: |
           set -euo pipefail
 
@@ -54,10 +62,23 @@ jobs:
             sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/\\/\\\\/g; s/"/\\"/g'
           }
 
+          slack_user() {
+            login="$1"
+            slack_id=$(jq -nr --argjson map "${SLACK_USER_MAP:-{}}" --arg login "$login" '$map[$login] // empty')
+            if [ -n "$slack_id" ]; then
+              printf '<@%s>\n' "$slack_id"
+            else
+              printf '*%s*\n' "$(printf '%s\n' "$login" | slack_escape)"
+            fi
+          }
+
           # Read from the event file, never interpolate the title into shell
           title=$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH" \
             | tr -d '\r\n' | slack_escape)
           echo "title=$title" >> "$GITHUB_OUTPUT"
+
+          author=$(jq -r '.pull_request.user.login' "$GITHUB_EVENT_PATH")
+          echo "author=$(slack_user "$author")" >> "$GITHUB_OUTPUT"
 
           # Label fork PRs — Mintlify doesn't build previews from forks
           if [ "$(jq -r '.pull_request.head.repo.fork' "$GITHUB_EVENT_PATH")" = "true" ]; then
@@ -86,7 +107,7 @@ jobs:
               - type: context
                 elements:
                   - type: mrkdwn
-                    text: "opened by *${{ github.event.pull_request.user.login }}* · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}${{ steps.meta.outputs.fork }}"
+                    text: "opened by ${{ steps.meta.outputs.author }} · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}${{ steps.meta.outputs.fork }}"
 
       - name: Stash the thread ts on the PR
         env:
@@ -127,7 +148,8 @@ jobs:
           fi
 
           if [ -n "$url" ]; then
-            echo "line= · <${url}|:mag: Preview>" >> "$GITHUB_OUTPUT"
+            url=$(printf '%s\n' "$url" | sed -E 's#^(https://[^/]+).*#\1#')
+            echo "line= · <${url}>" >> "$GITHUB_OUTPUT"
           else
             echo "line=" >> "$GITHUB_OUTPUT"
           fi
@@ -151,7 +173,56 @@ jobs:
               - type: context
                 elements:
                   - type: mrkdwn
-                    text: "opened by *${{ github.event.pull_request.user.login }}* · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}${{ steps.preview.outputs.line }}"
+                    text: "opened by ${{ steps.meta.outputs.author }} · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}${{ steps.preview.outputs.line }}"
+
+      - name: Build changed files message
+        id: files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          slack_escape() {
+            sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/\\/\\\\/g; s/"/\\"/g'
+          }
+
+          files=$(gh api "repos/$REPO/pulls/$NUM/files" --paginate | jq -s 'add')
+          count=$(printf '%s\n' "$files" | jq 'length')
+          limit=12
+
+          {
+            echo "text<<EOF"
+            if [ "$count" -eq 0 ]; then
+              echo ":page_facing_up: No changed files reported by GitHub."
+            elif [ "$count" -le "$limit" ]; then
+              echo ":page_facing_up: *Changed files*"
+              printf '%s\n' "$files" \
+                | jq -r '.[] | "- `" + .filename + "` (" + .status + ")"' \
+                | slack_escape
+            else
+              echo ":page_facing_up: *Changed files:* ${count} files changed. Showing first ${limit}."
+              printf '%s\n' "$files" \
+                | jq -r --argjson limit "$limit" '.[:$limit][] | "- `" + .filename + "` (" + .status + ")"' \
+                | slack_escape
+              printf '%s\n' "$files" \
+                | jq -r --argjson limit "$limit" '"... and " + ((length - $limit) | tostring) + " more files."'
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Add changed files to Slack thread
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            thread_ts: "${{ steps.post.outputs.ts }}"
+            text: |
+              ${{ steps.files.outputs.text }}
 
   # ── Threaded replies: review activity and close ──
   reply:
@@ -165,6 +236,7 @@ jobs:
       - name: Validate Slack channel
         env:
           SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          SLACK_USER_MAP: ${{ vars.SLACK_USER_MAP }}
         run: |
           set -euo pipefail
 
@@ -180,12 +252,18 @@ jobs:
               ;;
           esac
 
+          if [ -n "${SLACK_USER_MAP}" ] && ! jq -e 'type == "object"' >/dev/null <<< "$SLACK_USER_MAP"; then
+            echo "::error::SLACK_USER_MAP must be a valid JSON object."
+            exit 1
+          fi
+
       - name: Find the thread and build the message
         id: msg
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           NUM: ${{ github.event.pull_request.number }}
+          SLACK_USER_MAP: ${{ vars.SLACK_USER_MAP }}
         run: |
           set -euo pipefail
 
@@ -209,28 +287,41 @@ jobs:
 
           title=$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH" \
             | tr -d '\r\n' | slack_escape)
+          author=$(jq -r '.pull_request.user.login' "$GITHUB_EVENT_PATH")
           action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
 
           case "$action" in
             review_requested)
-              who=$(jq -r '.requested_reviewer.login // .requested_team.slug' "$GITHUB_EVENT_PATH" | slack_escape)
-              text=":raising_hand: Review requested from *${who}*"
+              if [ "$(jq -r '.requested_reviewer.login // empty' "$GITHUB_EVENT_PATH")" ]; then
+                who=$(jq -r '.requested_reviewer.login' "$GITHUB_EVENT_PATH")
+                text=":raising_hand: Review requested from $(slack_user "$who")"
+              else
+                who=$(jq -r '.requested_team.slug' "$GITHUB_EVENT_PATH" | slack_escape)
+                text=":raising_hand: Review requested from *${who}*"
+              fi
               ;;
             submitted)
-              who=$(jq -r '.review.user.login' "$GITHUB_EVENT_PATH" | slack_escape)
+              who=$(jq -r '.review.user.login' "$GITHUB_EVENT_PATH")
               case "$(jq -r '.review.state' "$GITHUB_EVENT_PATH")" in
-                approved)          text=":white_check_mark: *${who}* approved" ;;
-                changes_requested) text=":warning: *${who}* requested changes" ;;
+                approved)          text=":white_check_mark: $(slack_user "$who") approved" ;;
+                changes_requested) text=":warning: $(slack_user "$who") requested changes" ;;
                 *)                 echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
               esac
               ;;
             closed)
-              approvers=$(gh api "repos/$REPO/pulls/$NUM/reviews" --paginate \
-                --jq '[.[] | select(.state=="APPROVED") | .user.login] | unique | join(", ")' \
-                | slack_escape)
+              approvers=""
+              while IFS= read -r approver; do
+                mention=$(slack_user "$approver")
+                if [ -z "$approvers" ]; then
+                  approvers="$mention"
+                else
+                  approvers="${approvers}, ${mention}"
+                fi
+              done < <(gh api "repos/$REPO/pulls/$NUM/reviews" --paginate \
+                --jq '[.[] | select(.state=="APPROVED") | .user.login] | unique | .[]')
               if [ "$(jq -r '.pull_request.merged' "$GITHUB_EVENT_PATH")" = "true" ]; then
-                by=$(jq -r '.pull_request.merged_by.login' "$GITHUB_EVENT_PATH" | slack_escape)
-                text=":large_green_circle: *Merged* by *${by}*"
+                by=$(jq -r '.pull_request.merged_by.login' "$GITHUB_EVENT_PATH")
+                text=":large_green_circle: *Merged* by $(slack_user "$by")"
               else
                 text=":red_circle: *Closed without merging*"
               fi
@@ -242,6 +333,7 @@ jobs:
           {
             echo "ts=$ts"
             echo "title=$title"
+            echo "author=$(slack_user "$author")"
             echo "text=$text"
           } >> "$GITHUB_OUTPUT"
 
@@ -265,7 +357,7 @@ jobs:
               - type: context
                 elements:
                   - type: mrkdwn
-                    text: "opened by *${{ github.event.pull_request.user.login }}* · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}"
+                    text: "opened by ${{ steps.msg.outputs.author }} · `${{ github.repository }}` #${{ github.event.pull_request.number }} · +${{ github.event.pull_request.additions }}/-${{ github.event.pull_request.deletions }}"
 
       - name: Stash missing thread ts on the PR
         if: steps.msg.outputs.parent_missing == 'true'
@@ -274,6 +366,57 @@ jobs:
         run: |
           gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
             -f body="<!-- slack-thread-ts:${{ steps.post_missing_parent.outputs.ts }} -->"
+
+      - name: Build changed files message
+        id: files
+        if: steps.msg.outputs.parent_missing == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          slack_escape() {
+            sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/\\/\\\\/g; s/"/\\"/g'
+          }
+
+          files=$(gh api "repos/$REPO/pulls/$NUM/files" --paginate | jq -s 'add')
+          count=$(printf '%s\n' "$files" | jq 'length')
+          limit=12
+
+          {
+            echo "text<<EOF"
+            if [ "$count" -eq 0 ]; then
+              echo ":page_facing_up: No changed files reported by GitHub."
+            elif [ "$count" -le "$limit" ]; then
+              echo ":page_facing_up: *Changed files*"
+              printf '%s\n' "$files" \
+                | jq -r '.[] | "- `" + .filename + "` (" + .status + ")"' \
+                | slack_escape
+            else
+              echo ":page_facing_up: *Changed files:* ${count} files changed. Showing first ${limit}."
+              printf '%s\n' "$files" \
+                | jq -r --argjson limit "$limit" '.[:$limit][] | "- `" + .filename + "` (" + .status + ")"' \
+                | slack_escape
+              printf '%s\n' "$files" \
+                | jq -r --argjson limit "$limit" '"... and " + ((length - $limit) | tostring) + " more files."'
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Add changed files to Slack thread
+        if: steps.msg.outputs.parent_missing == 'true'
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            thread_ts: "${{ steps.post_missing_parent.outputs.ts }}"
+            text: |
+              ${{ steps.files.outputs.text }}
 
       - name: Reply in thread
         if: steps.msg.outputs.skip != 'true'
@@ -286,7 +429,7 @@ jobs:
             channel: "${{ vars.SLACK_CHANNEL_ID }}"
             thread_ts: "${{ steps.msg.outputs.ts || steps.post_missing_parent.outputs.ts }}"
             text: "${{ steps.msg.outputs.text }}"
-            reply_broadcast: ${{ steps.msg.outputs.closed == 'true' }}
+            reply_broadcast: false
 
       - name: Strike through the parent message
         if: steps.msg.outputs.closed == 'true'
