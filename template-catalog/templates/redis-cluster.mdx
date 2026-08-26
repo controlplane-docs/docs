@@ -1,12 +1,12 @@
 ---
 title: Redis Cluster
-description: Deploy Redis Cluster on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and native data sharding across multiple primary nodes with replication.
-keywords: ['redis sharded', 'hash slot', 'cluster mode', 'kv distributed', 'horizontal redis', 'crc16', 'cluster slots', 'redis-cli', 'cache cluster']
+description: Deploy Redis Cluster on Control Plane using the Template Catalog. Runs Redis or Valkey with native data sharding across multiple primary nodes, replication, persistent volumes, and scheduled backups.
+keywords: ['redis sharded', 'hash slot', 'cluster mode', 'kv distributed', 'horizontal redis', 'crc16', 'cluster slots', 'redis-cli', 'cache cluster', 'redis fork', 'cluster bus', 'moved redirect']
 ---
 
 ## Overview
 
-Redis Cluster is a distributed Redis deployment with automatic data sharding across multiple primary nodes and built-in replication. This template deploys a native Redis Cluster with 3 primary shards and 3 replicas, providing both horizontal scalability and high availability without an external Sentinel process.
+Redis Cluster is a distributed Redis deployment with automatic data sharding across multiple primary nodes and built-in replication. This template deploys a native Redis Cluster with 3 primary shards and 3 replicas, providing both horizontal scalability and high availability without an external Sentinel process. Nodes run Redis by default, and the `engine` knob added in version 1.6.0 runs the same cluster on Valkey instead — see [Engine Selection](#engine-selection).
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
@@ -14,7 +14,7 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ### What Gets Created
 
-- **Stateful Redis Cluster Workload** — (`RELEASE_NAME-redis-cluster`): all replicas managed together. Replica 0 initializes the cluster once all nodes are healthy.
+- **Stateful Redis Cluster Workload** — (`RELEASE_NAME-redis-cluster`): all six nodes managed together, each running Redis or Valkey according to `engine`. Replica 0 initializes the cluster once all nodes are healthy.
 - **Volume Set** — Persistent storage for each Redis node's data directory.
 - **Secret** — An opaque secret containing the Redis cluster configuration (`redis.conf`), mounted into each container.
 - **Secret** — An opaque secret containing the cluster initialization script, mounted and executed at startup.
@@ -53,37 +53,53 @@ This template has no external prerequisites unless backup is enabled. To install
 The default `values.yaml` for this template:
 
 ```yaml
-replicas: 6 # minimum value is 6
+# ─── Engine ───────────────────────────────────────────────────────────────────
+# Which server the cluster nodes run. `redis` is the default and changes nothing.
+# `valkey` runs every node on the image below — Valkey is the BSD-licensed fork
+# of Redis 7.2 and ships redis-server / redis-cli compatibility symlinks, so the
+# cluster bootstrap, config directives and probes are identical.
+# Chosen at INSTALL time: switching an existing release between engines is not
+# supported — see Engine Selection below.
+engine: redis                     # redis | valkey
+# Used for every node when engine is valkey; `image` below is then ignored.
+# Only the Debian-based tags are supported (the -alpine tags have no bash and the
+# start script requires it).
+valkeyImage: valkey/valkey:8.1.9
 
+# Redis image for the cluster nodes. Pinned so installs are reproducible.
+image: docker.io/redis:7.2
+
+replicas: 6 # minimum value is 6
 port: 6379
 memory: 250Mi
 cpu: 200m
 
-internalAccess:
+internalAccess: # Sets the internal firewall scope - if set to none, replicas will not be able to reach each other
   type: same-gvc # options: none, same-gvc, same-org, workload-list
-  workloads: # Note: can only be used if type is same-gvc or workload-list
+  workloads:  # Note: can only be used if type is same-gvc or workload-list
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
   autoscaling:
-    enabled: false
-    maxCapacity: 100 # Maximum capacity in GiB
-    minFreePercentage: 10 # Trigger scaling when free space drops below this percentage
-    scalingFactor: 1.2 # Multiply current capacity by this factor when scaling up
+    enabled: false # Set to true to enable autoscaling
+    maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
+    minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
+    scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
 
 # Configure Redis authentication by uncommenting and setting the password field
 redis: {}
-  # password: your-secure-password
+  # password: "your-secure-password-here"
 
 backup:
   enabled: false
-  image: controlplanecorporation/redis-backup:1.0 # compatible with all Redis versions
+  image: ghcr.io/controlplane-com/backup-images/redis-backup:1.0.0
   schedule: "0 2 * * *"  # daily at 2am UTC
 
   resources:
     cpu: 100m
-    memory: 128Mi
+    memory: 512Mi # cluster mode dumps every primary sequentially; 128Mi OOMs during GCS uploads
 
   provider: aws # Options: aws or gcp
 
@@ -92,13 +108,47 @@ backup:
     region: us-east-1
     cloudAccountName: my-backup-cloudaccount
     policyName: my-backup-policy
-    prefix: redis-cluster/backups
+    prefix: "redis-cluster/backups"
 
   gcp:
-    bucket: my-backup-bucket
-    cloudAccountName: my-backup-cloudaccount
-    prefix: redis-cluster/backups
+    bucket: ""
+    cloudAccountName: ""
+    prefix: "redis-cluster/backups"
 ```
+
+### Engine Selection
+
+`engine` chooses which server every cluster node runs. `redis` is the default and changes nothing — an install that does not set it deploys exactly as it did before version 1.6.0.
+
+Set `engine: valkey` to run the cluster on [Valkey](https://valkey.io/) instead. Valkey is the BSD-3-Clause fork of Redis 7.2, stewarded by the Linux Foundation. It has no paid edition, so nothing in it is feature-gated.
+
+```yaml
+engine: valkey
+valkeyImage: valkey/valkey:8.1.9
+```
+
+Nothing else in the template changes. The Valkey image ships `redis-server`, `redis-cli`, `redis-sentinel`, `redis-benchmark`, `redis-check-rdb` and `redis-check-aof` compatibility symlinks, so the cluster bootstrap script, the config directives, the readiness probe and the backup job all run unmodified. Sharding, `MOVED` redirects, hostname announcement, authentication, replica counts, backups and firewall behavior are identical on both engines.
+
+| | `engine: redis` (default) | `engine: valkey` |
+|---|---|---|
+| Image knob read | `image` | `valkeyImage` |
+| Default image | `docker.io/redis:7.2` | `valkey/valkey:8.1.9` |
+| License | Redis RSALv2 / SSPLv1 | BSD-3-Clause |
+| `INFO server` reports | `redis_version:7.2.x` | `server_name:valkey`, `valkey_version:8.1.9`, and `redis_version:7.2.4` for client compatibility |
+
+- `valkeyImage` is used for every node whenever `engine` is `valkey`, and `image` is then ignored entirely — a Redis tag left in `image` has no effect.
+- Use the Debian-based Valkey tags. The `-alpine` tags ship no `bash`, which both the cluster start script and the readiness probe require.
+- Valkey reports `redis_version:7.2.4` in `INFO` for client compatibility. Read `server_name` and `valkey_version` to tell what is actually running — anything that version-gates on `redis_version` will believe it is talking to Redis 7.2.
+- The marketplace card still shows the Redis version. A chart's `appVersion` is a constant and cannot follow a values knob.
+- Do not enable `dual-channel-replication-enabled` on Valkey; a known upstream defect confuses replica accounting.
+
+<Warning>
+**Choose the engine at install time — switching an existing release is not supported.**
+
+On the pinned default image (`docker.io/redis:7.2`) the switch does carry the data across: it was tested, all 48 seeded keys survived, and the cluster re-formed from its persisted `nodes.conf`. That only holds while `image` is untouched. Move `image` to a newer Redis and the same switch destroys the node instead — newer Redis releases write an on-disk format Valkey rejects, and on `redis:8` the node fails with `Can't handle RDB format version 15` and exits rather than starting.
+
+The failure is also close to invisible. The start script discards server output, so `cpln logs` returns zero lines for the failing node and the deployment message is empty; the only symptom is a node that never becomes ready. Migrate with dump/restore or replication instead of relying on the switch.
+</Warning>
 
 ### Authentication
 
@@ -106,17 +156,19 @@ Authentication is disabled by default. To enable it, set a password:
 
 ```yaml
 redis:
-  password: your-secure-password
+  password: "your-secure-password-here"
 ```
 
 When set, the password is stored in a dictionary secret and injected into both `requirepass` and `masterauth` in `redis.conf`, ensuring all nodes authenticate with each other.
 
+From version 1.6.0 the readiness probe requires an actual `PONG` from the node. Earlier versions ran `redis-cli ping`, which exits 0 even when the server answers `NOAUTH Authentication required` — so a password-protected cluster reported ready even with the wrong password. One consequence is worth knowing: because the workload rolls with `OrderedReady`, a bad credential now stalls the rollout at the first replica instead of rolling all six nodes into a broken state while every status surface reports healthy.
+
 ### Cluster Size
 
-- `replicas` — Total number of Redis nodes. **Minimum is 6** (3 primaries + 3 replicas). The cluster is always created with `--cluster-replicas 1`, meaning each primary has exactly one replica.
+- `replicas` — Total number of Redis nodes. **6 is the only supported value** (3 primaries + 3 replicas). The cluster is always created with `--cluster-replicas 1`, meaning each primary has exactly one replica. Replica 0 waits for all nodes to be healthy before running `redis-cli --cluster create`.
 
 <Note>
-Do not scale the replica count below 6. The cluster requires at least 3 primary nodes and 3 replica nodes to initialize. Replica 0 waits for all nodes to be healthy before running `redis-cli --cluster create`.
+`replicas` is effectively pinned at 6, not merely floored. Below 6 the cluster cannot initialize — it requires 3 primary nodes for quorum and this template pairs each with a replica. Above 6 the install is rejected at apply: the workload uses replica-direct addressing, and a built-in platform quota caps replica-direct workloads at 6, so `replicas: 8` fails with `exceed the autoscaling.maxScale of 6 (quota: replicas-per-replica-direct-workload)`.
 </Note>
 
 ### Resources
@@ -162,12 +214,42 @@ Each individual node is also accessible directly:
 RELEASE_NAME-redis-cluster-N.RELEASE_NAME-redis-cluster.GVC_NAME.cpln.local:6379
 ```
 
+Both forms use the configured `port`; substitute your own value if you changed it. Add `-a PASSWORD` to your client when `redis.password` is set.
+
 ### Ports
 
 | Port | Protocol | Description |
 |------|----------|-------------|
-| `6379` | TCP | Redis data port |
-| `16379` | TCP | Redis cluster bus (internal node-to-node communication) |
+| `port` — default `6379` | TCP | Redis data port |
+| `port + 10000` — default `16379` | TCP | Cluster bus (node-to-node gossip and failover elections) |
+
+- `port` — The port every node listens on. Redis derives the cluster bus as `port + 10000`, and the template declares both ports, so a custom `port` needs no further configuration — but any client or firewall rule expecting `16379` must move with it.
+
+<Warning>
+**`port` only works from version 1.6.0.** In earlier versions any non-default value crash-looped every node permanently. Three defects combined: the readiness probe and five calls in the cluster start script ran `redis-cli` with no `-p` (so they always targeted `127.0.0.1:6379`), and the cluster bus was hardcoded to `16379` instead of being derived from `port`, leaving gossip undeclared so the cluster could never form. All three are fixed in 1.6.0 and verified at `6379`, `7000` and `6380`, with the derived bus proven by observing a failover election carried over it. At the default port nothing about the deployment changes, so existing installs are unaffected.
+</Warning>
+
+## Cluster Formation and Readiness
+
+A fresh install takes roughly five minutes to become usable. The workload is stateful and brings its six replicas up in order; replica 0 then runs `redis-cli --cluster create` once every node answers.
+
+<Note>
+**`ready` means the node answers, not that the cluster exists.** The readiness probe asks the local server for a `PONG`. It cannot also require `cluster_state:ok`, because the cluster is not created until all six nodes are up and the workload rolls with `OrderedReady` — a probe that waited for cluster state would deadlock the rollout it gates. During first boot a node can therefore report ready with no cluster for up to about a minute.
+</Note>
+
+Check the cluster itself rather than the workload's ready flag:
+
+```bash
+cpln workload exec RELEASE_NAME-redis-cluster \
+  --gvc GVC_NAME \
+  --replica RELEASE_NAME-redis-cluster-0 \
+  --container redis-cluster \
+  -- redis-cli -p 6379 cluster info
+```
+
+`cluster_state:ok` with `cluster_slots_assigned:16384` and `cluster_known_nodes:6` means the cluster is formed. Add `-a PASSWORD` to the `redis-cli` call when `redis.password` is set, and use your own value if you changed `port`.
+
+Version 1.6.0 also fixes a bootstrap DNS race on default installs. Cluster creation re-resolves every peer hostname, and a name that answered moments earlier can briefly stop resolving; that used to kill the container, measured at up to 7 restarts and around 20 minutes to converge. Creation now retries in place, and still fails loudly if it genuinely cannot succeed.
 
 ## Backup
 
@@ -253,5 +335,8 @@ aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.rdb.gz - \
     </Card>
     <Card title="Redis Cluster Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/redis-cluster">
     View the source files, default values, and chart definition
+    </Card>
+    <Card title="Valkey Documentation" icon="book" href="https://valkey.io/topics/">
+    Valkey topic guides, including the cluster tutorial
     </Card>
 </CardGroup>
