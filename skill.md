@@ -61,7 +61,7 @@ Org (Organization) — top-level isolation boundary, globally unique name
 | **Workloads** | Deploy containers as serverless, standard, cron, or stateful | Primary deployment unit — most users start here |
 | **Template Catalog** | 30+ production-ready templates (Postgres, Redis, Kafka, MongoDB, etc.) | Need a database, queue, or common service — install instead of building from scratch |
 | **Managed Kubernetes (mk8s)** | Provision Kubernetes clusters across AWS, GCP, Azure, Hetzner, and more | Need a full Kubernetes cluster (teams deploy INTO mk8s clusters) |
-| **CPLN Platform (BYOK)** | Register existing Kubernetes clusters as Control Plane locations | Already have Kubernetes — want Control Plane workload management on top |
+| **CPLN BYOK** | Register existing Kubernetes clusters as Control Plane locations | Already have Kubernetes — want Control Plane workload management on top |
 | **Kubernetes Operator** | Manage Control Plane resources as Kubernetes CRDs (ArgoCD/GitOps) | Want Kubernetes-native GitOps for Control Plane infrastructure |
 | **Agents** | Secure tunnels to private networks (VPCs, on-prem, data centers) | Workloads need to reach private TCP endpoints behind firewalls |
 | **External Logging** | Ship logs to S3, CloudWatch, Coralogix, Datadog, Logz.io, Stackdriver | Compliance, long-term retention, or external log analysis |
