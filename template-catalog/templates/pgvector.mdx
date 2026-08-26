@@ -1,0 +1,572 @@
+---
+title: pgvector
+description: Deploy pgvector on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, HNSW and IVFFlat indexes, the PgBouncer session-variable caveat, public access, and scheduled S3, GCS and MinIO backups.
+keywords: ['vector database', 'embeddings', 'similarity search', 'rag', 'nearest neighbor', 'cosine distance', 'langchain', 'llamaindex', 'pinecone alternative', 'qdrant alternative', 'halfvec', 'vector index', 'ann search', 'postgres extension', 'ef_search']
+---
+
+## Overview
+
+pgvector adds a `vector` column type and approximate nearest-neighbor indexes to PostgreSQL, so embeddings live in the same database as the relational data they describe. This template deploys PostgreSQL 18 with pgvector 0.8.6 on a persistent volume, with an optional PgBouncer connection pooler and optional scheduled backups to AWS S3, GCS, or a self-hosted MinIO instance.
+
+The extension is not just installed in the image — the template **creates it for you on first boot**, in the database named in your credentials secret. A fresh install can store vectors and run similarity queries with no setup SQL.
+
+Database credentials are **not** template values. PostgreSQL reads its username, password and database name from a dictionary secret you create before installing, so no password passes through Helm or lands in the release.
+
+<Note>
+pgvector on Control Plane operates as a single-replica deployment. Do not scale up the replica count, as this would result in multiple isolated instances rather than a replicated cluster. For automatic failover, see [High Availability](#high-availability).
+</Note>
+
+### What Gets Created
+
+- **Stateful pgvector Workload** — (`RELEASE_NAME-pgvector`): a single replica of PostgreSQL 18 with pgvector 0.8.6, listening on port `5432`.
+- **Volume Set** — (`RELEASE_NAME-pgvector-vs`): persistent storage for the data directory, with optional autoscaling and a final snapshot retained for 7 days.
+- **First-Boot SQL Secret** — (`RELEASE_NAME-pgvector-init`): an opaque secret mounted at `/docker-entrypoint-initdb.d/00-pgvector.sql`, holding the `CREATE EXTENSION` statements. It contains no credentials.
+- **Identity & Policy** — (`RELEASE_NAME-pgvector-identity`, `RELEASE_NAME-pgvector-policy`): an identity bound to the database, pooler and backup workloads, and a policy granting it `reveal` on exactly the secrets this release uses — nothing else. When backups are enabled, the identity also carries the Cloud Account binding the backup job uses to reach your bucket.
+- **PgBouncer Workload** *(optional)* — (`RELEASE_NAME-pgbouncer`): a connection pooler in front of PostgreSQL, created when `pgbouncer.enabled: true`.
+- **Backup Cron Workload** *(optional)* — (`RELEASE_NAME-pgvector-backup`): a scheduled `pg_dumpall` that writes compressed SQL dumps to AWS S3, GCS or MinIO, created when `backup.enabled: true`.
+
+The template creates **no credential secret of its own**. Every password lives in the prerequisite secrets described below.
+
+<Note>
+This template does not create a GVC. You must deploy it into an existing GVC.
+</Note>
+
+## Prerequisites
+
+**One secret must exist before you install.** It holds the credentials your applications put in their connection strings. The values never pass through Helm, so they do not land in the release. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. PostgreSQL creates that role and that database on first boot, and the template creates the `vector` extension inside it:
+
+    ```bash
+    cpln secret create-dictionary --name my-pgvector-credentials \
+      --entry username=pgvector \
+      --entry password='YOUR-STRONG-PASSWORD' \
+      --entry database=vectors
+    ```
+
+    Set `config.credentialsSecretName` to the name you used. Secret names are org-wide, so give each release its own.
+  </Step>
+  <Step title="Read the secret back later">
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values:
+
+    ```bash
+    cpln secret reveal my-pgvector-credentials -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `config.credentialsSecretName` is blank, but a name that points at a secret which does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines** — there is nothing to log, and every summary surface just looks like a slow deploy. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-pgvector --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-pgvector-credentials no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action; recovery was measured here at **10 minutes 11 seconds**. To skip the wait, run `cpln workload force-redeployment RELEASE_NAME-pgvector --gvc GVC_NAME`. Waiting does not leave you with a half-built database: once the secret exists, first boot runs normally and the `vector` extension is created.
+</Warning>
+
+Backups need a bucket, and for AWS or GCP a Control Plane Cloud Account, before they can be enabled — see [Backup Prerequisites](#backup-prerequisites). MinIO backups need a second dictionary secret holding `accessKey` and `secretKey`. Nothing else is required.
+
+## Installation
+
+To install, follow the instructions for your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+# ─── Image ────────────────────────────────────────────────────────
+image: pgvector/pgvector:0.8.6-pg18 # PostgreSQL 18 + pgvector 0.8.6 (Debian bookworm base)
+
+# ─── Resources ────────────────────────────────────────────────────
+resources:
+  minCpu: 300m
+  minMemory: 512Mi
+  maxCpu: 1000m     # vector search is CPU-bound; keep maxCpu:minCpu at or below 4:1 or the apply is rejected
+  maxMemory: 2048Mi # HNSW index builds are far faster when the graph fits in memory
+
+# ─── Database Config ──────────────────────────────────────────────
+config:
+  # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+  # A `dictionary` secret holding exactly three keys: `username`, `password`
+  # and `database`. If it does not exist at install time the deployment
+  # WEDGES silently — `cpln logs` returns nothing at all. See Prerequisites
+  # in the README for the exact `cpln secret create-dictionary` command.
+  credentialsSecretName: my-pgvector-credentials
+
+  # Extra extensions created alongside `vector`, FIRST BOOT ONLY (ignored on an
+  # existing volume). Must already exist in the image, e.g. pg_trgm, pgcrypto,
+  # btree_gin. An unknown name fails the first boot — see the README.
+  extraExtensions: []
+
+# ─── Storage ──────────────────────────────────────────────────────
+volumeset:
+  capacity: 10 # initial capacity in GiB (minimum is 10)
+  autoscaling:
+    enabled: false # Set to true to enable autoscaling
+    maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
+    minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
+    scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
+
+# ─── Access ───────────────────────────────────────────────────────
+internalAccess: # Sets the internal firewall scope - if set to none, nothing in the GVC can reach the database
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads:  # Note: can only be used if type is same-gvc or workload-list
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+publicAccess:
+  enabled: false # exposes 5432 via a TCP load balancer; connections are unencrypted — prefer internal access
+
+# ─── PgBouncer Connection Pooler (optional) ───────────────────────
+pgbouncer:
+  enabled: false
+  image: edoburu/pgbouncer:v1.25.1-p0
+  poolMode: transaction # session, transaction, statement; in transaction mode session GUCs LEAK between clients
+  defaultPoolSize: 25   # number of real Postgres connections PgBouncer maintains
+  maxClientConn: 1000   # maximum number of client connections PgBouncer accepts
+  replicas: 1
+
+  resources:
+    cpu: 200m
+    memory: 128Mi
+
+# ─── Backups (optional) ───────────────────────────────────────────
+backup:
+  enabled: false
+  image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0 # PG18 client, matches the server major
+  schedule: "0 2 * * *"   # daily at 2am UTC
+
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+  provider: aws # Options: aws, gcp, or minio
+
+  aws:
+    bucket: my-pgvector-bucket
+    region: us-east-1
+    cloudAccountName: my-s3-cloud-account
+    policyName: my-pgvector-backup-policy # bucket-scoped IAM policy, see README
+    prefix: pgvector/backups # folder name where your backups will be stored
+
+  gcp:
+    bucket: my-pgvector-bucket
+    cloudAccountName: my-gcs-cloud-account
+    prefix: pgvector/backups # folder name where your backups will be stored
+
+  minio: # Backup to a self-hosted MinIO workload (or any S3-compatible endpoint)
+    endpoint: http://my-minio-workload:9000 # e.g. http://WORKLOAD_NAME:9000 for an internal MinIO template deployment
+    bucket: my-pgvector-bucket
+    # REQUIRED PREREQUISITE SECRET when provider is `minio` — a `dictionary`
+    # secret holding `accessKey` and `secretKey`. See Storage setup in the README.
+    credentialsSecretName: my-pgvector-minio-credentials
+    prefix: pgvector/backups # folder name where your backups will be stored
+```
+
+### Credentials
+
+- `config.credentialsSecretName` — Name of the dictionary secret holding `username`, `password` and `database`. PostgreSQL creates that role and that database on first boot, and this is the credential your applications put in their connection strings.
+
+The secret must exist before installing — see [Prerequisites](#prerequisites). The workload reads it through `cpln://secret/...` references, so the values appear in neither the Helm release nor the stored workload spec.
+
+<Note>
+These credentials are only applied on first startup, when the data directory is empty. Rotating the secret afterwards does not change the stored password; change it inside PostgreSQL with `ALTER ROLE ... WITH PASSWORD` and update the secret to match. A `cpln://` reference is also only resolved when a replica starts, so force a redeployment of the workload after updating a secret it already reads.
+</Note>
+
+### Extensions
+
+- `config.extraExtensions` — Additional extensions created alongside `vector` at first boot. Each entry must be an extension the image already ships, such as `pg_trgm`, `pgcrypto` or `btree_gin`. Names are validated at render time against `^[a-z][a-z0-9_]*$`, so an entry with punctuation or capitals fails the install rather than reaching the database.
+
+The `vector` extension itself is always created and does not need to be listed here.
+
+<Warning>
+**`config.extraExtensions` is read only on first boot, and a name the image does not carry costs you that extension.** The init script stops at the bad name, the container exits once, and the restart finds a populated data directory and skips initialization entirely — leaving a healthy server that has `vector` (created first) but not your extra extension, with nothing in the deployment status to say so. Adding an extension later is one statement:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+</Warning>
+
+### Resources
+
+- `resources.minCpu` / `resources.minMemory` — Minimum CPU and memory guaranteed to the workload.
+- `resources.maxCpu` / `resources.maxMemory` — Maximum CPU and memory the workload can use.
+
+Vector search is CPU-bound and HNSW index builds are far faster when the graph fits in memory, so these defaults are higher than the plain [PostgreSQL](/template-catalog/templates/postgres) template's.
+
+<Note>
+On a stateful workload the ratio of `maxCpu` to `minCpu` may not exceed 4:1. The shipped `1000m` / `300m` is 3.33:1; raising `maxCpu` without raising `minCpu` can cross the limit and is rejected when the workload is applied.
+</Note>
+
+### Storage
+
+- `volumeset.capacity` — Initial volume size in GiB (minimum 10).
+- `volumeset.autoscaling.enabled` — Allow the volume to grow as it fills. When enabled:
+  - `maxCapacity` — Maximum volume size in GiB.
+  - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
+  - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
+
+Growth is online — no restart is involved, and the filesystem expands within seconds of the volume resize. Expect roughly two minutes between crossing the threshold and the larger volume appearing, and note that the new size is rounded up.
+
+### Internal Access
+
+- `internalAccess.type` — Controls which workloads can connect to pgvector on port `5432`:
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access allowed |
+| `same-gvc` | Allow access from all workloads in the same GVC |
+| `same-org` | Allow access from all workloads in the same organization |
+| `workload-list` | Allow access only from specific workloads listed in `workloads` |
+
+- `internalAccess.workloads` — The workload links allowed in, used with `same-gvc` or `workload-list`.
+
+### Public Access
+
+- `publicAccess.enabled` — Publish port `5432` through a TCP load balancer, reachable from outside the org. Off by default.
+
+When enabled, Control Plane assigns a canonical endpoint. Read it from `status.canonicalEndpoint` in the workload:
+
+```bash
+cpln workload get RELEASE_NAME-pgvector --gvc GVC_NAME -o yaml
+```
+
+<Warning>
+**Public connections are unencrypted.** The image ships no TLS certificate, so the server reports `ssl` as `off` and a client that demands `sslmode=require` fails with a connection timeout rather than a clear TLS error. The libpq default of `sslmode=prefer` connects. Anyone who reaches the endpoint needs only the database password, so prefer internal access over `RELEASE_NAME-pgvector.GVC_NAME.cpln.local` where you can.
+</Warning>
+
+Firewall changes take 30 seconds to a few minutes to propagate — turning public access on was measured taking **136 seconds** to become reachable. After changing `internalAccess` or `publicAccess`, re-test rather than trusting the first response.
+
+### PgBouncer Connection Pooling
+
+PgBouncer is an optional connection pooler that sits in front of PostgreSQL and multiplexes application connections into a smaller pool of real database connections — useful for the bursty, short-lived connections typical of retrieval and embedding services. When enabled, it becomes the primary connection endpoint for your applications:
+
+```text
+RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432
+```
+
+- `pgbouncer.enabled` — Enable or disable PgBouncer.
+- `pgbouncer.image` — PgBouncer container image.
+- `pgbouncer.poolMode` — Controls how connections are reused:
+
+| Mode | Description |
+|------|-------------|
+| `transaction` | Connection held only for the duration of a transaction, then returned to the pool. Best for most web and API workloads. Not compatible with session-level features (`SET` variables, temporary tables, advisory locks) — see the warning below. |
+| `session` | Connection held for the entire client session. Compatible with all PostgreSQL features but provides less reuse. Increase `defaultPoolSize` to match your expected concurrent client count. |
+| `statement` | Connection returned after every statement. Transactions are not supported. Rarely used. |
+
+- `pgbouncer.defaultPoolSize` — Number of real PostgreSQL connections PgBouncer maintains per pool (default: `25`).
+- `pgbouncer.maxClientConn` — Maximum number of client connections PgBouncer accepts (default: `1000`). Clients past the limit are refused at connect time; the database itself is unaffected.
+- `pgbouncer.replicas` — Number of PgBouncer instances. PgBouncer is stateless and can be scaled horizontally.
+- `pgbouncer.resources.cpu` / `pgbouncer.resources.memory` — Resources allocated to each PgBouncer replica.
+
+<Note>
+PgBouncer reads the same credentials secret and identity as the pgvector workload — no additional secrets or IAM configuration is required. Its `userlist.txt` and `pgbouncer.ini` are generated at startup from the `username`, `password` and `database` keys in that secret.
+</Note>
+
+<Warning>
+**In `transaction` pool mode a plain `SET hnsw.ef_search` is not bound to your client — it can leak between clients.** This is an isolation hazard, not a tuning inconvenience: PgBouncer hands the same server connection to different clients, so your setting may be lost, may be *replaced by another client's value*, or may raise an error. Measured with 16 concurrent clients in `transaction` mode: 5 kept their own value, **9 read a different client's value**, and 2 got `ERROR: unrecognized configuration parameter "hnsw.ef_search"`. Direct connections do not leak, and `poolMode: session` was clean 16 out of 16.
+
+It matters on this template specifically because `ef_search` is the recall knob — raising it from the default `40` to `400` took an exact-match test from 4 hits out of 5 to 5 out of 5. Under transaction pooling your recall tuning is therefore not merely lost; it can silently become another client's.
+
+Two remedies, either of which is sufficient:
+
+- Scope the setting to a transaction with `SET LOCAL`, which was clean 16 out of 16:
+
+  ```sql
+  BEGIN;
+  SET LOCAL hnsw.ef_search = 100;
+  SELECT id FROM items ORDER BY embedding <=> '[0.1,0.2]' LIMIT 5;
+  COMMIT;
+  ```
+
+- Or set `pgbouncer.poolMode: session`, at the cost of the connection multiplexing PgBouncer is there for.
+
+This is upstream PgBouncer behavior, not a template setting. PgBouncer is off by default, so a default install is not exposed to it.
+</Warning>
+
+### Backup
+
+Backup is disabled by default. When enabled, a cron workload runs `pg_dumpall` on the configured schedule and uploads compressed SQL dumps to AWS S3, GCS or MinIO. The job authenticates with the username and password from your credentials secret.
+
+- `backup.enabled` — Enable scheduled backups.
+- `backup.image` — Backup container image, matched to the server's major version. The shipped `18.1.0` tag carries a PostgreSQL 18 client.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC). Interval forms such as `*/15 * * * *` are accepted.
+- `backup.provider` — `aws`, `gcp`, or `minio`.
+- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+- `backup.PROVIDER.prefix` — Folder path within the bucket where backups are stored.
+
+All three provider paths were exercised end to end at the shipped settings, with the resulting objects downloaded and read back, plus a full restore round-trip.
+
+<Warning>
+**Changing `backup.provider` on an existing release leaves the old cloud binding attached.** Control Plane merges an identity's cloud-binding block and never removes one, so a release switched from `aws` to `gcp` keeps both bindings even though the template renders only the new one. Uninstall and reinstall to change providers cleanly.
+</Warning>
+
+## Using pgvector
+
+The `vector` extension is already created in the database named in your credentials secret, so there is no setup SQL to run:
+
+```sql
+CREATE TABLE items (id bigserial PRIMARY KEY, content text, embedding vector(1536));
+CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops);
+SELECT id, content FROM items ORDER BY embedding <=> '[0.1,0.2,...]' LIMIT 5;
+```
+
+### Distance Operators
+
+| Operator | Distance | Index operator class |
+|---|---|---|
+| `<->` | L2 (Euclidean) | `vector_l2_ops` |
+| `<=>` | Cosine | `vector_cosine_ops` |
+| `<#>` | Negative inner product | `vector_ip_ops` |
+| `<+>` | L1 (taxicab) | `vector_l1_ops` |
+
+### Index Types and Recall
+
+Both index types build on this image and are chosen by the planner on cost — no `enable_seqscan` tricks required.
+
+| Index | Characteristics | Recall knob |
+|---|---|---|
+| `hnsw` | Graph built incrementally; slower to build, better recall per query | `SET hnsw.ef_search = 100;` (default `40`) |
+| `ivfflat` | Wants representative data present at build time, and a list count: `WITH (lists = 100)` | `SET ivfflat.probes = 10;` (default `1`) |
+
+Approximate indexes trade recall for speed, so an exact match can be missed at the default settings. Raising `hnsw.ef_search` to `400` turned a 4-of-5 exact-match result into 5 of 5. Large index builds are much faster after `SET maintenance_work_mem = '512MB';`.
+
+<Warning>
+**With PgBouncer enabled in `transaction` mode, set these per query using `SET LOCAL` inside a transaction.** A plain `SET` can leak to, or be overwritten by, another client — see [PgBouncer Connection Pooling](#pgbouncer-connection-pooling).
+</Warning>
+
+### Dimension Limits
+
+A `vector` column holds up to **16,000** dimensions but can only be **indexed** up to **2,000**. That is the most common surprise: 1,536-dimension embeddings index fine, while 3,072-dimension ones are rejected with `column cannot have more than 2000 dimensions for hnsw index`. Use `halfvec`, which indexes up to 4,000 dimensions, or reduce the dimensionality.
+
+## Backup Prerequisites
+
+Only needed when `backup.enabled: true`.
+
+### AWS S3
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+
+2. If you do not have a Control Plane Cloud Account set up, follow the [Create a Cloud Account](/guides/create-cloud-account) guide. Set `backup.aws.cloudAccountName` to its name.
+
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion",
+                "s3:GetBucketLocation",
+                "s3:AbortMultipartUpload",
+                "s3:ListBucketMultipartUploads",
+                "s3:ListMultipartUploadParts"
+            ],
+            "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+            ]
+        }
+    ]
+}
+```
+
+4. Set `backup.aws.policyName` to the name of the policy created in step 3. The template attaches it to the workload's identity, and attaches nothing else — the bucket in your policy is the only storage the backup job can reach.
+
+5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+
+### GCS
+
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+
+2. If you do not have a Control Plane Cloud Account set up, follow the [Create a Cloud Account](/guides/create-cloud-account) guide. Set `backup.gcp.cloudAccountName` to its name.
+
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account. The template additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket in `backup.gcp.bucket`.
+
+4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+
+### MinIO
+
+No Cloud Account is needed — credentials are supplied as a secret.
+
+1. Create a bucket in MinIO. Set `backup.minio.bucket` to its name.
+
+2. Set `backup.minio.endpoint` to the MinIO S3 API address including the port. For the [MinIO](/template-catalog/templates/minio) template deployed in the same GVC, use `http://WORKLOAD_NAME:9000`.
+
+3. Create a [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `accessKey` and `secretKey`, and set `backup.minio.credentialsSecretName` to its name. For the MinIO template these are its `admin.username` and `admin.password`:
+
+```bash
+cpln secret create-dictionary --name my-pgvector-minio-credentials \
+  --entry accessKey=MINIO_ACCESS_KEY \
+  --entry secretKey=MINIO_SECRET_KEY
+```
+
+4. Set `backup.minio.prefix` to the folder path where backups will be stored.
+
+<Note>
+The policy this template creates grants the workload `reveal` on the database credentials secret, the first-boot SQL secret, and — only when `backup.provider: minio` — the MinIO credentials secret. Nothing else.
+</Note>
+
+## Restoring a Backup
+
+The dumps are whole-cluster `pg_dumpall` output and contain `CREATE EXTENSION IF NOT EXISTS vector`, so **restore into a database whose image carries pgvector**. Replaying one into a stock `postgres:18` fails at that line and the tables are never created.
+
+Run the following from a client with access to the backup bucket, using the username and password from your credentials secret.
+
+**AWS S3:**
+
+```sh
+export PGPASSWORD="PASSWORD"
+
+aws s3 cp "s3://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
+  | gunzip \
+  | psql \
+      --host=RELEASE_NAME-pgvector.GVC_NAME.cpln.local \
+      --port=5432 \
+      --username=USERNAME \
+      --dbname=postgres
+
+unset PGPASSWORD
+```
+
+**GCS:**
+
+```sh
+export PGPASSWORD="PASSWORD"
+
+gsutil cp "gs://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
+  | gunzip \
+  | psql \
+      --host=RELEASE_NAME-pgvector.GVC_NAME.cpln.local \
+      --port=5432 \
+      --username=USERNAME \
+      --dbname=postgres
+
+unset PGPASSWORD
+```
+
+**MinIO:**
+
+```sh
+export PGPASSWORD="PASSWORD"
+export AWS_ACCESS_KEY_ID="MINIO_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="MINIO_SECRET_KEY"
+aws configure set default.s3.addressing_style path
+
+aws s3 cp "s3://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - --endpoint-url "http://MINIO_ENDPOINT:9000" \
+  | gunzip \
+  | psql \
+      --host=RELEASE_NAME-pgvector.GVC_NAME.cpln.local \
+      --port=5432 \
+      --username=USERNAME \
+      --dbname=postgres
+
+unset PGPASSWORD AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+```
+
+<Note>
+**Use a PostgreSQL 18 `psql` for the restore.** An older client reaches the end of a PG18 dump and prints `invalid command \unrestrict`. The restore still completes correctly, but the message is alarming and avoidable.
+</Note>
+
+## High Availability
+
+This template is a single server on a single volume. A node failure reschedules the workload and reattaches the same volume, so the exposure is downtime, not data loss:
+
+| Event | Measured |
+|---|---|
+| `cpln helm upgrade` (write outage) | 92 seconds |
+| Replica loss and reschedule | 84 seconds |
+
+Nothing serializes the rollout on a stateful workload, so treat every upgrade as a planned write outage of roughly a minute and a half. Data on the volume survives both events intact, including built HNSW graphs, which are not rebuilt.
+
+For automatic failover, use the [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) template, whose image also carries pgvector. **It is not the same build:**
+
+| | pgvector template | postgres-highly-available |
+|---|---|---|
+| PostgreSQL | 18 | 17 |
+| pgvector | 0.8.6 | 0.8.0 |
+
+Both `hnsw` and `ivfflat` exist in 0.8.0, so the gap is fixes and refinements rather than a missing index type. It is still a different pgvector release on a different database major, so verify against your own queries before treating the two as interchangeable.
+
+## Connecting
+
+| Path | Address | Notes |
+|---|---|---|
+| PostgreSQL, pooled | `RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432` | Only when `pgbouncer.enabled: true`. Prefer this endpoint when the pooler is on. |
+| PostgreSQL, direct | `RELEASE_NAME-pgvector.GVC_NAME.cpln.local:5432` | Subject to `internalAccess.type`. |
+| PostgreSQL, public | `status.canonicalEndpoint` on the pgvector workload, port `5432` | Only when `publicAccess.enabled: true`. Unencrypted. |
+| Credentials | `cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml` | Never stored in the Helm release. |
+
+## Important Notes
+
+- **Create the credentials secret before installing.** A reference to a secret that does not exist wedges the workload with no log output at all; see [Prerequisites](#prerequisites) for the one command that shows the reason.
+- **The `vector` extension is created by this template, not by the image.** It lands in the database named in your credentials secret, on first boot only.
+- **`config.extraExtensions` and the credentials are read only when the data directory is empty.** Add an extension later with `CREATE EXTENSION IF NOT EXISTS ...`, and rotate a password with `ALTER ROLE ... WITH PASSWORD`, updating the secret to match.
+- **PgBouncer in `transaction` mode leaks session settings between clients** — including `hnsw.ef_search`. Use `SET LOCAL` inside a transaction, or `poolMode: session`. See [PgBouncer Connection Pooling](#pgbouncer-connection-pooling).
+- **`publicAccess` is unencrypted** — the image ships no TLS certificate, so `sslmode=require` fails. Prefer internal access.
+- **Do not scale past one replica.** A second stateful replica gets its own volume, which is a second empty database rather than a replica.
+- **A `cpln helm upgrade` restarts the server** — measured at 92 seconds of failed writes. The first upgrade after an install re-applies resources even when the values are byte-identical.
+- **Restore with a PostgreSQL 18 `psql`, into an image that carries pgvector.** A stock `postgres:18` fails on the dump's `CREATE EXTENSION` line.
+- **Data lives on the volume set** and survives redeploys; `cpln helm uninstall` deletes it, taking the database with it. Your credentials secret is yours and is left alone.
+- **Firewall changes take 30 seconds to a few minutes to take effect.** After changing `internalAccess` or `publicAccess`, re-test rather than trusting the first response.
+
+## External References
+
+<CardGroup cols={2}>
+    <Card title="pgvector Documentation" icon="book" href="https://github.com/pgvector/pgvector">
+    Upstream reference for vector types, operators, and index tuning
+    </Card>
+    <Card title="pgvector Image" icon="docker" href="https://hub.docker.com/r/pgvector/pgvector">
+    The image this template deploys, and its available tags
+    </Card>
+    <Card title="PostgreSQL 18 Documentation" icon="database" href="https://www.postgresql.org/docs/18/index.html">
+    Official documentation for the server version shipped here
+    </Card>
+    <Card title="PgBouncer Documentation" icon="database" href="https://www.pgbouncer.org/config.html">
+    PgBouncer configuration reference
+    </Card>
+    <Card title="Cloud Accounts" icon="cloud" href="/guides/create-cloud-account">
+    Create a Control Plane Cloud Account for backup storage access
+    </Card>
+    <Card title="pgvector Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/pgvector">
+    View the source files, default values, and chart definition
+    </Card>
+</CardGroup>
