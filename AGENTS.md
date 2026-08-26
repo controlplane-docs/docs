@@ -27,7 +27,7 @@ cli-reference/      — CLI installation, usage guides, troubleshooting (command
 iac/                — Infrastructure as Code (Terraform, Pulumi)
 template-catalog/   — 30+ production-ready templates (Postgres, Redis, Kafka, etc.)
 mk8s/               — Managed Kubernetes providers and add-ons
-byok/               — CPLN Platform (Bring Your Own Kubernetes)
+byok/               — CPLN BYOK (Bring Your Own Kubernetes)
 api-reference/      — REST API docs (GENERATED from OpenAPI — do NOT edit manually)
 external-logging/   — External logging integrations (S3, Datadog, Coralogix, etc.)
 content/            — JavaScript utilities (tab sync, redirects)
@@ -137,7 +137,7 @@ Navigation is defined in `docs.json` under the `navigation` key.
 
 ### Current Tabs
 
-Documentation, How-to Guides, Template Catalog, Managed Kubernetes, CPLN Platform, MCP Server, Infra as Code, CLI Reference, API Reference.
+Home, How-to Guides, Template Catalog, Managed Kubernetes, CPLN BYOK, AI Agents, Infra as Code, CLI Reference, API Reference.
 
 **Note:** If you add a new tab, update this list. Also update `llms.txt` to include the new tab's pages in the page index.
 
