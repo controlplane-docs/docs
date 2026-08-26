@@ -1,12 +1,14 @@
 ---
 title: Redis
-description: Deploy Redis on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and master-replica clustering with Sentinel automatic failover.
-keywords: ['kv store', 'in-memory db', 'cache', 'redis-cli', 'memcached alternative', 'pubsub', 'persistence aof', 'rdb snapshot', 'leader election', 'session store']
+description: Deploy Redis or Valkey on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and master-replica clustering with Sentinel automatic failover.
+keywords: ['kv store', 'in-memory db', 'cache', 'redis-cli', 'valkey sentinel', 'redis alternative', 'memcached alternative', 'pubsub', 'persistence aof', 'rdb snapshot', 'leader election', 'session store']
 ---
 
 ## Overview
 
 Redis is a high-performance in-memory data store. This template deploys a Redis master-replica cluster with Redis Sentinel for automatic failover and leader election. Both tiers run Redis 8 by default; `redis:7.4` remains a supported value if you need to pin the previous line.
+
+Setting a single `engine` knob runs both tiers on [Valkey](#redis-or-valkey-engine), the BSD-licensed fork of Redis, instead. Leaving it alone changes nothing.
 
 <Note>
 This template does not create a GVC. You must deploy it into an existing GVC.
@@ -14,8 +16,8 @@ This template does not create a GVC. You must deploy it into an existing GVC.
 
 ### What Gets Created
 
-- **Stateful Redis Workload** — (`RELEASE_NAME-redis`): a master-replica cluster. Replica 0 starts as the primary; all others replicate from it.
-- **Stateful Sentinel Workload** — (`RELEASE_NAME-sentinel`): monitors the Redis cluster and orchestrates automatic failover when the primary becomes unavailable.
+- **Stateful Redis Workload** — (`RELEASE_NAME-redis`): a master-replica cluster running Redis, or Valkey when `engine: valkey`. Replica 0 starts as the primary; all others replicate from it.
+- **Stateful Sentinel Workload** — (`RELEASE_NAME-sentinel`): monitors the cluster and orchestrates automatic failover when the primary becomes unavailable. Always runs the same engine as the Redis tier.
 - **Secret** — An opaque secret containing the Redis server configuration (`redis.conf`), mounted into each Redis container.
 - **Secret** — An opaque secret containing the Sentinel configuration (`sentinel.conf`), mounted into each Sentinel container.
 - **Secret** *(optional)* — A dictionary secret holding the Redis auth password, created when `redis.auth.password.enabled` is true.
@@ -57,11 +59,16 @@ This template has no external prerequisites unless backup or public access is en
 The default `values.yaml` for this template:
 
 ```yaml
+engine: redis                     # redis | valkey
+# Used for BOTH tiers when engine is valkey; redis.image / sentinel.image are
+# then ignored. Only the Debian-based tags are supported.
+valkeyImage: valkey/valkey:8.1.9
+
 redis:
   image: redis:8
   resources:
-    cpu: 200m
-    memory: 256Mi
+    maxCpu: 200m
+    maxMemory: 256Mi
     minCpu: 80m
     minMemory: 128Mi
   replicas: 3
@@ -76,7 +83,7 @@ redis:
     password:
       enabled: false
       value: change-me-redis-password
-  serverCommand: redis-server
+  serverCommand: redis-server  # correct for both engines — the Valkey image ships a redis-server symlink
   # extraArgs: "--maxclients 20000 --maxmemory 200mb --maxmemory-policy allkeys-lru"
   publicAccess:
     enabled: false
@@ -109,8 +116,8 @@ redis:
     enabled: false  # adds a redis_exporter sidecar that exposes metrics at :9121/metrics
     image: oliver006/redis_exporter:v1.67.0-alpine
     resources:
-      cpu: 50m
-      memory: 64Mi
+      maxCpu: 50m
+      maxMemory: 64Mi
       minCpu: 25m
       minMemory: 32Mi
     dropMetrics: []  # e.g., ["redis_command_.*", "redis_keyspace_.*"]
@@ -137,8 +144,8 @@ redis:
 sentinel:
   image: redis:8
   resources:
-    cpu: 200m
-    memory: 256Mi
+    maxCpu: 200m
+    maxMemory: 256Mi
     minCpu: 80m
     minMemory: 128Mi
   replicas: 3
@@ -219,6 +226,43 @@ grafana:
       dashboards: grafana   # must match the label on your Grafana CR
 ```
 
+### Redis or Valkey Engine
+
+One knob selects the server both tiers run. `engine: redis` is the default and changes nothing: with `engine` left alone, every resource this template creates is identical to the previous version apart from the chart-version tags.
+
+```yaml
+engine: valkey                    # redis | valkey
+valkeyImage: valkey/valkey:8.1.9  # used for BOTH tiers when engine is valkey
+```
+
+[Valkey](https://valkey.io/) is the BSD-3-Clause fork of Redis 7.2, stewarded by the Linux Foundation. There is no paid edition, so nothing — replication, Sentinel, failover, persistence, backups — is feature-gated.
+
+- **Both tiers move together.** `engine: valkey` puts the Redis *and* Sentinel workloads on `valkeyImage`; `redis.image` and `sentinel.image` are then ignored. A Redis-Sentinel / Valkey-server hybrid cannot be produced with this knob.
+- **Nothing else in the chart changes.** The Valkey image ships `redis-server`, `redis-cli` and `redis-sentinel` compatibility symlinks, so every command, config directive and health probe described on this page is identical on both engines. `redis.serverCommand` stays `redis-server`.
+- **Only the Debian-based Valkey tags work.** The `-alpine` tags have no bash, and this chart's readiness and liveness probes are bash scripts.
+- **Do not set `dual-channel-replication-enabled yes` through `redis.extraArgs` on Valkey.** A [known upstream defect](https://github.com/valkey-io/valkey/issues/2338) makes Sentinel see duplicate replicas. It defaults to `no` and the chart never sets it.
+
+To confirm which server a running deployment is on:
+
+```bash
+cpln workload exec RELEASE_NAME-redis --gvc GVC_NAME \
+  --replica RELEASE_NAME-redis-0 --container redis -- redis-cli INFO server
+```
+
+Valkey answers with `server_name:valkey` and a `valkey_version` line; Redis has neither.
+
+#### Version Reporting
+
+Valkey reports `redis_version:7.2.4` in `INFO` for client compatibility, and carries the real version in `server_name` and `valkey_version`. The default Redis image reports `redis_version:8.10.1`, so to a client library a Valkey install *looks like* a version downgrade. That matters only if your client gates features on `redis_version` — check it before switching.
+
+The marketplace card shows the Redis version for either engine: a chart's `appVersion` is a constant and cannot follow a values knob.
+
+<Warning>
+**The engine is an install-time choice and cannot be switched on a running deployment.** With persistence enabled, pointing an existing Redis data directory at Valkey crash-loops the replaced replica — `Can't handle RDB format version 15`, container exits 1 — because `redis:8` writes a data format Valkey does not read. With persistence disabled the node silently starts empty instead. Migrate between engines with dump/restore or replication, never by changing `engine`.
+
+The rollout replaces replicas one at a time and halts on the unhealthy one, so the remaining nodes keep serving; changing `engine` back recovers the release.
+</Warning>
+
 ### Redis Version
 
 Both the data nodes and Sentinel run `redis:8` by default. Redis 8 is the current stable line and adds AGPLv3 as a license option alongside the existing RSALv2/SSPLv1 terms. To stay on the previous line, pin both images:
@@ -229,6 +273,8 @@ redis:
 sentinel:
   image: redis:7.4
 ```
+
+These image knobs apply to the Redis engine only. Under `engine: valkey`, both tiers use `valkeyImage` and `redis.image` / `sentinel.image` are ignored.
 
 <Warning>
 **Upgrading an existing Redis 7.4 deployment to Redis 8 is one-way.** Redis 8 loads a 7.4 data file directly, so upgrading with persistence enabled keeps your data — but once a node has written its data file under Redis 8, a 7.4 image can no longer load it. Snapshot the volume set before upgrading if you want a rollback path.
@@ -270,7 +316,7 @@ Sentinel can be configured with a separate password for Sentinel-to-Sentinel com
 ### Redis Cluster
 
 - `redis.replicas` — Number of Redis replicas. Defaults to `3`. Replica 0 is always the initial primary.
-- `redis.resources.cpu` / `redis.resources.memory` — Maximum CPU and memory per replica.
+- `redis.resources.maxCpu` / `redis.resources.maxMemory` — Maximum CPU and memory per replica.
 - `redis.resources.minCpu` / `redis.resources.minMemory` — Minimum CPU and memory guaranteed per replica.
 - `redis.multiZone` — Spread replicas across availability zones within the location.
 - `redis.extraArgs` — Additional Redis server arguments (e.g. `--maxmemory 200mb --maxmemory-policy allkeys-lru`).
@@ -282,11 +328,11 @@ Sentinel monitors the Redis cluster and automatically promotes a replica when th
 - `sentinel.replicas` — Number of Sentinel replicas. A minimum of 3 is required for a majority quorum.
 - `sentinel.quorumAutoCalculation` — When `true`, the quorum is calculated automatically as `(replicas / 2) + 1`. Set to `false` to use `sentinel.quorumOverride`.
 - `sentinel.quorumOverride` — Manual quorum value, used only when `quorumAutoCalculation` is `false`.
-- `sentinel.resources.cpu` / `sentinel.resources.memory` — Maximum CPU and memory per Sentinel replica.
+- `sentinel.resources.maxCpu` / `sentinel.resources.maxMemory` — Maximum CPU and memory per Sentinel replica.
 - `sentinel.resources.minCpu` / `sentinel.resources.minMemory` — Minimum CPU and memory guaranteed per Sentinel replica.
 - `sentinel.multiZone` — Spread Sentinel replicas across availability zones.
 
-Sentinel marks a master down after 5 seconds without a response. In testing on Redis 8, a full failover — detection, election, promotion of a replica, and clients seeing the new master — completed 6.7–8.4 seconds after the master stopped responding, and the old master rejoined as a replica once it recovered.
+Sentinel marks a master down after 5 seconds without a response. In testing on Redis 8, a full failover — detection, election, promotion of a replica, and clients seeing the new master — completed 6.7–8.4 seconds after the master stopped responding, and the old master rejoined as a replica once it recovered. Valkey 8.1.9 measured in the same band: 8.7 seconds end to end, costing a Sentinel-aware client about 6 seconds of writes.
 
 ### Replication Tuning
 
@@ -329,7 +375,7 @@ redis:
 
 ### Metrics
 
-A `redis_exporter` sidecar can be enabled to expose Prometheus metrics. When enabled, Control Plane scrapes `:9121/metrics` automatically every 30 seconds and makes the metrics available in the console. The default exporter image is verified against Redis 8, including against a password-protected server.
+A `redis_exporter` sidecar can be enabled to expose Prometheus metrics. When enabled, Control Plane scrapes `:9121/metrics` automatically every 30 seconds and makes the metrics available in the console. The default exporter image is verified against Redis 8 and Valkey 8.1.9, including against a password-protected server.
 
 - `redis.exporter.enabled` — Set to `true` to add the exporter sidecar to each Redis replica.
 - `redis.exporter.image` — Exporter image (default: `oliver006/redis_exporter:v1.67.0-alpine`).
@@ -404,6 +450,10 @@ The dashboard includes template variables for datasource, GVC, workload, and rep
 ### Storage
 
 Persistence is disabled by default. When enabled, a Volume Set is created to store data across restarts.
+
+<Warning>
+**Enable persistence at install time, not on a running release.** Turning `redis.persistence.enabled` or `sentinel.persistence.enabled` on for a deployment that is already running stalls the rollout indefinitely: every replica sits on `Replica N will be restarted shortly`, the Volume Set's volumes stay `unbound`, and the data directory never leaves the container overlay. A forced redeployment does not clear it — this was measured at 27 minutes with no progress. Uninstall and reinstall with persistence enabled instead. A fresh install with persistence comes up normally, and upgrading a release that already owns its volume rolls fine. This is independent of `engine`.
+</Warning>
 
 **Redis persistence:**
 
@@ -609,11 +659,13 @@ redis-cli \
 
 ## Important Notes
 
+- **The engine is an install-time choice.** Switching `engine` on a running release does not migrate anything — Valkey cannot read a data file written by Redis 8. Migrate with dump/restore or replication.
+- **Persistence is an install-time choice too.** Enabling it on a running release stalls the rollout indefinitely. Enable it on the initial install, or uninstall and reinstall.
 - **The Redis 7.4 to 8 upgrade is one-way.** Data written under Redis 8 cannot be loaded by a 7.4 image. Snapshot the volume set first if you need a rollback path.
 - **Never rotate the Redis password in place.** It deadlocks the rolling update. Re-apply the previous password to recover; uninstall and reinstall to change it.
 - **Always discover the master through Sentinel.** The master moves during failovers and rolling upgrades, so a client pinned to replica 0 will hit `READONLY` errors after either.
 - **Enable `sentinel.persistence` in production.** Persisted Sentinel state lets replicas rejoin the real master after a restart instead of assuming replica 0 is still the master.
-- **Firewall changes take about 2.5 minutes to propagate.** After tightening `internal_inboundAllowType` or the allowed workload list, previously-allowed clients may keep connecting briefly before the new rule takes effect.
+- **Firewall changes can take up to about five minutes to propagate.** After tightening `internal_inboundAllowType` or the allowed workload list, previously-allowed clients may keep connecting for several minutes before the new rule takes effect — 305 seconds was the longest measured. Re-check before concluding a rule does not work.
 
 ## External References
 
@@ -623,6 +675,12 @@ redis-cli \
     </Card>
     <Card title="Redis Sentinel Documentation" icon="book" href="https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/">
     Redis Sentinel setup and client configuration
+    </Card>
+    <Card title="Valkey Documentation" icon="book" href="https://valkey.io/topics/">
+    Official Valkey documentation
+    </Card>
+    <Card title="Redis and Valkey Migration" icon="book" href="https://valkey.io/topics/migration/">
+    Moving data between Redis and Valkey
     </Card>
     <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/redis-backup">
     Source code for the Redis backup container image
