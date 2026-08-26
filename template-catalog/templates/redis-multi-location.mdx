@@ -1,27 +1,75 @@
 ---
 title: Redis Multi-Location
-description: Deploy Redis Multi-Location on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and geographically distributed master-replica clustering with Sentinel.
-keywords: ['redis geo', 'multi-region cache', 'global cache', 'redis active passive', 'cross-region redis', 'cache replication', 'kv store geo', 'redis-cli', 'leader election']
+description: Deploy one Redis or Valkey master-replica cluster stretched across Control Plane locations using the Template Catalog. Covers the engine choice, cross-region replication, Sentinel failover, authentication, public access, and backups.
+keywords: ['redis geo', 'multi-region cache', 'global cache', 'valkey', 'valkey cluster', 'redis alternative', 'cross-region redis', 'cache replication', 'redis sentinel', 'kv store geo', 'redis-cli', 'automatic failover', 'elasticache alternative']
 ---
 
 ## Overview
 
-Redis Multi-Location deploys a single Redis Sentinel cluster spanning multiple Control Plane locations within one GVC. All Redis replicas across all locations belong to the same cluster — replica 0 in the first location starts as the primary, and Sentinel automatically elects a new primary from any location on failure.
+Redis Multi-Location deploys a single Redis Sentinel cluster spanning multiple Control Plane locations within one GVC. All replicas across all locations belong to the same cluster — replica 0 in the first configured location starts as the master, and Sentinel automatically elects a new master from any location on failure.
+
+Since template version 2.2.0 the same cluster can run **[Valkey](https://valkey.io/)** instead of Redis. It is one value, chosen at install, and it changes nothing else about the deployment — see [Redis or Valkey](#redis-or-valkey).
 
 <Note>
-This template creates a new GVC. At least 2 locations are required.
+This template creates a new GVC. At least 2 locations are required. For a cluster inside a single location, use [Redis](/template-catalog/templates/redis) instead.
 </Note>
+
+### How Many Locations You Need
+
+A failover needs a **majority of Sentinels** to agree, and Sentinel runs exactly one instance per location. That arithmetic decides what the cluster survives.
+
+| Locations | Majority | Location losses survived | What happens when one location is lost |
+|---|---|---|---|
+| **2** | 2 | **0** | Surviving replicas hold the data, but **no automatic failover** — the vote cannot be reached. |
+| **3** | 2 | **1** | **Automatic failover.** A replica in a surviving location is promoted. |
+| **5** | 3 | **2** | Survives losing **two** locations. |
+
+With N locations you survive `floor((N-1)/2)` losses, so an even count buys nothing over the odd count below it.
 
 ### What Gets Created
 
-- **GVC** — A new GVC spanning the configured locations.
-- **Stateful Redis Workload** — A single cross-location Redis cluster. Replica 0 in the first location starts as the primary; all others replicate from it. Each replica gets its own persistent volume.
-- **Stateful Sentinel Workload** — 1 Sentinel replica per location (not configurable). Monitors the cluster and orchestrates automatic failover across locations.
-- **Volume Set** — Persistent storage for Redis data (configurable capacity and autoscaling).
-- **Secrets** — Opaque secrets for the Redis and Sentinel configurations, mounted into each container.
-- **Identity & Policy** — Separate identities and policies for the Redis and Sentinel workloads, each with `reveal` access to their respective secrets.
+- **GVC** — A new GVC spanning the configured locations. Installed standalone, this template always creates it; used as a subchart, the parent owns the GVC and this chart creates none.
+- **Stateful Redis Workload** — `{release}-redis`, running `redis.replicasPerLocation` instances in **every** configured location. One instance is the master; the rest replicate from it, across locations. Each instance gets its own persistent volume and is individually addressable.
+- **Stateful Sentinel Workload** — `{release}-sentinel`, exactly 1 instance per location (not configurable). Monitors the master, holds the failover vote, and persists the elected master and its peer list to its own volume.
+- **Volume Sets** — `{release}-redis-vs` for Redis data (configurable capacity and autoscaling) and `{release}-sentinel-vs` (10 GiB) for Sentinel's rewritten configuration.
+- **Secrets** — Opaque secrets holding the Redis and Sentinel base configurations, mounted into each container. **Passwords are not created by this template** — see [Prerequisites](#prerequisites).
+- **Identity & Policy** — A separate identity and policy per tier, each with `reveal` on exactly the secrets that tier reads, plus a bucket-scoped cloud binding when backups are enabled.
 - **Domain** *(optional)* — One domain per workload when public access is enabled, exposing Redis and Sentinel at the configured addresses.
-- **Backup Cron Workload** *(optional)* — A scheduled backup job that writes Redis snapshots to AWS S3 or GCS. Runs in the first configured location only.
+- **Backup Cron Workload** *(optional)* — `{release}-redis-backup`, a scheduled job that writes a compressed snapshot to AWS S3 or GCS. Runs in the first configured location only.
+
+## Prerequisites
+
+<Warning>
+The GVC named in `global.gvc.name` **must not already exist.** Helm adopts a GVC that does, and `helm uninstall` then deletes it along with every unrelated workload in it. Always point this template at a fresh GVC name.
+</Warning>
+
+A default install needs nothing else. Passwords, backups and public access each add a step:
+
+<Steps>
+  <Step title="Create the password secrets (only if you want authentication)">
+    Passwords are never Helm values, so they never land in the release. Each one is an [opaque secret](/guides/create-secret/opaque) with `encoding: plain` whose **payload is the password itself** — one value, no keys:
+
+    ```bash
+    # The Redis password (redis.passwordSecretName)
+    printf '%s' "$(openssl rand -hex 24)" | cpln secret create-opaque --name my-redis-password --encoding plain -f -
+
+    # Sentinel's own password, independent of the one above (sentinel.passwordSecretName)
+    printf '%s' "$(openssl rand -hex 24)" | cpln secret create-opaque --name my-redis-sentinel-password --encoding plain -f -
+    ```
+
+    Set `redis.passwordSecretName` and `sentinel.passwordSecretName` to the names you used, and read a password back later with `cpln secret reveal my-redis-password`. Leave either value empty to run that tier without a password.
+  </Step>
+  <Step title="Create a bucket and cloud account (only for backups)">
+    See [Backup](#backup) for the per-provider steps.
+  </Step>
+  <Step title="Add DNS records for a domain you own (only for public access)">
+    See [Public Access](#public-access).
+  </Step>
+</Steps>
+
+<Warning>
+Create the password secrets **before** installing. Without them `helm install` still reports success, but the workload waits on a secret that does not exist and `cpln logs` returns nothing at all — the reason appears only in `cpln workload get-deployments WORKLOAD --gvc GVC_NAME -o yaml`, under `status.versions[].message`. Creating the secret afterwards clears the wedge on its own within several minutes.
+</Warning>
 
 ## Installation
 
@@ -54,27 +102,59 @@ To install, follow the instructions for your preferred method:
 The default `values.yaml` for this template:
 
 ```yaml
-gvc:
-  name: my-redis-gvc
-  locations: # Replica count applies to Redis workload only; Sentinel always runs 1 per location
-    - name: aws-eu-central-1
-      replicas: 2
-    - name: aws-us-west-2
-      replicas: 2
-    - name: aws-us-east-1
-      replicas: 2
+# ─── GVC and locations ────────────────────────────────────────────────────────
+# Lives under `global` so a parent chart sets it once and Helm propagates it
+# here — that is the only channel that reaches an aliased subchart.
 
+global:
+  gvc:
+    # This chart CREATES this GVC when it is installed standalone, and creates
+    # nothing when it is a subchart (the parent owns the GVC). Standalone, the
+    # name must NOT already exist: Helm adopts a GVC that does, and
+    # `helm uninstall` then DELETES it and everything in it.
+    name: redis-multi-location-gvc
+    # Minimum 2 locations. Sentinel runs exactly one instance per location and
+    # a failover needs a majority of them, so an odd count is what buys
+    # automatic failover: 3 locations survive losing one, 5 survive losing two.
+    locations:
+      - name: aws-us-east-1
+      - name: aws-eu-central-1
+      - name: aws-us-west-2
+
+# ─── Engine ───────────────────────────────────────────────────────────────────
+# Which server this deployment runs. `redis` is the default and changes nothing.
+# `valkey` runs BOTH the Redis and Sentinel tiers on the image below — Valkey is
+# the BSD-licensed fork of Redis 7.2 and ships redis-server / redis-cli /
+# redis-sentinel compatibility symlinks, so nothing else in this chart changes.
+# Chosen at INSTALL time: an existing data directory cannot be moved between
+# engines (Valkey cannot read RDB/AOF files written by Redis 7.4+).
+engine: redis # redis | valkey
+# Used for BOTH tiers when engine is valkey; redis.image / sentinel.image are
+# then ignored. Use a DEBIAN-based tag: both tiers build their config with
+# `echo "\n..."`, which busybox does not expand, so an `-alpine` tag fails at
+# start with `Bad directive` (true of the redis `-alpine` tags too).
+valkeyImage: valkey/valkey:8.1.9
+
+# ─── Redis ────────────────────────────────────────────────────────────────────
 redis:
-  image: redis:7.4
+  image: redis:7.4 # ignored when engine is valkey
+  # Redis instances in EVERY location. Deliberately its own knob rather than
+  # `global.gvc.locations[].replicas`: that list is shared with a parent chart,
+  # where `replicas` already means the parent's own members per location.
+  replicasPerLocation: 2
   resources:
     cpu: 200m
     memory: 256Mi
-  serverCommand: redis-server  # Can be overridden based on the version of redis/valkey image
-  # extraArgs: "--maxmemory 200mb --maxmemory-policy allkeys-lru"
-  # password: your-redis-password
+  serverCommand: redis-server # correct for both engines — the Valkey image ships a redis-server symlink
+  extraArgs: "" # e.g. "--maxmemory 200mb --maxmemory-policy allkeys-lru"
+  # OPTIONAL PREREQUISITE SECRET — empty means no Redis password at all.
+  # An `opaque` secret (encoding `plain`) whose payload IS the password; it is
+  # never a values entry, so it never lands in the Helm release. Create it
+  # BEFORE install — see Prerequisites in the README.
+  passwordSecretName: "" # e.g. my-redis-password
   publicAccess:
     enabled: false
-    address: redis.example-cpln.com
+    address: redis.my-domain.com # a domain you own; prove ownership before enabling
   volumeset:
     initialCapacity: 20 # GiB
     autoscaling:
@@ -83,92 +163,144 @@ redis:
       minFreePercentage: 10
       scalingFactor: 1.2
 
+# ─── Sentinel ─────────────────────────────────────────────────────────────────
+# Exactly one Sentinel per location — the count is not configurable.
 sentinel:
-  image: redis:7.4
+  image: redis:7.4 # ignored when engine is valkey
   resources:
     cpu: 200m
     memory: 256Mi
-  # extraArgs: "--sentinel down-after-milliseconds mymaster 5000 --sentinel failover-timeout mymaster 10000"
-  # password: your-sentinel-password
+  extraArgs: "" # e.g. "--sentinel down-after-milliseconds mymaster 5000"
+  # OPTIONAL PREREQUISITE SECRET — empty means Sentinel itself is unauthenticated.
+  # Same shape as redis.passwordSecretName, and independent of it.
+  passwordSecretName: "" # e.g. my-redis-sentinel-password
   publicAccess:
     enabled: false
-    address: redis-sentinel.example-cpln.com
+    address: redis-sentinel.my-domain.com # a domain you own
 
-# Applies to both Redis and Sentinel workloads
+# ─── Networking (applies to both the Redis and Sentinel workloads) ────────────
 firewall:
   internalAllowType: same-gvc # options: same-gvc, same-org, workload-list
-  # externalInboundAllowCIDR: "0.0.0.0/0"  # Required when publicAccess is enabled. Comma-separated list.
-  # externalOutboundAllowCIDR: "0.0.0.0/0"  # Comma-separated list.
-  # workloads:
-  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+  workloads: [] # only used when internalAllowType is workload-list
+  #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+  externalInboundAllowCIDR: "" # comma-separated; defaults to 0.0.0.0/0 when publicAccess is on
+  externalOutboundAllowCIDR: "" # comma-separated
 
+# ─── Backups ──────────────────────────────────────────────────────────────────
+# A nightly RDB snapshot to object storage. The cron workload runs in the FIRST
+# location only — a cron workload otherwise fires in every location of its GVC
+# and writes N copies of the same dump into one bucket.
 backup:
   enabled: false
-  image: controlplanecorporation/redis-backup:1.0
-  schedule: "0 2 * * *"  # daily at 2am UTC
+  image: ghcr.io/controlplane-com/backup-images/redis-backup:1.0.0
+  schedule: "0 2 * * *" # cron schedule, default is daily at 02:00 UTC
 
   resources:
     cpu: 100m
     memory: 128Mi
 
-  provider: aws # Options: aws or gcp
+  provider: aws # options: aws or gcp
 
   aws:
-    bucket: my-backup-bucket
+    bucket: my-redis-bucket
     region: us-east-1
-    cloudAccountName: my-backup-cloudaccount
-    policyName: my-backup-policy
-    prefix: "redis/backups"
+    cloudAccountName: my-s3-cloud-account
+    policyName: my-redis-backup-policy # bucket-scoped IAM policy, see README
+    prefix: redis/backups # folder within the bucket
 
   gcp:
-    bucket: my-backup-bucket
-    cloudAccountName: my-backup-cloudaccount
-    prefix: "redis/backups"
+    bucket: my-redis-bucket
+    cloudAccountName: my-gcs-cloud-account
+    prefix: redis/backups # folder within the bucket
 ```
 
-### Locations
+### GVC and Locations
 
-- `gvc.name` — Name of the GVC to create. **Must be unique within your organization** if deploying multiple instances.
-- `gvc.locations` — List of Control Plane locations to deploy into. At least 2 locations are required.
-- `locations[].name` — Location identifier (e.g. `aws-us-east-1`).
-- `locations[].replicas` — Number of Redis replicas to run in that location. Sentinel always runs exactly 1 replica per location regardless of this setting.
+The GVC name and the location list live under `global.gvc` so that a parent chart can set them once when this template is used as a subchart.
+
+- `global.gvc.name` — Name of the GVC this chart creates. It must not already exist.
+- `global.gvc.locations[].name` — A Control Plane location (e.g. `aws-us-east-1`). At least 2 are required; see [How Many Locations You Need](#how-many-locations-you-need).
+
+<Note>
+`global.gvc.locations[].replicas` is deliberately **not** read by this template — that field belongs to parent charts that share the same location list. Set `redis.replicasPerLocation` instead, which applies to every location. A standalone install that sets `replicas` fails at render with a message saying so.
+</Note>
+
+### Redis or Valkey
+
+`engine` picks the server both tiers run. It is the only difference between the two shapes — topology, replica counts, configuration, Sentinel behavior, secrets, firewall and backups are identical, and setting `engine: valkey` changes exactly the two image references in the whole deployment.
+
+| | `engine: redis` (default) | `engine: valkey` |
+|---|---|---|
+| Image | `redis.image` / `sentinel.image` (`redis:7.4`) | `valkeyImage` (`valkey/valkey:8.1.9`) for **both** tiers |
+| License | Redis Source Available / SSPL | BSD-3-Clause, Linux Foundation — no paid edition, nothing feature-gated |
+| On-disk format | RDB 12 | RDB 11 (the Redis 7.2 format) |
+
+[Valkey](https://valkey.io/) is the fork of Redis 7.2 that the Linux Foundation stewards. Its image ships `redis-server`, `redis-cli` and `redis-sentinel` compatibility symlinks, so every command, configuration directive and connection string on this page is unchanged — including `masterauth`, `sentinel auth-pass` and the hostname-based replica discovery this template relies on across locations. `redis.serverCommand` stays `redis-server` on both engines.
+
+- **`engine` binds both tiers at once.** You cannot end up with a Valkey server behind a Redis Sentinel by accident: setting `engine: valkey` makes `redis.image` and `sentinel.image` inert.
+- **Set `valkeyImage` to a Debian-based tag.** Both tiers assemble their configuration with `echo "\n..."`, which busybox does not expand, so an `-alpine` tag fails at start with `Bad directive or wrong number of arguments`. The `redis` `-alpine` tags fail the same way.
+- **Valkey 9.x tags are reachable through `valkeyImage` but have not been tested with this template.** Valkey 9 writes RDB format 80, which no Redis release can read, so it is a one-way move rather than a supported upgrade.
+- **`INFO` reports `redis_version:7.2.4` on Valkey** for client compatibility. Read `server_name` and `valkey_version` to see what is really running — anything that version-gates on `redis_version` believes it is talking to Redis 7.2.
+- **The marketplace card and the `app.cpln.io/version` tag still show the Redis version** (`7.4`) on a Valkey install. A chart's `appVersion` is a constant and cannot follow a values setting.
+
+<Warning>
+**`engine` is an install-time choice and cannot be changed on an existing install.** This template ships `appendonly yes`, and `redis:7.4` writes its append-only base file in RDB format 12, which Valkey 8 refuses. `helm upgrade` **reports success**, then every Redis replica crash-loops with `Can't handle RDB format version 12` and `Error reading the RDB base file appendonly.aof.N.base.rdb, AOF loading aborted`, exiting with code 1. Setting `engine` back to `redis` and upgrading again recovers the data untouched — measured at 130 seconds with all 100 test keys intact. Move between engines with a dump and restore, or by replicating into a fresh install; never by changing the value.
+</Warning>
 
 ### Authentication
 
-Authentication is disabled by default. Redis and Sentinel can be configured with independent passwords.
+Authentication is disabled by default. Redis and Sentinel take independent passwords, each supplied as the [prerequisite secret](#prerequisites) named by its own value — never as a Helm value.
 
-- `redis.password` — Password applied as both `requirepass` and `masterauth` in the Redis configuration.
-- `sentinel.password` — Optional separate password for Sentinel-to-Sentinel communication (`requirepass` on the Sentinel process).
+- `redis.passwordSecretName` — Names the opaque secret whose payload is applied as both `requirepass` and `masterauth` on every Redis instance. Empty means no Redis password at all.
+- `sentinel.passwordSecretName` — Names the opaque secret whose payload is applied as `requirepass` on the Sentinel process. Independent of the Redis password; empty means Sentinel itself is unauthenticated.
+
+Both tiers read their secret at container start, and Sentinel rewrites its own configuration from it on every start.
+
+<Warning>
+**Rotating a password requires a forced redeployment — it does not apply on its own.** Updating the secret in place restarts nothing: measured five minutes after a rotation, the workload version was unchanged and the **old password was still accepted**, with a healthy status throughout. There is no error anywhere, so a rotation looks like it worked while the old credential keeps working indefinitely. Apply it explicitly, Sentinel first and Redis second:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-sentinel --gvc GVC_NAME
+cpln workload force-redeployment RELEASE_NAME-redis --gvc GVC_NAME
+```
+</Warning>
+
+<Note>
+Adding, changing or removing `redis.passwordSecretName` through a `helm upgrade` restarts every Redis instance in every location at once, which takes the master out of quorum and starts a failover. Treat it as a planned restart of the whole tier. Changing only the Sentinel password is safe — a Sentinel-only restart triggers no failover vote.
+</Note>
 
 ### Redis
 
-- `redis.image` — Redis (or Valkey) image to use.
-- `redis.resources.cpu` / `redis.resources.memory` — CPU and memory allocated per Redis replica.
-- `redis.serverCommand` — Override the server command (e.g. `valkey-server` for Valkey images).
-- `redis.extraArgs` — Additional server arguments appended to the startup command.
+- `redis.image` — Redis image to use. Ignored when `engine` is `valkey`.
+- `redis.replicasPerLocation` — Number of Redis instances to run in **each** location (default `2`). The total instance count is this value multiplied by the number of locations.
+- `redis.resources.cpu` / `redis.resources.memory` — CPU and memory allocated per Redis instance.
+- `redis.serverCommand` — The server binary to execute. `redis-server` is correct for both engines.
+- `redis.extraArgs` — Additional server arguments appended to the startup command, for example `--maxmemory 200mb --maxmemory-policy allkeys-lru`. They override the equivalent settings in the base configuration.
 
 ### Sentinel
 
-Sentinel monitors the Redis primary across all locations and promotes a replica on failure. One Sentinel replica is deployed per location — this is fixed and not configurable. Quorum is calculated automatically based on the number of locations.
+Sentinel monitors the Redis master across all locations and promotes a replica on failure. One Sentinel instance is deployed per location — this is fixed and not configurable. Quorum is calculated automatically from the number of locations. The master name is `mymaster`.
 
-- `sentinel.image` — Redis (or Valkey) image to use for Sentinel.
-- `sentinel.resources.cpu` / `sentinel.resources.memory` — CPU and memory allocated per Sentinel replica.
-- `sentinel.extraArgs` — Additional Sentinel arguments (e.g. custom `down-after-milliseconds` or `failover-timeout`).
+- `sentinel.image` — Image to use for Sentinel. Ignored when `engine` is `valkey`.
+- `sentinel.resources.cpu` / `sentinel.resources.memory` — CPU and memory allocated per Sentinel instance.
+- `sentinel.extraArgs` — Additional Sentinel arguments, for example `--sentinel down-after-milliseconds mymaster 5000`.
 
 ### Storage
 
-- `redis.volumeset.initialCapacity` — Initial volume size in GiB for Redis data (default 20).
+- `redis.volumeset.initialCapacity` — Initial volume size in GiB for Redis data (default 20). Every Redis instance gets its own volume.
 - `redis.volumeset.autoscaling.enabled` — Automatically expand the volume as it fills. When enabled:
   - `maxCapacity` — Maximum volume size in GiB.
   - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
   - `scalingFactor` — Multiply current capacity by this factor when scaling up.
 
+Sentinel's own 10 GiB volume, which holds its rewritten configuration, is not configurable.
+
 ### Public Access
 
-Redis and Sentinel can be exposed over the internet via TCP using Control Plane's domain resource with per-replica port routing.
+Redis and Sentinel can be exposed over the internet as raw TCP via Control Plane's domain resource, with per-replica port routing.
 
 <Note>
-When `publicAccess` is enabled, a Dedicated Load Balancer is automatically enabled on the GVC. This is required for TCP port routing and is a paid Control Plane feature.
+When `publicAccess` is enabled, a Dedicated Load Balancer is automatically enabled on the GVC. This is required for TCP port routing and is a paid Control Plane feature. Used as a subchart, this template creates no GVC — a parent that turns on public access must set `spec.loadBalancer.dedicated` on its own GVC resource.
 </Note>
 
 - `redis.publicAccess.enabled` — Expose Redis publicly (default: `false`).
@@ -185,7 +317,7 @@ When enabled, a Control Plane domain resource is created for each address. Port 
 | Redis | `6380`, `6381`, ... (one per replica across all locations) |
 | Sentinel | `26380`, `26381`, ... (one per location) |
 
-`firewall.externalInboundAllowCIDR` must be set when public access is enabled. Without it, inbound external traffic will be blocked.
+`firewall.externalInboundAllowCIDR` defaults to `0.0.0.0/0` when public access is enabled; set it to restrict which addresses can reach the workloads.
 
 **Connecting externally:**
 
@@ -196,9 +328,11 @@ redis-cli -h redis.your-domain.com -p 6380 ping
 # Redis replica 1
 redis-cli -h redis.your-domain.com -p 6381 ping
 
-# Sentinel replica 0 (location 0)
+# Sentinel in the first location
 redis-cli -h redis-sentinel.your-domain.com -p 26380 ping
 ```
+
+Add `--no-auth-warning -a "$PASSWORD"` to either command if you set the matching password.
 
 ### Firewall
 
@@ -213,14 +347,18 @@ A single firewall configuration applies to both the Redis and Sentinel workloads
 | `workload-list` | Allow access only from specific workloads listed in `workloads` |
 
 - `firewall.workloads` — List of specific workload links, used when `internalAllowType` is `workload-list`.
-- `firewall.externalInboundAllowCIDR` — Comma-separated list of CIDRs allowed to reach the workloads externally. **Required when public access is enabled.** Use `0.0.0.0/0` to allow all, or restrict to specific IP ranges.
+- `firewall.externalInboundAllowCIDR` — Comma-separated list of CIDRs allowed to reach the workloads externally. Defaults to `0.0.0.0/0` when public access is enabled.
 - `firewall.externalOutboundAllowCIDR` — Comma-separated list of CIDRs the workloads are allowed to connect to externally.
+
+<Note>
+A firewall change is not instant — allow up to about five minutes and re-test before concluding a setting did not apply.
+</Note>
 
 ### Connecting to Redis
 
-All replicas across all locations belong to a single cluster and are accessible within the GVC. Replica 0 in the first configured location starts as the primary.
+All replicas across all locations belong to a single cluster and are reachable from anywhere in the GVC. Replica 0 in the first configured location starts as the master; after any failover, Sentinel is the authority on where the master is.
 
-**Option 1 — Load-balanced endpoint (any replica):**
+**Option 1 — Load-balanced endpoint (any replica; only the master accepts writes):**
 
 ```text
 RELEASE_NAME-redis.GVC_NAME.cpln.local:6379
@@ -233,7 +371,7 @@ replica-0.RELEASE_NAME-redis.LOCATION.GVC_NAME.cpln.local:6379
 replica-1.RELEASE_NAME-redis.LOCATION.GVC_NAME.cpln.local:6379
 ```
 
-**Option 3 — Via Sentinel to always write to the current primary:**
+**Option 3 — Via Sentinel, to always write to the current master:**
 
 ```bash
 MASTER_INFO=$(redis-cli -h RELEASE_NAME-sentinel.GVC_NAME.cpln.local -p 26379 SENTINEL get-master-addr-by-name mymaster)
@@ -242,13 +380,15 @@ MASTER_PORT=$(echo $MASTER_INFO | cut -d' ' -f2)
 redis-cli -h $MASTER_HOST -p $MASTER_PORT SET my-key "Hello world"
 ```
 
+Add `--no-auth-warning -a "$SENTINEL_PASSWORD"` to the Sentinel call and `--no-auth-warning -a "$REDIS_PASSWORD"` to the Redis call when passwords are configured.
+
 For Sentinel-aware clients, connect through:
 
 ```text
 RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379
 ```
 
-The Sentinel master name is `mymaster`.
+A specific Sentinel is reachable at `replica-0.RELEASE_NAME-sentinel.LOCATION.GVC_NAME.cpln.local:26379`. The Sentinel master name is `mymaster`.
 
 ### Ports
 
@@ -259,14 +399,40 @@ The Sentinel master name is `mymaster`.
 | Redis (public) | `6380`, `6381`, ... | TCP | One port per replica across all locations |
 | Sentinel (public) | `26380`, `26381`, ... | TCP | One port per location |
 
+## Availability and Failover
+
+Measured on a two-location cluster (`aws-us-east-1` and `aws-us-west-2`) running Valkey 8.1.9 with `replicasPerLocation: 2` — one master and three replicas — and a one-second write probe connecting through Sentinel.
+
+| Event | Measured impact |
+|---|---|
+| Cold install until every replica is ready | **96 s** on Valkey, **63 s** on the default Redis engine |
+| Cross-region replication of a write | `WAIT 3 1000` returned `3` — both replicas in the **other** region acknowledged the write within one second |
+| Loss of the instance holding the master role | Sentinel went from `+sdown` to `+failover-end` in **2.3 s**; clients saw an **8.0 s** write gap; the stopped instance rejoined as a replica with no key loss |
+| `helm upgrade`, or a forced redeployment of the Redis tier | Every replica restarts at once: an **8.45 s** write gap, and the master moved to the other region |
+
+<Warning>
+**Treat every `helm upgrade` as a planned write outage and a change of master.** Instances do not restart one at a time — the field that would serialize the rollout is not retained by the platform on a stateful workload, so all of them go down together and Sentinel elects a new master when they return.
+</Warning>
+
+<Note>
+The failover above is the loss of the **master instance**, not of a whole location — the two-location cluster used for these measurements cannot fail over on location loss, because its Sentinel quorum is 2 of 2. Use three or more locations to survive losing one.
+</Note>
+
+Replication is **asynchronous**, so a failover can lose writes the promoted replica had not yet received, bounded by the replication lag at the moment of failure.
+
 ## Backup
 
-Backup is disabled by default. When enabled, a cron workload runs in the first configured location only and uploads a single compressed `.rdb.gz` snapshot to AWS S3 or GCS. The backup image is compatible with all Redis versions.
+Backup is disabled by default. When enabled, a cron workload runs in the first configured location only and uploads a single compressed `redis-<timestamp>.rdb.gz` snapshot to AWS S3 or GCS. It runs in one location because a cron workload otherwise fires in every location of its GVC and writes one copy of the same dump per location into the same bucket.
 
 - `backup.enabled` — Enable scheduled backups.
-- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
+- `backup.image` — The backup container image.
+- `backup.schedule` — Cron expression for backup frequency (default: daily at 02:00 UTC).
 - `backup.provider` — `aws` or `gcp`.
 - `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+
+<Note>
+The job connects to the load-balanced Redis endpoint, so the snapshot is taken from whichever instance answers — usually a replica rather than the master. Replicas apply writes asynchronously, so a snapshot can be marginally behind the master at the instant it was taken.
+</Note>
 
 ### AWS S3
 
@@ -299,7 +465,7 @@ Before enabling backup with `provider: aws`, complete the following in your AWS 
 }
 ```
 
-4. Set `backup.aws.policyName` to the name of the policy created in step 3.
+4. Set `backup.aws.policyName` to the name of the policy created in step 3. This bucket-scoped policy is all the workload identity needs — no broad managed policy is required.
 5. Set `backup.aws.prefix` to the folder path where backups will be stored.
 
 ### GCS
@@ -308,28 +474,52 @@ Before enabling backup with `provider: gcp`, complete the following in your GCP 
 
 1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
-3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account. The template additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket named in `backup.gcp.bucket`.
 4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
 
 ## Restoring a Backup
 
-The backup produces a single file (`redis-<timestamp>.rdb.gz`). Download and decompress it, then copy it to `/data/dump.rdb` on the replica you want to restore and restart that replica.
+The backup produces a single file (`redis-<timestamp>.rdb.gz`).
 
-For GCS, replace `aws s3 cp s3://...` with `gsutil cp gs://...`.
+<Warning>
+**Restoring is not a one-liner here, and the obvious approach silently does nothing.** This template runs with `appendonly yes`, so Redis loads `appendonlydir/` at start and **ignores `dump.rdb` entirely** — copying a downloaded RDB into the data directory changes nothing, and reports no error. The Redis image also ships neither `aws` nor `gsutil`, so the download happens outside the container.
+</Warning>
+
+Fetch the object first:
 
 ```sh
-aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.rdb.gz - \
-  | gunzip > /tmp/dump.rdb
+aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.rdb.gz - | gunzip > ./dump.rdb   # AWS S3
+gsutil cp gs://BUCKET_NAME/PREFIX/BACKUP_FILE.rdb.gz - | gunzip > ./dump.rdb   # GCS
 ```
+
+Loading it then requires starting the instance with AOF disabled so the RDB is read, and re-enabling AOF afterwards so it is rewritten from memory. **That sequence has not been verified against this template.** Rehearse it against a scratch install before you need it, rather than first attempting a restore during an incident.
+
+## Important Notes
+
+- **The GVC in `global.gvc.name` must not already exist.** Helm adopts an existing GVC, and `helm uninstall` then deletes it along with every unrelated workload in it.
+- **Choose `engine` before the first install.** It cannot be changed afterwards: a Valkey server refuses the on-disk format Redis 7.4 wrote, `helm upgrade` reports success anyway, and every replica crash-loops until the value is set back. See [Redis or Valkey](#redis-or-valkey).
+- **Create the password secrets before installing.** `redis.passwordSecretName` and `sentinel.passwordSecretName` name secrets this template does not create; pointing either at a secret that does not exist wedges the deployment waiting on it.
+- **Rotating a password needs a forced redeployment.** Updating the secret in place changes nothing, and the old password keeps working with every status surface reporting healthy.
+- **Every `helm upgrade` restarts every replica in every location at once**, costing a short write outage and a change of master.
+- **Two locations give no automatic failover**, because the Sentinel vote cannot reach a majority. Use three or more to survive losing a location.
+- **Never suspend a location.** Suspending and resuming one permanently withdraws its endpoints from the other locations' service discovery while every status surface still reports healthy. To remove a location, remove it from `global.gvc.locations`.
+- **Allow about two minutes after a cold install** before believing a replica is unreachable — cross-region service discovery takes that long to converge, and a firewall change can take a further few minutes.
+- **Data survives an upgrade but not an uninstall** — `helm uninstall` deletes both volume sets.
 
 ## External References
 
 <CardGroup cols={2}>
-    <Card title="Redis Documentation" icon="book" href="https://redis.io/docs/">
+    <Card title="Redis Documentation" icon="book" href="https://redis.io/docs/latest/">
     Official Redis documentation
     </Card>
     <Card title="Redis Sentinel Documentation" icon="book" href="https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/">
     Redis Sentinel setup and client configuration
+    </Card>
+    <Card title="Valkey Documentation" icon="book" href="https://valkey.io/topics/">
+    Official Valkey documentation and configuration reference
+    </Card>
+    <Card title="Redis Persistence" icon="floppy-disk" href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">
+    How RDB and AOF files are written and loaded
     </Card>
     <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/redis-backup">
     Source code for the Redis backup container image
