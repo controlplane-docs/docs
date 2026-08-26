@@ -1,0 +1,334 @@
+---
+title: Guacamole
+description: Deploy Apache Guacamole on Control Plane using the Template Catalog. A clientless remote desktop gateway that opens RDP, VNC, SSH, and telnet sessions to your internal machines in a plain browser tab, with no client, plugin, or VPN, backed by PostgreSQL.
+keywords: ['guacd', 'clientless remote desktop', 'browser rdp', 'remote desktop gateway', 'bastion host', 'jump host', 'vnc gateway', 'ssh in browser', 'html5 remote access', 'apache guacamole', 'vpn alternative', 'audited remote access']
+---
+
+## Overview
+
+Apache Guacamole is a clientless remote desktop gateway: users open RDP, VNC, SSH, and telnet sessions to internal machines in a plain browser tab, with no client, plugin, or VPN to install. This template deploys the Guacamole web application, the `guacd` protocol daemon, and a bundled PostgreSQL that holds users, connections, permissions, and session history.
+
+The install is **private by default**: `publicAccess.enabled` is `false`, because this gateway fronts your internal machines. You reach the UI over a port forward, sign in, and then opt in to publishing it — see [First Run](#first-run).
+
+The administrator login is not a template value. It comes from a dictionary secret you create before installing, so it never passes through Helm and never lands in the release.
+
+### Architecture
+
+- **Gateway workload** — One `standard` workload running three containers and mounting no volume set. It is pinned to a single replica by design; see [Sessions and Restarts](#sessions-and-restarts).
+  - `guacamole` — Tomcat serving the web UI, the REST API, and the browser tunnel on HTTP port `8080`. It is served at `/`, not `/guacamole/`, and honors the forwarded client address so connection history records the real client IP rather than the mesh proxy.
+  - `guacd` — The protocol daemon that speaks RDP, VNC, SSH, and telnet on the wire, reached by the web application over loopback `127.0.0.1:4822`.
+  - `schema-init` — Loads the database schema and writes the administrator account on first boot, then idles. Tomcat does not start serving until it has finished.
+- **PostgreSQL** — The [postgres](/template-catalog/templates/postgres) template as a subchart, running PostgreSQL 18. It holds every byte Guacamole persists: users, connections, connection parameters, permissions, and session history.
+
+### What Gets Created
+
+- **Standard Guacamole Workload** — (`RELEASE_NAME-guacamole`): the three containers above, on port `8080`, fixed at one replica.
+- **Stateful PostgreSQL Workload** — Single-replica PostgreSQL, automatically connected to Guacamole.
+- **Volume Set** — The PostgreSQL data volume. The gateway workload itself has no volume set.
+- **Database Credentials Secret** — A dictionary secret named by `postgres.config.credentialsSecretName`, which this template **creates** from `postgres.credentials.*` and hands to the bundled database. There is nothing for you to create here.
+- **Script Secrets** — (`RELEASE_NAME-guacamole-start` and `RELEASE_NAME-guacamole-init`): two opaque secrets holding the shell scripts the containers run. Neither contains a credential.
+- **Identity & Policy** — An identity for the gateway workload with `reveal` scoped to exactly four secrets: your admin secret, the database credentials secret, and the two script secrets. No cloud bindings are attached. The PostgreSQL subchart brings its own identity and policy.
+
+<Note>
+This template does not create a GVC. You must deploy it into an existing GVC.
+</Note>
+
+<Warning>
+`guacd`'s port `4822` is deliberately **not published**. The protocol daemon is unauthenticated — anything that can reach it can drive an arbitrary RDP, VNC, or SSH session. Containers in one workload share a network namespace, so the web application reaches it on loopback while nothing outside the replica can. Do not "fix" this by declaring the port.
+</Warning>
+
+## Prerequisites
+
+**One secret must exist before you install.** Its values never pass through Helm, so they never land in the release. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the admin secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly two keys — `username` and `password`. They become the Guacamole administrator account, replacing the well-known stock `guacadmin` account before Tomcat ever serves a request.
+
+    ```bash
+    cpln secret create-dictionary --name my-guacamole-admin \
+      --entry username=admin \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `admin.secretName` to the name you used. Nothing else is required for a default install — the database password is internal plumbing that this template turns into a secret for you.
+  </Step>
+  <Step title="Read the secret back later">
+    The `-o yaml` is required — plain `cpln secret reveal` prints only a summary table, not the values:
+
+    ```bash
+    cpln secret reveal my-guacamole-admin -o yaml
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+**Create the secret before installing.** The template refuses to render when the name is blank, but a name pointing at a secret that does not exist installs "successfully" and then wedges: every resource reports created, the workload never becomes ready, and **`cpln logs` returns zero lines** because no container ever starts. The only diagnostic is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-guacamole --gvc GVC_NAME -o yaml
+```
+
+It names the missing secret: `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` The command is `get-deployments` — plain `cpln workload get` has no `versions` key at all. Creating the secret recovers the workload on its own: **poll for 5.5 to 10.5 minutes rather than time-boxing it** (9 minutes 46 seconds measured here). `cpln workload force-redeployment RELEASE_NAME-guacamole --gvc GVC_NAME` cuts that to roughly 90 seconds.
+</Warning>
+
+<Warning>
+**The administrator password is applied on first boot only.** It seeds the database once, so rotating the secret afterwards does **not** change your login — this was verified by rotating the secret, forcing a redeployment into a container proven to hold the new value, and confirming the *original* password still authenticated. Change the password in the Guacamole UI instead. That behavior is deliberate: otherwise every restart would silently overwrite a password changed in the UI.
+</Warning>
+
+## Installation
+
+To install, follow the instructions for your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## First Run
+
+A default install is closed to the internet: the canonical endpoint returns `403`. Sign in through a port forward first, add a connection, and publish the UI only if you want it reachable from outside the GVC.
+
+<Steps>
+  <Step title="Wait for the workload to report ready">
+    PostgreSQL comes up first, then the `schema-init` container loads the schema and writes your administrator account, and only then does Tomcat start serving. A default install typically reaches ready in about a minute and a half.
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-guacamole --gvc GVC_NAME
+    ```
+
+    If the workload sits waiting for the schema, read the `schema-init` container's logs first — it is almost always still waiting on PostgreSQL.
+  </Step>
+  <Step title="Reach the UI over a port forward">
+    `cpln port-forward` is a top-level command, not a `cpln workload` subcommand. It tunnels through Control Plane infrastructure and is independent of the firewall settings:
+
+    ```bash
+    cpln port-forward RELEASE_NAME-guacamole 8080:8080 --gvc GVC_NAME
+    ```
+
+    Then open `http://localhost:8080` and sign in with the `username` and `password` from your admin secret. Guacamole is served at `/`, not at `/guacamole/`.
+  </Step>
+  <Step title="Add a connection">
+    A fresh install has no connections and looks empty until you add one. Go to **Settings → Connections → New Connection**, choose a protocol, and set the target host and port. For a machine in the same GVC, use the fully qualified internal name — `WORKLOAD_NAME.GVC_NAME.cpln.local` — because a bare short name does not reliably resolve.
+  </Step>
+  <Step title="Publish the UI, if you want it public">
+    Upgrade the release with `publicAccess.enabled: true`. The canonical `*.cpln.app` hostname then appears under `status.canonicalEndpoint`:
+
+    ```bash
+    cpln workload get RELEASE_NAME-guacamole --gvc GVC_NAME -o yaml
+    ```
+
+    Allow up to a few minutes for the firewall change to take effect before concluding it did not work.
+  </Step>
+</Steps>
+
+<Note>
+`guacadmin` / `guacadmin`, Guacamole's well-known stock account, is **never valid here**. The stock row is renamed and re-hashed to your credentials before Tomcat binds a port, so it is not left behind alongside your account.
+</Note>
+
+## Supported Protocols
+
+The `guacd:1.6.0` image has **RDP, VNC, SSH, and telnet** compiled in. The Kubernetes protocol is not included.
+
+Each connection you create names a protocol plus a target host and port, and `guacd` dials that host from inside the GVC — so the gateway reaches private machines that are not exposed to the internet, and every session is written to Guacamole's connection history with who connected, to what, and when.
+
+## Configuration
+
+The default `values.yaml` for this template:
+
+```yaml
+guacamole:
+  image: guacamole/guacamole:1.6.0
+  resources:
+    minCpu: 500m
+    maxCpu: 1000m
+    minMemory: 1Gi
+    maxMemory: 2Gi # JVM heap defaults to ~1/4 of this
+
+guacd:
+  image: guacamole/guacd:1.6.0 # keep this tag equal to the guacamole tag
+  resources:
+    minCpu: 100m
+    maxCpu: 1000m
+    minMemory: 256Mi
+    maxMemory: 1Gi # raise for many concurrent RDP sessions
+
+admin:
+  secretName: my-guacamole-admin # dictionary secret with username + password — MUST exist before install
+
+logLevel: info # trace | debug | info | error; applies to both containers
+
+publicAccess:
+  enabled: false # false = internal only; true = UI on the auto-assigned *.cpln.app HTTPS endpoint
+
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # used only with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
+
+postgres:
+  image: postgres:18 # also used by the schema-init container, so psql matches the server
+  credentials: # the chart writes these into the secret named below — nothing for you to create
+    username: guacamole
+    password: change-me-guacamole-db # change before installing
+    database: guacamole
+  config:
+    credentialsSecretName: my-guacamole-db-credentials # secret names are org-wide — give each release its own
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 1Gi
+  volumeset:
+    capacity: 10 # GiB (minimum 10)
+```
+
+### Images and Resources
+
+- `guacamole.image` / `guacd.image` — The two official images. **Keep the tags equal**: the web application and the protocol daemon are versioned together upstream.
+- `guacamole.resources` — CPU and memory bounds for Tomcat. The JVM sizes its heap at roughly a quarter of `maxMemory`, so raise `maxMemory` to give the heap more room.
+- `guacd.resources` — CPU and memory bounds for the protocol daemon. Raise `maxMemory` for many concurrent RDP sessions; each active session costs memory here rather than in Tomcat.
+- `postgres.image` — Also sets the image of the `schema-init` container, so `psql` always matches the server version. One value drives both.
+
+### Admin Account
+
+`admin.secretName` names the dictionary secret holding `username` and `password`. It is **required** and must exist before you install — see [Prerequisites](#prerequisites) for the command and the failure mode. The credentials are applied on first boot only; change the password in the Guacamole UI afterwards, not in the secret.
+
+### Logging
+
+`logLevel` sets verbosity for **both** containers from one value: `trace`, `debug`, `info` (default), or `error`. The chart rejects anything else at render.
+
+<Note>
+`warn` is deliberately not an option. `guacd` spells that level `warning` while the web application spells it `warn`, so no single value covers both containers. Use `error` or `info`.
+</Note>
+
+### Access
+
+- `publicAccess.enabled` — Serve the UI on the auto-assigned `*.cpln.app` HTTPS endpoint. It is **`false` by default**, because this gateway fronts your internal machines: with it off, external requests are refused at the edge with a `403`, and you reach the UI over a port forward. Turning it on was measured at 25 seconds to take effect.
+- `internalAccess.type` — Controls which workloads in Control Plane can reach Guacamole over the internal network:
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access. |
+| `same-gvc` | Allow access from all workloads in the same GVC (default). |
+| `same-org` | Allow access from all workloads in the same organization. |
+| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
+
+<Note>
+Firewall changes are not instantaneous. After an upgrade that flips `publicAccess.enabled` or `internalAccess.type` reports success, requests can keep hitting the old rules for anywhere from half a minute to a few minutes. Re-test after a pause rather than concluding the knob did not work.
+</Note>
+
+This firewall governs **inbound** traffic to Guacamole. It does not restrict which hosts `guacd` may dial out to: a remote desktop gateway needs outbound reach to the machines its connections target, so egress stays open. Control what a user can connect to through the connections and permissions you create inside Guacamole.
+
+### Backing Database
+
+The bundled PostgreSQL is the [postgres](/template-catalog/templates/postgres) template as a subchart, and every one of its knobs is available under the `postgres` key. `postgres.credentials.*` are internal plumbing — no human types this password anywhere — so this template builds the credentials secret from them rather than asking you to create it. **Change `postgres.credentials.password` before installing**: it seeds the database on first boot and cannot be changed by editing values afterwards.
+
+<Warning>
+**Give each release its own `postgres.config.credentialsSecretName`.** Secret names are organization-wide, so a second release left on the default name is **refused at install** with `cannot be updated because it is being managed by a different release`. Nothing is shared, overwritten, or deleted — the first release is unaffected, and the second creates nothing.
+</Warning>
+
+## Sessions and Restarts
+
+This template runs **exactly one replica**, and there is no `replicas` knob. Guacamole keeps authentication tokens in each Tomcat's memory with no cross-instance sharing, and the platform offers no session affinity, so a second replica would randomly sign users out.
+
+The consequence is worth stating precisely, because it is not downtime:
+
+| Event | Endpoint availability | User sessions |
+|---|---|---|
+| Rolling upgrade | **112 of 112 requests served with `200`** — no measured unavailability | Existing tokens are rejected; users sign in again and open desktop sessions end |
+| Replica destroyed and rescheduled | **204 of 204 requests served with `200`** | Same — tokens do not survive |
+
+So any restart — an upgrade, a replica reschedule, or a forced redeployment — **drops active desktop sessions and signs everyone out**. Reconnecting re-establishes the session. Nothing persisted is lost: users, connections, permissions, and history all live in PostgreSQL.
+
+<Warning>
+**Rotating a prerequisite secret does not restart this workload.** Editing the admin secret was polled for nearly seven minutes with no workload version change, no error, and a healthy `ready: true` the whole time — the old value simply stayed in force. Run `cpln workload force-redeployment RELEASE_NAME-guacamole --gvc GVC_NAME` to pick up a rotated secret. For the admin credentials specifically, even a redeployment will not change your login — those are first-boot only.
+</Warning>
+
+## Connecting
+
+| Access | Endpoint | Notes |
+|---|---|---|
+| Local access (default, public access off) | `cpln port-forward RELEASE_NAME-guacamole 8080:8080 --gvc GVC_NAME`, then `http://localhost:8080` | Tunnels through Control Plane; independent of the firewall. |
+| Web UI (public) | `https://<canonical>.cpln.app` | Only with `publicAccess.enabled: true`. Find it under `status.canonicalEndpoint` (`cpln workload get RELEASE_NAME-guacamole --gvc GVC_NAME -o yaml`). |
+| Internal (in-GVC) | `http://RELEASE_NAME-guacamole.GVC_NAME.cpln.local:8080` | Reachable from other workloads per `internalAccess.type`. Use the fully qualified name — a bare short name does not reliably resolve for a standard workload. |
+| PostgreSQL (in-GVC) | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | Credentials are the keys of the secret named by `postgres.config.credentialsSecretName`. |
+| Admin login | `username` / `password` from your admin secret | `cpln secret reveal my-guacamole-admin -o yaml` |
+
+## Backing Up
+
+The bundled database is the [postgres](/template-catalog/templates/postgres) template, so **every backup option that template has is already available here** — there is nothing extra to install. Backups are off by default and cover everything Guacamole persists: users, connections, connection parameters, permissions, and session history.
+
+```yaml
+postgres:
+  backup:
+    enabled: true
+    schedule: "0 2 * * *" # daily at 02:00 UTC
+    provider: aws # aws | gcp | minio
+    aws:
+      bucket: my-postgres-bucket
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account
+      policyName: my-postgres-backup-policy # bucket-scoped IAM policy
+      prefix: postgres/backups
+```
+
+Complete the storage setup for your provider **before** enabling backups: the bucket, a Control Plane [cloud account](https://docs.controlplane.com/guides/create-cloud-account), and the access grant. The full per-provider walkthrough — including the exact IAM policy JSON, the GCP role, the MinIO credentials secret, and how to restore — lives in the [postgres](/template-catalog/templates/postgres) template documentation.
+
+<Note>
+`postgres.backup.image` must match the PostgreSQL major version in `postgres.image`. If you move off the defaults, change both together.
+</Note>
+
+## Important Notes
+
+- **The admin secret must exist before you install.** A missing one wedges the deployment silently with no log output at all; see [Prerequisites](#prerequisites) for the one diagnostic that names it.
+- **The admin password is first-boot only.** Rotating the secret afterwards does not change your login. Change the password in the Guacamole UI instead.
+- **`guacadmin` / `guacadmin` is never valid here** — the stock account is renamed and re-hashed before Tomcat binds a port. If it ever works, that is a bug, not a leftover.
+- **Rotating any prerequisite secret does not restart the workload.** The old value stays in force, with no error and a healthy status, until you run `cpln workload force-redeployment`.
+- **Single replica by design, and there is no `replicas` knob.** A restart keeps the endpoint up but drops active desktop sessions and signs everyone out. See [Sessions and Restarts](#sessions-and-restarts).
+- **Public access is off by default.** Expose this gateway deliberately, and reach the UI over `cpln port-forward` until you do. Firewall changes take from half a minute to a few minutes to take effect.
+- **`guacd`'s port `4822` is intentionally unpublished** because the protocol daemon is unauthenticated. Only the web application in the same replica can reach it.
+- **Only RDP, VNC, SSH, and telnet are available** in `guacd:1.6.0`. The Kubernetes protocol is not compiled in.
+- **Use the fully qualified internal name** — `WORKLOAD_NAME.GVC_NAME.cpln.local` — both for reaching Guacamole and for the connection targets you configure in it.
+- **Give each release its own `postgres.config.credentialsSecretName`**, and change `postgres.credentials.password` before installing. The password seeds the database on first boot and cannot be changed by editing values afterwards.
+- **Data survives restarts and upgrades; uninstalling deletes it.** Users, connections, and history live in the PostgreSQL volume set, which goes with the release. Your admin secret is yours and survives an uninstall.
+- **A fresh install looks empty until you add a connection** — that is expected, not a broken deploy. See [First Run](#first-run).
+
+## External References
+
+<CardGroup cols={2}>
+  <Card title="Guacamole Manual" href="https://guacamole.apache.org/doc/gug/" icon="book">
+    The official Apache Guacamole administrator and user guide
+  </Card>
+  <Card title="Administration" href="https://guacamole.apache.org/doc/gug/administration.html" icon="users">
+    Managing users, connections, groups, and permissions
+  </Card>
+  <Card title="Using Guacamole" href="https://guacamole.apache.org/doc/gug/using-guacamole.html" icon="display">
+    Connecting, the menu, clipboard, and file transfer
+  </Card>
+  <Card title="Configuring Guacamole" href="https://guacamole.apache.org/doc/gug/configuring-guacamole.html" icon="sliders">
+    Connection parameters for RDP, VNC, SSH, and telnet
+  </Card>
+  <Card title="PostgreSQL Authentication" href="https://guacamole.apache.org/doc/gug/postgresql-auth.html" icon="database">
+    How Guacamole stores users and connections in PostgreSQL
+  </Card>
+  <Card title="Guacamole Template" href="https://github.com/controlplane-com/templates/tree/main/guacamole" icon="github">
+    View the source files, default values, and chart definition
+  </Card>
+</CardGroup>
