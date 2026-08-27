@@ -1,28 +1,38 @@
 ---
 title: Coraza WAF
-description: Deploy Coraza WAF on Control Plane using the Template Catalog. Covers configuration, OWASP CRS rules, and reverse proxy setup for filtering traffic to target workloads.
-keywords: ['web application firewall', 'modsecurity', 'caddy waf', 'l7 firewall', 'request inspection', 'rule engine', 'core ruleset', 'envoy waf', 'attack mitigation', 'sql injection block']
+description: Deploy Coraza WAF with the OWASP Core Rule Set on Control Plane using the Template Catalog. A reverse proxy that inspects and filters traffic before forwarding it to a workload you already run.
+keywords: ['web application firewall', 'owasp crs', 'modsecurity', 'caddy waf', 'l7 firewall', 'request inspection', 'seclang rules', 'core rule set', 'reverse proxy', 'attack mitigation', 'sql injection block', 'coraza-crs image']
 ---
 
 ## Overview
 
-Coraza is an open-source Web Application Firewall (WAF) that integrates the OWASP Core Rule Set (CRS) for comprehensive protection against common web attacks. This template uses the [Coraza Caddy](https://github.com/coreruleset/coraza-crs-docker) image, which runs Coraza as a plugin inside the Caddy web server to handle request inspection and proxying. It sits in front of a target workload, filtering all incoming requests before forwarding them.
+Coraza is an open-source web application firewall that ships with the OWASP Core Rule Set (CRS). This template deploys the [coraza-crs](https://github.com/coreruleset/coraza-crs-docker) image, which runs Coraza as a plugin inside the Caddy web server, as a reverse proxy in front of a workload you already run. Traffic enters the WAF, is inspected against CRS and any rules you add, and is forwarded to the workload behind it.
+
+The template does not deploy the workload it protects, and it only inspects traffic that is actually routed through it — see [Important Notes](#important-notes).
+
+### Architecture
+
+- **WAF Workload** — Coraza and CRS on Caddy, listening on `WAFPort` and proxying to `targetWorkload:targetPort`. A `standard` workload that autoscales on CPU between one and three replicas.
+- **Startup Hook** — A `postStart` hook that points the image's Caddy reverse-proxy handler at your target workload. It resolves the handler by name, waits for the Caddy admin API with a bounded timeout, reads the result back, and fails closed: a WAF that cannot configure itself refuses to serve rather than passing traffic through uninspected.
+- **Custom Rules** — Your own [seclang](https://coraza.io/docs/seclang/directives/) rules, loaded after the Core Rule Set.
 
 ### What Gets Created
 
-- **Workload** — A Coraza WAF container running with OWASP CRS, configured as a reverse proxy to your target workload.
-- **Secrets** — A startup script secret that configures the Caddy reverse proxy, and a custom rules secret (suffixed `-coraza-custom-rules`) containing an initial example rule, editable after installation to define your own WAF policies.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the startup and custom rules secrets.
+- **Standard Workload** — (`RELEASE_NAME-coraza-waf`): the Coraza container, listening on `WAFPort`, publicly reachable and reachable from the same GVC.
+- **Startup Secret** — (`RELEASE_NAME-coraza-startup`): an opaque secret holding the startup hook script, mounted into the container.
+- **Custom Rules Secret** — (`RELEASE_NAME-coraza-custom-rules`): an opaque secret holding your rules, mounted at `/opt/coraza/rules.d/custom.conf`. It ships with one example rule.
+- **Identity & Policy** — An identity for the WAF workload with `reveal` scoped to exactly those two secrets. No cloud bindings are attached.
 
 <Note>
-This template does not create a GVC. You must deploy it into an existing GVC alongside your target workload.
+This template does not create a GVC. You must deploy it into an existing GVC alongside the workload you want to protect.
 </Note>
 
 ## Prerequisites
 
-The target workload must be reachable from the Coraza WAF workload. Before installing, ensure the target workload's internal access is configured to allow traffic from the WAF:
+**The workload you intend to protect must already exist**, and the WAF must be able to reach it:
 
-- Set the target workload's `internal_access` to `same-gvc`, `same-org`, or use `workload-list` to explicitly allow the Coraza workload.
+- Set `targetWorkload` to that workload's fully qualified internal address, `WORKLOAD_NAME.GVC_NAME.cpln.local`, and `targetPort` to the port it serves.
+- Set that workload's internal firewall to `same-gvc`, `same-org`, or a `workload-list` that includes `RELEASE_NAME-coraza-waf`. The internal default is `none`, which blocks the WAF from reaching it.
 
 ## Installation
 
@@ -55,63 +65,139 @@ To install, follow the instructions for your preferred method:
 The default `values.yaml` for this template:
 
 ```yaml
-image: ghcr.io/coreruleset/coraza-crs@sha256:eed7280e0de4820507b500b1ee10de820c175165d5cce329609bf34f32977af8
+# Pinned by digest = tag 4.25-caddy-alpine-202607180107 (OWASP CRS 4.25.0, Caddy v2.11.2).
+# Only the *-caddy-alpine-* variants work with this template, and only a datecode or a
+# digest is safe to pin — moving tags such as -lts get repointed upstream.
+image: ghcr.io/coreruleset/coraza-crs@sha256:21e95b2117c8c818f263944f45bd233608b3d18dd95653f71539972eb0cdfca1
 
 # MUST BE CHANGED
-targetWorkload: my-workload.my-gvc.cpln.local # Internal name of the workload to proxy traffic to
+targetWorkload: my-workload.my-gvc.cpln.local # Workload internal name of the workload to proxy traffic to
 
-targetPort: 8080 # Port of the target workload
+targetPort: 8080 # Port of the workload to proxy traffic to
 
-WAFPort: 80 # Port on the WAF workload exposed to the internet
+WAFPort: 80 # Port on the WAF workload to expose to the internet
 
+# Coraza inspects request bodies on the CPU, so these size the largest body the WAF
+# can inspect inside timeoutSeconds. See "Request size, CPU and timeout" in the README
+# before lowering them — 50m/128Mi, the pre-1.2.0 defaults, 504 on any body over ~30 KB.
 resources:
-  cpu: 50m
-  memory: 128Mi
+  cpu: 500m
+  memory: 512Mi
+
+# Request timeout, in seconds, for everything passing through the WAF. It caps both the
+# time Coraza spends inspecting a request body and the time the upstream has to answer;
+# anything slower gets a 504 from the WAF, not from your application.
+timeoutSeconds: 30
 
 multiZone: false
-
-diskBodyInspection: true # When true, request bodies exceeding the in-memory limit are buffered to disk for inspection
 ```
 
-### Target Workload
+### Proxy Target
 
-- `targetWorkload` — The internal DNS name of the workload to proxy traffic to. Uses the format `WORKLOAD_NAME.GVC_NAME.cpln.local`. **This must be changed before deploying.**
-- `targetPort` — The port on the target workload that Coraza should forward requests to.
-- `WAFPort` — The port on the Coraza workload exposed to the internet (default `80`).
+- `targetWorkload` — The internal DNS name of the workload to proxy traffic to, in the form `WORKLOAD_NAME.GVC_NAME.cpln.local`. **This must be changed before deploying.** The short workload name alone is not reliable; always use the fully qualified form.
+- `targetPort` — The port the target workload serves on.
+- `WAFPort` — The port the WAF workload exposes, and the port clients connect to (default `80`).
 
-### Resources
+Changing any of these re-runs the startup hook on the new replica, which re-resolves and re-patches the reverse proxy. Allow up to a few minutes after a `WAFPort` change for the new container port to propagate at the edge.
 
-- `resources.cpu` / `resources.memory` — CPU and memory allocated to the WAF workload.
+### Choosing an Image Tag
+
+**Only the `*-caddy-alpine-*` variants work.** The `-nginx-` and `-apache-` builds of `coraza-crs` ship no Caddy binary, so this template cannot configure them. The newest CRS releases — 4.28 and later — are published *only* as nginx and apache variants, so reaching for the highest version number lands on an image this template cannot drive. Take the newest `*-caddy-alpine-*` build instead.
+
+**Pin a digest or a datecode, never a moving tag.** Tags such as `4.25-caddy-alpine-lts` and `caddy-alpine` are repointed by upstream, so the image can change under a deployment nobody touched. A digest (`coraza-crs@sha256:…`) or a datecode (`4.25-caddy-alpine-202607180107`) names one specific build. The shipped default is a pinned digest of the newest Caddy build available.
+
+New CRS releases are therefore never picked up on their own — updating the rule set is a deliberate `image` change.
+
+### Request Body Size and Timeout
+
+Coraza inspects request bodies on the CPU, and `timeoutSeconds` cuts a request off part-way through. Together, `resources.cpu` and `timeoutSeconds` set the largest request body the WAF accepts:
+
+```text
+largest inspected body ≈ 120 KB × cpu-cores × timeoutSeconds
+```
+
+At the shipped defaults (`cpu: 500m`, `timeoutSeconds: 30`) that is about **1.8 MB**, measured against the public endpoint:
+
+| POST body | Result |
+|---|---|
+| 1 KB | 200 (0.05 s) |
+| 50 KB | 200 (0.88 s) |
+| 1500 KB | 200 (26.19 s) |
+| 1700 KB | 200 (29.77 s) |
+| 1900 KB | **504** (30.04 s) |
+
+A body too large to inspect within `timeoutSeconds` returns a **504 from the WAF, not from your application**. GET traffic is unaffected, so a smoke test that only issues GETs will not reveal the ceiling.
+
+Inspection cost scales with CPU, but not linearly: the measured rate is about 17.5 ms per KB of body at `cpu: 500m`, and below roughly `250m` CPU quota throttling makes it disproportionately worse. To accept larger bodies, raise `resources.cpu` first — that inspects the same body faster, rather than merely waiting longer — then raise `timeoutSeconds`, and raise `resources.memory` alongside them, since memory use scales with body size (a single inspected 3 MB body peaked at about 124 MiB).
+
+Two ceilings you cannot raise from values: Coraza stops inspecting bodies above **13 MB** (`SecRequestBodyLimit`, fixed in the image), and `timeoutSeconds` also caps how long your own upstream has to answer — so set it above your application's slowest response.
+
+<Note>
+`timeoutSeconds` is enforced at the public edge. A caller inside the GVC that connects to the WAF directly over `cpln.local` is not subject to it, so a body-size or latency test run from inside the GVC will not reproduce the 504.
+</Note>
+
+### Resources and Placement
+
+- `resources.cpu` / `resources.memory` — CPU and memory for the WAF container. These are the limits, and they size request-body inspection — see [Request Body Size and Timeout](#request-body-size-and-timeout).
 - `multiZone` — When `true`, deploys replicas across multiple zones for higher availability.
 
 <Note>
 Not all locations support multi-zone deployments. Confirm that your target location supports multi-zone before enabling this option.
 </Note>
 
-### Body Inspection
-
-- `diskBodyInspection` — Controls how request bodies larger than the 512KB in-memory limit are handled:
-
-| Value | Behavior |
-|-------|----------|
-| `true` (default) | Bodies exceeding 512KB are buffered to disk at `/tmp/coraza`, enabling full inspection up to 12.5MB |
-| `false` | All body inspection stays in memory; bodies up to 12.5MB are held in memory, avoiding disk I/O at the cost of higher memory pressure on large requests |
-
 ### Custom Rules
 
-After installation, custom WAF rules can be added by editing the secret named `<release-name>-coraza-custom-rules`. The secret includes an example rule to get started:
+Add your own rules by editing the secret named `RELEASE_NAME-coraza-custom-rules`, either in the Console or with `cpln secret edit RELEASE_NAME-coraza-custom-rules`. It ships with one example rule, which blocks any request whose URI contains `attack`:
 
 ```text
 SecRule REQUEST_URI "@rx attack" "id:1001,phase:1,deny,msg:'Blocked attack attempt'"
 ```
 
+Rules use [seclang directives](https://coraza.io/docs/seclang/directives/). The secret is loaded **after** the Core Rule Set, so it can also switch a CRS rule off:
+
+```text
+SecRuleRemoveById 920450
+```
+
+CRS rule `920450` blocks any request carrying an `Expect: 100-continue` header, which some HTTP clients — `curl` among them — add automatically for large uploads. An application behind the WAF can therefore see 403s that have nothing to do with its payload. Removing that one rule leaves the rest of CRS in force, including the example rule above.
+
 <Note>
-After modifying the custom rules secret, you must restart the workload replicas for the changes to take effect.
+Rules are read at startup. After changing the secret, restart the replicas with `cpln workload force-redeployment RELEASE_NAME-coraza-waf --gvc GVC_NAME` for the change to take effect.
 </Note>
+
+Custom rules layer on top of CRS, so a rule ID that collides with a CRS rule silently overrides it. Pick IDs outside the CRS ranges.
 
 ### Logging
 
-All Coraza logs are sent to `/dev/stdout` and are readable in the Control Plane built-in logging interface. Logging behavior can be adjusted through environment variables in the workload configuration after installation.
+Coraza's access, audit, and debug logs go to `/dev/stdout` and are readable through the built-in logging interface:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-coraza-waf"}' --limit 100 --since 30m
+```
+
+The startup hook's own `[INFO]` and `[FATAL]` lines appear in the same stream. Log destinations and verbosity can be changed through the `CORAZA_*` environment variables on the workload after installation.
+
+## Connecting
+
+| What | Value |
+|---|---|
+| Public | The WAF workload's canonical endpoint on `WAFPort` — this is the address clients should use |
+| Internal (same GVC) | `RELEASE_NAME-coraza-waf.GVC_NAME.cpln.local:WAFPort` |
+| Upstream | Whatever you set as `targetWorkload` and `targetPort` |
+
+Send traffic to the WAF, not to the workload behind it.
+
+## Important Notes
+
+- **This only protects traffic that goes through it.** The WAF is a proxy, so the workload behind it must not remain publicly reachable on its own endpoint, or requests bypass inspection entirely.
+- **Only `*-caddy-alpine-*` images work, and only a digest or a datecode is safe to pin.** Moving tags such as `-lts` change the image under a running deployment. See [Choosing an Image Tag](#choosing-an-image-tag).
+- **CRS rule updates require a deliberate `image` change.** That is the right default for a security control, but new CRS releases are not picked up on their own.
+- **A request body too large to inspect inside `timeoutSeconds` returns 504 from the WAF, not from your application.** Size `resources.cpu` and `timeoutSeconds` together — see [Request Body Size and Timeout](#request-body-size-and-timeout).
+- **CRS blocks any request carrying an `Expect: 100-continue` header** (rule `920450`), which some HTTP clients add for large uploads. Switch that one rule off in the custom rules secret if your clients send it.
+- **`timeoutSeconds` also caps how long the protected workload may take to answer**, not only how long inspection may take.
+- **Custom rules layer on top of CRS**, so a rule ID that collides with a CRS rule silently overrides it, and rule changes take effect only after the replicas restart.
+- **The WAF fails closed.** If the startup hook cannot configure the reverse proxy, the container restarts rather than serving uninspected traffic. If the workload does not start, check `cpln logs` for a `[FATAL]` line naming the failed check; an incompatible non-Caddy image instead exits immediately with `exitCode: 127` after logging `Launching caddy run …`.
+- **Do not override the container's `command` or `args`.** They run the image's own entrypoint behind a `tail` that forwards the startup hook's output onto the container log; replacing them leaves a failed hook with no diagnosis.
 
 ## External References
 
@@ -120,10 +206,16 @@ All Coraza logs are sent to `/dev/stdout` and are readable in the Control Plane 
     Official Coraza WAF documentation and tutorials
     </Card>
     <Card title="OWASP CRS Documentation" icon="shield" href="https://coreruleset.org/docs/">
-    Core Rule Set documentation and custom rule authoring
+    Core Rule Set documentation and rule reference
     </Card>
-    <Card title="Coraza CRS Docker" icon="github" href="https://github.com/coreruleset/coraza-crs-docker">
-    Coraza CRS Docker image reference
+    <Card title="seclang Directives" icon="list-check" href="https://coraza.io/docs/seclang/directives/">
+    Directive reference for writing custom rules
+    </Card>
+    <Card title="Coraza CRS Docker" icon="docker" href="https://github.com/coreruleset/coraza-crs-docker">
+    Image source, supported variants, and available tags
+    </Card>
+    <Card title="Caddy Admin API" icon="gear" href="https://caddyserver.com/docs/api">
+    The API the startup hook uses to configure the reverse proxy
     </Card>
     <Card title="Coraza Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/coraza">
     View the source files, default values, and chart definition
