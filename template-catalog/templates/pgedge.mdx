@@ -1,6 +1,16 @@
 ---
 title: pgEdge Distributed PostgreSQL
+description: Deploy a pgEdge active-active distributed PostgreSQL cluster on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, locations, Spock multi-master replication, pgcat pooling and routing, backups to S3 or GCS, and migrating from template version 1.x.
+keywords: ['active-active database', 'multi-master replication', 'geo-distributed sql', 'multi-region database', 'logical replication', 'replicate_ddl', 'repset_add_table', 'last-update-wins', 'conflict resolution', 'read write splitting', 'connection pooler', 'cockroachdb alternative', 'write anywhere']
 ---
+
+<Warning>
+**Template version 2.0.0 is a breaking change, and one of the changes is a data-loss hazard.**
+
+- **The template no longer creates a GVC.** It deploys into the GVC you install into. The `gvc.name` and `gvc.locations` values are gone; locations moved to a top-level `locations` list.
+- **Never upgrade a 1.x release onto 2.0.0 in place.** A 1.x release owns the GVC it created, and Helm deletes what a chart stops declaring — the upgrade destroys that GVC and **every workload, volume set and identity inside it**. Migrate to a new release instead: [Migrating from 1.x](#migrating-from-1-x).
+- **Replication never worked on 1.x.** The pinned PostgreSQL 17.11 image does not allow Spock's output plugin, so no replication slot could be created and every node silently accepted writes that never left it. 2.0.0 fixes this for new installs; an existing 1.x cluster needs [a one-time setting change](#switching-replication-on-for-an-existing-1-x-cluster).
+</Warning>
 
 ## Overview
 
@@ -8,30 +18,55 @@ pgEdge is an active-active distributed PostgreSQL cluster using Spock multi-mast
 
 Database credentials are **not** template values. pgEdge reads its username, password and database name from a dictionary secret you create before installing, so no password passes through Helm or lands in the release.
 
-<Warning>
-**Template version 1.1.0 is a breaking security change.** `postgres.username`, `postgres.password` and `postgres.database` were removed, and an install or upgrade that still sets any of them now fails at render instead of silently falling back to a published default password. If you are running 1.0.2 or earlier, read [Upgrading From 1.0.x](#upgrading-from-1-0-x) before you touch the release.
-</Warning>
-
 ### Architecture
 
 - **pgEdge** — Stateful workload running PostgreSQL 17 with the Spock extension. All nodes are active writers connected in a full-mesh replication ring. Each replica gets its own persistent volume.
-- **pgcat** — Connection pooler providing a single virtual endpoint for applications. Routes writes to the designated primary and distributes reads across all nodes.
+- **pgcat** — Connection pooler providing a single virtual endpoint for applications. Sends writes to one designated node and spreads reads across the others.
 - **Spock** — Multi-master logical replication extension included in the pgEdge image. Handles cross-node replication with last-update-wins conflict resolution.
 
 ### What Gets Created
 
-- **Stateful pgEdge Workload** — PostgreSQL 17 with the Spock extension. One set of replicas per configured location, each with its own persistent volume.
-- **Standard pgcat Workload** — Connection pooler that routes application traffic to pgEdge nodes. Autoscales on RPS.
-- **Cron Backup Workload** *(optional)* — Runs `pg_dump` on a schedule and uploads the result to AWS S3 or GCS. Only active in the first configured location.
-- **Volume Set** — ext4 general-purpose SSD volumes with 7-day snapshots. One volume per replica.
-- **Identity & Policy** — An identity bound to the workloads with `reveal` permissions on all secrets. When backup is enabled, the identity is also configured with the appropriate cloud account and IAM policy.
-- **Secrets** — A dictionary secret holding database credentials, an opaque secret containing the pgcat TOML configuration, and an opaque secret containing the node startup script.
-- **GVC** — A GVC spanning all configured locations.
+- **Stateful pgEdge Workload** — PostgreSQL 17 with the Spock extension. One set of replicas per configured location, each replica individually addressable through replica-direct DNS.
+- **Standard pgcat Workload** — Connection pooler that routes application traffic to pgEdge nodes. Runs `pgcat.minReplicas` to `pgcat.maxReplicas` replicas in each configured location and autoscales on RPS.
+- **Cron Backup Workload** *(optional)* — Runs `pg_dump` on a schedule and uploads the result to AWS S3 or GCS. Suspended in every location except the first one you configure.
+- **Volume Set** — ext4 general-purpose SSD volumes with 7-day snapshots and a final snapshot on deletion. One volume per replica.
+- **Identity & Two Policies** — An identity bound to the workloads, with `reveal` on this release's secrets and on your credentials secret, plus `view` on the one GVC you install into so each node can confirm at boot that the GVC really has every location you listed. When backup is enabled, the identity also carries the cloud account and IAM policy.
+- **Secrets** — An opaque secret holding the pgEdge node startup script, an opaque secret holding the pgcat startup script, and, only when backup is enabled, a dictionary secret holding the backup destination. Your credentials secret is created by you and is never part of the release.
+
+<Note>
+**This template does not create a GVC.** Every resource lands in the GVC you install into, so `cpln workload exec`, `cpln logs` and uninstalling all work against that GVC, and uninstalling can never delete it. Nothing runs in a GVC location you did not list in `locations`.
+</Note>
 
 ## Prerequisites
 
-- At least one Control Plane [location](/reference/location) to deploy into.
-- For backup: an AWS or GCP [cloud account](/guides/create-cloud-account) and a storage bucket.
+**A GVC must already exist, and it must contain every location you list in `locations`.** The requirement is one-directional — the GVC may have *more* locations than you list, and nothing pgEdge-related runs in those. Check what a GVC has before installing:
+
+```bash
+cpln gvc get GVC_NAME -o json
+```
+
+The locations are under `spec.staticPlacement.locationLinks`. To add a missing one:
+
+```bash
+cpln gvc add-location GVC_NAME --location aws-us-east-2
+```
+
+Every workload in a GVC runs in every location that GVC has, so add locations to a shared GVC deliberately.
+
+<Warning>
+**A location the GVC does not have is not caught at install time.** The install succeeds — the platform does not validate it — and the pgEdge containers then refuse to initialize, restarting with this in the logs:
+
+```text
+[pgedge] FATAL: locations declared in values are not in GVC 'my-gvc': aws-eu-central-1
+[pgedge] GVC 'my-gvc' has: aws-us-west-2 aws-us-east-2
+```
+
+A node that has **already** initialized logs a `WARNING` instead and keeps serving, so this check can never take down a running cluster. Read it with a server-side filter:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-pgedge"} |= "[pgedge]"' --limit 100 --since 15m
+```
+</Warning>
 
 **One `dictionary` secret must exist before you install.** These are the credentials you type into every connection string, so they are not values — a value would leave them in the Helm release.
 
@@ -54,8 +89,9 @@ cpln workload get-deployments RELEASE_NAME-pgedge --gvc GVC_NAME -o yaml
 Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the missing secret repairs it on its own in roughly **5.5 to 10.5 minutes**, or run `cpln workload force-redeployment RELEASE_NAME-pgedge --gvc GVC_NAME` to clear it in about 90 seconds.
 </Warning>
 
+For backups you also need an AWS or GCP [cloud account](/guides/create-cloud-account) and a storage bucket. See [Backup](#backup).
 
-### Installation
+## Installation
 
 To install, follow the instructions for your preferred method:
 
@@ -81,51 +117,110 @@ To install, follow the instructions for your preferred method:
     </Card>
 </CardGroup>
 
-## Upgrading From 1.0.x
+## Migrating from 1.x
 
-Template versions up to 1.0.2 took the database credentials as plain Helm values and shipped a working default password. Version 1.1.0 removes them.
+Template versions through 1.1.1 created their own GVC, so that GVC is part of the 1.x release's manifest. Version 2.0.0 does not declare it — and Helm deletes what a chart stops declaring.
 
 <Warning>
-**Carrying the old values forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing cluster is left untouched and running:
+**An in-place upgrade from 1.x to 2.0.0 destroys the cluster.** Measured with the chart's guard removed: the upgrade **deleted the GVC and every workload, volume set and identity inside it in 6 seconds, and reported that the release had been upgraded successfully.** Reading the GVC back afterwards returned `404`. The volume set holds your data.
+
+The chart ships a render-time refusal so this cannot happen by accident: any leftover `gvc` key in your values aborts the upgrade before a single API call is made, leaving your cluster untouched and running.
 
 ```text
-Error: execution error at (pgedge/templates/identity.yaml:3:4): pgedge: postgres.username,
-postgres.password and postgres.database were REMOVED — they are now a `dictionary` secret you
-create, named by postgres.credentialsSecretName, holding the keys `username`, `password` and
-`database`. Delete them from your values. See Prerequisites in the README.
+Error: execution error at (pgedge/templates/identity.yaml:2:4): pgedge 2.0.0: the `gvc` values key
+was REMOVED. This chart no longer creates a GVC -- it deploys into the GVC you install into, and
+`gvc.locations` moved to the top-level `locations`. DO NOT `helm upgrade` a 1.x release onto 2.0.0:
+the upgrade drops `kind: gvc` from the manifest and Helm deletes what a chart no longer declares,
+which DESTROYS that GVC and every workload, volumeset and identity inside it.
 ```
+
+**The guard cannot cover one case: an upgrade run with no values at all.** A 1.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires and the deletion proceeds. Do not run an upgrade of a 1.x release against the 2.0.0 chart under any circumstances — migrate to a new release instead.
 </Warning>
 
 <Steps>
-  <Step title="Create the secret with the credentials the cluster already has">
-    Credentials were applied when the data directory was first initialized, so a new value does not change the cluster — it just leaves clients unable to authenticate. Follow [Prerequisites](#prerequisites) using your existing values.
+  <Step title="Back up the old cluster">
+    Use `backup.enabled` on the 1.x release, or take a manual dump against a node directly:
+
+    ```bash
+    pg_dump "host=replica-0.OLD_RELEASE-pgedge.LOCATION.OLD_GVC.cpln.local user=USERNAME dbname=DATABASE" \
+      | gzip > pgedge-backup.sql.gz
+    ```
+
+    If replication on the old cluster is dead — which it is on every 1.x install that never applied the fix below — nodes may hold **different** data. Compare row counts per node before deciding which one to dump, or reconcile them first with [the replication fix](#switching-replication-on-for-an-existing-1-x-cluster).
   </Step>
-  <Step title="Remove the old keys and upgrade">
-    Delete `postgres.username`, `postgres.password` and `postgres.database`, and set `postgres.credentialsSecretName`.
+  <Step title="Choose the GVC for the new release">
+    Create or pick a GVC and make sure it has exactly the locations you intend to list in `locations`. See [Prerequisites](#prerequisites).
   </Step>
-  <Step title="Rotate a default password">
-    `password` was published in the public template repository. Rotate with `ALTER ROLE myuser WITH PASSWORD '...'` on any node, then update the secret to match.
+  <Step title="Create the credentials secret and install 2.0.0 as a NEW release">
+    Use a **different release name**: secret names are org-wide, so a same-named release collides with the 1.x one even in another GVC.
+
+    Coming from 1.0.2 or earlier, the credentials were plain values then (`postgres.username`, `postgres.password`, `postgres.database`) and the template shipped a working default password that was published in the public template repository. Put your current values into the dictionary secret so clients keep working, then rotate the password once the new cluster is serving:
+
+    ```sql
+    ALTER ROLE myuser WITH PASSWORD 'NEW-STRONG-PASSWORD';
+    ```
+
+    ```bash
+    printf 'data:\n  password: NEW-STRONG-PASSWORD\n' | cpln secret patch my-pgedge-credentials -f -
+    ```
+
+    A rotated secret is only picked up when a replica starts, so follow it with `cpln workload force-redeployment RELEASE_NAME-pgcat --gvc GVC_NAME`.
+  </Step>
+  <Step title="Restore and cut over">
+    Restore the dump into the new cluster (see [Restoring a Backup](#restoring-a-backup)), then point your applications at the new pooled endpoint, `NEW_RELEASE-pgcat.NEW_GVC.cpln.local:5432`.
+  </Step>
+  <Step title="Uninstall the old release against the GVC you installed it into">
+    Not the GVC it created — the GVC you passed at install time is where Helm tracks the release, and uninstalling from there takes the created GVC with it.
   </Step>
 </Steps>
 
-<Note>
-**pgcat now builds its configuration at container start.** Its config is a TOML *file*, and a `cpln://` reference inside a file is never resolved — the platform only resolves them for environment variables. So rather than rendering the password into the file, 1.1.0 mounts a startup script that assembles the config from the secret at boot. Nothing changes in how you configure pgcat; the `pgcat.*` values are unchanged.
-</Note>
+### Switching Replication On for an Existing 1.x Cluster
+
+PostgreSQL 17.11 ships `output_plugin_libraries = 'pgoutput, test_decoding'`, and Spock's output plugin is not on that list. On every template version through 1.1.1 this means **no replication slot could ever be created**: each subscription sits at `down`, each node accepts writes that never leave it, and every status surface still reports healthy. The reason appears in the node's own PostgreSQL server log, not in `cpln logs`:
+
+```text
+ERROR:  library "spock_output" may not be used as an output plugin
+```
+
+Version 2.0.0 writes the setting into `postgresql.conf` during `initdb`, so a **fresh** 2.0.0 install needs nothing. An existing data directory keeps the old setting, so if you are staying on 1.x while planning the migration, apply it by hand **on every node**, connecting to each node directly rather than through pgcat:
+
+```bash
+psql "host=replica-0.RELEASE_NAME-pgedge.LOCATION.GVC_NAME.cpln.local user=USERNAME dbname=DATABASE" \
+  -c "ALTER SYSTEM SET output_plugin_libraries = pgoutput, test_decoding, spock_output;" \
+  -c "SELECT pg_reload_conf();"
+```
+
+<Warning>
+**The value must be unquoted here.** `ALTER SYSTEM` adds the quoting for you; quoting it yourself stores a single bogus plugin literally named `"pgoutput, test_decoding, spock_output"` and the error persists. This differs from the `postgresql.conf` form, where the whole list is one quoted string. Confirm with `SHOW output_plugin_libraries;` — the output must contain no quotation marks.
+</Warning>
+
+Subscriptions move to `replicating` within seconds of the reload. Check on every node:
+
+```sql
+SELECT subscription_name, status FROM spock.sub_show_status();
+```
+
+<Warning>
+**On 1.x, avoid restarting all nodes at once.** The pre-2.0.0 startup routine drops every replication slot that is momentarily inactive — which is all of them during a simultaneous restart — and never recreates them, so the mesh breaks and does not heal on its own. This is fixed in 2.0.0; on 1.x, restart one location at a time.
+</Warning>
 
 ## Configuration
 
 The default `values.yaml` for this template:
 
 ```yaml
-gvc:
-  name: pgedge-gvc
-  locations: # For replicas: use 1 for dev/testing, 3 for production
-    - name: aws-us-west-2
-      replicas: 3
-    - name: aws-us-east-2
-      replicas: 3
-    - name: aws-eu-central-1
-      replicas: 3
+# ─── Locations ────────────────────────────────────────────────────────────────
+# This chart deploys into the GVC you install into — it does NOT create one.
+# Every location listed here MUST already exist in that GVC, or the pgEdge nodes
+# refuse to initialise with a named error (see Prerequisites in the README).
+# Extra locations in the GVC are fine: nothing pgEdge-related runs in them.
+locations: # For replicas: use 1 for dev/testing, 3 for production
+  - name: aws-us-west-2
+    replicas: 3
+  - name: aws-us-east-2
+    replicas: 3
+  - name: aws-eu-central-1
+    replicas: 3
 
 image: ghcr.io/pgedge/pgedge-postgres:17-spock5-standard
 
@@ -136,7 +231,12 @@ resources:
   maxMemory: 4Gi
 
 postgres:
-  credentialsSecretName: my-pgedge-credentials # see Prerequisites — must exist before install
+  # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+  # A `dictionary` secret holding exactly three keys: `username`, `password`
+  # and `database`. If it does not exist at install time the deployment
+  # WEDGES silently — `cpln logs` returns nothing at all. See Prerequisites
+  # in the README for the exact `cpln secret create-dictionary` command.
+  credentialsSecretName: my-pgedge-credentials
 
 multiZone: false  # Set to true to spread replicas across availability zones within each location
 
@@ -152,12 +252,11 @@ pgcat:
   image: ghcr.io/postgresml/pgcat:v1.2.0 # pinned: `latest` makes installs non-reproducible
   poolMode: transaction  # options: session, transaction, statement
   defaultPoolSize: 25    # Real Postgres connections pgcat maintains per pool
-  maxClientConn: 1000    # Maximum client connections pgcat accepts
   resources:
     cpu: 500m
     memory: 256Mi
-  minReplicas: 2
-  maxReplicas: 4
+  minReplicas: 2         # per location
+  maxReplicas: 4         # per location
 
 internal_access: # Sets both pgedge and pgcat workloads
   type: same-gvc  # options: same-gvc, same-org, workload-list
@@ -167,7 +266,7 @@ internal_access: # Sets both pgedge and pgcat workloads
 backup:
   enabled: false
   image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
-  schedule: "0 2 * * *"   # daily at 2am UTC
+  schedule: "0 2 * * *"   # daily at 2am UTC — runs in locations[0] only
 
   resources:
     cpu: 100m
@@ -188,16 +287,22 @@ backup:
     prefix: pgedge/backups  # folder where backups will be stored
 ```
 
-### GVC & Locations
+### Locations and Replicas
 
-Each independent pgEdge deployment must use a unique `gvc.name`. Configure one or more locations, each with a replica count:
+Each entry pairs a location with a replica count. Every location listed must exist in the GVC you install into; extra GVC locations are ignored. Listing the same location twice is rejected at render — duplicates would produce duplicate Spock node names.
 
 | Environment | Replicas per location |
 |---|---|
 | Dev / testing | 1 |
 | Production | 3 |
 
+The **first** entry is special: its `replica-0` is the node pgcat sends writes to, and it is the only location the backup cron runs in.
+
 Set `multiZone: true` to spread replicas across availability zones within each location. Verify your selected locations support multiple availability zones before enabling.
+
+<Note>
+GVC locations you did not list show as red in the console, with `This workload location is deactivated because maxScale is set to 0.` That is the mechanism that keeps a shared GVC safe — it is what a healthy install looks like, not a fault.
+</Note>
 
 ### Volume Set
 
@@ -215,7 +320,7 @@ volumeset:
 
 ### Internal Access
 
-Control which workloads can connect to pgEdge and pgcat:
+Control which workloads can connect to pgEdge and pgcat. Neither workload is exposed publicly, and the template has no public access option.
 
 ```yaml
 internal_access:
@@ -231,7 +336,7 @@ internal_access:
 
 ### pgcat Pool Modes
 
-pgcat multiplexes application connections into a smaller pool of real database connections, reducing overhead and protecting Postgres from connection exhaustion.
+pgcat multiplexes application connections into a smaller pool of real database connections, reducing overhead and protecting Postgres from connection exhaustion. `defaultPoolSize` sets how many real Postgres connections pgcat maintains per pool.
 
 | Mode | Behavior |
 |---|---|
@@ -239,43 +344,84 @@ pgcat multiplexes application connections into a smaller pool of real database c
 | `session` | Connection held for the entire client session. Compatible with all Postgres features but provides less connection reuse. |
 | `statement` | Connection returned after every statement. Transactions are not supported. Rarely used. |
 
+### pgcat Read and Write Routing
+
+pgcat parses each query, sends writes to `replica-0` of your first configured location, and sends reads to the other nodes. A single-node cluster has no other node, so that one node serves reads as well — otherwise every `SELECT` would fail with `AllServersDown`. This switches on node count alone and needs no configuration.
+
+<Warning>
+**Routing is decided by statement shape, not by what the statement does.** A data-modifying CTE such as `WITH ins AS (INSERT ... RETURNING *) SELECT * FROM ins` is classified as a read and routed to a replica. Every node accepts writes, so the write still succeeds — but "writes go to the primary" is a heuristic, not a guarantee. Send anything whose placement matters through a connection you know reaches the node you intend.
+</Warning>
+
+<Note>
+**pgcat builds its configuration at container start.** Its config is a TOML *file*, and a `cpln://` secret reference inside a file is never resolved — the platform only resolves those for environment variables. So rather than rendering the password into the file, the template mounts a startup script that assembles the config from the secret at boot. Nothing changes in how you configure pgcat.
+</Note>
+
 ## Connecting
 
-Connect through pgcat for all application traffic. Each application only needs this single endpoint — pgcat handles routing to the appropriate pgEdge node:
+Connect through pgcat for all application traffic. Use the fully-qualified `.GVC_NAME.cpln.local` form — the bare workload name does not resolve reliably from every workload type.
 
-```
-Host:     {release-name}-pgcat.{gvc-name}.cpln.local
-Port:     5432
-Database: {postgres.database}
-Username: {postgres.username}
-Password: {postgres.password}
-```
+| | |
+|---|---|
+| Pooled endpoint (use this) | `RELEASE_NAME-pgcat.GVC_NAME.cpln.local:5432` |
+| A single node, directly | `replica-N.RELEASE_NAME-pgedge.LOCATION.GVC_NAME.cpln.local:5432` |
+| pgcat admin console | Same host, database `pgcat`, user `pgcat_admin` |
+| Database | The `database` entry of your credentials secret |
+| Username / password | The `username` / `password` entries of your credentials secret |
+| pgcat admin password | The `password` entry of your credentials secret |
+
+Connect to a node directly when you need to control which node executes a statement — schema changes, per-node verification and reconciliation all require a direct connection.
 
 ## Schema Changes (DDL)
 
-Spock replicates row-level changes (`INSERT`, `UPDATE`, `DELETE`) automatically. DDL (`CREATE TABLE`, `ALTER TABLE`, etc.) must be broadcast using `spock.replicate_ddl()` so it executes on all nodes.
+Spock replicates row-level changes (`INSERT`, `UPDATE`, `DELETE`) automatically. **DDL does not replicate.** A plain `CREATE TABLE` or `ALTER TABLE` applies only to the node you ran it on; the other nodes never learn about it, and rows written into that table on one node cannot be applied on a node where it does not exist.
 
-### Creating a table
+<Warning>
+**Every table must have a `PRIMARY KEY`.** The template adds each new table to the `default` replication set automatically, and that set replicates `UPDATE` and `DELETE`, which Spock cannot do without a key. A table without one does not merely fail to replicate — the `CREATE TABLE` itself is rejected:
 
-Run on **one node only** — the DDL replicates to all nodes, then add the table to the replication set:
+```text
+ERROR:  table events cannot be added to replication set default
+DETAIL:  table does not have PRIMARY KEY and given replication set is configured to replicate UPDATEs and/or DELETEs
+```
+</Warning>
+
+### Creating a Table
+
+The simplest correct procedure is to run the same `CREATE TABLE` on **every** node. The auto-add trigger fires locally on each one, so the table ends up in the `default` replication set everywhere and DML replicates in all directions:
 
 ```sql
--- Step 1: Run on ONE node -- creates the table on all nodes
+-- Run on EVERY node, connecting to each directly (not through pgcat)
+CREATE TABLE orders (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  amount numeric,
+  created_at timestamptz DEFAULT now()
+);
+```
+
+For larger clusters you can broadcast the DDL instead — but it takes **two** steps, and the second one runs on the other nodes, not on the node that broadcast:
+
+```sql
+-- Step 1: on ONE node -- creates the table on all nodes
 SELECT spock.replicate_ddl('CREATE TABLE orders (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   amount numeric,
   created_at timestamptz DEFAULT now()
 );');
 
--- Step 2: Run on ONE node -- adds the table to the replication set on all nodes
+-- Step 2: on every OTHER node -- adds the table to that node's replication set
 SELECT spock.repset_add_table('default', 'orders'::regclass);
 ```
 
-<Note>
-Step 2 is required because Spock suppresses event triggers during replication apply to prevent loops. The `repset_add_table` call itself replicates to all other nodes automatically.
-</Note>
+Step 2 is needed because Spock suppresses event triggers while applying replicated changes, so the auto-add trigger fires only on the node that called `replicate_ddl`. Running step 2 on *that* node fails with `duplicate key value violates unique constraint "replication_set_table_pkey"`, and skipping it strands writes made on the other nodes — outbound filtering happens where the write lands. Confirm on every node:
+
+```sql
+SELECT * FROM spock.tables WHERE relname = 'orders';
+```
+
+Each node must return a row.
 
 ### Other DDL
+
+`ALTER TABLE` and `DROP TABLE` follow the same rule — apply on every node, or broadcast once:
 
 ```sql
 SELECT spock.replicate_ddl('ALTER TABLE orders ADD COLUMN status text DEFAULT ''pending'';');
@@ -294,20 +440,44 @@ id uuid PRIMARY KEY DEFAULT gen_random_uuid()
 id serial PRIMARY KEY
 ```
 
+## Restarts and Replication Health
+
+An upgrade, or anything else that restarts the pgEdge tier, restarts **every replica in every location at once** — nothing serializes a rolling restart on a stateful workload. Treat it as a planned write interruption.
+
+- **Writes are unavailable for about 60 seconds.** Measured across a three-location simultaneous restart, with one write per second flowing through pgcat.
+- **pgcat bans a backend for a further 60 seconds** after a failed health check, so queries can keep failing with `AllServersDown` for up to a minute after the nodes themselves are back.
+- **Readiness is not a serving signal here.** The workload can report ready before writes actually succeed again.
+
+The mesh reconciles itself afterwards without intervention: on boot each node keeps replication slots that a subscription still owns, drops only genuinely orphaned ones, skips the cleanup entirely while any peer is unreachable, and recreates any subscription whose slot has gone missing. A deliberately broken subscription healed unattended in about two minutes, and a cluster survived three consecutive simultaneous restarts intact.
+
+<Warning>
+**Self-repair restores replication, not history.** When a broken subscription is rebuilt, replication resumes from the current position — rows written while it was down are **not** backfilled. A node that took writes while it was cut off needs those rows reconciled by hand.
+</Warning>
+
+Check replication health on any node:
+
+```sql
+SELECT subscription_name, status FROM spock.sub_show_status();
+```
+
+Every row must read `replicating`. On a healthy cluster of N nodes, each node has N−1 subscriptions and N−1 replication slots.
+
 ## Backup
 
-When `backup.enabled` is `true`, a cron workload runs `pg_dump` on the configured schedule. Because every pgEdge node holds a full copy of the data, the backup job connects to `replica-0` of the first configured location. Backup runs only in the first location — other locations have the backup workload suspended.
+When `backup.enabled` is `true`, a cron workload runs `pg_dump` on the configured schedule. Because every pgEdge node holds a full copy of the data, the backup job connects to `replica-0` of the first configured location — and runs in that location only, however many locations the GVC has.
+
+Keep `backup.schedule` quoted in your values file. Any valid cron expression works, including one beginning with `*` such as `"*/30 * * * *"`.
 
 ### AWS S3 Prerequisites
 
-1. Create your S3 bucket and note its name and region.
+1. Create your S3 bucket and note its name and region. Set `backup.aws.bucket` and `backup.aws.region`.
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Note the cloud account name.
 3. Create a new AWS IAM policy with the following JSON (replace `YOUR_BUCKET_NAME`):
 
 <Warning>
 **Version 1.1.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
 
-**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
+**Update your IAM policy to the full action list below.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before.
 </Warning>
 
 ```json
@@ -342,7 +512,7 @@ When `backup.enabled` is `true`, a cron workload runs `pg_dump` on the configure
 
 ### GCS Prerequisites
 
-1. Create your GCS bucket and note its name.
+1. Create your GCS bucket and note its name. Set `backup.gcp.bucket`.
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Note the cloud account name.
 3. Add the `Storage Admin` role to the GCP service account created by the cloud account.
 4. Set `backup.gcp.cloudAccountName` to your cloud account name.
@@ -379,9 +549,13 @@ unset PGPASSWORD
 
 ## Important Notes
 
-- **GVC naming** — Each independent pgEdge deployment must use a unique GVC name.
+- **Never upgrade a 1.x release onto 2.0.0 in place** — it deletes the GVC the 1.x chart created and everything in it. Migrate to a new release: [Migrating from 1.x](#migrating-from-1-x).
+- **The GVC must contain every location you list**, and may contain more. A missing location is not caught at install: the pgEdge container exits with `FATAL: locations declared in values are not in GVC ...`. An already-initialized node logs a `WARNING` instead and keeps serving.
+- **Shrinking the GVC's location list under a running cluster** leaves every node logging that warning on each restart — shrink `locations` in your values at the same time.
+- **Release names must be unique per org** — secrets are org-wide, so two releases with the same name collide even in different GVCs.
 - **Minimum replicas** — Use at least 3 replicas per location for production to survive a node loss within a location.
 - **Conflict resolution** — Concurrent writes to the same row from different nodes are resolved by last-update-wins based on commit timestamp. For workloads requiring stronger consistency, route writes for a given entity to a single node using application-level logic.
+- **DDL does not replicate** — create every table on every node, and give every table a `PRIMARY KEY` or `CREATE TABLE` fails outright.
 - **multiZone** — Verify your selected locations support multiple availability zones before enabling.
 
 ## External References
