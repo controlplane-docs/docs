@@ -1,38 +1,119 @@
 ---
 title: Airflow
-description: Deploy Apache Airflow on Control Plane using the Template Catalog. Covers the prerequisite auth secret, the Fernet key that cannot be rotated, the closed-by-default web UI reached over a port-forward, Celery workers with KEDA autoscaling, git-sync DAG delivery, and upgrading from template version 1.4.x.
-keywords: ['apache airflow', 'dag scheduler', 'etl orchestrator', 'workflow engine', 'prefect alternative', 'dagster alternative', 'airflow webserver', 'celeryexecutor', 'keda autoscaling', 'fernet key', 'task queue', 'git-sync', 'port forward']
+description: Deploy Apache Airflow on Control Plane using the Template Catalog. Covers the prerequisite auth secret, the Fernet key that cannot be rotated, the single location the release runs in, the closed-by-default web UI reached over a port-forward, Celery workers with optional KEDA autoscaling, git-sync DAG delivery, and migrating from template version 1.x.
+keywords: ['apache airflow', 'dag scheduler', 'etl orchestrator', 'workflow engine', 'prefect alternative', 'dagster alternative', 'airflow webserver', 'celeryexecutor', 'keda autoscaling', 'fernet key', 'task queue', 'git-sync', 'port forward', 'shared volumeset']
 ---
+
+<Warning>
+**Template version 2.0.0 is a breaking change, and one of the changes is a data-loss hazard.**
+
+- **The template no longer creates a GVC.** It deploys into the GVC you install into. The `gvc.name` and `gvc.locations` values are gone; Airflow runs in a single top-level `location` string.
+- **Never upgrade a 1.x release onto 2.0.0 in place.** A 1.x release owns the GVC it created, and Helm deletes what a chart stops declaring — the upgrade destroys that GVC and **every workload, volume set and identity inside it**, including your metadata database and your DAGs. Migrate to a new release instead: [Migrating from 1.x](#migrating-from-1-x).
+- **KEDA autoscaling is now opt-in and defaults to `false`.** KEDA is a GVC-level setting a chart cannot turn on for you, and turning it on against a GVC that does not have it is accepted in silence. See [KEDA Autoscaling](#keda-autoscaling).
+</Warning>
 
 ## Overview
 
-Apache Airflow is an open-source platform for programmatically authoring, scheduling, and monitoring workflows. This template deploys a full Airflow 3.x stack using the CeleryExecutor, with Redis as the task broker, PostgreSQL as the metadata database, KEDA autoscaling for the Celery workers, and optional git-sync DAG delivery.
+Apache Airflow is an open-source platform for programmatically authoring, scheduling, and monitoring workflows. This template deploys a full Airflow 3.x stack into an existing GVC using the CeleryExecutor, with Redis as the task broker, PostgreSQL as the metadata database, Celery workers at a fixed replica count or scaled by KEDA, and optional git-sync DAG delivery.
 
 The admin login and both signing keys are not template values. They come from a dictionary secret you create before installing, so they never pass through Helm and never land in the release. The web UI ships **closed to the internet**, because it can trigger arbitrary code and decrypt every credential stored in an Airflow Connection.
 
 <Warning>
-**Template version 1.5.0 is a breaking change.** `airflow.auth.jwtSecret`, `airflow.auth.fernetKey`, `airflow.admin.password` and `gitSync.auth.token` were removed, `airflow.auth.jwtExpirationDelta` and `airflow.auth.jwtRefreshThreshold` were removed because Airflow 3.x ignores them, and the public web UI became closed by default. An install that still sets any removed key fails at render. If you are running 1.4.x or earlier, read [Upgrading From Earlier Versions](#upgrading-from-earlier-versions) first — the Fernet key change is a data migration, not an upgrade.
+**Template version 1.5.0 was also a breaking change.** `airflow.auth.jwtSecret`, `airflow.auth.fernetKey`, `airflow.admin.password` and `gitSync.auth.token` were removed, `airflow.auth.jwtExpirationDelta` and `airflow.auth.jwtRefreshThreshold` were removed because Airflow 3.x ignores them, and the public web UI became closed by default. An install that still sets any removed key fails at render. If you are coming from 1.4 or earlier, read [Earlier Breaking Changes](#earlier-breaking-changes) as well — the Fernet key change is a data migration, not an upgrade.
 </Warning>
 
 ### What Gets Created
 
-- **GVC** — This template **creates its own GVC**, named by `gvc.name`, because KEDA is a GVC-level setting.
-- **Airflow Webserver** — (`RELEASE_NAME-airflow-webserver`): a stateful, single-replica workload running the API server, scheduler, dag-processor and triggerer in one container, serving the UI and REST API on port `8080`.
-- **Celery Workers** — (`RELEASE_NAME-airflow-celery-worker`): a stateful workload executing DAG tasks, scaled by KEDA on the Redis queue length.
+- **Airflow Webserver** — (`RELEASE_NAME-airflow-webserver`): a stateful, single-replica workload running the API server, scheduler, dag-processor and triggerer in one container, serving the UI and REST API on port `8080`. It is the only tier with external inbound access, and the only one that runs the boot-time GVC checks.
+- **Celery Workers** — (`RELEASE_NAME-airflow-celery-worker`): a stateful workload executing DAG tasks, at a fixed `airflow.celeryWorker.replicas` or scaled by KEDA on the Redis queue length.
 - **Redis** — (`RELEASE_NAME-airflow-redis`): the Celery broker, on its own persistent volume set.
 - **PostgreSQL** — (`RELEASE_NAME-airflow-postgres`): the Airflow metadata database, on its own persistent volume set.
 - **Airflow Volume Set** — (`RELEASE_NAME-airflow-vs`): a shared-filesystem volume mounted as the Airflow home by the webserver and every worker, so they all see the same DAGs and logs.
 - **Config Secret** — (`RELEASE_NAME-airflow-config`): a dictionary secret holding the metadata database username and password. It carries no key material.
-- **Identity & Policy** — An identity bound to the workloads and a policy granting it `reveal` on exactly the secrets they mount: the database config secret, your auth secret, and your git token secret when git-sync uses one.
+- **Webserver Startup Secret** — (`RELEASE_NAME-airflow-webserver-startup`): an opaque secret holding the webserver's startup script, which runs the topology checks before Airflow's own boot sequence.
+- **Identity & Two Policies** — An identity bound to the workloads, with `reveal` on exactly the secrets they mount (the database config secret, the startup script, your auth secret, and your git token secret when git-sync uses one), plus `view` on the one GVC you install into so the webserver can check its own topology at boot.
 - **git-sync Sidecar** *(optional)* — Polls a Git repository and syncs DAGs onto the shared volume.
 
+<Note>
+**This template does not create a GVC.** Every resource lands in the GVC you install into, pinned to the single `location` you configure, so `cpln workload exec`, `cpln logs` and uninstalling all work against that GVC, and uninstalling can never delete it. Nothing Airflow-related runs in the GVC's other locations.
+</Note>
+
+## Migrating from 1.x
+
+Template versions through 1.5.0 created their own GVC — KEDA is a GVC-level setting, and the chart wanted to own it. Version 2.0.0 does not declare a GVC at all, and Helm deletes what a chart stops declaring.
+
 <Warning>
-**This template creates a GVC, so point `gvc.name` at a new name.** Helm adopts a GVC that already exists, and `helm uninstall` then deletes it along with every unrelated workload in it. Never point it at a GVC that already holds other workloads.
+**An in-place upgrade from 1.x to 2.0.0 destroys the deployment.** Measured on a sibling template with the guard removed: the upgrade **deleted the GVC and every workload, volume set and identity inside it in 6 seconds, and reported that the release had been upgraded successfully.** Reading the GVC back afterwards returned `404`. Here that would take your metadata database — every Connection, Variable, DAG run and task history — and the shared volume holding your DAGs and logs.
+
+The chart ships a render-time refusal so this cannot happen by accident: any leftover `gvc` key in your values aborts the upgrade before Helm computes a diff or contacts the API, leaving your deployment untouched and running.
+
+```text
+Error: execution error at (airflow/templates/workload-webserver.yaml:1:4): airflow 2.0.0: the `gvc`
+values key was REMOVED. This chart no longer creates a GVC — it deploys into the GVC you install
+into, and `gvc.locations` became the single top-level `location`. DO NOT `helm upgrade` a 1.x
+release onto 2.0.0: the upgrade drops `kind: gvc` from the manifest and Helm deletes what a chart no
+longer declares, which DESTROYS that GVC and every workload, volumeset and identity inside it —
+including your Airflow metadata database and your DAGs.
+```
+
+**Two things this guard cannot do.** An upgrade run with no values at all sees only the new chart's defaults, has no `gvc` key to catch, and proceeds — so the rule matters more than the guard. And when the refusal does fire, `cpln helm upgrade` **exits 0**: nothing is destroyed, but a script chaining on success would carry on regardless. Check the output, not the exit code.
 </Warning>
 
-## Upgrading From Earlier Versions
+Migrate to a **new release** instead:
 
-Template version 1.4.x and earlier carried the JWT signing secret, the Fernet key, the admin password and the git token as plain Helm values, and shipped a working `CHANGE_ME` default for the first three. All four were removed with no compatibility fallback; a values file that still sets one fails at render with a message naming its replacement.
+<Steps>
+  <Step title="Choose the GVC for the new release">
+    Create or pick a GVC that already contains the location you intend to set as `location`. See [Prerequisites](#prerequisites). If you plan to use KEDA, enable it on that GVC now.
+  </Step>
+  <Step title="Install 2.0.0 as a NEW release, pointing at the SAME auth secret">
+    Use a **different release name** — secret names are org-wide, so a same-named release collides with the 1.x one even in another GVC. Point `airflow.auth.secretName` at the **same auth secret** the 1.x release used: the `fernetKey` must be identical, or every Connection and Variable you restore becomes unreadable.
+  </Step>
+  <Step title="Move the metadata database">
+    Substitute the `postgres.config.username` and `postgres.config.database` values each release actually uses:
+
+    ```bash
+    cpln workload exec OLD_RELEASE-airflow-postgres --gvc OLD_GVC --container postgresql -- \
+      pg_dump -U username -d airflow -Fc > airflow.dump
+    ```
+
+    ```bash
+    cpln workload exec NEW_RELEASE-airflow-postgres --gvc NEW_GVC --container postgresql --stdin -- \
+      pg_restore -U username -d airflow --clean --if-exists < airflow.dump
+    ```
+  </Step>
+  <Step title="Move the DAGs">
+    With `gitSync.enabled: true` there is nothing to do — the sidecar re-clones onto the new volume. Otherwise copy them off the old shared volume:
+
+    ```bash
+    cpln workload exec OLD_RELEASE-airflow-webserver --gvc OLD_GVC --container airflow -- \
+      tar -cf - -C /opt/airflow/dags . > dags.tar
+    ```
+
+    ```bash
+    cpln workload exec NEW_RELEASE-airflow-webserver --gvc NEW_GVC --container airflow --stdin -- \
+      tar -xf - -C /opt/airflow/dags < dags.tar
+    ```
+  </Step>
+  <Step title="Verify before you uninstall anything">
+    Force a redeployment of the new webserver so the scheduler re-reads the restored database, then confirm in the UI that your DAGs, Connections and Variables are all present. Only then uninstall the old release — that deletes the GVC 1.x created, and everything still in it.
+
+    Uninstall it **against the GVC you installed it into**, not the one it created: that is where Helm tracks the release, and uninstalling from there takes the created GVC with it.
+  </Step>
+</Steps>
+
+Values that moved or were removed in 2.0.0. Each one is named at render time rather than ignored, so an old values file produces an error instead of a silent misconfiguration:
+
+| 1.x | 2.0.0 |
+|---|---|
+| `gvc.name` | Gone. The chart deploys into the GVC you install into |
+| `gvc.locations` | `location`, a single top-level location **name** |
+| `keda.enabled: true` by default | `false` by default, and it now requires KEDA enabled on your GVC |
+| — | `airflow.celeryWorker.replicas`, the fixed worker count used when KEDA is off |
+| — | `internalAccess.type` / `internalAccess.workloads` |
+
+### Earlier Breaking Changes
+
+Template version 1.4 and earlier carried the JWT signing secret, the Fernet key, the admin password and the git token as plain Helm values, and shipped a working `CHANGE_ME` default for the first three. All four were removed in 1.5.0 with no compatibility fallback; a values file that still sets one fails at render with a message naming its replacement.
 
 | 1.4.x and earlier | 1.5.0 |
 |---|---|
@@ -56,7 +137,45 @@ If your 1.4.x install ran on the shipped `CHANGE_ME` default, every one of those
 
 ## Prerequisites
 
-**One secret must exist before you install.** Its values never pass through Helm, so they never land in the release. Secrets are org-level, so no GVC flag is involved.
+### A GVC Containing the Location You Configure
+
+**A GVC must already exist, and `location` must be one of its locations.** Extra locations in the GVC are fine — nothing Airflow-related runs in them. Check what a GVC has before installing:
+
+```bash
+cpln gvc get GVC_NAME -o json
+```
+
+The locations are under `spec.staticPlacement.locationLinks`. To add a missing one:
+
+```bash
+cpln gvc add-location GVC_NAME --location aws-us-east-1
+```
+
+Every workload in a GVC runs in every location that GVC has, so add locations to a shared GVC deliberately.
+
+<Warning>
+**A `location` the GVC does not have is not caught at install time, and it starts nothing.** The platform stores the placement without validating it, so the install reports every resource created and succeeds — and then all four workloads sit at zero replicas, in every location. `cpln logs` returns **zero lines**, because no container ever runs.
+
+The signal is the per-location deployment message, on any of the four workloads:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-airflow-webserver --gvc GVC_NAME -o yaml
+```
+
+```text
+This workload location is deactivated because maxScale is set to 0.
+```
+
+That message is also what a *correctly* configured release shows for the GVC's other locations, so read it together with the location you configured: if **every** location reports it, `location` names somewhere the GVC does not have. Symptom in one line: the release deployed and nothing started.
+</Warning>
+
+<Note>
+If a location is removed from the GVC while Airflow is already running, the webserver's boot check reports it in the log on the next restart and keeps serving rather than taking a live install down.
+</Note>
+
+### One Secret Must Exist Before You Install
+
+Its values never pass through Helm, so they never land in the release. Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
   <Step title="Create the auth secret">
@@ -109,6 +228,28 @@ cpln workload get-deployments RELEASE_NAME-airflow-webserver --gvc GVC_NAME -o y
 It names the missing secret: `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` The command is `get-deployments` — plain `cpln workload get` has no `versions` key at all. Creating the secret recovers the workload on its own, but slowly: **poll for 5.5 to 10.5 minutes rather than time-boxing it** (10 minutes 17 seconds measured here). `cpln workload force-redeployment RELEASE_NAME-airflow-webserver --gvc GVC_NAME` cuts that to roughly 90 seconds.
 </Warning>
 
+### KEDA on the GVC
+
+Only needed when you set `keda.enabled: true`. KEDA is a **GVC-level** setting, so this template cannot turn it on for you. Enable it on the GVC first, then install with `keda.enabled: true`. Edit the file the first command writes rather than composing one:
+
+```bash
+cpln gvc get MY_GVC -o yaml-slim > gvc.yaml
+```
+
+Set `spec.keda.enabled: true` in that file, apply it, and confirm:
+
+```bash
+cpln apply -f gvc.yaml
+```
+
+```bash
+cpln gvc get MY_GVC -o yaml | grep -A1 'keda:'
+```
+
+<Warning>
+**Never hand-write a partial GVC file for `cpln apply`.** It replaces a GVC's `spec` rather than merging into it, so a file carrying only `spec.keda` wipes `spec.staticPlacement.locationLinks` — and every workload in that GVC loses its placement. Always start from `cpln gvc get ... -o yaml-slim`.
+</Warning>
+
 ## Installation
 
 To install, follow the instructions for your preferred method:
@@ -140,14 +281,18 @@ To install, follow the instructions for your preferred method:
 The default `values.yaml` for this template:
 
 ```yaml
-# ─── Global Virtual Cloud (GVC) ───────────────────────────────────────────────
-# This template CREATES its GVC (KEDA is a GVC-level setting). Point it at a NEW
-# name — never at a GVC that already holds other workloads, because uninstalling
-# the release deletes the GVC it adopted along with everything in it.
-gvc:
-  name: airflow
-  locations:
-    - name: aws-eu-central-1
+# ─── Location ─────────────────────────────────────────────────────────────────
+# This chart deploys into the GVC you install into — it does NOT create one.
+# Airflow runs in exactly ONE location, and this names it. It MUST already be a
+# location of that GVC; the webserver reads the GVC at boot and refuses a fresh
+# install if it is not (see Important Notes in the README).
+# Extra locations in the GVC are fine: nothing Airflow-related runs in them.
+#
+# One location is not a simplification. A `shared` volumeset provisions ONE
+# VOLUME PER LOCATION, so the Airflow home — DAGs and task logs — written in one
+# location is invisible in another, and the metadata database and Celery broker
+# are each a single volume bound to a single replica.
+location: aws-us-east-1
 
 # ─── Postgres (Airflow metadata database) ─────────────────────────────────────
 # Bundled plumbing: it serves Airflow only, is unreachable from outside the GVC,
@@ -161,7 +306,7 @@ postgres:
     maxMemory: 1024Mi
   config:
     username: username
-    password: change-me-airflow-db # set at FIRST install; see Upgrading in the README
+    password: change-me-airflow-db # set at FIRST install; see Migrating in the README
     database: airflow
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
@@ -184,6 +329,7 @@ airflow:
       memory: 3Gi
   celeryWorker:
     image: controlplanecorporation/celery:v1
+    replicas: 1 # fixed worker count; ignored when keda.enabled is true
     resources:
       cpu: 256m
       memory: 512Mi
@@ -210,7 +356,7 @@ airflow:
     minFileProcessInterval: 10 # minimum interval between processing a DAG file (seconds)
 
   celery:
-    workerConcurrency: 1 # tasks each worker runs concurrently, when KEDA is enabled
+    workerConcurrency: 1 # tasks each worker runs concurrently
 
 volumeset:
   airflow:
@@ -223,6 +369,13 @@ volumeset:
 # takes up to a couple of minutes to propagate.
 firewallConfig:
   inboundAllowCIDR: []
+
+# Who may reach Airflow's workloads from inside the org. Every workload this
+# release creates is ALWAYS allowed, whatever is set here — the webserver and the
+# workers have to reach the metadata database, the broker and each other.
+internalAccess:
+  type: same-gvc # options: same-gvc, same-org, workload-list
+  workloads: [] # only with workload-list, e.g. - //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
 # ─── DAG delivery (git-sync) ──────────────────────────────────────────────────
 gitSync:
@@ -238,9 +391,18 @@ gitSync:
     secretName: ""
 
 # ─── KEDA autoscaling (Celery workers) ────────────────────────────────────────
+# OFF by default, because KEDA is a GVC-LEVEL setting this chart can no longer
+# turn on for you: enabling it means editing the GVC you install into (see
+# Prerequisites in the README). Leave it off and workers run at a fixed
+# `airflow.celeryWorker.replicas`.
+#
+# Turning it on WITHOUT enabling KEDA on the GVC fails SILENTLY: the workload is
+# accepted, never autoscales, and simply sits at `minScale` forever — at
+# minScale 0 that is zero workers and every task queues with no error anywhere
+# (measured 2026-08-28). The webserver checks the GVC at boot and says so.
 keda:
-  enabled: true
-  minScale: 1 # minimum number of Celery workers
+  enabled: false
+  minScale: 1 # minimum number of Celery workers; 0 = scale to zero when idle
   maxScale: 3 # maximum number of Celery workers
   scaleToZeroDelay: 300 # idle time before scaling to zero (seconds)
   listLength: 3 # Redis queue length that triggers a scale-up
@@ -249,10 +411,19 @@ keda:
   pollingInterval: 4 # how often KEDA queries Redis (seconds)
 ```
 
-### GVC
+### Location
 
-- `gvc.name` — The name of the GVC this template creates. It must not name an existing GVC.
-- `gvc.locations` — The locations the GVC spans.
+- `location` — the single location name every workload in the release is pinned to. It must already be a location of the GVC you install into.
+
+Airflow runs in exactly **one** location, and that is structural rather than a simplification. The Airflow home is a `shared` volume set, and a shared volume set provisions **one volume per location** — so two locations would mean two Airflow homes that cannot see each other's DAGs or task logs. The metadata database and the Celery broker are each a single volume bound to a single replica on top of that. There is no multi-location shape to configure.
+
+<Note>
+GVC locations you did not name run nothing. Their deployment reads `This workload location is deactivated because maxScale is set to 0.` That is the mechanism that keeps a shared GVC safe — it is what a healthy install looks like, not a fault. It is also why a `location` the GVC lacks starts nothing anywhere; see [Prerequisites](#prerequisites).
+</Note>
+
+<Note>
+**Version 2.0.0 fixes a placement bug.** In 1.5.0 the webserver and the Redis broker carried no per-location options at all, so on a multi-location GVC the platform's defaults applied and the release would have run **one scheduler and one broker per location** — split queues, and more than one scheduler against the same metadata database. Every workload in 2.0.0 declares `0` scale by default with a single complete entry for `location`.
+</Note>
 
 ### PostgreSQL Metadata Database
 
@@ -271,6 +442,7 @@ keda:
 
 - `airflow.webserver.image` / `airflow.celeryWorker.image` — Images for the webserver and the Celery workers.
 - `airflow.webserver.resources` / `airflow.celeryWorker.resources` — CPU and memory limits for each tier.
+- `airflow.celeryWorker.replicas` — The fixed number of Celery workers. Ignored when `keda.enabled` is `true`, which hands the replica count to KEDA instead.
 - `airflow.webPort` — The port serving the UI and the REST API.
 - `airflow.auth.secretName` — Name of the prerequisite dictionary secret holding `jwtSecret`, `fernetKey` and `adminPassword`. It must exist before you install.
 - `airflow.auth.jwtExpirationTime` — API access-token lifetime in seconds, applied as `AIRFLOW__API_AUTH__JWT_EXPIRATION_TIME`. The shipped `86400` is Airflow's own default.
@@ -278,6 +450,10 @@ keda:
 - `airflow.scheduler.dagDirListInterval` — How often the DAG folder is rescanned, in seconds.
 - `airflow.scheduler.minFileProcessInterval` — Minimum interval between processing the same DAG file, in seconds.
 - `airflow.celery.workerConcurrency` — Tasks each Celery worker runs concurrently.
+
+<Note>
+The webserver runs the API server, scheduler, dag-processor and triggerer in one container and is pinned to a single replica, so `airflow.celeryWorker.replicas` (or KEDA) is the only horizontal scaling knob here — you scale task execution, not scheduling.
+</Note>
 
 The admin account is provisioned by Airflow's `SimpleAuthManager`: the container writes a password file from the secret on every start, so the login always matches the current secret contents.
 
@@ -307,6 +483,18 @@ The Airflow home uses a shared (NFS-style) filesystem so the webserver and every
 A firewall change takes roughly **30 seconds to 5 minutes** to propagate (measured 20–85 seconds here). During the transition the endpoint can return `503` before it settles on `200` or `403`, so re-poll rather than trusting the first response.
 </Note>
 
+`internalAccess` controls which workloads inside the org may reach Airflow's own workloads:
+
+| Type | Description |
+|------|-------------|
+| `same-gvc` | Allow access from all workloads in the same GVC |
+| `same-org` | Allow access from all workloads in the org |
+| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads`, **plus this release's own four workloads**, which the template always adds |
+
+<Note>
+This list governs traffic between the release's own tiers — the webserver and the workers reaching the metadata database, the broker and each other — not just traffic from your applications. The template merges its own four workloads in for you, and when `keda.enabled` is `true` it also allows the KEDA operator onto the Redis tier, whose queue length KEDA polls. So you only need to list your own clients.
+</Note>
+
 ### DAG Delivery With git-sync
 
 git-sync runs as a sidecar on the webserver and worker workloads, pulling a Git repository onto the shared Airflow volume and pointing `AIRFLOW__CORE__DAGS_FOLDER` at the synced checkout on both tiers.
@@ -324,18 +512,33 @@ With git-sync off, put DAG files directly in `/opt/airflow/dags` on the shared v
 
 ### KEDA Autoscaling
 
-KEDA scales the Celery workers on the Redis queue length. Scaling from one to three workers under a burst, and back down again, is proven on this template.
+KEDA scales the Celery workers on the Redis queue length, including down to zero between runs. It is **off by default** as of 2.0.0. With it off, workers run at the fixed `airflow.celeryWorker.replicas`.
 
-| Property | Description |
-|---|---|
-| `keda.enabled` | Enable KEDA autoscaling of the Celery workers. |
-| `keda.minScale` | Minimum number of workers. |
-| `keda.maxScale` | Maximum number of workers. |
-| `keda.scaleToZeroDelay` | Idle time in seconds before scaling to zero. |
-| `keda.listLength` | Redis queue length that triggers a scale-up. |
-| `keda.cooldownPeriod` | Seconds between scaling events. |
-| `keda.initialCooldownPeriod` | Seconds after startup before scaling begins. |
-| `keda.pollingInterval` | How often KEDA queries Redis, in seconds. |
+| Property | Default | Description |
+|---|---|---|
+| `keda.enabled` | `false` | Enable KEDA autoscaling of the Celery workers. Requires KEDA enabled on the GVC. |
+| `keda.minScale` | `1` | Minimum number of workers. `0` scales to zero when idle. |
+| `keda.maxScale` | `3` | Maximum number of workers. |
+| `keda.scaleToZeroDelay` | `300` | Idle time in seconds before scaling to zero. |
+| `keda.listLength` | `3` | Redis queue length that triggers a scale-up. |
+| `keda.cooldownPeriod` | `1` | Seconds between scaling events. |
+| `keda.initialCooldownPeriod` | `1` | Seconds after startup before scaling begins. |
+| `keda.pollingInterval` | `4` | How often KEDA queries Redis, in seconds. |
+
+<Warning>
+**Enable KEDA on the GVC before you set `keda.enabled: true`, in that order.** KEDA is a GVC-level setting this template cannot turn on for you, and getting it wrong is accepted in silence: the workload is created without any error, reports `ready: true`, and simply **never autoscales** — it sits at `keda.minScale` forever. At `minScale: 0` that is zero workers, and every task queues with nothing reporting a problem anywhere.
+
+The webserver checks the GVC at boot and is the only thing that surfaces it. On a **fresh** install it refuses to start and says so:
+
+```text
+[airflow] FATAL: keda.enabled is true in your values, but GVC 'my-gvc' has spec.keda.enabled = false.
+KEDA is a GVC-LEVEL setting this chart cannot turn on for you.
+```
+
+On an **established** install the same condition is a warning and Airflow keeps scheduling, so a GVC change can never take a running deployment down. The refusal also clears itself: enable KEDA on the GVC and the crash-looping webserver passes the check on its next restart, with no redeploy or reinstall needed.
+
+See [KEDA on the GVC](#keda-on-the-gvc) for the commands.
+</Warning>
 
 ## Wide Fan Outs Can Silently Lose Tasks
 
@@ -397,7 +600,10 @@ curl http://localhost:8080/api/v2/dags \
 - The auth secret must exist **before** you install. Without it the deployment wedges with no log output at all; see [Prerequisites](#prerequisites) for the one diagnostic that names it, and expect recovery to take up to about ten and a half minutes after you create it.
 - **The Fernet key can never be rotated** — every stored Connection and Variable is encrypted under it. Generate it once, keep it, and back it up somewhere you will still have it later.
 - **A wide simultaneous fan-out silently loses roughly a third of its tasks** — see [Wide Fan Outs Can Silently Lose Tasks](#wide-fan-outs-can-silently-lose-tasks).
-- **This template creates its GVC**, so `gvc.name` must be a new name — uninstalling deletes the GVC it adopted along with everything in it.
+- **Never upgrade a 1.x release onto 2.0.0 in place** — it deletes the GVC the 1.x chart created and everything in it, including your metadata database and DAGs. Migrate to a new release: [Migrating from 1.x](#migrating-from-1-x).
+- **`location` must be a location of your GVC.** If it is not, the install still succeeds and then nothing starts anywhere, with no container to produce a log line. Check `cpln workload get-deployments` for `This workload location is deactivated because maxScale is set to 0.` on every location.
+- **Airflow runs in a single location by construction** — the shared Airflow home provisions one volume per location, so a second location would be a second, disconnected set of DAGs and logs.
+- **Enable KEDA on the GVC before setting `keda.enabled: true`.** Getting the order wrong is accepted with no error and leaves the workers stuck at `keda.minScale` forever — zero workers, and silently queuing tasks, at `minScale: 0`.
 - Set `postgres.config.password` at first install. It is bundled plumbing, but the shipped placeholder is published and the value cannot be changed once the data directory exists.
 - The UI is closed by default and a firewall change takes up to a few minutes to apply, so an endpoint still returning `403` right after an upgrade is not necessarily broken.
 - The first Helm upgrade after an install re-applies resources even with identical values, restarting the webserver and the database — the UI was unavailable for about three minutes in testing. Later upgrades are clean.
