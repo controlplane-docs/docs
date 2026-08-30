@@ -1,85 +1,74 @@
 ---
 title: TiDB
-description: Deploy TiDB on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, distributed MySQL-compatible clustering with TiKV storage and PD coordination, and scheduled S3 and GCS backups.
+description: Deploy TiDB on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, distributed MySQL-compatible clustering with TiKV storage and PD coordination, scheduled S3 and GCS backups, and migrating from template version 1.x.
 keywords: ['htap', 'newsql', 'cockroachdb alternative', 'spanner alternative', 'horizontally scalable mysql', 'pingcap', 'tidb cluster', 'tikv', 'placement driver', 'tiflash', 'dictionary secret', 'br backup']
 ---
+
+<Warning>
+**Template version 2.0.0 is a breaking change, and one of the changes is a data-loss hazard.**
+
+- **The template no longer creates a GVC.** It deploys into a GVC you already have. `gvc.name` is gone, and `gvc.locations` / `gvc.pdReplicas` moved to the top-level `locations` and `pdReplicas`.
+- **Never upgrade a 1.x release onto 2.0.0 in place.** A 1.x release owns the GVC it created, and Helm deletes what a chart stops declaring — the upgrade destroys that GVC and everything inside it. Install a new release instead: [Migrating from 1.x](#migrating-from-1-x).
+- **`exposeServer` and `devMode` are removed**, and a values file that still sets either one fails at render. See [Access](#access) and [Locations](#locations).
+- **`internal_access` with `type: workload-list` never worked before 2.0.0** — a duplicate key discarded your list. It now reaches the stored spec and is enforced.
+</Warning>
 
 ## Overview
 
 TiDB is a distributed, MySQL-compatible database designed for horizontal scalability and high availability. It separates compute from storage across three components: a SQL processing layer (TiDB Server), a distributed key-value store (TiKV), and a placement driver (PD) that manages cluster metadata and scheduling.
 
-This template deploys a production-ready TiDB cluster across multiple Control Plane locations using PingCAP's official images.
+This template deploys a TiDB cluster across one or more Control Plane locations using PingCAP's official images, with optional scheduled backups to S3 or GCS.
 
 Database credentials are **not** template values. The init job and TiDB Server read the root password, application user, password and database name from a dictionary secret you create before installing, so none of them pass through Helm or land in the release.
 
-<Warning>
-**Template version 1.8.0 is a breaking security change.** The whole `autoCreateDatabase.database` block was removed, and an install or upgrade that still sets it now fails at render instead of silently falling back to published default passwords. If you are running 1.7.0 or earlier, read [Upgrading From 1.7.0 or Earlier](#upgrading-from-1-7-0-or-earlier) before you touch the release.
-</Warning>
-
 ### What Gets Created
 
-- **GVC** — A new GVC spanning the configured locations.
-- **Stateful PD Workload** — (`RELEASE_NAME-pd`): placement driver cluster distributed across locations according to `pdReplicas`. Uses `replicaDirect` addressing so each PD node is individually reachable.
-- **Stateful TiKV Workload** — (`RELEASE_NAME-tikv`): distributed storage nodes. Replica count per location is controlled by `gvc.locations[].replicas`.
-- **Standard TiDB Server Workload** — (`RELEASE_NAME-server`): MySQL-compatible SQL layer on port `4000`. Per-location replica count follows `gvc.locations[].replicas`.
-- **DB Init Workload** *(optional)* — (`RELEASE_NAME-tidb-db-init`): a one-time initialization job that sets the root password and creates the application database and user. Disable after first deployment.
-- **Backup Cron Workload** *(optional)* — A scheduled backup job that uses TiDB's `br` tool to write a full cluster snapshot to AWS S3 or GCS.
-- **Volume Set** — PD storage (`RELEASE_NAME-tidb-pd-vs`): 10 GiB fixed, ext4, general-purpose-ssd, with 7-day snapshot retention.
-- **Volume Set** — TiKV storage (`RELEASE_NAME-tidb-tikv-vs`): configurable capacity with optional autoscaling, ext4, general-purpose-ssd, with 7-day snapshot retention.
+- **Stateful PD Workload** — (`RELEASE_NAME-pd`): the placement driver quorum, `pdReplicas` members spread evenly across your locations. Uses `replicaDirect` addressing so each PD member is individually reachable.
+- **Stateful TiKV Workload** — (`RELEASE_NAME-tikv`): distributed storage nodes. Replica count per location is controlled by `locations[].replicas`.
+- **Standard TiDB Server Workload** — (`RELEASE_NAME-server`): MySQL-compatible SQL layer on port `4000`. Per-location replica count follows `locations[].replicas`.
+- **DB Init Cron Workload** *(optional, on by default)* — (`RELEASE_NAME-tidb-db-init`): a scheduled job that sets the root password and creates the application database and user, then fast-exits on every later run.
+- **Backup Cron Workload** *(optional)* — A scheduled job that uses TiDB's `br` tool to write a full cluster snapshot to AWS S3 or GCS, unsuspended in exactly one location.
+- **Volume Set** — PD storage (`RELEASE_NAME-tidb-pd-vs`): `volumeset.pd.capacity` GiB with no autoscaling, ext4, general-purpose SSD, with 7-day snapshot retention.
+- **Volume Set** — TiKV storage (`RELEASE_NAME-tidb-tikv-vs`): configurable capacity with optional autoscaling, ext4, general-purpose SSD, with 7-day snapshot retention.
 - **Secrets** — Opaque secrets containing startup scripts for PD, TiKV, TiDB Server, and the database init job. **No credential secret** — the passwords live only in the prerequisite secret you create.
-- **Identity & Policy** — A shared identity bound to all workloads, and a policy granting it `reveal` on the template's own secrets plus exactly the credentials secret you created, with cloud storage access when backup is enabled.
+- **Identity & Two Policies** — A shared identity bound to all workloads, with `reveal` on the template's own secrets plus exactly the credentials secret you created, `view` on the one GVC you install into so PD can confirm at boot that the GVC really has every location you listed, and cloud storage access when backup is enabled.
 
-## Upgrading From 1.7.0 or Earlier
-
-Template versions up to 1.7.0 took the database credentials as plain Helm values, shipped working defaults for them, and wrote them into a chart-owned secret named after the release. Version 1.8.0 removes all of that.
-
-| | 1.7.0 and earlier | 1.8.0 |
-|---|---|---|
-| Database credentials | `autoCreateDatabase.database.rootPassword`, `.user`, `.password`, `.db` values | `autoCreateDatabase.credentialsSecretName` → a dictionary secret you create |
-| Where the passwords live | Chart-created secret `RELEASE_NAME-tidb-user`, and the Helm release | Only the secret you create |
-
-<Warning>
-**Carrying the old block forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running, rather than quietly restarting against different credentials:
-
-```text
-Error: execution error at (tidb/templates/identity.yaml:1:4): tidb: autoCreateDatabase.database
-was REMOVED — rootPassword, user, password and db are now a `dictionary` secret you create,
-named by autoCreateDatabase.credentialsSecretName. Delete the block from your values.
-See Prerequisites in the README.
-```
-</Warning>
-
-<Steps>
-  <Step title="Read the credentials the cluster already uses">
-    The init job applies these once, on first initialization, so an existing cluster keeps whatever it was created with. Recover them from your current values file, or from the secret the old version created — do this **before** upgrading:
-
-    ```bash
-    cpln secret reveal RELEASE_NAME-tidb-user -o yaml
-    ```
-
-    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values.
-  </Step>
-  <Step title="Create the prerequisite secret with those same values">
-    Follow [Prerequisites](#prerequisites), using the existing root password, user, password and database name. Different values here do not change the cluster — the init job exits early once the database exists, so they would just leave clients unable to authenticate.
-  </Step>
-  <Step title="Remove the old block from your values">
-    Delete the whole `autoCreateDatabase.database` block, and set `autoCreateDatabase.credentialsSecretName` to your secret's name.
-  </Step>
-  <Step title="Upgrade, then rotate the passwords">
-    After the upgrade succeeds, change any password that came from a 1.7.0 default — those defaults were published in the public template repository, so treat them as compromised. Rotate inside TiDB, then update the secret to match:
-
-    ```sql
-    ALTER USER 'root'@'%' IDENTIFIED BY 'NEW-ROOT-PASSWORD';
-    ALTER USER 'myuser'@'%' IDENTIFIED BY 'NEW-STRONG-PASSWORD';
-    ```
-  </Step>
-</Steps>
-
-<Warning>
-**`RELEASE_NAME-tidb-user` is no longer created.** Anything outside this release that read credentials from it by name must be pointed at the secret you create instead. A reference to a secret that no longer exists does not fail loudly; it wedges the referring workload silently.
-</Warning>
+<Note>
+**This template does not create a GVC.** It deploys into a GVC you already have — every resource lands in the GVC you install into, so `cpln workload exec`, `cpln logs` and uninstalling all work against that GVC, and uninstalling can never delete it. Every location you list in `locations` must already be on that GVC, and a GVC location you did not list simply runs nothing.
+</Note>
 
 ## Prerequisites
+
+Two things must be in place before you install: a GVC with the right locations, and a credentials secret.
+
+### A GVC with your locations
+
+**A GVC must already exist, and it must contain every location you list in `locations`.** The requirement is one-directional — the GVC may have *more* locations than you list, and nothing TiDB-related runs in those. Check what a GVC has before installing:
+
+```bash
+cpln gvc get GVC_NAME -o json
+```
+
+The locations are under `spec.staticPlacement.locationLinks`. To add a missing one:
+
+```bash
+cpln gvc add-location GVC_NAME --location aws-us-east-2
+```
+
+Every workload in a GVC runs in every location that GVC has, so add locations to a shared GVC deliberately.
+
+<Warning>
+**A location the GVC does not have is not caught at install time.** The install succeeds — the platform does not validate it — and PD then refuses to bootstrap, restarting with this in the logs:
+
+```text
+[tidb-pd] FATAL: locations declared in values are not in GVC 'my-gvc': aws-us-west-2
+[tidb-pd] GVC 'my-gvc' has: aws-us-east-1 aws-us-east-2
+```
+
+A PD member that **already holds data** logs a `WARNING` instead and keeps serving, so this check can never take down a running cluster.
+</Warning>
+
+### Database credentials
 
 **One secret must exist before you install**, when `autoCreateDatabase.enabled` is `true` (the default). It holds the credentials your applications put in their connection strings, plus the cluster's root password. The values never pass through Helm, so they do not land in the release. Secrets are org-level, so no GVC flag is involved.
 
@@ -118,18 +107,14 @@ The secret my-tidb-credentials no longer exists. Workload updates are paused unt
 secret is added or the reference to the secret removed.
 ```
 
-Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action, in roughly **5.5 to 10.5 minutes** measured across five templates, or run `cpln workload force-redeployment RELEASE_NAME-server --gvc GVC_NAME` to clear it in about 90 seconds.
+Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action, in roughly **5.5 to 10.5 minutes** measured across several templates, or run `cpln workload force-redeployment RELEASE_NAME-server --gvc GVC_NAME` to clear it in about 90 seconds.
 </Warning>
 
-<Note>
-This template creates its own GVC, named by `gvc.name` (default `tidb-gvc`). Use that name for `--gvc` in the commands above, not the GVC you ran `cpln helm install` against. The wedge affects `RELEASE_NAME-server` and `RELEASE_NAME-tidb-db-init`, which are the workloads that read the secret.
-</Note>
-
-Backups need a bucket and a Control Plane Cloud Account before they can be enabled — see [AWS S3](#aws-s3) or [GCS](#gcs). Nothing else is required.
+Backups need a bucket and a Control Plane [cloud account](/guides/create-cloud-account) before they can be enabled — see [AWS S3](#aws-s3) or [GCS](#gcs). Nothing else is required.
 
 ## Installation
 
-Create the [prerequisite secret](#prerequisites) first, then install by whichever method you prefer:
+Create the [prerequisite secret](#database-credentials) first, then install by whichever method you prefer:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -153,24 +138,84 @@ Create the [prerequisite secret](#prerequisites) first, then install by whicheve
     </Card>
 </CardGroup>
 
+## Migrating from 1.x
+
+Template versions through 1.8.1 created their own GVC, so that GVC is part of the 1.x release's manifest. Version 2.0.0 does not declare it — and Helm deletes what a chart stops declaring.
+
+<Warning>
+**An in-place upgrade from 1.x to 2.0.0 destroys the cluster.** Measured on a sibling template with the guard removed: the upgrade **deleted the GVC and every workload, volume set and identity inside it in about six seconds, while printing `upgraded successfully`.** Reading the GVC back afterwards returned `404`. The volume sets hold your data.
+
+The chart ships a render-time refusal so this cannot happen by accident: any leftover `gvc` key in your values aborts the upgrade before a single API call is made, leaving your cluster untouched and running.
+
+```text
+Error: execution error at (tidb/templates/identity.yaml:1:4): tidb 2.0.0: the `gvc` values key was
+REMOVED. This chart no longer creates a GVC -- it deploys into the GVC you install into ... DO NOT
+`helm upgrade` a 1.x release onto 2.0.0 ... See `Migrating from 1.x` in the README.
+```
+
+**The guard cannot cover one case: an upgrade run with no values file at all.** A 1.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires and the deletion proceeds. Do not run an upgrade of a 1.x release against the 2.0.0 chart under any circumstances — install a new release and move the data across.
+</Warning>
+
+<Steps>
+  <Step title="Recover the credentials the existing cluster uses">
+    Versions up to 1.7.0 took the credentials as plain Helm values and wrote them into a chart-owned secret named after the release. Read them out of your current values file, or out of that secret:
+
+    ```bash
+    cpln secret reveal RELEASE_NAME-tidb-user -o yaml
+    ```
+
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values. Any password that came from a pre-1.8.0 default was published in the public template repository — treat it as compromised and choose a new one for the new cluster.
+  </Step>
+  <Step title="Back up the old cluster">
+    Enable `backup` on the 1.x release, or run `br backup full` by hand against the old PD endpoint.
+  </Step>
+  <Step title="Choose the GVC for the new release">
+    Create or pick a GVC and make sure it has exactly the locations you intend to list in `locations`. See [Prerequisites](#prerequisites).
+  </Step>
+  <Step title="Create the credentials secret and install 2.0.0 as a NEW release">
+    Follow [Database credentials](#database-credentials), then install into that GVC with a **different release name** — secret names are org-wide, so a same-named release collides with the 1.x one even in another GVC.
+  </Step>
+  <Step title="Restore and cut over">
+    Restore into the new cluster (see [Restoring a Backup](#restoring-a-backup)), then point your applications at the new `RELEASE_NAME-server` endpoint.
+  </Step>
+  <Step title="Uninstall the old release against the GVC you installed it into">
+    Not the `tidb-gvc` it created — the GVC you passed at install time is where Helm tracks the release, and uninstalling from there takes the created GVC with it.
+  </Step>
+</Steps>
+
+Values keys that moved or were removed in 2.0.0:
+
+- `gvc.locations` is now the top-level `locations`, `gvc.pdReplicas` is now the top-level `pdReplicas`, and `gvc.name` is gone entirely.
+- `devMode` is gone. It only waived a three-location requirement that no longer exists — `locations` may hold a single location, and PD's replication factor is now derived from the number of TiKV nodes you configure rather than mode-switched.
+- `exposeServer` is gone. It never published the MySQL port: opening public inbound does nothing for port 4000 without a direct load balancer the chart does not render, so the only thing the canonical endpoint would have served was TiDB's **unauthenticated status API** on port 10080. Reach the server over internal GVC DNS or `cpln port-forward` instead.
+- `replicas: 0` on a location is refused. 1.x turned it into a suspended location, and suspending a location permanently withdraws that workload's endpoints from other locations' service discovery. Remove the location from `locations` instead.
+
+<Note>
+The guards fire on the mere presence of the removed keys, so `exposeServer: false` and `devMode: false` fail too. Anyone carrying a 1.x values file forward will hit an error naming the key and its replacement, rather than a silent misconfiguration.
+</Note>
+
 ## Configuration
 
 The default `values.yaml` for this template:
 
 ```yaml
-devMode: false # WARNING: For development/testing only. Bypasses the 3-location HA requirement. Do NOT enable in production.
+# ─── Locations ────────────────────────────────────────────────────────────────
+# This chart deploys into the GVC you install into — it does NOT create one.
+# Every location listed here MUST already exist in that GVC, or PD refuses to
+# bootstrap with a named error (see Prerequisites in the README).
+# Extra locations in the GVC are fine: nothing TiDB-related runs in them.
+#
+# `replicas` is the number of TiKV nodes AND TiDB server nodes in that location.
+# The default — one location, three nodes — survives the loss of a node.
+# Surviving the loss of a whole LOCATION needs at least three locations.
+locations:
+  - name: aws-us-east-1
+    replicas: 3
 
-gvc:
-  name: tidb-gvc
-  locations:
-  # Location's replica count will only affect storage (tikv) and server workloads
-    - name: aws-us-east-2
-      replicas: 1
-    - name: aws-eu-central-1
-      replicas: 1
-    - name: aws-us-east-1
-      replicas: 1
-  pdReplicas: 3 # options: 3, 5, 7
+# PD (placement driver) members, spread evenly across `locations`. PD is Raft
+# based, so odd counts only: 1, 3, 5 or 7. 1 is a single point of failure and is
+# for testing only.
+pdReplicas: 3
 
 images:
   server: pingcap/tidb:v8.5.7
@@ -197,7 +242,9 @@ autoCreateDatabase: # Enable to automatically create the database on initializat
   # time the deployment WEDGES silently — `cpln logs` returns nothing at all.
   # See Prerequisites in the README for the create-dictionary command.
   credentialsSecretName: my-tidb-credentials
-
+  # How often the init job runs. It fast-exits once the database exists, so
+  # this only controls how soon after install that happens.
+  schedule: "*/5 * * * *"
 volumeset:
   tikv:
     capacity: 10 # initial capacity in GiB (minimum is 10)
@@ -209,28 +256,26 @@ volumeset:
   pd:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 
-exposeServer: false # Set to true to expose TIDB server publicly
-
 external_access: # Set if client is outside the GVC or in another location
   server_outboundAllowCIDR: []
   tikv_outboundAllowCIDR: [] # Note: when backup.enabled is true, the template automatically allows outbound access (0.0.0.0/0) regardless of this value.
   pd_outboundAllowCIDR: []
 
+# Who may reach each tier from inside the org. Every workload this release
+# creates is ALWAYS allowed, whatever is set here — the tiers have to reach each
+# other, and each tier's own replicas have to reach each other.
 internal_access:
   server:
     type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads:  # Note: can only be used if type is same-gvc or workload-list
-      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+    workloads:  # Note: can only be used if type is workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
   tikv:
     type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads:  # Note: can only be used if type is same-gvc or workload-list
-      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+    workloads:  # Note: can only be used if type is workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
   pd:
     type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads:  # Note: can only be used if type is same-gvc or workload-list
-      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+    workloads:  # Note: can only be used if type is workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
 backup:
@@ -238,7 +283,7 @@ backup:
   image: ghcr.io/controlplane-com/backup-images/tidb-backup:8.5.7
   schedule: "0 2 * * *"  # daily at 2am UTC
   activeDeadlineSeconds: 14400  # 4 hours max per backup job
-  location: aws-us-east-1  # Run backup in the location closest to your storage bucket/region
+  location: aws-us-east-1  # MUST be one of `locations` above; put it near your bucket
 
   resources:
     cpu: 1
@@ -261,67 +306,54 @@ backup:
 
 ### Locations
 
-- `gvc.name` — Name of the GVC to create. Must be unique within your organization if deploying multiple instances.
-- `gvc.locations` — List of Control Plane locations. **At least 3 locations are required** unless `devMode` is enabled.
-- `locations[].replicas` — Number of TiKV and TiDB Server replicas per location. Set to `0` to suspend a component in that location without removing it from the configuration.
-- `gvc.pdReplicas` — Total number of PD replicas across all locations. Must be `3`, `5`, or `7`. When set to `3`, exactly 3 locations are required. Replicas are distributed evenly across locations.
+- `locations` — List of Control Plane locations. Every one must already exist in the GVC you install into.
+- `locations[].replicas` — Number of TiKV **and** TiDB Server replicas in that location. Must be at least 1; `0` is refused at render.
+- `pdReplicas` — Total number of PD members across all locations, spread evenly with any remainder going to the first ones. PD is Raft-based, so it must be `1`, `3`, `5` or `7`. A value of `1` is a single point of failure and is for testing only.
 
-### Development Mode
+The default — one location, three TiKV nodes, three PD members — survives the loss of a node. It does **not** survive the loss of a location. For that, use three locations with PD spread one per location:
 
-Set `devMode: true` to bypass the 3-location requirement and deploy with 1 or 2 locations for development and testing purposes.
-
-<Warning>
-`devMode` provides no fault tolerance. If the location(s) become unavailable, the cluster will halt. Never enable this in production.
-</Warning>
-
-Even in dev mode, PD still requires 3 replicas (`pdReplicas: 3`) and TiKV still needs at least 3 total instances across all locations. Configure `replicas` per location accordingly:
-
-**1 location — all 3 TiKV instances in a single location:**
 ```yaml
-devMode: true
-gvc:
-  locations:
-    - name: aws-us-east-2
-      replicas: 3
-  pdReplicas: 3
+locations:
+  - name: aws-us-east-1
+    replicas: 1
+  - name: aws-us-west-2
+    replicas: 1
+  - name: aws-eu-central-1
+    replicas: 1
+pdReplicas: 3
 ```
 
-**2 locations — at least 3 total TiKV instances across both:**
-```yaml
-devMode: true
-gvc:
-  locations:
-    - name: aws-us-east-2
-      replicas: 2
-    - name: aws-us-east-1
-      replicas: 1
-  pdReplicas: 3
-```
+PD then keeps quorum when one location goes away, and TiKV spreads each region's three copies one per location.
+
+<Note>
+GVC locations you did not list show as red in the console, with `This workload location is deactivated because maxScale is set to 0.` That is the mechanism that keeps a shared GVC safe — it is what a healthy install looks like, not a fault.
+</Note>
+
+### Images and Resources
+
+- `images.server` / `images.tikv` / `images.pd` — Container images for each tier. Bump these together with `backup.image`: from v8.5.7, `br` enforces a version match with the cluster.
+- `resources.pd.cpu` / `resources.pd.memory` — CPU and memory per PD member.
+- `resources.server.cpu` / `resources.server.memory` — CPU and memory per TiDB Server replica.
+- `resources.tikv.cpu` / `resources.tikv.memory` — CPU and memory per TiKV replica.
+
+The shipped defaults are sized for testing. For production, PD wants 4–8 CPU / 8–16Gi, TiDB Server 8–16 CPU / 16–32Gi (it scales with concurrent connections), and TiKV 8–16 CPU / 32–64Gi (memory-hungry for caching).
 
 ### Database Initialization
 
 - `autoCreateDatabase.enabled` — Wires the credentials secret into the TiDB Server and init workload, and grants the identity `reveal` on it.
-- `autoCreateDatabase.deployInitWorkload` — Deploys a one-time init job that sets the root password and creates the application database and user. The job checks whether the database already exists before running — if it does, it exits immediately.
+- `autoCreateDatabase.deployInitWorkload` — Deploys the init job that sets the root password and creates the application database and user.
+- `autoCreateDatabase.credentialsSecretName` — Name of the dictionary secret holding `rootPassword`, `user`, `password` and `db`. See [Database credentials](#database-credentials).
+- `autoCreateDatabase.schedule` — How often the init job runs.
+
+The init job is a **cron workload**, and that is deliberate. It fast-exits once the database exists — measured at 191 to 317 milliseconds of script body — so every run after the first is a no-op, and `schedule` really only controls how soon after install the database appears. With the default `*/5 * * * *`, a measured install had the database created **61 seconds** after `helm install` finished, well ahead of the five-minute worst case.
 
 <Note>
-After the cluster is initialized, set `autoCreateDatabase.deployInitWorkload` to `false` and upgrade the template to remove the init workload and free up resources.
+Set `autoCreateDatabase.deployInitWorkload: false` and upgrade if you would rather remove the job entirely once the cluster is initialized. It is cheap to leave on; the trade is a workload that runs forever for a one-time purpose.
 </Note>
-
-### Credentials
-
-- `autoCreateDatabase.credentialsSecretName` — Name of the dictionary secret holding `rootPassword`, `user`, `password` and `db`. The init job sets the root password, then creates that user and that database.
-
-The secret must exist before installing — see [Prerequisites](#prerequisites). The workloads read it through `cpln://secret/...` references, so the passwords appear in neither the Helm release nor the stored workload spec.
 
 <Note>
-These are applied only on first initialization. If the database already exists, the init workload exits without making changes — so changing the secret afterwards does **not** change the cluster, it only changes what clients present when they authenticate. To rotate on an existing cluster, run `ALTER USER` inside TiDB first, then update the secret to match.
+Credentials are applied on first initialization only. Changing the secret afterwards does **not** change the cluster — it only changes what clients present when they authenticate. To rotate on an existing cluster, run `ALTER USER` inside TiDB first, then update the secret, then force a redeployment: a `cpln://` reference is resolved when a replica starts and is never re-resolved while it runs.
 </Note>
-
-### Resources
-
-- `resources.pd.cpu` / `resources.pd.memory` — CPU and memory per PD replica.
-- `resources.server.cpu` / `resources.server.memory` — CPU and memory per TiDB Server replica.
-- `resources.tikv.cpu` / `resources.tikv.memory` — CPU and memory per TiKV replica.
 
 ### Storage
 
@@ -335,7 +367,7 @@ These are applied only on first initialization. If the database already exists, 
 
 **PD storage** (fixed):
 
-- `volumeset.pd.capacity` — Initial volume size in GiB for PD metadata (minimum 10).
+- `volumeset.pd.capacity` — Initial volume size in GiB for PD metadata (minimum 10). PD only holds cluster metadata, so it has no autoscaling knob.
 
 Both volume sets retain snapshots for 7 days and create a final snapshot on deletion.
 
@@ -347,29 +379,50 @@ Both volume sets retain snapshots for 7 days and create a final snapshot on dele
 |------|-------------|
 | `same-gvc` | Allow access from all workloads in the same GVC (recommended) |
 | `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from specific workloads |
+| `workload-list` | Allow access only from the workloads listed in `workloads` |
+
+<Note>
+**List only your clients.** Every workload this release creates is always allowed, whatever you set — the three tiers have to reach each other, and each tier's own replicas have to reach each other, so a `workload-list` naming only your applications would otherwise cut the cluster off from itself. Before 2.0.0 the `workloads` list never reached the stored spec at all, so `workload-list` blocked everything.
+</Note>
+
+An access-knob change takes time to propagate — up to about ten minutes has been measured across this catalog. Keep re-polling rather than concluding the knob is broken.
 
 **External access:**
 
-- `exposeServer` — Set to `true` to allow external connections to the TiDB MySQL port (`4000`) from any IP (`0.0.0.0/0`).
 - `external_access.server_outboundAllowCIDR` / `tikv_outboundAllowCIDR` / `pd_outboundAllowCIDR` — Outbound CIDR allowlists for each component, for reaching external services. When `backup.enabled` is `true`, TiKV outbound access is automatically set to `0.0.0.0/0` so nodes can upload directly to cloud storage, regardless of `tikv_outboundAllowCIDR`.
+
+**There is no public inbound access.** The TiDB Server workload takes none, and `exposeServer` was removed in 2.0.0 because it never published the MySQL port. Reach the server over internal GVC DNS, or forward the port:
+
+```bash
+cpln port-forward RELEASE_NAME-server 4000:4000 --gvc GVC_NAME
+```
+
+`cpln port-forward` is a top-level command, not a `cpln workload` subcommand, and it works against a workload with no public inbound at all.
 
 ### Connecting to TiDB
 
-TiDB Server is MySQL-compatible. Connect using any MySQL client from within the same GVC:
+TiDB Server is MySQL-compatible. Connect using any MySQL client from a workload in the same GVC:
 
-```text
-RELEASE_NAME-server.GVC_NAME.cpln.local:4000
+| What | Where | Credentials |
+|---|---|---|
+| MySQL protocol (applications) | `RELEASE_NAME-server.GVC_NAME.cpln.local:4000` | `user` / `password` from the credentials secret; database `db` |
+| MySQL protocol (root) | same | `root` / `rootPassword` from the credentials secret |
+| PD HTTP API (cluster state) | `RELEASE_NAME-pd.GVC_NAME.cpln.local:2379` | none — internal only |
+
+```bash
+mysql -h RELEASE_NAME-server.GVC_NAME.cpln.local -P 4000 -u myuser -p
 ```
 
-Use the `user` and `password` entries of the secret named by `autoCreateDatabase.credentialsSecretName`, or connect as `root` with its `rootPassword` entry.
+Always use the fully qualified `.GVC_NAME.cpln.local` form. The bare workload name is not reliable on this platform — whether it resolves depends on the workload type.
+
+The `pingcap/tidb` image ships **no** MySQL client, so run the command from another workload in the same GVC — a throwaway `mysql:8` workload works. Depending on how many replicas and locations you configured, the cluster can take a few minutes to accept connections.
 
 ### Ports
 
 | Workload | Port | Protocol | Description |
 |----------|------|----------|-------------|
 | TiDB Server | `4000` | TCP | MySQL-compatible SQL port |
-| TiDB Server | `10080` | HTTP | TiDB status and metrics |
+| TiDB Server | `10080` | HTTP | TiDB status and metrics — unauthenticated, and not publicly reachable |
 | PD | `2379` | TCP | PD client port |
 | PD | `2380` | TCP | PD peer (Raft) port |
 | TiKV | `20160` | TCP | TiKV data port |
@@ -380,9 +433,10 @@ Use the `user` and `password` entries of the secret named by `autoCreateDatabase
 Backup is disabled by default. When enabled, a cron workload uses TiDB's `br` tool to take a full cluster snapshot on the configured schedule and upload it to AWS S3 or GCS.
 
 - `backup.enabled` — Enable scheduled backups.
+- `backup.image` — The backup image. Its version must match the cluster: from v8.5.7, `br` enforces the check even with `--check-requirements=false`, so bump this together with `images.*`.
 - `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
 - `backup.provider` — `aws` or `gcp`.
-- `backup.location` — The Control Plane location where the backup job runs. Set to the location **closest to your storage bucket** to minimize cross-region transfer latency and costs.
+- `backup.location` — The Control Plane location where the backup job runs. It **must be one of your `locations`**, and the chart refuses to render otherwise: the cron is suspended everywhere else, so a mismatch would mean the backup never ran anywhere with no failed run to observe. Set it to the location nearest your bucket to minimize transfer cost and latency.
 - `backup.activeDeadlineSeconds` — Maximum time allowed per backup job in seconds (default: `14400` / 4 hours).
 - `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
 
@@ -397,12 +451,6 @@ Before enabling backup with `provider: aws`, complete the following in your AWS 
 1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
 3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
-
-<Warning>
-**Version 1.8.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
-
-**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
-</Warning>
 
 ```json
 {
@@ -440,12 +488,16 @@ Before enabling backup with `provider: gcp`, complete the following in your GCP 
 
 1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
-3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+3. Grant the Cloud Account's service account the **Storage Admin** (`roles/storage.admin`) role on that bucket. The chart also binds `roles/storage.objectAdmin` to the workload identity.
 4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+
+<Note>
+**Switch providers with a fresh install, not an upgrade.** An identity's cloud binding is never removed once set — the API merges rather than replaces — so a release switched from `aws` to `gcp` keeps the old provider's binding attached even though the chart no longer renders it.
+</Note>
 
 ## Restoring a Backup
 
-Backups are stored at `BUCKET/PREFIX/tidb-TIMESTAMP/`. To restore, run `br restore full` from a machine with network access to the PD endpoint.
+Backups land at `BUCKET/PREFIX/tidb-TIMESTAMP/`. Restore with `br restore full`, run from a workload **inside the GVC** — `*.cpln.local` names do not resolve from anywhere else, and the `ghcr.io/controlplane-com/backup-images/tidb-backup` image is the one that carries a matching `br`.
 
 **AWS S3:**
 
@@ -464,9 +516,22 @@ br restore full \
   --storage="gcs://BUCKET_NAME/PREFIX/tidb-TIMESTAMP"
 ```
 
+<Warning>
+**This restore path is the upstream procedure and has not been exercised end to end against a backup produced by this template.** In particular, the SST object layout differs between the S3 (`1/<name>`) and GCS (`1_<name>`) backends. Rehearse a restore into a scratch release before you need one.
+</Warning>
+
 <Note>
 The `br` binary version must match your TiDB cluster version. Download it from the [TiDB Community Toolkit](https://docs.pingcap.com/tidb/stable/download-ecosystem-tools).
 </Note>
+
+## Important Notes
+
+- **Never upgrade a 1.x release onto 2.0.0 in place** — it deletes the GVC the 1.x chart created and everything in it. Install a new release: [Migrating from 1.x](#migrating-from-1-x).
+- **The GVC must contain every location you list**, and may contain more. A missing location is not caught at install: PD exits with `FATAL: locations declared in values are not in GVC ...`. A PD member that already holds data logs a `WARNING` instead and keeps serving.
+- **PD's replication factor is fixed when the cluster first bootstraps.** It is the number of TiKV nodes you configure, capped at 3, and PD persists it — scaling TiKV up later does not raise it. Start with at least 3 TiKV nodes if you ever want 3-way replication.
+- **There is no public access to the MySQL port.** Reach the server over internal GVC DNS or with `cpln port-forward`.
+- **Release names must be unique per org** — secrets are org-wide, so two releases with the same name collide even in different GVCs.
+- **Credentials apply on first initialization only.** Rotate with `ALTER USER` inside TiDB first, then update the secret, then force a redeployment.
 
 ## External References
 
@@ -474,8 +539,14 @@ The `br` binary version must match your TiDB cluster version. Download it from t
     <Card title="TiDB Documentation" icon="book" href="https://docs.pingcap.com/tidb/stable">
     Official TiDB documentation
     </Card>
-    <Card title="TiDB Community Toolkit" icon="book" href="https://docs.pingcap.com/tidb/stable/download-ecosystem-tools">
+    <Card title="TiDB Architecture" icon="sitemap" href="https://docs.pingcap.com/tidb/stable/tidb-architecture/">
+    How PD, TiKV and TiDB Server fit together
+    </Card>
+    <Card title="TiDB Community Toolkit" icon="screwdriver-wrench" href="https://docs.pingcap.com/tidb/stable/download-ecosystem-tools">
     Download `br` and other TiDB ecosystem tools
+    </Card>
+    <Card title="Backup and Restore" icon="rotate-left" href="https://docs.pingcap.com/tidb/stable/backup-and-restore-overview/">
+    The BR backup and restore overview
     </Card>
     <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/tidb-backup">
     Source code for the TiDB backup container image

@@ -1,34 +1,79 @@
 ---
 title: CockroachDB
-description: Deploy CockroachDB on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and multi-region Raft consensus with automatic failover.
+description: Deploy CockroachDB on Control Plane using the Template Catalog. Covers locations and replicas, PgBouncer connection pooling, region survivability, backups to S3 or GCS, the two working restore paths, and migrating from template version 1.x.
 keywords: ['crdb', 'distributed sql', 'globally distributed db', 'newsql', 'spanner alternative', 'postgres compatible', 'survive region failure', 'replica direct lb', 'horizontally scalable', 'geo db']
 ---
 
+<Warning>
+**Template version 2.0.0 is a breaking change, and one of the changes is a data-loss hazard.**
+
+- **The template no longer creates a GVC.** It deploys into a GVC you already have. `gvc.name` is gone, and `gvc.locations` moved to a top-level `locations` list.
+- **Never upgrade a 1.x release onto 2.0.0 in place.** A 1.x release owns the GVC it created, and Helm deletes what a chart stops declaring — the upgrade destroys that GVC and everything inside it. Install a new release instead: [Migrating from 1.x](#migrating-from-1-x).
+- **The restore procedure earlier versions documented could never work.** The backup is a *full-cluster* backup, and CockroachDB refuses to restore one onto a cluster that already has databases — which this template always creates. Both working paths are in [Restoring a Backup](#restoring-a-backup).
+- **The default is now a single location**, so surviving the loss of a region is off until you configure three. See [Multi-Region Survivability](#multi-region-survivability).
+</Warning>
+
 ## Overview
 
-CockroachDB is a distributed SQL database that provides automatic replication, horizontal scalability, and built-in fault tolerance across multiple regions. This template deploys a multi-region CockroachDB cluster on Control Plane as a stateful workload with replica-direct load balancing.
+CockroachDB is a distributed SQL database that provides automatic replication, horizontal scalability, and built-in fault tolerance. This template deploys a CockroachDB cluster on Control Plane as a stateful workload with replica-direct load balancing, a PgBouncer connection pooler in front of it, and optional scheduled backups to S3 or GCS.
 
-Each location runs a configurable number of replicas that discover and join one another using Control Plane's internal DNS. On first deployment, the cluster initializes itself, creates a database and user, registers all regions, and sets the survival goal to `SURVIVE REGION FAILURE`.
+Each location runs a configurable number of nodes that discover and join one another using Control Plane's internal DNS. On first deployment the cluster initializes itself and creates a database and user. With three or more locations it also registers every location as a CockroachDB region and sets the survival goal to `SURVIVE REGION FAILURE`.
 
 ### What Gets Created
 
-- **GVC** — A dedicated GVC across the specified locations.
-- **Stateful CockroachDB Workload** — CockroachDB (`v25.4.0`) with per-location replica scaling and replica-direct load balancing.
-- **Standard PgBouncer Workload** *(enabled by default)* — A connection pooler that multiplexes application connections across all CockroachDB nodes. When enabled, this becomes the primary connection endpoint.
-- **Volume Set** — Persistent ext4 storage (general-purpose-ssd) with final snapshot creation and 7-day retention.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the startup and user secrets, and cloud storage access when backup is enabled.
-- **Secrets** — A startup script for cluster join/initialization and an opaque secret for the database user credential.
-- **Backup Cron Workload** *(optional)* — A scheduled job that triggers a CockroachDB `BACKUP` SQL command to stream data directly to AWS S3 or GCS.
+- **Stateful CockroachDB Workload** — CockroachDB (`v25.4.0`) with per-location replica counts and replica-direct load balancing. Each node drains gracefully on shutdown.
+- **Standard PgBouncer Workload** *(enabled by default)* — A connection pooler that multiplexes application connections across every CockroachDB node in every location. When enabled, this becomes the primary connection endpoint.
+- **Volume Set** — Persistent ext4 storage (general-purpose SSD), one volume per node, with a final snapshot on deletion and 7-day retention.
+- **Identity & Two Policies** — An identity bound to the workloads, with `reveal` on this release's secrets, `view` on the one GVC you install into so each node can confirm at boot that the GVC really has every location you listed, and cloud storage access when backup is enabled.
+- **Secrets** — The CockroachDB startup script, the PgBouncer startup script, and a small database-configuration secret.
+- **Backup Cron Workload** *(optional)* — A scheduled job that issues a CockroachDB `BACKUP INTO` statement, unsuspended in exactly one location.
+
+<Note>
+**This template does not create a GVC.** It deploys into a GVC you already have — every resource lands in the GVC you install into, so `cpln workload exec`, `cpln logs` and uninstalling all work against that GVC, and uninstalling can never delete it. Every location you list in `locations` must already be on that GVC, and a GVC location you did not list simply runs nothing.
+</Note>
 
 ### Architecture
 
-CockroachDB uses the [Raft consensus protocol](https://www.cockroachlabs.com/docs/stable/architecture/replication-layer#raft) to replicate data across nodes. Each Control Plane location maps to a CockroachDB locality region, and replicas advertise their address via internal DNS (`replica-N.WORKLOAD.LOCATION.GVC.cpln.local`).
+CockroachDB uses the [Raft consensus protocol](https://www.cockroachlabs.com/docs/stable/architecture/replication-layer#raft) to replicate data across nodes. Each Control Plane location maps to a CockroachDB locality region, and nodes advertise their address via internal DNS (`replica-N.WORKLOAD.LOCATION.GVC.cpln.local`).
 
-With 3 or more regions and the `SURVIVE REGION FAILURE` survival goal, the cluster tolerates the complete loss of one region without impacting availability.
+With three or more locations and the `SURVIVE REGION FAILURE` survival goal, the cluster tolerates the complete loss of one location without interrupting reads or writes.
+
+## Prerequisites
+
+**A GVC must already exist, and it must contain every location you list in `locations`.** The requirement is one-directional — the GVC may have *more* locations than you list, and nothing CockroachDB-related runs in those. Check what a GVC has before installing:
+
+```bash
+cpln gvc get GVC_NAME -o json
+```
+
+The locations are under `spec.staticPlacement.locationLinks`. To add a missing one:
+
+```bash
+cpln gvc add-location GVC_NAME --location aws-us-east-2
+```
+
+Every workload in a GVC runs in every location that GVC has, so add locations to a shared GVC deliberately.
+
+<Warning>
+**A location the GVC does not have is not caught at install time.** The install succeeds — the platform does not validate it — and the CockroachDB containers then refuse to initialize, restarting with this in the logs:
+
+```text
+[cockroach] FATAL: locations declared in values are not in GVC 'my-gvc': aws-us-west-2
+[cockroach] GVC 'my-gvc' has: aws-us-east-1 aws-us-east-2
+```
+
+A node that **already holds data** logs a `WARNING` instead and keeps serving, so this check can never take down a running cluster. Read it with a server-side filter:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cockroach"} |= "[cockroach]"' --limit 100 --since 15m
+```
+</Warning>
+
+Nothing else is required for a default install. Backups additionally need a storage bucket and a Control Plane [cloud account](/guides/create-cloud-account) — see [Backup](#backup).
 
 ## Installation
 
-This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
+To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -52,22 +97,71 @@ This template has no external prerequisites unless backup is enabled. To install
     </Card>
 </CardGroup>
 
+## Migrating from 1.x
+
+Template versions through 1.5.0 created their own GVC, so that GVC is part of the 1.x release's manifest. Version 2.0.0 does not declare it — and Helm deletes what a chart stops declaring.
+
+<Warning>
+**An in-place upgrade from 1.x to 2.0.0 destroys the cluster.** Measured on a sibling template with the guard removed: the upgrade **deleted the GVC and every workload, volume set and identity inside it in about six seconds, while printing `upgraded successfully`.** Reading the GVC back afterwards returned `404`. The volume sets hold your data.
+
+The chart ships a render-time refusal so this cannot happen by accident: any leftover `gvc` key in your values aborts the upgrade before a single API call is made, leaving your cluster untouched and running.
+
+```text
+Error: execution error at (cockroach/templates/identity.yaml:2:4): cockroach 2.0.0: the `gvc` values
+key was REMOVED. This chart no longer creates a GVC -- it deploys into the GVC you install into, and
+`gvc.locations` moved to the top-level `locations`. DO NOT `helm upgrade` a 1.x release onto 2.0.0:
+the upgrade drops `kind: gvc` from the manifest and Helm deletes what a chart no longer declares,
+which DESTROYS that GVC and every workload, volumeset and identity inside it.
+```
+
+**The guard cannot cover one case: an upgrade run with no values file at all.** A 1.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires and the deletion proceeds. Do not run an upgrade of a 1.x release against the 2.0.0 chart under any circumstances — install a new release and move the data across.
+</Warning>
+
+<Steps>
+  <Step title="Back up the old cluster">
+    Enable `backup` on the 1.x release, or issue a `BACKUP INTO` by hand against a node. See [Backup](#backup) for the bucket and cloud account setup.
+  </Step>
+  <Step title="Choose the GVC for the new release">
+    Create or pick a GVC and make sure it has exactly the locations you intend to list in `locations`. See [Prerequisites](#prerequisites).
+  </Step>
+  <Step title="Install 2.0.0 as a NEW release into that GVC">
+    Use a **different release name**: secret names are org-wide, so a same-named release collides with the 1.x one even in another GVC.
+  </Step>
+  <Step title="Restore and cut over">
+    Restore into the new cluster (see [Restoring a Backup](#restoring-a-backup)), then point your applications at the new PgBouncer endpoint.
+  </Step>
+  <Step title="Uninstall the old release against the GVC you installed it into">
+    Not the GVC it created — the GVC you passed at install time is where Helm tracks the release, and uninstalling from there takes the created GVC with it.
+  </Step>
+</Steps>
+
+Two other values keys changed in 2.0.0:
+
+- `gvc.locations` is now the top-level `locations`, and `gvc.name` is gone entirely.
+- `replicas: 0` on a location is refused at render. It used to suspend that location silently while still counting it as a region the database had been told about, which no node ever joined. Remove the location from `locations` instead.
+
 ## Configuration
 
 The default `values.yaml` for this template:
 
 ```yaml
-gvc:
-  name: cockroach-gvc
-  locations:
-    - name: aws-us-west-2
-      replicas: 3
-    - name: aws-us-east-2
-      replicas: 3
-    - name: aws-eu-central-1
-      replicas: 3
+# ─── Locations ────────────────────────────────────────────────────────────────
+# This chart deploys into the GVC you install into — it does NOT create one.
+# Every location listed here MUST already exist in that GVC, or the CockroachDB
+# nodes refuse to initialise with a named error (see Prerequisites in the README).
+# Extra locations in the GVC are fine: nothing CockroachDB-related runs in them.
+#
+# Surviving the loss of a whole location needs at least THREE locations. One
+# location with three replicas survives a node loss, not a region loss.
+locations:
+  - name: aws-us-east-1
+    replicas: 3
 
 image: cockroachdb/cockroach:v25.4.0
+
+# Confirm every location in your GVC supports multi-zone before enabling this --
+# a location that does not will wedge with no error. See the README.
+multiZone: false
 
 resources:
   cpu: 2
@@ -78,7 +172,7 @@ database:
   user: myuser
 
 volumeset:
-  capacity: 10 # initial capacity in GiB (minimum is 10)
+  capacity: 10 # Initial capacity in GiB (minimum is 10)
   autoscaling:
     enabled: false # Set to true to enable autoscaling
     maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
@@ -97,29 +191,29 @@ pgbouncer:
   defaultPoolSize: 25    # number of real CockroachDB connections PgBouncer maintains per pod
   maxClientConn: 250     # maximum number of client connections PgBouncer accepts per pod
   maxDbConnections: 100  # hard cap on total CockroachDB connections regardless of how many PgBouncer pods are running
-  minReplicas: 2
-  maxReplicas: 4
-  serverCheckDelay: 30      # seconds between idle server connection health checks
-  serverConnectTimeout: 2   # seconds before giving up on a new server connection
-  serverLoginRetry: 0       # seconds before retrying a failed server login; 0 = no caching of failures
-  clientLoginTimeout: 10    # seconds before rejecting a client waiting for login
-  queryWaitTimeout: 10      # seconds before rejecting a logged-in client waiting for a server connection
+  minReplicas: 2         # per location
+  maxReplicas: 4         # per location
+  serverCheckDelay: 30      # seconds between idle server connection health checks (default 30)
+  serverConnectTimeout: 2   # seconds before giving up on a new server connection (default 15)
+  serverLoginRetry: 0       # seconds before retrying a failed server login; 0 = no caching of failures (default 15)
+  clientLoginTimeout: 10    # seconds before rejecting a client waiting for login (default 60)
+  queryWaitTimeout: 10      # seconds before rejecting a logged-in client waiting for a server connection (default 120)
   internal_access:
     type: same-gvc # options: same-gvc, same-org, workload-list; controls who can connect to PgBouncer
     workloads:  # Note: can only be used if type is workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
   resources:
-    cpu: 200m
+    maxCpu: 200m
     minCpu: 100m
-    memory: 1Gi
+    maxMemory: 1Gi
     minMemory: 128Mi
 
 backup:
   enabled: false
-  image: controlplanecorporation/cockroach-backup:1.0
+  image: ghcr.io/controlplane-com/backup-images/cockroach-backup:1.1
   schedule: "0 2 * * *"
   activeDeadlineSeconds: 14400   # hard kill after 4 hours if backup hangs
-  location: aws-us-east-2        # run the backup job in the same region as your storage bucket
+  location: aws-us-east-1        # MUST be one of `locations` above; put it near your bucket
   resources:
     cpu: 500m
     memory: 512Mi
@@ -138,13 +232,42 @@ backup:
 
 ### Locations and Replicas
 
-Configure the `gvc.locations` section to control which regions the cluster spans and how many replicas run in each.
+Each entry in `locations` pairs a location with a node count. Every location listed must already exist in the GVC you install into; extra GVC locations run nothing. Listing the same location twice is refused at render, as is an empty list, an entry with no `name`, and `replicas: 0`.
+
+The default is one location with three nodes. That survives the loss of a node; it does **not** survive the loss of a location — see [Multi-Region Survivability](#multi-region-survivability).
+
+<Warning>
+**A one-node deployment is refused at render.** Each node joins every *other* node, so a single node gets an empty `--join` list and the binary rejects it. The smallest supported shape is **3 replicas in one location**, matching CockroachDB's default replication factor of 3.
+
+```text
+Error: execution error at (cockroach/templates/identity.yaml:2:4): cockroach: a one-node deployment
+cannot start. Each node joins every OTHER replica, so a single node gets an empty --join list ...
+Use at least 3 replicas in total; 3 replicas in one location is the smallest supported shape.
+```
+</Warning>
 
 <Note>
-While CockroachDB can run on 1 location, a minimum of 3 locations with 3 replicas per location is recommended. This is the minimum required for CockroachDB to survive a full region failure.
+GVC locations you did not list show as red in the console, with `This workload location is deactivated because maxScale is set to 0.` That is the mechanism that keeps a shared GVC safe — it is what a healthy install looks like, not a fault.
 </Note>
 
-Setting a location's `replicas` to `0` suspends the workload in that location without removing it from the configuration.
+### Multi-Zone Placement
+
+Set `multiZone: true` to spread nodes across availability zones within each location.
+
+<Warning>
+**Confirm every location in your GVC supports multi-zone placement before enabling this.** A location that does not support it accepts the setting and then wedges — the workload never becomes ready and nothing in the logs explains why, because no container ever starts. The only place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-cockroach --gvc GVC_NAME -o yaml
+```
+
+```text
+Workload is misconfigured (multizone enabled in an incompatible cluster).
+Please contact support or disable multizone.
+```
+
+The incompatibility was measured on a stateful workload with a block volume set — which is exactly the shape every CockroachDB node has — in `aws-us-west-2`, while `aws-us-east-1` and `aws-us-east-2` were unaffected. Leave it `false` if you are unsure.
+</Warning>
 
 ### Database Initialization
 
@@ -156,15 +279,17 @@ database:
   user: myuser
 ```
 
-The created user is granted full access to the specified database.
+The created user is granted `ALL` on that database.
 
 <Note>
-These values are only applied on the first initialization. If the cluster has already been initialized, they are skipped on restart or upgrade. To change credentials or the database name on an existing cluster, use CockroachDB's native commands (e.g. `ALTER USER`, `RENAME DATABASE`).
+These values are only applied on the first initialization. If the cluster has already been initialized, they are skipped on restart or upgrade. To change the user or the database name on an existing cluster, use CockroachDB's native commands (`ALTER USER`, `RENAME DATABASE`).
+
+In CockroachDB v25, `ALL` on a *database* does not confer `SELECT` on tables owned by another user, so the application user cannot read tables `root` created. Tables the application user creates itself work normally.
 </Note>
 
 ### Resources and Storage
 
-- `resources.cpu` and `resources.memory` set the CPU and memory allocated to each CockroachDB replica.
+- `resources.cpu` and `resources.memory` set the CPU and memory allocated to each CockroachDB node.
 - `volumeset.capacity` sets the initial persistent volume size in GiB (minimum 10).
 - `volumeset.autoscaling.enabled` — Enable automatic volume expansion as data grows.
 - `volumeset.autoscaling.maxCapacity` — Maximum volume size in GiB.
@@ -173,7 +298,7 @@ These values are only applied on the first initialization. If the cluster has al
 
 ### Internal Access
 
-The `internal_access` section controls which workloads can reach CockroachDB directly. When PgBouncer is enabled, `internal_access` only applies to direct CockroachDB connections — use `pgbouncer.internal_access` to control who can connect through PgBouncer.
+The `internal_access` section controls which workloads can reach CockroachDB directly, and `pgbouncer.internal_access` controls who can connect through the pooler. Neither workload is exposed publicly, and the template has no public access option.
 
 | Type | Description |
 |------|-------------|
@@ -190,66 +315,100 @@ internal_access:
     - //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
+<Note>
+**List only your clients.** CockroachDB is peer-to-peer — node-to-node Raft traffic is inbound traffic to the same workload — so the chart adds this release's own workloads (the cluster, PgBouncer and the backup cron) to every list it renders. Without that, a `workload-list` naming only your applications would blackhole replication while every replica still reported `ready: true`.
+
+With PgBouncer enabled, the CockroachDB workload's own list is the release's workloads only, and `internal_access.workloads` is not applied to it — clients are expected to go through the pooler. Set `pgbouncer.internal_access` to control who reaches the pooler, and disable PgBouncer if you want clients on port 26257 directly.
+</Note>
+
+An access-knob change takes time to propagate. Measurements on this template ranged from about **2 minutes to just over 9 minutes** for the new rule to be fully in force, so keep re-testing rather than concluding the knob did not work.
+
 ### PgBouncer Connection Pooling
 
-PgBouncer is enabled by default. It multiplexes application connections into a smaller pool of real database connections, reducing overhead and protecting CockroachDB from connection exhaustion under high concurrency. It connects to all CockroachDB nodes across all locations, so failover and load distribution are handled transparently.
+PgBouncer is enabled by default. It multiplexes application connections into a smaller pool of real database connections, reducing overhead and protecting CockroachDB from connection exhaustion under high concurrency. It is configured with every CockroachDB node across every location as a backend, so failover and load distribution are handled transparently.
+
+From 2.0.0 that backend list is built by PgBouncer's own startup script from the same topology the CockroachDB nodes use to build their `--join` list, rather than being rendered separately by Helm — so the two tiers cannot disagree about which nodes exist.
 
 When enabled, PgBouncer becomes the primary connection endpoint — connect to it instead of CockroachDB directly:
 
-```
-RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432
+```text
+RELEASE_NAME-cockroach-pgbouncer.GVC_NAME.cpln.local:5432
 ```
 
 **Pool modes:**
 
 | Mode | Behavior |
-|------|----------|
+|------|-------------|
 | `transaction` | Connection held only for the duration of a transaction. Best for most web and API workloads. Not compatible with `SET` variables, temporary tables, or advisory locks. |
 | `session` | Connection held for the entire client session. Compatible with all features but provides less connection reuse. |
 | `statement` | Connection returned after every statement. Transactions are not supported. Rarely used. |
 
 - `pgbouncer.defaultPoolSize` — Real CockroachDB connections PgBouncer maintains per pod.
-- `pgbouncer.maxClientConn` — Maximum client connections PgBouncer accepts per pod.
+- `pgbouncer.maxClientConn` — Maximum client connections PgBouncer accepts per pod. A client beyond the limit is rejected with `FATAL: no more connections allowed (max_client_conn)`.
 - `pgbouncer.maxDbConnections` — Hard cap on total CockroachDB connections shared across all PgBouncer pods. Set this to a value your cluster can safely handle regardless of how many pods are running.
-- `pgbouncer.minReplicas` / `pgbouncer.maxReplicas` — PgBouncer autoscales on RPS between these bounds.
+- `pgbouncer.minReplicas` / `pgbouncer.maxReplicas` — PgBouncer autoscales on RPS between these bounds **in each configured location**.
+- `pgbouncer.serverCheckDelay`, `serverConnectTimeout`, `serverLoginRetry`, `clientLoginTimeout`, `queryWaitTimeout` — PgBouncer's own timeouts, in seconds.
+- `pgbouncer.resources` — `minCpu` / `maxCpu` / `minMemory` / `maxMemory` per PgBouncer pod. These were named `cpu` and `memory` before 2.0.0; the old names are refused at render with a message naming the replacement.
 - `pgbouncer.internal_access` — Controls which workloads can connect to PgBouncer (same options as `internal_access`).
 
 ### Connecting to CockroachDB
 
-When PgBouncer is enabled (default), connect through it on port 5432:
+The cluster runs in `--insecure` mode, so there are no SQL credentials — access is governed by `internal_access` and the GVC boundary and nothing else. Control Plane provides mTLS for all inter-workload communication.
+
+| What | Where |
+|---|---|
+| PgBouncer (the default endpoint) | `RELEASE_NAME-cockroach-pgbouncer.GVC_NAME.cpln.local:5432` |
+| CockroachDB SQL, direct | `RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257` |
+| One specific node | `replica-N.RELEASE_NAME-cockroach.LOCATION.GVC_NAME.cpln.local:26257` |
+| DB Console (HTTP UI) | port 8080, not exposed — reach it with `cpln port-forward` |
+| Credentials | none; the cluster is insecure-mode and network-isolated |
+
+From another workload in the same GVC:
 
 ```bash
-psql "host=RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local port=5432 dbname=mydb user=myuser sslmode=disable"
+cockroach sql --insecure \
+  --host=RELEASE_NAME-cockroach-pgbouncer.GVC_NAME.cpln.local:5432 --database=mydb
 ```
 
-When PgBouncer is disabled, connect directly to CockroachDB on port 26257:
+Always use the fully qualified `.GVC_NAME.cpln.local` form. The bare workload name is not reliable on this platform — whether it resolves depends on the workload type.
+
+The DB Console shows cluster health, query performance and node status. It is not exposed externally; forward port 8080 of the CockroachDB workload and open `http://localhost:8080`:
 
 ```bash
-cockroach sql --insecure --host=RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257
+cpln port-forward RELEASE_NAME-cockroach 8080:8080 --gvc GVC_NAME
 ```
 
-<Note>
-This template deploys CockroachDB in insecure mode (no TLS). It is intended for internal workloads that connect through Control Plane's internal network, where mTLS is handled by Control Plane.
-</Note>
-
-The DB Console (HTTP UI) runs on port 8080 for monitoring cluster health, query performance, and node status. It is not exposed externally — access it via port forward and open `http://localhost:8080` in your browser.
+`cpln port-forward` is a top-level command, not a `cpln workload` subcommand.
 
 ### Application Retry Logic
 
 Your application must implement retry logic on database connections. PgBouncer routes around failed CockroachDB nodes, but transient errors are still surfaced to the application during failover events — such as a location outage or rolling restarts — while PgBouncer cycles through backends and Raft leader elections complete. Without retries, these transient errors will propagate directly to the client.
 
+## Multi-Region Survivability
+
+Surviving the loss of an entire location requires **at least three locations**, and the template's default is one. With fewer than three, that step is skipped entirely — no CockroachDB configuration can make a one- or two-location cluster survive the loss of a region.
+
+With three or more locations, the first deploy registers every configured location as a CockroachDB region and sets the database's survival goal to `REGION`. Verify it on the cluster itself:
+
+```sql
+SHOW SURVIVAL GOAL FROM DATABASE mydb;
+SHOW REGIONS FROM CLUSTER;
+```
+
 <Note>
-This template creates a GVC with a default name defined in the values file. If you plan to deploy multiple instances, you **must assign a unique GVC name** for each deployment.
+**Earlier versions could fail this step silently.** The `SURVIVE REGION FAILURE` statement ran in a way that swallowed its own error, so the install reported success while the database was left at the default *zone* survival goal. From 2.0.0 a failure is reported explicitly and prints `SHOW REGIONS FROM CLUSTER`. On a three-location cluster the goal is applied and verified. If you are on 1.x, check the survival goal directly rather than trusting the log's silence.
 </Note>
+
+A production cluster survives a location outage cleanly — a measured three-location, nine-node cluster served reads and writes with zero failures throughout the loss of one whole location, and recovered by itself. Rolling out or restarting nodes in the remaining locations *during* an outage exceeds the cluster's fault tolerance and causes a brief period of downtime for ranges on those nodes.
 
 ## Backup
 
-Backup is disabled by default. When enabled, a cron workload triggers a CockroachDB `BACKUP` SQL command on the configured schedule. CockroachDB nodes stream backup data directly to cloud storage using their own workload identity — the backup job only issues the SQL command and does not transfer data itself.
+Backup is disabled by default. When enabled, a cron workload issues a CockroachDB `BACKUP INTO` statement on the configured schedule. CockroachDB nodes stream the backup data to cloud storage themselves using the workload identity — the backup job only triggers the SQL command and does not transfer data itself.
 
 - `backup.enabled` — Enable scheduled backups.
 - `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
-- `backup.provider` — `aws` or `gcp`.
-- `backup.location` — The Control Plane location where the backup cron job runs. **Set this to the region closest to your storage bucket** to minimize cross-region transfer latency.
+- `backup.provider` — `aws` or `gcp`. Any other value is refused at render.
+- `backup.location` — The Control Plane location where the backup cron runs. It **must be one of your `locations`**, and the chart refuses to render otherwise: the cron is suspended everywhere else, so a mismatch would mean the backup never ran anywhere with no failed run to observe. Set it to the location nearest your bucket to avoid cross-region egress.
 - `backup.activeDeadlineSeconds` — Hard timeout for the backup job in seconds (default: `14400` / 4 hours). The job is killed if it exceeds this limit.
 - `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
 
@@ -260,12 +419,6 @@ Before enabling backup with `provider: aws`, complete the following in your AWS 
 1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
 2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
 3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
-
-<Warning>
-**Version 1.4.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
-
-**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
-</Warning>
 
 ```json
 {
@@ -306,25 +459,50 @@ Before enabling backup with `provider: gcp`, complete the following in your GCP 
 3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
 4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
 
+<Note>
+**Switch providers with a fresh install, not an upgrade.** An identity's cloud binding is never removed once set — the API merges rather than replaces — so a release switched from `aws` to `gcp` keeps the old provider's binding attached even though the chart no longer renders it.
+</Note>
+
 ## Restoring a Backup
 
-Backups are stored at `BUCKET/PREFIX/`. Run `cockroach sql` from a machine with network access to the cluster.
+Backups are written as a **full-cluster** backup collection at `BUCKET/PREFIX/`. Run the restore from a workload inside the GVC, or through a forwarded port to a CockroachDB node — the cluster is not reachable from outside.
 
-**AWS S3**
+Which statement you use depends on what you are restoring into, and getting this wrong is the common failure.
+
+### Into the cluster you already have
+
+Restore the database under a new name. A full-cluster restore cannot be used here: CockroachDB refuses one on any cluster that already has user databases, and this template always creates `mydb` and `myuser` on first deploy.
 
 ```sh
-cockroach sql --insecure \
-  --host="RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257" \
+cockroach sql --insecure --host="RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257" \
+  --execute="RESTORE DATABASE mydb FROM LATEST IN 's3://BUCKET_NAME/PREFIX?AUTH=implicit&AWS_REGION=BUCKET_REGION' WITH new_db_name = 'mydb_restored';"
+```
+
+On GCS, swap the URI for `'gs://BUCKET_NAME/PREFIX?AUTH=implicit'`. Drop `WITH new_db_name` only if you have already dropped `mydb`.
+
+### Into an empty cluster
+
+A full-cluster restore also brings back users and cluster settings, but it requires the target to have **no user databases at all** — so drop the ones this template created first:
+
+```sh
+cockroach sql --insecure --host="RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257" \
+  --execute="DROP DATABASE mydb CASCADE; DROP USER myuser;"
+
+cockroach sql --insecure --host="RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257" \
   --execute="RESTORE FROM LATEST IN 's3://BUCKET_NAME/PREFIX?AUTH=implicit&AWS_REGION=BUCKET_REGION';"
 ```
 
-**GCS**
+Running the second statement without the first fails with `full cluster restore can only be run on a cluster with no tables or databases`.
 
-```sh
-cockroach sql --insecure \
-  --host="RELEASE_NAME-cockroach.GVC_NAME.cpln.local:26257" \
-  --execute="RESTORE FROM LATEST IN 'gs://BUCKET_NAME/PREFIX?AUTH=implicit';"
+<Warning>
+**A full-cluster restore looks like it failed, and succeeds anyway.** Because it restores the *system* tables, the client returns
+
+```text
+ERROR: job ...: node liveness error: restarting in background
 ```
+
+one node restarts and reports `is_live=false` for roughly two minutes, and `defaultdb`/`system` briefly show `is offline: restoring`. The restore nevertheless completes — measured at about 40 seconds to the restored database being visible and about two and a half minutes to every node live again. Check `SHOW JOBS` rather than believing the error. Restoring into the cluster you already have has none of this behavior.
+</Warning>
 
 ## External References
 
@@ -335,8 +513,11 @@ cockroach sql --insecure \
     <Card title="Multi-Region Overview" icon="globe" href="https://www.cockroachlabs.com/docs/stable/multiregion-overview">
     Learn about multi-region deployments
     </Card>
-    <Card title="Survive Region Failure" icon="shield" href="https://www.cockroachlabs.com/docs/stable/alter-database#survive-region-failure">
+    <Card title="Survival Goals" icon="shield" href="https://www.cockroachlabs.com/docs/stable/multiregion-survival-goals">
     Configure region failure survival goals
+    </Card>
+    <Card title="RESTORE" icon="rotate-left" href="https://www.cockroachlabs.com/docs/stable/restore">
+    The RESTORE statement reference
     </Card>
     <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/cockroach-backup">
     Source code for the CockroachDB backup container image
