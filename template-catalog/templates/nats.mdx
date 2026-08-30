@@ -1,28 +1,72 @@
 ---
 title: NATS
-description: Deploy NATS on Control Plane using the Template Catalog. Covers configuration, multi-region super cluster, WebSocket support, gateway routing, and optional JetStream persistent storage.
-keywords: ['pubsub', 'event bus', 'lightweight broker', 'rabbitmq alternative', 'kafka alternative', 'jetstream', 'streaming', 'request reply', 'cncf', 'message broker', 'nats template']
+description: Deploy NATS on Control Plane using the Template Catalog. Covers locations and cluster sizing, JetStream persistence, WebSocket access, gateway super clusters, internal firewall scope, and migrating from template version 2.x.
+keywords: ['pubsub', 'event bus', 'lightweight broker', 'rabbitmq alternative', 'kafka alternative', 'jetstream', 'streaming', 'request reply', 'cncf', 'message broker', 'nats template', 'super cluster', 'gateway routing', 'websocket messaging']
 ---
+
+<Warning>
+**Template version 3.0.0 is a breaking change, and two of the changes need action before you install.**
+
+- **The template no longer creates a GVC.** It deploys into the GVC you install into. The `gvc.name` and `gvc.locations` values are gone; locations moved to a top-level `locations` list.
+- **Never upgrade a 2.x release onto 3.0.0 in place.** A 2.x release owns the GVC it created, and Helm deletes what a chart stops declaring — the upgrade destroys that GVC and **every workload, volume set and identity inside it**, including your JetStream data. Migrate to a new release instead: [Migrating from 2.x](#migrating-from-2-x).
+- **NATS is now closed to the internet by default.** `allowCIDR` was `0.0.0.0/0`, and this template configures no NATS authentication, so a default install published an unauthenticated message bus. It is now `[]`. See [Public Access](#public-access).
+</Warning>
 
 ## Overview
 
-NATS is an open-source, high-performance, lightweight messaging system optimized for cloud-native architectures. It supports pub/sub, queueing, and request/reply patterns. This template deploys a NATS super cluster using the official NATS image across multiple regions, with each location running independent replicas. JetStream can be enabled for persistent streams, durable consumers, K-V store, and object store — each replica gets its own dedicated volume. By default it exposes a WebSocket interface on port 443 via Control Plane's TLS termination.
+NATS is an open-source, high-performance, lightweight messaging system optimized for cloud-native architectures. It supports pub/sub, queueing, and request/reply patterns. This template deploys a NATS cluster into an existing GVC: one cluster per configured location, joined into a cross-region super cluster over NATS gateways when you configure more than one.
+
+JetStream can be enabled for durable streams, consumers, a key-value store, and an object store, with a dedicated volume per server. A WebSocket listener is available for browser clients, served by Control Plane on port 443 once you open `allowCIDR`.
 
 ### What Gets Created
 
-- **GVC** — A dedicated GVC spanning the configured locations.
-- **Stateful NATS Workload** — A NATS super cluster using the official `nats` image, with per-location replica counts, exposing the client port (4222), cluster port (6222), gateway port (7222), and optionally the WebSocket port (8080).
-- **Volume Set** *(optional, when JetStream is enabled)* — Persistent storage for JetStream data. Each replica gets its own volume, with optional autoscaling.
-- **Secrets** — An opaque configuration secret containing the full NATS server config, and an opaque extra data secret used for the `nats_extra_config` block.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to both secrets.
+- **Stateful NATS Workload** (`RELEASE_NAME-nats`) — one NATS cluster per configured location, running that location's `replicas` servers. Uses `replicaDirect` addressing, which is what the route and gateway URLs are built from. Binds the client port (4222), the cluster port (6222), the WebSocket port (8080) when enabled, and the gateway port (7222) when more than one location is configured.
+- **Volume Set** (`RELEASE_NAME-nats-vs`) *(only when JetStream is enabled)* — per-server xfs storage at `/data/nats` for the JetStream store.
+- **Secret** (`RELEASE_NAME-nats-secret`) — an opaque startup script that generates each server's `nats.conf` at boot from the location it is running in.
+- **Secret** (`RELEASE_NAME-nats-extra-data`) *(only when `nats_extra_config` is set)* — the extra configuration, appended verbatim to the generated config.
+- **Identity & Two Policies** — an identity bound to the workload, with `reveal` on this release's secrets and nothing else, plus `view` on the one GVC you install into so each server can confirm at boot that the GVC really has every location you listed.
 
 <Note>
-This template creates a GVC. If you plan to deploy multiple instances, you must assign a unique GVC name for each deployment.
+**This template does not create a GVC.** Every resource lands in the GVC you install into, so `cpln workload exec`, `cpln logs` and uninstalling all work against that GVC, and uninstalling can never delete it. Nothing runs in a GVC location you did not list in `locations`.
 </Note>
+
+## Prerequisites
+
+**A GVC must already exist, and it must contain every location you list in `locations`.** The requirement is one-directional — the GVC may have *more* locations than you list, and no NATS server runs in those. Check what a GVC has before installing:
+
+```bash
+cpln gvc get GVC_NAME -o json
+```
+
+The locations are under `spec.staticPlacement.locationLinks`. To add a missing one:
+
+```bash
+cpln gvc add-location GVC_NAME --location aws-us-east-2
+```
+
+Every workload in a GVC runs in every location that GVC has, so add locations to a shared GVC deliberately.
+
+<Warning>
+**A location the GVC does not have is not caught at install time.** The install succeeds — the platform stores the placement without validating it — and the servers declared there never start, while the servers that did start keep retrying route and gateway URLs that can never answer. Each server reads the GVC at boot and reports it:
+
+```text
+[nats] locations declared in values are not in GVC 'my-gvc': aws-eu-central-1
+[nats] GVC 'my-gvc' has: aws-us-east-1
+[nats] 3 of 6 declared servers can actually start. Every running server keeps retrying route and gateway URLs in the missing location(s), which can never answer.
+```
+
+With JetStream enabled, a server with an **empty** store refuses to bootstrap on this; a server whose store already holds data warns and keeps serving, so the check can never take a live cluster down. With JetStream off it only ever warns. Read it with a server-side filter:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-nats"} |= "[nats]"' --limit 100 --since 15m
+```
+</Warning>
+
+Nothing else is required for a default install — this template takes no prerequisite secrets.
 
 ## Installation
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -46,154 +90,283 @@ This template has no external prerequisites. To install, follow the instructions
     </Card>
 </CardGroup>
 
+## Migrating from 2.x
+
+Template versions through 2.0.0 created their own GVC, so that GVC is part of the 2.x release's manifest. Version 3.0.0 does not declare it — and Helm deletes what a chart stops declaring.
+
+<Warning>
+**An in-place upgrade from 2.x to 3.0.0 destroys the deployment.** Measured on a sibling template with the guard removed: the upgrade **deleted the GVC and every workload, volume set and identity inside it in 6 seconds, and reported that the release had been upgraded successfully.** Reading the GVC back afterwards returned `404`. With JetStream enabled, the volume set holds your streams.
+
+The chart ships a render-time refusal so this cannot happen by accident: any leftover `gvc` key in your values aborts the upgrade before a single API call is made, leaving your cluster untouched and running.
+
+```text
+Error: execution error at (nats/templates/workloads.yaml:3:4): nats 3.0.0: the `gvc` values key was
+REMOVED. This chart no longer creates a GVC -- it deploys into the GVC you install into, and
+`gvc.locations` moved to the top-level `locations`. DO NOT `helm upgrade` a 2.x release onto 3.0.0:
+the upgrade drops `kind: gvc` from the manifest and Helm deletes what a chart no longer declares,
+which DESTROYS that GVC and every workload, volumeset and identity inside it -- including your
+JetStream data.
+```
+
+**The guard cannot cover one case: an upgrade run with no values at all.** A 2.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires and the deletion proceeds. Do not run an upgrade of a 2.x release against the 3.0.0 chart under any circumstances — migrate to a new release instead.
+</Warning>
+
+<Steps>
+  <Step title="Choose the GVC for the new release">
+    Create or pick a GVC and make sure it has exactly the locations you intend to list in `locations`. See [Prerequisites](#prerequisites).
+  </Step>
+  <Step title="Install 3.0.0 as a NEW release">
+    Use a **different release name**: secret names are org-wide, so a same-named release collides with the 2.x one even in another GVC. Translate your old `gvc.locations` into the top-level `locations` list, and note that `allowCIDR` now defaults to closed — if the 2.x deployment served browser clients over WebSocket, set your own ranges explicitly.
+  </Step>
+  <Step title="Move the traffic">
+    Point publishers and subscribers at the new release. With JetStream, mirror the streams across with the `nats` CLI before cutting over — a stream is not carried by the chart.
+  </Step>
+  <Step title="Uninstall the old release against the GVC you installed it into">
+    Not the GVC it created — the GVC you passed at install time is where Helm tracks the release, and uninstalling from there takes the created GVC with it.
+  </Step>
+</Steps>
+
+Values that moved or were removed in 3.0.0. The chart names each one at render time rather than ignoring it, so an old values file produces an error instead of a silent misconfiguration:
+
+| 2.x | 3.0.0 |
+|---|---|
+| `gvc.name` | Gone. The chart deploys into the GVC you install into |
+| `gvc.locations` | `locations`, at the top level |
+| `nats_defaults.cluster.listen` | Gone. Derived as `0.0.0.0:<port>`, so it can no longer disagree with the port |
+| `nats_defaults.gateway.listen` | Gone, for the same reason |
+| `nats_defaults.cluster.noAdvertise` | Gone. It was never wired to anything and silently did nothing. Use `cluster { no_advertise: true }` in `nats_extra_config` if you need it |
+| `volumeset.autoscaling` | Gone. The scaling behavior was never verified on this template, so the knob was removed rather than shipped untested |
+| `locations[].replicas: 0` | Not allowed. Remove the location instead |
+
 ## Configuration
 
 The default `values.yaml` for this template:
 
 ```yaml
-gvc:
-  name: nats-gvc
-  locations:
-    - name: aws-us-east-1
-      replicas: 2
-    - name: aws-us-west-2
-      replicas: 2
-    - name: aws-eu-central-1
-      replicas: 2
+# ─── Locations ────────────────────────────────────────────────────────────────
+# This chart deploys into the GVC you install into — it does NOT create one.
+# Every location listed here MUST already exist in that GVC. A location the GVC
+# lacks contributes route and gateway URLs for servers that never start: the
+# other servers retry those peers forever and you silently have less redundancy
+# than you configured. The servers check this against the live GVC at boot and
+# say so (see Important Notes in the README).
+#
+# One entry = one NATS cluster; `replicas` = servers in that cluster. Two or more
+# locations are joined into a super cluster over NATS gateways.
+#
+# The default is ONE location with THREE servers: the smallest shape that both
+# installs on any single-location GVC and is a real NATS cluster — 3 is NATS's
+# recommended cluster size and the minimum for fault-tolerant JetStream. Set it
+# to YOUR GVC's locations before installing. See the quorum table in the README.
+locations:
+  - name: aws-us-east-1
+    replicas: 3
+
+image: nats:2.11.6-alpine # official NATS image tag — bump to upgrade NATS
 
 resources:
   cpu: 100m
   memory: 256Mi
 
-image: nats:2.11.6-alpine # official NATS image tag — bump to upgrade NATS version
-
+# ─── NATS listeners ───────────────────────────────────────────────────────────
+# Each listener binds 0.0.0.0 on the port below. Monitoring is fixed on 8222 and
+# is not published as a container port.
 nats_defaults:
-  port: 4222
+  port: 4222 # client port (nats:// and internal GVC clients)
   cluster:
-    listen: "0.0.0.0:6222"
-    port: 6222
-    noAdvertise: false
+    port: 6222 # route connections between replicas in the SAME location
   gateway:
-    listen: "0.0.0.0:7222"
-    port: 7222
-
+    port: 7222 # gateway connections BETWEEN locations; unused with one location
   websocket:
-    enabled: true
+    enabled: true # publishes the workload's public endpoint; Control Plane serves it on 443
     port: 8080
     compression: false
-    noTls: true # Control Plane handles TLS termination
-    # allowedOrigins: []  # Uncomment and add origins if needed
-    # advertise: "ws://example.com:8080"  # Uncomment if different from default
+    noTls: true # Control Plane terminates TLS — leave true unless you supply certs
 
-allowCIDR:
-  - 0.0.0.0/0 # Allow all traffic. Change to specific CIDRs to limit exposure.
-              # Only applicable to the WebSocket port. Control Plane exposes it on port 443.
+# Inbound public CIDRs for the WebSocket endpoint, which Control Plane exposes on
+# port 443. EMPTY = no public access, which is the default: this chart configures
+# NO NATS authentication, so opening it to 0.0.0.0/0 publishes an unauthenticated
+# message bus to the internet — measured handing an anonymous outside client the
+# cluster name, every server name and their private IPs. Add your own ranges here
+# only alongside an `authorization { … }` block in `nats_extra_config`.
+allowCIDR: []
 
+# ─── JetStream ────────────────────────────────────────────────────────────────
 jetstream:
-  enabled: false # set to true to enable persistent JetStream streaming and storage
+  enabled: false # set to true for durable streams, consumers, K/V and object store
 
 volumeset:
   capacity: 10 # initial capacity in GiB per replica (minimum is 10)
-  autoscaling:
-    enabled: false
-    maxCapacity: 100
-    minFreePercentage: 10
-    scalingFactor: 1.2
 
-# Add any additional valid NATS configuration here — appended to the server config at startup
+# Any additional valid NATS configuration — appended verbatim to the generated
+# server config at startup. A syntax error here is a container that will not
+# start, not a render failure.
 nats_extra_config: ""
 
-internalAccess: # Sets the internal firewall scope
+# ─── Access ───────────────────────────────────────────────────────────────────
+internalAccess:
   type: same-gvc # options: none, same-gvc, same-org, workload-list
-  workloads: # Note: can only be used if type is same-gvc or workload-list
-    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+  workloads: [] # only used when type is workload-list; the NATS workload is added automatically
+  #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
-### Image
+### Locations and Cluster Sizing
 
-- `image` — The NATS container image to use. Defaults to the official `nats:2.11.6-alpine` image. Bump the tag to upgrade the NATS version.
+Each entry pairs a location with a server count. Every location listed must already exist in the GVC you install into; extra GVC locations are ignored. Listing the same location twice is rejected at render, as is a location with `replicas: 0` — to stop running somewhere, remove the entry.
 
-### GVC and Locations
+The default is one location with three servers: the smallest shape that is both a real NATS cluster and installable on any single-location GVC.
 
-- `gvc.name` — Name of the GVC to create. Must be unique per deployment if running multiple instances.
-- `gvc.locations` — List of locations where NATS replicas will run. Each entry requires:
-  - `name` — The location identifier (e.g. `aws-us-east-1`).
-  - `replicas` — Number of NATS replicas in that location. Set to `0` to suspend a location without removing it.
+| Servers | Core NATS | JetStream |
+|---|---|---|
+| 1 | Works | Standalone. `R1` streams only, no fault tolerance |
+| 2 | Works | **Refused by this template** — quorum is 2 of 2, so losing either server takes JetStream down entirely. Strictly worse than a single server |
+| 3 | Works | Survives losing one server. NATS's recommended minimum |
+| 5 | Works | Survives losing two servers |
 
-### Resources
+<Note>
+Only the 2-server shape is refused, because it is the one reached by accident: scaling from 1 to 2 looks like an improvement and is not. A 3-server roster whose GVC is missing one location becomes this shape at runtime, and the startup script warns when it sees exactly 2 servers running.
+</Note>
 
-- `resources.cpu` / `resources.memory` — CPU and memory allocated to each NATS replica.
+Adding a **second location** does not change the quorum arithmetic — it buys geographic locality. Each location is its own NATS cluster, so clients connect to servers near them, and gateways forward only the traffic that has interested subscribers on the other side. JetStream's meta group spans the whole super cluster, so size the *total* server count against the table above, and give each location at least 3 servers if you want streams to survive losing a whole location.
+
+<Note>
+GVC locations you did not list run nothing. Their deployment reads `This workload location is deactivated because maxScale is set to 0.` That is the mechanism that keeps a shared GVC safe — it is what a healthy install looks like, not a fault. One consequence is worth knowing: the **workload-level** `ready` badge then reports `false` permanently, because that location's deployment never becomes ready, while the per-location status stays `true`. Gate any script on the per-location status, not the rollup.
+</Note>
+
+Cross-region gateway traffic is billed, which is why a single location is the default.
+
+### Image and Resources
+
+- `image` — the NATS container image. Defaults to the official `nats:2.11.6-alpine`; bump the tag to upgrade NATS.
+- `resources.cpu` / `resources.memory` — allocated to each NATS server. The defaults are small; raise them for real throughput.
+
+### Listeners
+
+Every listener binds `0.0.0.0` on its configured port. Monitoring is fixed on `8222` and is not published as a container port.
+
+| Knob | Default | Purpose |
+|---|---|---|
+| `nats_defaults.port` | `4222` | Client port, for `nats://` clients inside the GVC |
+| `nats_defaults.cluster.port` | `6222` | Route connections between servers in the **same** location |
+| `nats_defaults.gateway.port` | `7222` | Gateway connections **between** locations. Published only when more than one location is configured |
+| `nats_defaults.websocket.enabled` | `true` | Publishes the workload's public endpoint; Control Plane serves it on 443 |
+| `nats_defaults.websocket.port` | `8080` | Internal WebSocket port |
+| `nats_defaults.websocket.compression` | `false` | Per-message deflate |
+| `nats_defaults.websocket.noTls` | `true` | Control Plane terminates TLS — leave `true` unless you supply certificates |
+
+The template refuses at render time to bind a port Control Plane reserves for system use, and to put two listeners on the same port. Both failures are otherwise invisible to `helm template`: a reserved port is rejected by the API at install, and a port collision is accepted and then crash-loops the container with `address already in use`.
+
+### Public Access
+
+```yaml
+allowCIDR: []  # empty = no public access
+```
+
+`allowCIDR` lists the inbound CIDR ranges allowed to reach the WebSocket endpoint from the internet. It applies to the WebSocket port only — the client (4222), cluster (6222) and gateway (7222) ports are never exposed publicly.
+
+<Warning>
+**This template configures no NATS authentication, so opening `allowCIDR` publishes an unauthenticated message bus.** Measured against an open deployment: an anonymous outside client was handed the cluster name, every server name and their private IPs, and could publish and subscribe freely. Version 3.0.0 changed the default from `0.0.0.0/0` to `[]` for this reason.
+
+Open it only alongside an `authorization { ... }` block in [`nats_extra_config`](#extra-nats-configuration), and prefer the narrowest ranges that cover your clients.
+</Warning>
+
+<Note>
+**Do not pin a single `/32`.** Measured during testing: a client behind a corporate proxy pool moved to a different address, and a perfectly healthy deployment began returning `403` to it. Widening the range restored access. Use a range wide enough to cover your egress, not just the address you happen to have today.
+</Note>
+
+To reach a closed deployment without opening it at all, tunnel to it with `cpln port-forward`:
+
+```bash
+cpln port-forward RELEASE_NAME-nats 4222:4222 --gvc GVC_NAME
+```
 
 ### JetStream
 
-- `jetstream.enabled` — When `true`, enables NATS's built-in persistence layer, adding durable streams, consumers, K-V store, and object store on top of the core pub/sub model. Without it, NATS is purely in-memory.
+```yaml
+jetstream:
+  enabled: false # set to true for durable streams, consumers, K/V and object store
+```
 
-When JetStream is enabled, each replica gets its own dedicated persistent volume (configured via `volumeset`).
+Without JetStream, NATS is in-flight only: a message with no connected subscriber is gone. Enabling it adds durable streams, durable consumers, a key-value store and an object store, and creates the volume set. Sizing is decided by the total server count — see the table under [Locations and Cluster Sizing](#locations-and-cluster-sizing).
 
 <Note>
-Streams default to `num_replicas: 1`, meaning stream data lives on a single server. For streams that must survive a location outage, set `num_replicas` to 2 or higher in your application — this is configured per-stream, not in this template.
+Streams default to `num_replicas: 1`, so stream data lives on a single server. A stream only survives losing a server if you set `num_replicas` to 3 or more **when you create the stream** — that is per-stream, in your application, not a setting in this template.
 </Note>
 
 ### Volume Set
 
 The `volumeset` block applies only when `jetstream.enabled: true`.
 
-- `volumeset.capacity` — Initial volume size in GiB per replica (minimum 10).
-- `volumeset.autoscaling.enabled` — Automatically expand the volume as it fills. When enabled:
-  - `maxCapacity` — Maximum volume size in GiB.
-  - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
-  - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
+- `volumeset.capacity` — initial volume size in GiB per server, minimum 10. Each server gets its own volume at `/data/nats`.
 
-### WebSocket
-
-- `nats_defaults.websocket.enabled` — When `true`, exposes a WebSocket endpoint on the configured port. Control Plane handles TLS termination and serves it externally on port 443.
-- `nats_defaults.websocket.port` — Internal WebSocket port (default: `8080`).
-
-### External Access
-
-- `allowCIDR` — CIDR ranges allowed to reach the WebSocket port from the internet. Defaults to `0.0.0.0/0` (open to all). Restrict this to limit exposure.
-
-<Note>
-`allowCIDR` only applies to the WebSocket port. The NATS client port (4222), cluster port (6222), and gateway port (7222) are only accessible internally.
-</Note>
-
-### Internal Access
-
-- `internalAccess.type` — Controls which workloads can reach NATS on the client (4222), cluster (6222), and gateway (7222) ports:
-
-| Type | Description |
-|------|-------------|
-| `none` | No internal access allowed |
-| `same-gvc` | Allow access from all workloads in the same GVC |
-| `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from specific workloads listed in `workloads` |
-
-<Note>
-Do not set `internalAccess.type` to `none`. NATS replicas must be able to communicate with each other across the cluster and gateway ports for the super cluster to function.
-</Note>
+Uninstalling the release deletes the volume set and the JetStream data on it.
 
 ### Extra NATS Configuration
 
-- `nats_extra_config` — Any additional valid NATS server configuration appended to the server config at startup. Use this to set `max_payload`, configure accounts, or add other NATS server options:
+`nats_extra_config` is appended verbatim to the generated server configuration at startup. Use it for anything the template does not expose — payload limits, accounts, authorization:
 
 ```yaml
 nats_extra_config: |
   max_payload: 8MB
 ```
 
-### Connecting to NATS
+<Warning>
+**This block is injected verbatim and is not validated at render time.** A syntax error here is a container that will not start, which is easy to mistake for an infrastructure problem. Check the workload log for the NATS server's own parse error.
+</Warning>
 
-**Internally** (from workloads in the same GVC), connect on the standard NATS client port:
+### Internal Access
 
-```text
-nats://RELEASE_NAME-nats.GVC_NAME.cpln.local:4222
+```yaml
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # only with workload-list — list only your clients
+  #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
-**Externally** via WebSocket, connect through the Control Plane endpoint on port 443:
+| Type | Description |
+|------|-------------|
+| `none` | No internal access. **Refused for any multi-server deployment** — see below |
+| `same-gvc` | Allow access from all workloads in the same GVC |
+| `same-org` | Allow access from all workloads in the org |
+| `workload-list` | Allow access only from the workloads you list, **plus this release's own workload**, which the template adds for you |
 
-```text
-wss://RELEASE_NAME-nats.GVC_NAME.cpln.app
+<Warning>
+**This list is not only about client traffic.** The same internal firewall governs the route connections between servers in a location and the gateway connections between locations. A `workload-list` naming only your applications would cut the cluster off from itself: routes never establish, each server runs alone, and JetStream loses its meta group — while every replica still reports `ready: true`, because this workload has no readiness probe and readiness says nothing about clustering.
+
+The template adds its own workload to the list for you, so you only need to list your clients. For the same reason, `internalAccess.type: none` is refused at render for any deployment with more than one server; it is valid only for a single server reached over the public WebSocket endpoint.
+</Warning>
+
+## Connecting to NATS
+
+| From | Address | Credentials |
+|---|---|---|
+| Another workload in the same GVC | `nats://RELEASE_NAME-nats.GVC_NAME.cpln.local:4222` | None — this template configures no NATS authentication |
+| A specific server, for clustering or debugging | `nats://replica-N.RELEASE_NAME-nats.LOCATION.GVC_NAME.cpln.local:4222` | None |
+| The internet, over WebSocket | `wss://` + the workload's canonical endpoint, once `allowCIDR` is set | None, unless you add an `authorization { ... }` block |
+| Your own machine | A `cpln port-forward` tunnel to port 4222, then `nats://localhost:4222` | None |
+
+Use the fully-qualified `.GVC_NAME.cpln.local` form — the bare workload name does not resolve reliably from every workload type.
+
+<Note>
+**Read the public hostname, never assemble it.** The shape of a canonical endpoint varies between GVCs, so a hand-built hostname is a guess:
+
+```bash
+cpln workload get RELEASE_NAME-nats --gvc GVC_NAME -o yaml
 ```
+
+The value is `status.canonicalEndpoint`. Control Plane terminates TLS and serves the WebSocket listener on port 443, so connect with `wss://` on the default port.
+</Note>
+
+## Important Notes
+
+- **Never upgrade a 2.x release onto 3.0.0 in place** — it deletes the GVC the 2.x chart created and everything in it. Migrate to a new release: [Migrating from 2.x](#migrating-from-2-x).
+- **The GVC must contain every location you list**, and may contain more. A missing location is not caught at install; each server reports it at boot. With JetStream on, a server with an empty store refuses to bootstrap and one that already holds data warns and keeps serving.
+- **A GVC location you did not list runs nothing**, and makes the workload's rollup `ready` badge read `false` permanently while per-location status stays `true`. That is the expected result of pinning the location list, not a fault.
+- **There is no public access by default, and no NATS authentication.** Opening `allowCIDR` without an `authorization { ... }` block in `nats_extra_config` publishes an unauthenticated bus.
+- **A firewall change takes roughly 30 seconds to several minutes to propagate.** After changing `allowCIDR` or `internalAccess`, keep re-testing rather than concluding the knob is broken.
+- **A rolling restart of a stateful NATS tier is slow** — between about 5 and 9 minutes for 3 servers, one replica at a time, with a JetStream leader election in the middle if JetStream is on. The bus keeps serving throughout; a restart that is still converging after 5 minutes has not hung.
+- **JetStream data lives on the volume set and is deleted when you uninstall.** Streams also default to `num_replicas: 1` — set it higher per stream if a stream must survive a server loss.
+- **`nats_extra_config` is injected verbatim**, so a syntax error there stops the container rather than failing the render.
 
 ## External References
 
@@ -203,6 +376,15 @@ wss://RELEASE_NAME-nats.GVC_NAME.cpln.app
     </Card>
     <Card title="JetStream" icon="database" href="https://docs.nats.io/nats-concepts/jetstream">
     NATS JetStream persistence and streaming
+    </Card>
+    <Card title="Clustering" icon="sitemap" href="https://docs.nats.io/running-a-nats-service/configuration/clustering">
+    Route connections between servers in a cluster
+    </Card>
+    <Card title="Super Clusters and Gateways" icon="globe" href="https://docs.nats.io/running-a-nats-service/configuration/gateways">
+    Joining clusters across locations with gateways
+    </Card>
+    <Card title="Configuration Reference" icon="gear" href="https://docs.nats.io/running-a-nats-service/configuration">
+    Every NATS server configuration option
     </Card>
     <Card title="NATS Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/nats">
     View the source files, default values, and chart definition
