@@ -4,6 +4,10 @@ description: Deploy etcd Multi-Location on Control Plane using the Template Cata
 keywords: ['kv store', 'cross-region coordination', 'raft consensus', 'leader election', 'distributed lock', 'consul alternative', 'zookeeper alternative', 'geo-distributed', 'etcdctl', 'service discovery', 'config store', 'failover', 'auto-compaction', 'backend quota', 'nospace alarm']
 ---
 
+<Warning>
+**Version 2.0.0 no longer creates a GVC — it deploys into one you already have, and there is no in-place upgrade path from 1.x.** A `helm upgrade` across that boundary deletes the GVC the old release created and every workload, volume set and identity inside it. See [Migrating From Version 1](#migrating-from-version-1).
+</Warning>
+
 ## Overview
 
 etcd is a strongly consistent key-value store used as the coordination layer for leader election, distributed locking, and service configuration. This template deploys a **single stretched etcd cluster with exactly one member per Control Plane location**, sharing one raft quorum across regions, with raft timers tuned for cross-region round trips and auto-compaction enabled.
@@ -11,22 +15,25 @@ etcd is a strongly consistent key-value store used as the coordination layer for
 It is also the consensus store used by the [`postgres-multi-location`](/template-catalog/templates/postgres-multi-location) template, and is independently useful as a cross-region coordination store for your own services.
 
 <Note>
-This template creates a new GVC and requires at least 2 locations. For a single-location cluster, use the [etcd](/template-catalog/templates/etcd) template instead.
+This template deploys into a GVC **you already have**, and that GVC must have at least 2 locations. It does not create, provision or manage a GVC. For a single-location cluster, use the [etcd](/template-catalog/templates/etcd) template instead.
 </Note>
 
 ### What Gets Created
 
-- **GVC** — A new GVC pinned to the configured locations via static placement. The GVC is what pins the deployment's locations, so it is always created.
 - **Stateful etcd Workload** — (`RELEASE_NAME-etcd`): one member in each configured location, using `replicaDirect` addressing so every member is individually reachable. Client API on `2379`, raft peer traffic on `2380`.
 - **Volume Set** — (`RELEASE_NAME-etcd-vs`): persistent storage per member at `/var/lib/etcd` for the raft write-ahead log and snapshots. ext4, general-purpose-ssd, final snapshot on delete, 7-day snapshot retention.
 - **Secret** — (`RELEASE_NAME-etcd-startup`): an opaque startup script that computes each member's name, peer URL, and the full cluster list at container start from the location it is running in.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the startup script secret and nothing else.
+- **Identity & Two Policies** — An identity bound to the workload, granted `reveal` on the startup script secret and nothing else, plus `view` on **exactly the one GVC this release installs into**. The second grant is what lets each member read its own GVC's location list at boot; it is scoped to that single GVC, never to the whole org.
+
+No GVC resource is created. Every resource above lands in the GVC you install into, and the members read that GVC's name from the platform at runtime rather than from Helm, so a hostname can never drift from where the workload actually runs.
 
 Members find each other over per-replica internal DNS (`replica-0.RELEASE_NAME-etcd.LOCATION.GVC_NAME.cpln.local:2380`). There is no operator, no discovery service, and no join step — every member receives the full cluster list up front and they elect a leader among themselves.
 
 ## Installation
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+The only prerequisite is **an existing GVC whose locations include every entry in `global.locations`** — read its list with `cpln gvc get GVC_NAME -o yaml` and compare `spec.staticPlacement.locationLinks` before you install. Nothing else is needed: no cloud account, no bucket, no pre-created secret, no custom domain.
+
+To install, follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -55,19 +62,26 @@ This template has no external prerequisites. To install, follow the instructions
 The default `values.yaml` for this template:
 
 ```yaml
-# ─── GVC and locations ────────────────────────────────────────────────────────
-# Lives under `global` so a parent chart (postgres-multi-location) sets it once
-# and Helm propagates it here. See README before changing.
+# ─── Locations ────────────────────────────────────────────────────────────────
+# This chart deploys into the GVC you install into — it does NOT create one.
+# Every location listed here MUST already exist in that GVC: a location the GVC
+# lacks contributes a declared etcd member that can never start, which shrinks
+# the cluster to a bare majority while every status surface reads healthy.
+# The members refuse to bootstrap in that state rather than form it.
+#
+# Lives under `global` so a parent chart (postgres-multi-location consumes this
+# one as a subchart) sets the list once and Helm propagates it here — the two
+# lists can then never be edited apart.
 
 global:
-  gvc:
-    name: etcd-multi-location-gvc # the GVC this chart creates
-    # One etcd member per location. Minimum 2; 3 survives losing one location,
-    # 5 survives losing two. See the quorum table in the README.
-    locations:
-      - name: aws-us-east-1
-      - name: aws-eu-central-1
-      - name: aws-us-west-2
+  # One etcd member per location. Minimum 2; 3 survives losing one location,
+  # 5 survives losing two. See the quorum table in the README — 3 is the
+  # recommended production shape. This default is the smallest cluster the
+  # chart allows, because no location list can be right for every GVC: set it
+  # to YOUR GVC's locations before installing.
+  locations:
+    - name: aws-us-east-1
+    - name: aws-us-west-2
 
 # ─── etcd ─────────────────────────────────────────────────────────────────────
 image: controlplanecorporation/etcd:0.1
@@ -92,7 +106,7 @@ volumeset:
 
 internalAccess:
   type: same-gvc # options: same-gvc, same-org, workload-list
-  workloads: [] # only used when type is workload-list
+  workloads: [] # only used when type is workload-list; the etcd workload is added automatically
   #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
 # ─── Disaster recovery ────────────────────────────────────────────────────────
@@ -105,12 +119,9 @@ recovery:
 
 ### Locations and Quorum
 
-- `global.gvc.name` — Name of the GVC this template creates. It must **not** name a GVC that already exists.
-- `global.gvc.locations` — The member map: one etcd member is deployed in each listed location. At least 2 locations are required.
+`global.locations` is the member map: one etcd member is deployed in each listed location, and at least 2 locations are required. **Every name in it must already be one of the locations of the GVC you install into.** The default list is the smallest cluster the chart allows rather than a recommendation — no built-in list can match your GVC, so set it before installing.
 
-<Warning>
-Helm owns the GVC this template creates. If `global.gvc.name` matches a GVC that already exists, Helm adopts it and a later uninstall deletes that GVC along with everything inside it. Always pick a name no other release uses.
-</Warning>
+The list lives under `global` so a parent chart — [`postgres-multi-location`](/template-catalog/templates/postgres-multi-location) consumes this template as a subchart — sets it once and Helm propagates it here. The two lists can then never be edited apart. Each location runs exactly one member; `replicas` is fixed at `1` and any other value fails a standalone render.
 
 etcd commits a write only when a **majority** of members accept it. Because there is exactly one member per location, the location is the failure domain:
 
@@ -123,11 +134,28 @@ etcd commits a write only when a **majority** of members accept it. Because ther
 
 With N locations you survive `floor((N-1)/2)` losses, so an even count never buys anything over the odd count below it. Two locations is permitted as a deliberate warm-standby topology, but it survives nothing automatically.
 
-The `global.gvc` block lives under `global` so that a parent chart — `postgres-multi-location` consumes this template as a subchart — sets the GVC and location list once and Helm propagates it. Each location runs exactly one member; any other replica count fails at render time.
-
 <Note>
-Changing `global.gvc.locations` reprovisions the cluster: every member restarts with a new cluster list. This is not etcd's graceful `member add` / `member remove` path, so plan it as a maintenance window.
+Changing `global.locations` reprovisions the cluster: every member restarts with a new cluster list. This is not etcd's graceful `member add` / `member remove` path, so plan it as a maintenance window.
 </Note>
+
+### Matching the Location List to the GVC
+
+The platform does not validate the pairing in either direction, and both mismatches are dangerous in different ways. The template closes both.
+
+| `global.locations` | The GVC's locations | What happens |
+|---|---|---|
+| 3 | The same 3 | Correct. Survives losing one location. |
+| 3 | 2 of those 3 | Would otherwise **form and report healthy with zero fault tolerance** — a `new` bootstrap needs only a majority of the *declared* set. The template refuses to bootstrap instead. |
+| 3 | 1 of those 3 | Quorum is arithmetically unreachable. The template refuses to bootstrap rather than wait forever for an election that cannot complete. |
+| 3 | Those 3 plus another | The extra location runs **nothing** — the workload's default `minScale`/`maxScale` are `0`, and only the declared locations get a real replica count. Its deployment reads `This workload location is deactivated because maxScale is set to 0`. |
+
+Each member checks its own GVC at boot, using the scoped `view` grant described in [What Gets Created](#what-gets-created), and the check is deliberately asymmetric:
+
+- On a **fresh** data directory, any declared location the GVC lacks is a **hard failure**. The container exits with code `1` and logs a `[etcd] FATAL:` line naming the missing location and how many declared members could actually start.
+- On an **already-initialized** member it is a **warning only**, and the member keeps serving. A location removed from a GVC is indistinguishable from a location that is down, so failing here would turn "lost one member" into "lost the cluster".
+- If the GVC read itself fails — a control-plane blip, or a missing policy — the check is **skipped with a warning**. It never blocks a start on its own unavailability.
+
+Look for `[etcd]` lines in `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-etcd"}'` when a member will not come up.
 
 ### Image and Resources
 
@@ -193,10 +221,14 @@ The `internalAccess` section controls which workloads can reach the client API o
 | `workload-list` | Allow access only from the specific workloads listed in `internalAccess.workloads` |
 
 <Warning>
+**With `workload-list`, list only your clients — never the etcd workload itself.** The internal firewall governs *all* inbound internal traffic, including the raft peer traffic between the members of this same workload, so a list naming only clients used to cut the cluster off from itself: on an earlier version, every member was dead within about two minutes of the upgrade while Helm reported `upgraded successfully`. The template now appends its own workload link for you, so scoping access is safe — a client that is not listed is still refused, and the cluster stays whole.
+</Warning>
+
+<Warning>
 There is deliberately no public access: etcd in this template runs without TLS and without authentication. Anything permitted by `internalAccess` has full read/write access to the entire keyspace. Use `workload-list` if the GVC contains workloads that should not have it.
 </Warning>
 
-Firewall changes take up to roughly two and a half minutes to take effect. Re-test after waiting rather than concluding the setting was ignored.
+A firewall change takes roughly 30 seconds to a few minutes to take effect — over two minutes was measured on this template, and other templates have taken longer still. Re-test after waiting rather than concluding the setting was ignored.
 
 ### Connecting to etcd
 
@@ -205,6 +237,8 @@ Firewall changes take up to roughly two and a half minutes to take effect. Re-te
 | Client API, load-balanced across locations | `RELEASE_NAME-etcd.GVC_NAME.cpln.local:2379` |
 | A specific location's member | `replica-0.RELEASE_NAME-etcd.LOCATION.GVC_NAME.cpln.local:2379` |
 | Raft peer traffic (members only) | Port `2380` |
+
+`GVC_NAME` is the GVC you installed the release into — the template creates none of its own.
 
 Point clients at one endpoint per location so they can fail over. From inside the cluster:
 
@@ -251,10 +285,41 @@ A client co-located with the leader does not get local-write latency — one cro
 ## Upgrades
 
 <Warning>
-A `helm upgrade` takes the whole cluster down for about **66 seconds** (measured on three locations). Members in every location restart together, quorum is lost, and writes time out until it returns. The cluster recovers on its own, but every configuration change — including one that only changes a firewall rule — costs that window, so plan upgrades as a short planned outage.
+**Every `helm upgrade` restarts all members at roughly the same time — a rollout of about 105 seconds, with 20–30 seconds of lost quorum inside it.** Measured on three locations and reproduced at 104 seconds on a second upgrade. Writes time out while quorum is gone, the cluster recovers on its own, and the data survives. **A no-op upgrade that changes nothing costs exactly the same**, so there is no cheaper kind of upgrade to plan around — treat every change, including one that only touches a firewall rule, as a short planned outage.
 </Warning>
 
 Nothing serializes the restart: the field that would limit it (`rolloutOptions.maxUnavailableReplicas`) is not retained by the platform, so the chart deliberately does not set it. Running more members per location has not been tested and should not be assumed to help.
+
+## Migrating From Version 1
+
+Versions before 2.0.0 created their own GVC. **Do not `helm upgrade` a 1.x release onto 2.0.0.** Once the chart stops declaring a GVC, Helm prunes the one the old release created — and deleting a GVC deletes every workload, volume set and identity inside it. Measured on a sibling template: everything was gone in about **six seconds**, while the command printed `upgraded successfully`.
+
+<Warning>
+The chart refuses to render when your values still carry the 1.x `global.gvc` key, so a values-carrying upgrade fails safely before any resource is touched. That guard **cannot** fire on an upgrade run with no values file at all, because it then sees only 2.0.0's own defaults. The procedure below is the safety; the render guard is only a backstop.
+</Warning>
+
+Install 2.0.0 as a **new release against an existing GVC**, move the keyspace across, then remove the old release.
+
+<Steps>
+  <Step title="Choose the target GVC">
+    Pick a GVC whose locations are exactly the ones you want members in, and read them back with `cpln gvc get GVC_NAME -o yaml` — `spec.staticPlacement.locationLinks` is the list. Do **not** point the new release at the GVC the old release created: that GVC is still owned by the old Helm release, and uninstalling it later would take the new workloads with it.
+  </Step>
+  <Step title="Snapshot the old cluster's keyspace">
+    ```bash
+    cpln workload exec OLD_RELEASE-etcd --gvc OLD_GVC_NAME --container etcd \
+      -- etcdctl get "" --prefix -w json > keyspace.json
+    ```
+  </Step>
+  <Step title="Install 2.0.0 as a new release">
+    Replace `global.gvc.name` and `global.gvc.locations` in your old values with a single top-level `global.locations` list naming the chosen GVC's locations, then install into that GVC.
+  </Step>
+  <Step title="Confirm the new cluster, then write your keys into it">
+    `etcdctl member list -w table` must show one member per configured location before you load anything.
+  </Step>
+  <Step title="Remove the old release">
+    Uninstalling the old release removes it **and the GVC it created**, including its volume sets. Run it against the GVC the old release was installed into.
+  </Step>
+</Steps>
 
 ## Behavior Under Quorum Loss
 
@@ -265,7 +330,7 @@ When a majority of members is unreachable, the cluster stops committing writes. 
 - **`IS LEADER: true` is not proof of leadership.** An isolated survivor keeps reporting itself as leader for about 6 seconds while unable to commit anything. Health-check with a linearizable read (`etcdctl get KEY`, without `--consistency=s`), never with `endpoint status`.
 
 <Warning>
-Never suspend a location for this workload. Suspending and resuming a location permanently withdraws that location's endpoints from the other locations' service discovery while every status surface still reports healthy. Add or remove locations by editing `global.gvc.locations` instead.
+Never suspend a location for this workload. Suspending and resuming a location permanently withdraws that location's endpoints from the other locations' service discovery while every status surface still reports healthy. Add or remove locations by editing the GVC and `global.locations` together instead.
 </Warning>
 
 ## Recovering from a Lost Location
@@ -290,6 +355,10 @@ Never suspend a location for this workload. Suspending and resuming a location p
 <Warning>
 Never set `recovery.forceNewClusterInLocation` to more than one location, and never leave it set. Two members both forcing a new cluster produce two divergent single-member clusters that cannot be merged.
 </Warning>
+
+<Note>
+**The render-time check only compares this value against `global.locations`, not against the GVC.** Naming a location the GVC does not have therefore passes validation, no member runs there, and the flag is silently never applied. Every surviving member logs a warning saying exactly that — `[etcd] WARNING: recovery.forceNewClusterInLocation is set to '...', which GVC '...' does not have` — so read the logs if a recovery appears to do nothing.
+</Note>
 
 ## If the Backend Quota Fills
 

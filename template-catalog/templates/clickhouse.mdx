@@ -1,104 +1,89 @@
 ---
 title: ClickHouse
-description: Deploy ClickHouse on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, deployment modes, ClickHouse Keeper coordination, and S3, GCS, Azure Blob Storage, or Hetzner Object Storage.
+description: Deploy ClickHouse on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, deployment modes, ClickHouse Keeper coordination, object storage on S3, GCS, Azure Blob Storage or Hetzner, and migrating from template version 2.x.
 keywords: ['column store', 'olap', 'analytics db', 'duckdb alternative', 'redshift alternative', 'snowflake alternative', 'time series', 'click house template', 'data warehouse', 'columnar database', 'real-time analytics', 'azure blob storage', 'hetzner object storage', 'dictionary secret', 'clickhouse-client']
 ---
 
 <Warning>
-**Version 2.8.0 moves the Azure Storage account key out of values.** It was a plain template value, so it landed in your Helm release and in a stored config file. It is now a `dictionary` secret you create before installing, named by `azure.credentialsSecretName` and holding the key `accountKey` — the same shape the GCS and Hetzner credentials already use. An upgrade that still carries `azure.accountKey` is refused at render, with a message naming the replacement. Only affects `provider: azure`.
+**Template version 3.0.0 is a breaking change, and one of the changes is a data-loss hazard.**
+
+- **The template no longer creates a GVC.** It deploys into a GVC you already have. `gvc.name` is gone, and `gvc.locations` moved to a top-level `locations` list.
+- **Never upgrade a 2.x release onto 3.0.0 in place.** A 2.x release owns the GVC it created, and Helm deletes what a chart stops declaring — the upgrade destroys that GVC and everything inside it. Install a new release instead: [Migrating from 2.x](#migrating-from-2-x).
+- **`server.internal_access` and `keeper.internal_access` are now `server.internalAccess` and `keeper.internalAccess`**, and the `workloads` list is finally applied. In 2.x it was silently discarded, so `type: workload-list` blocked everything.
 </Warning>
 
 ## Overview
 
-ClickHouse is a high-performance, column-oriented analytical database designed for real-time querying and data warehousing at scale. This template deploys ClickHouse in either **single-node** or **cluster** mode depending on how locations are configured, backed by object storage (AWS S3, GCS, Azure Blob Storage, or Hetzner Object Storage) for long-term scalable storage and a local volume for fast read caching.
+ClickHouse is a high-performance, column-oriented analytical database designed for real-time querying and data warehousing at scale. This template deploys ClickHouse in either **single-node** or **cluster** mode depending on how locations are configured, backed by object storage (AWS S3, GCS, Azure Blob Storage, or Hetzner Object Storage) for the table data and a local volume for metadata and fast read caching.
 
 The database password is **not** a template value. ClickHouse reads it from a dictionary secret you create before installing, so it never passes through Helm or lands in the release.
 
-<Warning>
-**Template version 2.6.0 is a breaking security change.** `database.password` and `database.name` were removed, and an install or upgrade that still sets either one now fails at render instead of silently falling back to a published default password. If you are running 2.5.0 or earlier, read [Upgrading From 2.5.0 or Earlier](#upgrading-from-2-5-0-or-earlier) before you touch the release.
-</Warning>
-
 ### Deployment Modes
 
-| Mode | Configuration | Keeper |
-|---|---|---|
-| **Single-node** | 1 location, `replicas: 1` | Not deployed |
-| **Single-shard cluster** | 1 location, `replicas` > 1 | Deployed |
-| **Multi-shard cluster** | 3+ locations | Deployed across first 3 locations |
+The `locations` list is the topology, not just placement — its length selects the mode, and a location's position in it is that shard's number.
 
-2 locations is not supported — use 1 (single-node or single-shard) or 3+.
+| `locations` | Mode | Keeper |
+|---|---|---|
+| 1 location, `replicas: 1` | **Single-node** — development, staging, lower-traffic workloads | Not deployed |
+| 1 location, `replicas` > 1 | **Single-shard cluster** — one shard, N replicas, survives a replica loss | 1 member, so no fault tolerance |
+| 3 or more locations | **Multi-shard cluster** — one shard per location | 3 members across the first three locations, quorum 2 |
+| 2 locations | **Not supported** — refused at render | — |
 
 ### What Gets Created
 
-- **GVC** — A dedicated GVC across the specified locations.
-- **Stateful ClickHouse Server Workload** — The main analytical database workload with configurable replicas per location.
-- **Stateful ClickHouse Keeper Workload** *(cluster mode only)* — The coordination service workload (1 replica per location, always 3 total).
-- **Volume Sets** — Persistent storage for the server (metadata, state, and system files), and for Keeper in cluster mode.
-- **Secrets** — Startup script secrets for ClickHouse Server and Keeper, and a storage configuration secret for the selected provider (AWS S3, GCS, Azure Blob Storage, or Hetzner Object Storage). **No credential secret** — the password lives only in the prerequisite secret you create.
-- **Identity & Policy** — An identity bound to the workloads, and a policy granting it `reveal` on the template's own secrets plus exactly the credentials secret you created, with cloud access for reading and writing to object storage.
+- **Stateful ClickHouse Server Workload** — The analytical database itself, with configurable replicas per location.
+- **Stateful ClickHouse Keeper Workload** *(cluster modes only)* — The Raft coordination service, one replica in each of the first three locations.
+- **Volume Sets** — Persistent storage for the server (metadata, `store/` and system files) and, in cluster modes, for Keeper. Table data lives in object storage; the volume is metadata and read cache.
+- **Scratch Volumes** — Local filesystem cache and temporary spill.
+- **Secrets** — Startup script secrets for ClickHouse Server and Keeper, and a storage configuration secret for the selected provider. **No credential secret** — the password lives only in the prerequisite secret you create.
+- **Identity & Two Policies** — An identity bound to the workloads, with `reveal` on the template's own secrets plus exactly the secrets you created, `view` on the one GVC you install into so each container can confirm at boot that the GVC really has every location you listed, and cloud access to the bucket when the provider is AWS.
+
+<Note>
+**This template does not create a GVC.** It deploys into a GVC you already have — every resource lands in the GVC you install into, so `cpln workload exec`, `cpln logs` and uninstalling all work against that GVC, and uninstalling can never delete it. Every location you list in `locations` must already be on that GVC, and a GVC location you did not list simply runs nothing.
+</Note>
 
 ### Architecture
 
-In cluster mode, each location maps to one ClickHouse Keeper replica, forming a 3-node quorum for distributed coordination. ClickHouse Server replicas communicate with Keeper using Control Plane's internal DNS. In single-node mode, no Keeper is deployed. Primary data is stored in the configured object storage bucket in all modes; a local scratch volume serves as a fast read cache.
+In multi-shard mode, each of the first three locations runs one ClickHouse Keeper replica, forming a 3-node quorum for distributed coordination. ClickHouse Server replicas reach Keeper over Control Plane's internal DNS. In single-node mode, no Keeper is deployed. Primary data is stored in the configured object storage bucket in every mode; a local scratch volume serves as a fast read cache.
 
 <Note>
-To minimize network egress costs, deploy all locations in the same cloud provider and keep your object storage bucket in the same region(s). Using 1 replica per location for the ClickHouse server workload is sufficient for most cluster deployments.
+To minimize network egress costs, deploy all locations in the same cloud provider and keep your object storage bucket in the same region family. One server replica per location is enough for most cluster deployments.
 </Note>
-
-## Upgrading From 2.5.0 or Earlier
-
-Template versions up to 2.5.0 took the database password as a plain Helm value, shipped a working default for it, and wrote it into a chart-owned secret named after the release. Version 2.6.0 removes all of that.
-
-| | 2.5.0 and earlier | 2.6.0 |
-|---|---|---|
-| Database credentials | `database.password` and `database.name` values | `database.credentialsSecretName` → a dictionary secret you create |
-| Where the password lives | Chart-created secret `RELEASE_NAME-clickhouse-db-config`, and the Helm release | Only the secret you create |
-
-<Warning>
-**Carrying the old values forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running, rather than quietly restarting against a different password:
-
-```text
-Error: execution error at (clickhouse/templates/identity.yaml:1:4): clickhouse: database.password
-and database.name were REMOVED — they are now a `dictionary` secret you create, named by
-database.credentialsSecretName, holding the keys `password` and `database`. Delete them from
-your values. See Prerequisites in the README.
-```
-</Warning>
-
-<Steps>
-  <Step title="Read the password the cluster already uses">
-    The password is applied the first time the data directory is initialized, so an existing cluster keeps whatever it was created with. Recover it from your current values file, or from the secret the old version created — do this **before** upgrading:
-
-    ```bash
-    cpln secret reveal RELEASE_NAME-clickhouse-db-config -o yaml
-    ```
-
-    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values.
-  </Step>
-  <Step title="Create the prerequisite secret with those same values">
-    Follow [Database Credentials](#database-credentials), using the existing password and database name. Different values here do not change the cluster — they just leave the workload unable to authenticate.
-  </Step>
-  <Step title="Remove the old keys from your values">
-    Delete `database.password` and `database.name`, and set `database.credentialsSecretName` to your secret's name.
-  </Step>
-  <Step title="Upgrade, then rotate the password">
-    After the upgrade succeeds, change any password that came from a 2.5.0 default — those defaults were published in the public template repository, so treat them as compromised. Rotate inside ClickHouse, then update the secret to match:
-
-    ```sql
-    ALTER USER default IDENTIFIED WITH sha256_password BY 'NEW-STRONG-PASSWORD';
-    ```
-  </Step>
-</Steps>
-
-<Warning>
-**`RELEASE_NAME-clickhouse-db-config` is no longer created at all.** Anything outside this release that read the password or database name from it by name must be pointed at the secret you create instead. A reference to a secret that no longer exists does not fail loudly; it wedges the referring workload silently.
-</Warning>
 
 ## Prerequisites
 
-Two things must be in place before you install: a credentials secret, and object storage access for your chosen provider.
+Three things must be in place before you install: a GVC with the right locations, a credentials secret, and object storage access for your chosen provider.
 
-### Database Credentials
+### A GVC with your locations
+
+**A GVC must already exist, and it must contain every location you list in `locations`.** The requirement is one-directional — the GVC may have *more* locations than you list, and nothing ClickHouse-related runs in those. Check what a GVC has before installing:
+
+```bash
+cpln gvc get GVC_NAME -o json
+```
+
+The locations are under `spec.staticPlacement.locationLinks`. To add a missing one:
+
+```bash
+cpln gvc add-location GVC_NAME --location aws-us-east-2
+```
+
+Every workload in a GVC runs in every location that GVC has, so add locations to a shared GVC deliberately.
+
+<Warning>
+**A location the GVC does not have is not caught at install time.** The install succeeds — the platform does not validate it — and the containers then refuse to initialize, restarting with this in the logs:
+
+```text
+[clickhouse] FATAL: locations declared in values are not in GVC 'my-gvc': aws-eu-central-1
+[clickhouse] GVC 'my-gvc' has: aws-us-east-1 aws-us-east-2
+```
+
+A node that is **already initialized** logs a `WARNING` instead and keeps serving, so this check can never take down a running cluster.
+
+If **every** location you list is absent from the GVC, nothing starts at all and there is no container to log anything. `cpln workload get-deployments` then shows zero replicas in every location, `"desiredScale": 0`, and the message `This workload location is deactivated because maxScale is set to 0.` — that message, not the field, is the signal to look for.
+</Warning>
+
+### Database credentials
 
 **One secret must exist before you install.** It holds the password every ClickHouse client connection uses, so it is not a value — a value would leave it in the Helm release.
 
@@ -139,26 +124,20 @@ The secret my-clickhouse-credentials no longer exists. Workload updates are paus
 secret is added or the reference to the secret removed.
 ```
 
-Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action, in roughly **5.5 to 10.5 minutes** measured across five templates, or run `cpln workload force-redeployment RELEASE_NAME-clickhouse-server --gvc GVC_NAME` to clear it in about 90 seconds.
+Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action — measured at 9 minutes 12 seconds on this template, within the roughly **5.5 to 10.5 minute** band seen across the catalog — or run `cpln workload force-redeployment RELEASE_NAME-clickhouse-server --gvc GVC_NAME` to clear it in about 90 seconds.
 </Warning>
 
-<Note>
-This template creates its own GVC, named by `gvc.name` (default `clickhouse-gvc`). Use that name for `--gvc` in the commands above, not the GVC you ran `cpln helm install` against.
-</Note>
+### Object storage
 
-### AWS S3
+Object storage is required in **every** deployment mode, including single-node — there is no local-only shape. Choose one provider and complete its setup below. AWS is the only keyless option: access comes from a Cloud Account through the workload identity, so there is no key to store. The other three each need their own prerequisite dictionary secret.
 
-1. Create an S3 bucket. Note the bucket name and region — you will set these as `aws.bucket` and `aws.region` in your values file.
+#### AWS S3
 
-2. If you do not have a Control Plane Cloud Account set up, follow the [Create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) guide. Set `aws.cloudAccountName` to the name of your Cloud Account.
+1. Create an S3 bucket. Set `aws.bucket` to its name and `aws.region` to its region.
 
-3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+2. If you do not have a Control Plane Cloud Account set up, follow the [Create a Cloud Account](/guides/create-cloud-account) guide. Set `aws.cloudAccountName` to its name.
 
-<Warning>
-**Version 2.6.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
-
-**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
-</Warning>
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`, and set `aws.policyName` to its name:
 
 ```json
 {
@@ -187,19 +166,23 @@ This template creates its own GVC, named by `gvc.name` (default `clickhouse-gvc`
 }
 ```
 
-4. Set `aws.policyName` in your values file to the name of the policy created in step 3.
+#### GCS
 
-### GCS
+ClickHouse reaches GCS over its S3-compatible interface, which requires an interoperability HMAC key. A Cloud Account is not required.
 
-ClickHouse requires S3-compatible HMAC authentication for GCS. A Control Plane Cloud Account is not required.
-
-1. Create a GCS bucket. Set `gcp.bucket` in your values file to the bucket name.
+1. Create a GCS bucket. Set `gcp.bucket` to the bucket name.
 
 2. In the GCP console, navigate to **Settings > Interoperability** and click **Create a key for a service account**.
 
 3. Click **Create new account**, name your service account, and assign the **Storage Object Admin** role under Permissions.
 
-4. Copy the generated HMAC key and set `gcp.accessKeyId` and `gcp.secretAccessKey` in your values file.
+4. Store the generated HMAC key in a dictionary secret, and set `gcp.credentialsSecretName` to that secret's name:
+
+```bash
+cpln secret create-dictionary --name my-clickhouse-gcs-credentials \
+  --entry accessKeyId=YOUR_HMAC_ACCESS_KEY \
+  --entry secretAccessKey=YOUR_HMAC_SECRET
+```
 
 Alternatively, use the `gcloud` CLI:
 
@@ -217,20 +200,22 @@ gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
 gsutil hmac create clickhouse-storage@$(gcloud config get-value project).iam.gserviceaccount.com
 ```
 
-### Azure Blob Storage
+#### Azure Blob Storage
 
-ClickHouse uses Azure's native Blob Storage SDK. A Control Plane Cloud Account is not required — authentication uses a storage account access key directly.
+ClickHouse uses Azure's native Blob Storage SDK. A Cloud Account is not required — authentication uses a storage account access key.
 
 1. In the [Azure Portal](https://portal.azure.com), go to **Storage accounts → Create**. Use **Standard** performance, **LRS** redundancy, and leave hierarchical namespace off.
 
-2. Inside the storage account, go to **Containers → + Container** and create a container (e.g. `clickhouse-data`). Set access level to **Private**.
+2. Inside the storage account, go to **Containers → + Container** and create a container (e.g. `clickhouse-data`). Set access level to **Private**. Set `azure.storageAccount` and `azure.container`.
 
 3. Go to **Security + networking → Access keys** and copy either `key1` or `key2`.
 
-4. Set the following in your values file:
-   - `azure.storageAccount` — the storage account name
-   - `azure.container` — the container name from step 2
-   - `azure.accountKey` — the access key from step 3
+4. Store the key in a dictionary secret, and set `azure.credentialsSecretName` to that secret's name:
+
+```bash
+cpln secret create-dictionary --name my-clickhouse-azure-credentials \
+  --entry accountKey=YOUR_ACCOUNT_KEY
+```
 
 Alternatively, use the Azure CLI:
 
@@ -250,9 +235,9 @@ az storage account keys list \
   --query "[0].value" -o tsv
 ```
 
-### Hetzner Object Storage
+#### Hetzner Object Storage
 
-Hetzner Object Storage is S3-compatible. A Control Plane Cloud Account is not required — authentication uses an access key pair.
+Hetzner Object Storage is S3-compatible. A Cloud Account is not required — authentication uses an access key pair.
 
 Available regions:
 
@@ -262,19 +247,21 @@ Available regions:
 | `hel1` | Helsinki, Finland |
 | `fsn1` | Falkenstein, Germany |
 
-1. In the Hetzner Cloud console, go to **Object Storage** and create a bucket. Note the bucket name and region.
+1. In the Hetzner Cloud console, go to **Object Storage** and create a bucket. Set `hetzner.bucket` and `hetzner.region`.
 
 2. Go to **Security → S3 Credentials** and click **Generate credentials**. Save the access key and secret key immediately — the secret will not be shown again.
 
-3. Set the following in your values file:
-   - `hetzner.bucket` — the bucket name
-   - `hetzner.region` — the region code (e.g. `nbg1`)
-   - `hetzner.accessKeyId` — the access key from step 2
-   - `hetzner.secretAccessKey` — the secret key from step 2
+3. Store the pair in a dictionary secret, and set `hetzner.credentialsSecretName` to that secret's name:
+
+```bash
+cpln secret create-dictionary --name my-clickhouse-hetzner-credentials \
+  --entry accessKeyId=YOUR_ACCESS_KEY \
+  --entry secretAccessKey=YOUR_SECRET_KEY
+```
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+Create the [prerequisite secrets](#database-credentials) first, then install by whichever method you prefer:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -298,93 +285,151 @@ To install, follow the instructions for your preferred method:
     </Card>
 </CardGroup>
 
+## Migrating from 2.x
+
+Template versions through 2.8.0 created their own GVC, so that GVC is part of the 2.x release's manifest. Version 3.0.0 does not declare it — and Helm deletes what a chart stops declaring.
+
+<Warning>
+**An in-place upgrade from 2.x to 3.0.0 destroys the deployment.** Measured on a sibling template with the guard removed: the upgrade **deleted the GVC and every workload, volume set and identity inside it in about six seconds, while printing `upgraded successfully`.** Reading the GVC back afterwards returned `404`. The volume sets hold your ClickHouse metadata and Keeper state.
+
+The chart ships a render-time refusal so this cannot happen by accident: any leftover `gvc` key in your values aborts the upgrade before a single API call is made, leaving your cluster untouched and running.
+
+**The guard cannot cover one case: an upgrade run with no values file at all.** A 2.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires and the deletion proceeds. Do not run an upgrade of a 2.x release against the 3.0.0 chart under any circumstances — install a new release and re-ingest.
+</Warning>
+
+<Steps>
+  <Step title="Recover the password the existing cluster uses">
+    Versions up to 2.5.0 took the password as a plain Helm value and wrote it into a chart-owned secret named after the release. Read it out of your current values file, or out of that secret:
+
+    ```bash
+    cpln secret reveal RELEASE_NAME-clickhouse-db-config -o yaml
+    ```
+
+    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values. Any password that came from a pre-2.6.0 default was published in the public template repository — treat it as compromised and choose a new one for the new deployment.
+  </Step>
+  <Step title="Choose the GVC for the new release">
+    Create or pick a GVC and make sure it has exactly the locations you intend to list in `locations`. See [Prerequisites](#prerequisites).
+  </Step>
+  <Step title="Install 3.0.0 as a NEW release into that GVC">
+    Use a **different release name** — secret names are org-wide, so a same-named release collides with the 2.x one even in another GVC. Point the new release at the **same bucket with a different prefix**, or at a new bucket.
+  </Step>
+  <Step title="Re-ingest your data">
+    Do **not** try to adopt the old release's volume set. It holds metadata whose `<macros><shard>` identity and Keeper paths belong to the old topology, and it cannot be moved between releases.
+  </Step>
+  <Step title="Cut over, then uninstall the old release">
+    Point your applications at the new endpoint, then uninstall the old release **against the GVC you originally installed it into** — not the GVC it created. That is where Helm tracks the release, and uninstalling from there takes the created GVC with it.
+  </Step>
+</Steps>
+
+Renamed in 3.0.0: `gvc.locations` is now the top-level `locations`, and `server.internal_access` / `keeper.internal_access` are now `server.internalAccess` / `keeper.internalAccess`.
+
 ## Configuration
 
 The default `values.yaml` for this template:
 
 ```yaml
-gvc:
-  name: clickhouse-gvc
-  # Single-node mode: exactly 1 location with replicas: 1 — no Keeper, uses S3/GCS for storage
-  # Single-shard cluster: 1 location with replicas > 1 — Keeper required
-  # Multi-shard cluster: 3 or more locations — Keeper required
-  # Note: 2 locations is not supported
-  locations:
-    - name: aws-us-east-2
-      replicas: 1
-    - name: aws-us-west-2
-      replicas: 1
-    - name: aws-us-east-1
-      replicas: 1
+# ─── Locations ────────────────────────────────────────────────────────────────
+# This chart deploys into the GVC you install into — it does NOT create one.
+# Every location listed here MUST already exist in that GVC, or the nodes refuse
+# to initialise with a named error (see Prerequisites in the README).
+# Extra locations in the GVC are fine: nothing ClickHouse-related runs in them.
+#
+# Deployment mode is derived from this list:
+#   1 location,  replicas: 1   → single-node (no Keeper)
+#   1 location,  replicas: >1  → single-shard cluster (Keeper required)
+#   3 or more locations        → multi-shard cluster, one shard per location
+#   2 locations                → NOT supported
+locations:
+  - name: aws-us-east-1
+    replicas: 1
 
+# ─── Object Storage ───────────────────────────────────────────────────────────
 provider: aws # Options: aws, gcp, azure, or hetzner
 
-aws: # If enabled, all fields below are required - See prerequisites for guidance
-  bucket: clickhouse-s3-bucket # Name of your S3 bucket
+aws: # If enabled, all fields below are required - See README for guidance
+  bucket: my-clickhouse-bucket # Name of your S3 bucket
   region: us-east-1 # Region of your S3 bucket
-  cloudAccountName: clickhouse-s3-cloudaccount # Name of your Cloud Account
-  policyName: clickhouse-s3-policy # Name of your pre-created policy to allow access to the S3 bucket
+  cloudAccountName: my-clickhouse-cloudaccount # Name of your Cloud Account
+  policyName: my-clickhouse-s3-policy # Name of your pre-created policy to allow access to the S3 bucket
 
-gcp: # If enabled, all fields below are required - See prerequisites for guidance
-  bucket: clickhouse-gcs-bucket # Name of your GCS bucket
-  accessKeyId: gcs-access-key-id # Access key ID for your GCS service account
-  secretAccessKey: gcs-secret-access-key # Secret access key for your GCS service account
+gcp: # If enabled, all fields below are required - See README for guidance
+  bucket: my-clickhouse-gcs-bucket # Name of your GCS bucket
+  # REQUIRED PREREQUISITE SECRET — a `dictionary` secret holding exactly
+  # `accessKeyId` and `secretAccessKey` (the GCS interoperability HMAC pair).
+  # They reach ClickHouse as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY rather
+  # than being written into the disk XML, because a cpln:// reference inside a
+  # mounted config file is never resolved.
+  credentialsSecretName: my-clickhouse-gcs-credentials
 
-azure: # If enabled, all fields below are required - See prerequisites for guidance
+azure: # If enabled, all fields below are required - See README for guidance
   storageAccount: myclickhousestorage # Name of your Azure Storage Account
   container: clickhouse-data # Name of your Blob Storage container
-  accountKey: my-azure-storage-account-key # Access key for your Azure Storage Account
+  # REQUIRED PREREQUISITE SECRET — a `dictionary` secret holding exactly
+  # `accountKey` for your Azure Storage Account.
+  credentialsSecretName: my-clickhouse-azure-credentials
 
-hetzner: # If enabled, all fields below are required - See prerequisites for guidance
-  bucket: clickhouse-hetzner-bucket # Name of your Hetzner Object Storage bucket
+hetzner: # If enabled, all fields below are required - See README for guidance
+  bucket: my-clickhouse-hetzner-bucket # Name of your Hetzner Object Storage bucket
   region: nbg1 # Region of your bucket. Options: nbg1, hel1, fsn1
-  accessKeyId: my-hetzner-access-key-id # Access key ID for your Hetzner Object Storage
-  secretAccessKey: my-hetzner-secret-access-key # Secret access key for your Hetzner Object Storage
+  # REQUIRED PREREQUISITE SECRET — a `dictionary` secret holding exactly
+  # `accessKeyId` and `secretAccessKey` for your Hetzner Object Storage.
+  credentialsSecretName: my-clickhouse-hetzner-credentials
 
-clusterName: my_cluster # Used in cluster mode only
+# ─── Cluster ──────────────────────────────────────────────────────────────────
+# Used in cluster modes only. Must be a bare identifier: letters, digits and
+# underscores, not starting with a digit — it becomes an XML element name and is
+# used unquoted in `ON CLUSTER` DDL.
+clusterName: my_cluster
 
 database: # Automatically create a database on initialization using the default user
   # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
   # A `dictionary` secret holding exactly two keys: `password` and `database`.
   # ClickHouse has no separate username here — it uses the built-in `default`
   # user, so there is no `username` key. If the secret does not exist at install
-  # time the deployment WEDGES silently.
+  # time the deployment WEDGES silently; see Prerequisites in the README.
   credentialsSecretName: my-clickhouse-credentials
 
+# ─── Storage ──────────────────────────────────────────────────────────────────
 volumeset:
   server:
     capacity: 10 # initial capacity in GiB (minimum is 10)
   keeper:
-    capacity: 10 # initial capacity in GiB (minimum is 10) - cluster mode only
+    capacity: 10 # initial capacity in GiB (minimum is 10) - cluster modes only
 
+# ─── Server ───────────────────────────────────────────────────────────────────
 server:
   image: clickhouse/clickhouse-server:25.10
   resources:
     cpu: 2
     memory: 2Gi
-  internal_access:
-    type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads:  # Note: can only be used if type is same-gvc or workload-list
-      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+  internalAccess:
+    type: same-gvc # options: same-gvc, same-org, workload-list, none
+    workloads: [] # required when type is workload-list; list only your clients -- this release's
+    # own server and keeper workloads are added automatically, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
 
-keeper: # cluster mode only
+# ─── Keeper (cluster modes only) ──────────────────────────────────────────────
+keeper: # cluster modes only
   image: clickhouse/clickhouse-keeper:25.10
   resources:
     cpu: 2
     memory: 2Gi
-  internal_access:
-    type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads:  # Note: can only be used if type is same-gvc or workload-list
-      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+  internalAccess:
+    type: same-gvc # options: same-gvc, same-org, workload-list, none
+    workloads: [] # required when type is workload-list; list only your clients -- this release's
+    # own server and keeper workloads are added automatically, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
+### Locations
+
+Each entry in `locations` pairs a location with a replica count, and the list length selects the deployment mode — see [Deployment Modes](#deployment-modes). Every location listed must already exist in the GVC you install into; extra GVC locations run nothing. Two locations, a duplicate location, an empty list and `replicas: 0` are all refused at render.
+
 <Note>
-This template creates a GVC with a default name defined in the values file. If you plan to deploy multiple instances, you **must assign a unique GVC name** for each deployment.
+GVC locations you did not list show as red in the console, with `This workload location is deactivated because maxScale is set to 0.` That is the mechanism that keeps a shared GVC safe — it is what a healthy install looks like, not a fault.
 </Note>
 
 ### Provider and Object Storage
 
-Set `provider` to `aws`, `gcp`, `azure`, or `hetzner`, then fill in the corresponding section. Only the active provider's fields are used.
+Set `provider` to `aws`, `gcp`, `azure`, or `hetzner`, then fill in the corresponding section. Only the active provider's fields are used. See [Object storage](#object-storage) for the per-provider setup steps.
 
 **AWS S3**
 
@@ -400,8 +445,7 @@ Set `provider` to `aws`, `gcp`, `azure`, or `hetzner`, then fill in the correspo
 | Field | Description |
 |-------|-------------|
 | `gcp.bucket` | Name of the GCS bucket |
-| `gcp.accessKeyId` | HMAC access key ID for the GCS service account |
-| `gcp.secretAccessKey` | HMAC secret access key for the GCS service account |
+| `gcp.credentialsSecretName` | Dictionary secret holding `accessKeyId` and `secretAccessKey` — the interoperability HMAC pair |
 
 **Azure Blob Storage**
 
@@ -409,7 +453,7 @@ Set `provider` to `aws`, `gcp`, `azure`, or `hetzner`, then fill in the correspo
 |-------|-------------|
 | `azure.storageAccount` | Name of the Azure Storage Account |
 | `azure.container` | Name of the Blob Storage container |
-| `azure.accountKey` | Storage account access key (`key1` or `key2`) |
+| `azure.credentialsSecretName` | Dictionary secret holding `accountKey` |
 
 **Hetzner Object Storage**
 
@@ -417,50 +461,103 @@ Set `provider` to `aws`, `gcp`, `azure`, or `hetzner`, then fill in the correspo
 |-------|-------------|
 | `hetzner.bucket` | Name of the Hetzner Object Storage bucket |
 | `hetzner.region` | Bucket region — `nbg1`, `hel1`, or `fsn1` |
-| `hetzner.accessKeyId` | S3-compatible access key ID |
-| `hetzner.secretAccessKey` | S3-compatible secret access key |
+| `hetzner.credentialsSecretName` | Dictionary secret holding `accessKeyId` and `secretAccessKey` |
+
+<Note>
+**Switch providers with a fresh install, not an upgrade.** An identity's cloud binding is never removed once set — the API merges rather than replaces — so a release switched from one provider to another keeps the old provider's binding attached even though the chart no longer renders it.
+</Note>
 
 ### Cluster and Database
 
-- `clusterName` — The name used for distributed DDL queries. Only relevant in cluster mode.
+- `clusterName` — The name used for distributed DDL queries, in cluster modes only. It must be a bare identifier — letters, digits and underscores, not starting with a digit — because it becomes an XML element name and is used unquoted in `ON CLUSTER` statements. Anything else is refused at render.
 - `database.credentialsSecretName` — Name of the dictionary secret holding `password` and `database`. ClickHouse creates that database on first initialization, and the password is the one every client connection uses.
 
-The secret must exist before installing — see [Database Credentials](#database-credentials). The workloads read it through `cpln://secret/...` references, so the password appears in neither the Helm release nor the stored workload spec.
+The secret must exist before installing — see [Database credentials](#database-credentials). The workloads read it through `cpln://secret/...` references, so the password appears in neither the Helm release nor the stored workload spec.
+
+<Warning>
+**Renaming `clusterName` on an existing install orphans its `Distributed` tables.** They keep pointing at the old cluster name and fail with `Code: 701 ... Requested cluster 'my_cluster' not found (CLUSTER_DOESNT_EXIST)`. Recreate them after a rename.
+</Warning>
 
 <Note>
-These are applied only on first initialization, when the data directory is empty. Changing the secret afterwards does **not** change the running cluster — it only changes what the workload presents when it authenticates, which will then fail. To rotate on an existing cluster, run `ALTER USER default IDENTIFIED WITH sha256_password BY '...'` first, then update the secret to match.
+Credentials are applied only on first initialization, when the data directory is empty. Changing the secret afterwards does **not** change the running cluster — it only changes what the workload presents when it authenticates, which will then fail. To rotate on an existing cluster, run `ALTER USER default IDENTIFIED WITH sha256_password BY '...'` first, then update the secret, then force a redeployment. Updating a `cpln://` secret does not restart the workload by itself.
 </Note>
 
 ### Images
 
 - `server.image` — ClickHouse Server container image.
-- `keeper.image` — ClickHouse Keeper container image. Only used in cluster mode.
+- `keeper.image` — ClickHouse Keeper container image. Only used in cluster modes.
 
 ### Resources and Storage
 
 - `server.resources` / `keeper.resources` — CPU and memory allocated to each workload.
-- `volumeset.server.capacity` — Persistent volume size in GiB for server state (minimum 10).
-- `volumeset.keeper.capacity` — Persistent volume size in GiB for Keeper state (minimum 10). Only used in cluster mode.
+- `volumeset.server.capacity` — Persistent volume size in GiB for server metadata and cache (minimum 10).
+- `volumeset.keeper.capacity` — Persistent volume size in GiB for Keeper state (minimum 10). Only used in cluster modes.
 
 ### Internal Access
 
-Both `server.internal_access` and `keeper.internal_access` control which workloads can reach each component:
+Both `server.internalAccess` and `keeper.internalAccess` control which workloads can reach each component. Neither workload is exposed publicly, and the template has no public access option.
 
 | Type | Description |
 |------|-------------|
 | `same-gvc` | Allow access from all workloads in the same GVC |
 | `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from specific workloads listed in `workloads` |
+| `workload-list` | Allow access only from the workloads listed in `workloads` |
+| `none` | Allow no internal access at all |
 
-### Connecting to ClickHouse
+<Note>
+**List only your clients.** The server and Keeper reach each other over the same internal firewall, so the chart adds this release's own workloads to every list it renders. Without that, a `workload-list` naming only your applications takes down Keeper's Raft quorum and every cross-shard query while all status surfaces stay green.
+</Note>
 
-Once deployed, connect using the ClickHouse client from a workload in the same GVC:
+An access-knob change takes up to about five minutes to propagate — measured arms on this template settled between 55 and 123 seconds. Re-test before concluding it did not apply.
+
+## Connecting to ClickHouse
+
+| What | Where |
+|---|---|
+| Public endpoint | **None.** This template exposes no public access |
+| Native protocol (clients, `clickhouse-client`) | `RELEASE_NAME-clickhouse-server.GVC_NAME.cpln.local:9000` |
+| HTTP interface | `RELEASE_NAME-clickhouse-server.GVC_NAME.cpln.local:8123` |
+| A specific replica | `replica-INDEX.RELEASE_NAME-clickhouse-server.LOCATION.GVC_NAME.cpln.local:9000` |
+| Keeper (cluster modes) | `replica-0.RELEASE_NAME-clickhouse-keeper.LOCATION.GVC_NAME.cpln.local:9181` |
+| Username | `default` — there is no other user |
+| Password / database name | the `password` and `database` entries of your credentials secret |
+
+From another workload in the same GVC:
 
 ```bash
-clickhouse-client --host $WORKLOAD_NAME --password $PASSWORD
+clickhouse-client --host RELEASE_NAME-clickhouse-server.GVC_NAME.cpln.local \
+  --port 9000 --user default --password 'YOUR-PASSWORD'
 ```
 
-`$PASSWORD` is the `password` entry of the secret named by `database.credentialsSecretName`, and the user is ClickHouse's built-in `default`.
+Always use the fully qualified `.GVC_NAME.cpln.local` form. The bare workload name is not reliable on this platform — whether it resolves depends on the workload type.
+
+### Tables in Cluster Modes
+
+Use `ReplicatedMergeTree` plus a `Distributed` table. A plain `MergeTree` in a multi-shard cluster is single-copy and is not covered by the cluster's availability story.
+
+```sql
+CREATE TABLE events_local ON CLUSTER my_cluster (id UInt64, ts DateTime)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/events', '{replica}')
+ORDER BY id;
+
+CREATE TABLE events ON CLUSTER my_cluster AS events_local
+ENGINE = Distributed(my_cluster, currentDatabase(), events_local, rand());
+```
+
+`{shard}` and `{replica}` come from each node's `<macros>`, which the chart derives from the location's position in `locations`.
+
+## Important Notes
+
+- **Never upgrade a 2.x release onto 3.0.0 in place** — it deletes the GVC the 2.x chart created and everything in it. Install a new release: [Migrating from 2.x](#migrating-from-2-x).
+- **The GVC must contain every location you list**, and may contain more. A missing location is not caught at install: the container exits with `FATAL: locations declared in values are not in GVC ...`. An already-initialized node logs a `WARNING` instead and keeps serving.
+- **Two locations is not supported.** Use one (single-node or single-shard) or three or more.
+- **Object storage is required in every mode**, including single-node. There is no local-only shape.
+- **Keeper is the availability floor.** Three members tolerate one loss; the single-shard shape has one member and tolerates none. If a majority of Keeper locations are missing from the GVC, the containers exit with a named error rather than waiting for an election that can never complete.
+- **A `helm upgrade` restarts every replica in every location at once.** Nothing serializes a rolling restart on a stateful workload, so treat an upgrade as a planned query interruption: a rolling upgrade of a 3-shard cluster was measured at **about 83 seconds of total unavailability**, and a Keeper settings change at roughly **60 seconds** of coordination outage. On a single-node install, the first no-op upgrade after an install also restarts the one replica.
+- **With one replica per shard, losing a shard fails every distributed query**, not just the rows on that shard — measured at about 60 seconds to surface, and about 112 seconds to full recovery. Add replicas if partial results are not acceptable.
+- **Renaming `clusterName` orphans existing `Distributed` tables** (`Code: 701`). Recreate them after a rename.
+- **Keep locations and the bucket in the same provider and region family.** Cross-region traffic to object storage is billed on every query that misses the local cache.
+- **Release names must be unique per org** — secrets are org-wide, so two releases with the same name collide even in different GVCs.
 
 ## External References
 
@@ -468,20 +565,23 @@ clickhouse-client --host $WORKLOAD_NAME --password $PASSWORD
     <Card title="ClickHouse Documentation" icon="book" href="https://clickhouse.com/docs/">
     Official ClickHouse documentation
     </Card>
+    <Card title="ClickHouse Keeper" icon="sitemap" href="https://clickhouse.com/docs/guides/sre/keeper/clickhouse-keeper">
+    Raft coordination for replicated tables
+    </Card>
+    <Card title="Data Replication" icon="copy" href="https://clickhouse.com/docs/engines/table-engines/mergetree-family/replication">
+    The ReplicatedMergeTree engine family
+    </Card>
+    <Card title="Distributed Table Engine" icon="table" href="https://clickhouse.com/docs/engines/table-engines/special/distributed">
+    Fan a query out across shards
+    </Card>
     <Card title="ClickHouse with S3" icon="aws" href="https://clickhouse.com/docs/integrations/s3">
-    Integrating ClickHouse with AWS S3
+    Integrating ClickHouse with AWS S3 and S3-compatible providers
     </Card>
     <Card title="ClickHouse with GCS" icon="google" href="https://clickhouse.com/docs/integrations/gcs">
     Integrating ClickHouse with Google Cloud Storage
     </Card>
     <Card title="ClickHouse with Azure Blob Storage" icon="microsoft" href="https://clickhouse.com/docs/engines/table-engines/integrations/azureBlobStorage">
     Integrating ClickHouse with Azure Blob Storage
-    </Card>
-    <Card title="ClickHouse with S3-Compatible Storage" icon="database" href="https://clickhouse.com/docs/integrations/s3#s3-compatible-storage">
-    Integrating ClickHouse with S3-compatible providers including Hetzner
-    </Card>
-    <Card title="Cloud Accounts" icon="key" href="https://docs.controlplane.com/guides/create-cloud-account">
-    Create a Control Plane Cloud Account for AWS access
     </Card>
     <Card title="ClickHouse Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/clickhouse">
     View the source files, default values, and chart definition
