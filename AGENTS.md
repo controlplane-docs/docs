@@ -18,7 +18,7 @@ llms.txt            — AI-facing platform summary and full page index (source o
 skill.md            — Capability summary for AI tool integration (overrides Mintlify auto-generated)
 introduction.mdx    — Landing page
 whatis.mdx          — Platform overview
-concepts/           — Core concepts: org, GVC, workload, replica, deployment, location, identity, access control, billing, resource model
+concepts/           — Core concepts: org, GVC, workload, replica, deployment, location, identity, access control, billing, quota, resource model
 reference/          — Detailed resource configuration and behavior
 guides/             — Step-by-step how-to guides for creating and configuring resources
 core/               — Platform fundamentals: auth, security, logs, audit trail, query
