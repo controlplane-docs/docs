@@ -126,7 +126,7 @@ A workload without firewall config cannot reach its database, be reached by user
 
 - **Workload type is immutable.** Changing type requires delete + recreate. Capture state first: `cpln workload get NAME --gvc GVC -o yaml-slim > NAME.bak.yaml`.
 - **Capacity AI** works on every workload type (on by default for Standard, Serverless, and Cron). It is incompatible with: CPU autoscaling, multi-metric autoscaling, GPUs.
-- **Cron** deploys to ALL GVC locations with no overrides. `spec.job` with `schedule` required; probes, autoscaling, `timeoutSeconds`, `debug` ignored. `capacityAI` applies and is on by default, taking effect at the next scheduled run.
+- **Cron** deploys to ALL GVC locations; `suspend` in `spec.localOptions` is the only per-location override that applies. `spec.job` with `schedule` required; probes, autoscaling, `timeoutSeconds`, `debug` ignored. `capacityAI` applies and is on by default, taking effect at the next scheduled run.
 - **Workload name** max 49 chars; cannot end with `-headless`.
 - For container name reservations, probe XOR rules, GPU constraints, and full validation, fetch [/reference/workload/general](https://docs.controlplane.com/reference/workload/general) when authoring manifests.
 
@@ -213,7 +213,7 @@ Stateful provisioning, large image pushes, mk8s creation, GVC location adds — 
 | Multi-metric (cpu/memory/rps) | No | Yes | Yes | No |
 | KEDA (custom metrics) | No | Yes | Yes | No |
 
-**Scale to zero** is ONLY for Serverless with `rps` or `concurrency`. Standard and Stateful can scale to zero only via KEDA. Cron cannot scale to zero. All other types require minScale ≥ 1.
+**Scale to zero**: Serverless supports it with any of its metrics. Standard and Stateful reach it only via KEDA. Cron and VM cannot scale to zero; they require minScale ≥ 1.
 
 | Strategy | Best for |
 | --- | --- |

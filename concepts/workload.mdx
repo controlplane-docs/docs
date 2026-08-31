@@ -1,110 +1,60 @@
 ---
-title: Workloads
-description: "Workloads are the primary deployment unit in Control Plane. Covers container configuration, autoscaling, Capacity AI, logging, and the five workload types."
-keywords: ['microservice', 'app', 'service', 'pod', 'replica', 'serverless', 'standard', 'stateful', 'cron', 'vm', 'virtual machine', 'scheduled job', 'horizontal scaling', 'cpu utilization', 'memory utilization', 'capacity ai', 'hpa']
+title: 'Workload'
+description: 'A workload is one application: up to eight containers that share a network namespace, defined once in a GVC and run in every location that GVC spans.'
+keywords: ['microservice', 'app', 'service', 'pod', 'replica', 'serverless', 'stateful', 'cron job', 'virtual machine', 'scale to zero', 'capacity ai', 'localoptions', 'suspend', 'cpln.local']
 ---
 
-## Overview
+Everything you run on Control Plane is a workload: the unit you deploy, scale, route traffic to, and read logs from. Two choices shape everything else about it: the [type](/reference/workload/types) it is created as, and the [identity](/concepts/identity) attached to it.
 
-A workload represents a backend application such as a microservice. It is comprised of one or multiple containers. Containers within a workload communicate freely on `localhost`.
+## How It Fits
 
-Workloads run in Control Plane AWS, Azure, and GCP accounts, or in your own [BYOK location](/reference/location#byok-locations). The [GVC](/reference/gvc) determines which providers and locations are available. A workload can run in one location or across multiple providers and regions, depending on the GVC and workload placement settings.
+| Relationship | Rule |
+| --- | --- |
+| Parent | One [GVC](/concepts/gvc), which decides the locations. A workload cannot move to another GVC. |
+| Locations | Every location the GVC spans, automatically, with one [deployment](/concepts/deployment) per location. |
+| Containers | 1 to 8, each with its own image, resources, and ports. They deploy and scale together and reach each other over `localhost`. |
+| Identity | At most one [identity](/reference/identity), attached to give the workload its credentials for secrets, cloud services, and private networks. |
+| Storage | Persistent disks come from a [volume set](/reference/volumeset) in the same GVC: a disk per replica for one `stateful` or `vm` workload, or a `shared` filesystem any type can mount. Containers also mount [S3, GCS, and Azure buckets, secrets, and ephemeral scratch space](/reference/workload/volumes). |
 
-Workloads are managed using a common interface, regardless of cloud providers. Workload logs are consolidated across replicas, locations, and providers, and can be accessed through the API, CLI, Console, or Grafana.
+<img src="/images/concepts/workload-containers.svg" alt="A workload, my-app, drawn as one box holding two containers, app and sidecar, which reach each other over localhost. Up to eight containers in one workload: they deploy, scale, and stop together. The endpoint, the firewall, and the identity belong to the whole workload." style={{maxWidth:'720px',width:'100%',margin:'1.75rem auto',display:'block'}} />
 
-## Features
+Editing the workload creates a new version, and every location rolls it out beside the version already serving:
 
-- [Auto Scaling](#auto-scaling)
-- DNS geo-routing
-- [Capacity AI](#capacity-ai) - Intelligent resource management
-- Load balancing
-- [Location-specific override](#location-specific-override) of scaling and resource management
-- Logging
-- [Probes](#probes)
-- [Alerts](#alerts)
+<img src="/images/concepts/workload-rollout.svg" alt="The same workload, my-app, at two moments. While the update rolls out, version 6 is ready and serving and version 7 rolls out beside it, not ready. When the update reports ready, only version 7 remains, in a smaller box. The live version keeps serving while the update rolls out, then traffic switches over, and the old version drains. The workload keeps serving through every update, even a broken one." style={{maxWidth:'720px',width:'100%',margin:'1.75rem auto',display:'block'}} />
 
-## Auto Scaling
+## Key Behaviors
 
-Workload replicas are automatically scaled up and down based on the selected scaling strategy.
+- **The type is chosen once and decides the rest.** `serverless`, `standard`, `stateful`, `cron`, and `vm` differ in how they scale, how many ports they can expose, and how updates roll out. The [types reference](/reference/workload/types) has the comparison matrix.
+- **A broken update cannot take the workload down.** Each location keeps serving the last healthy version until the new one reports ready, which your [health probes](/reference/workload/containers#probes) define; then traffic switches to the new version and the old one drains, with no gap in service. [Rollout options](/reference/workload/general#rollout-options) set how many replicas turn over at once, and with [dynamic tags](/reference/workload/containers#images), pushing a new image under the same tag starts the rollout by itself.
+- **Per-location differences are overrides, not separate workloads.** [Local options](/reference/workload/general#location-specific-options) name a location and restate any of the default options, so one region can run a wider replica range than the rest. [Suspend](/reference/workload/general#suspend) the workload to stop every location, or set it in one location's overrides to stop that location alone; the workload then reports `partiallySuspended`.
+- **Scale-to-zero depends on the type.** A `serverless` workload scales to zero on any metric it supports. `standard` and `stateful` reach zero only through [KEDA](/reference/workload/autoscaling#keda), which the GVC must have enabled first. `cron` and `vm` cannot reach zero at all, and `minScale: 0` is rejected with `workloads of type 'vm' are unable to scale to zero, please set minScale > 0`.
+- **[Capacity AI](/reference/workload/capacity) right-sizes what autoscaling does not.** It moves CPU and memory between their minimum and maximum from historical usage, which is why it cannot run alongside CPU-based autoscaling: the combination is rejected with `CapacityAI may not be enabled when the autoscaling metric is 'cpu'`, and GPU containers exclude it too.
+- **Nothing reaches a workload until its firewall allows it.** Other workloads address it at `my-app.my-gvc.cpln.local` over mutual TLS, but the [internal firewall](/reference/workload/firewall#internal) defaults to `none`. Open it to `same-gvc`, `same-org`, or a `workload-list` naming exact workloads, which can cross GVCs. Public traffic is a separate [external firewall](/reference/workload/firewall#external) decision.
+- **A global endpoint and one per location come built in.** The global one is the [canonical endpoint](/reference/workload/general#canonical-endpoint-global): one HTTPS URL that sends each request to the nearest healthy location. Each location publishes an HTTPS endpoint of its own, and a [domain](/reference/domain) route puts a hostname you own in front of the workload, with its TLS certificate issued for you.
+- **Control Plane retries and times out requests for you.** A request that fails to connect to the workload is retried, twice by default, and a request the workload has not answered within 5 seconds fails. The [retry policy](/reference/workload/general#automatic-retries) and the [timeout](/reference/workload/general#timeout-seconds) are both workload settings.
+- **Logs, metrics, and a shell are built in.** Every replica streams [logs](/core/logs) and [metrics](/guides/default-metrics) automatically, and [`cpln workload connect`](/guides/cli/workload/connect) opens a shell in a running replica.
 
-Selectable Scaling Strategies:
+## Gotchas
 
-- Disabled
-- CPU Utilization
-- Memory Utilization
-- Concurrent Requests Quantity
-- Requests Per Second
-- Request Latency
+- **The type cannot be changed after creation.** A request that edits the type is rejected with `Workload type may not be changed.` Switching means creating a second workload, so capture the old spec first.
+- **A `serverless` workload must expose exactly one port, in one container.** No port at all is rejected with `workloads of type 'serverless' must have at least one container port exposed.`, and so is a second port or a second container with ports; portless background work belongs in a `standard` workload.
+- **A `cron` workload runs its schedule in every location the GVC spans.** The one per-location override that applies is `suspend`, which stops the schedule in that location alone.
+- **A missing secret pauses the deployment rather than failing it.** A `cpln://secret/my-secret` reference the workload's identity cannot yet `reveal` holds the rollout until [access is granted](/reference/identity); `cpln workload force-redeployment` clears it once it is.
+- **Replicas, CPU, and memory are quota'd per workload.** The replica quota caps autoscaling's `maxScale`, the CPU and memory quotas cap the totals across all containers, and all three are raised on request rather than by editing the spec. See [quotas](/reference/quota) for the defaults.
 
-See [Autoscaling](/reference/workload/autoscaling) for more information.
+## Learn More
 
-The minimum and maximum number of replicas that can be deployed are configurable. Scale to zero is available for [Serverless](/reference/workload/types#serverless) workloads using the `rps` or `concurrency` scaling strategies, and for [Standard](/reference/workload/types#standard) and [Stateful](/reference/workload/types#stateful) workloads when using KEDA. When the scale-to-zero condition is met, the workload can scale down to 0 and scale up immediately to fulfill new requests.
-
-<Info>
-  [Capacity AI](#capacity-ai) is not available if CPU Utilization is selected because dynamic allocation of CPU resources cannot be
-  accomplished while scaling replicas based on the usage of its CPU. See [Capacity AI Restrictions](/reference/workload/capacity#caveats) for the full list.
-</Info>
-
-## Capacity AI
-
-A workload can leverage intelligent allocation of its container's resources (CPU and memory) by using Capacity AI.
-
-Capacity AI uses historical usage analysis to adjust these resources between configured minimum and maximum values.
-
-This approach can substantially reduce costs; however, it may result in temporary performance issues during sudden spikes in usage.
-
-Before enabling capacity AI on your workload, review the [Capacity AI reference page](/reference/workload/capacity).
-
-## Location-specific Override
-
-By default, both [Capacity AI](#capacity-ai) and [Auto Scaling](#auto-scaling) settings are applied to all deployments at each location enabled in the [GVC](/concepts/gvc). However, these settings can be customized per location to enhance performance for specific audiences.
-
-This allows for granular control over how your workload scales in specific locations. For instance, if the majority of your users are in Europe, you can set the European locations to a higher level than the rest of the world.
-
-Setting location-specific options ensures that your target users are served quickly and helps reduce costs for unused resources.
-
-## Probes
-
-A probe is a Kubernetes feature that is used to monitor the health of an application running in a container.
-
-Each container can have a:
-
-- Readiness Probe
-
-  - An endpoint is configured to allow queries, enabling you to check if the workload is available and ready to receive requests.
-
-- Liveness Probe
-  - An endpoint is configured to allow queries, enabling you to check if the workload is healthy or needs to be restarted.
-
-## Alerts
-
-Using Grafana, you can create alerts on any of the standard metrics exposed by Control Plane, or on your [custom metrics](/reference/workload/custom-metrics). To access Grafana, navigate to one of your orgs in the Control Plane console and click the "Metrics" link.
-
-You have full access to Grafana alerting capabilities. For more information, see the [Grafana documentation](https://grafana.com/docs/grafana/latest/alerting/).
-
-## Inter-Workload Networking
-
-Workloads are reachable by other workloads at `<workload-name>.<gvc-name>.cpln.local`, but inter-workload traffic is **denied by default**. Each receiving workload must opt in by setting [`firewallConfig.internal.inboundAllowType`](/reference/workload/firewall#internal) to one of:
-
-- `same-gvc` — allow workloads in the same GVC.
-- `same-org` — allow workloads anywhere in the same org.
-- `workload-list` — allow specific workloads listed in `inboundAllowWorkload` (can span GVCs).
-
-The default is `none`, which blocks all inter-workload traffic.
-
-## Types
-
-- **Serverless**:
-  - Workloads that scale to zero when they aren't receiving requests.
-- **Standard**:
-  - Workloads serve network traffic on multiple ports and can scale to zero only when using KEDA.
-- **Cron**:
-  - Workloads that run on a schedule and do not serve network traffic. Each execution is expected to run to completion and exit. Scheduling, concurrency, retention, retry, and run-time deadline behavior are configured under the workload's `job` spec — see [Cron Configuration](/reference/workload/types#cron-configuration).
-- **Stateful**:
-  - Similar to a `standard` workload, `stateful` workloads have stable replica identities and hostnames, and can mount a [volume set](/reference/volumeset) for persistent storage.
-- **VM**:
-  - Run a full [virtual machine](/reference/workload/vm) — its own guest OS and kernel — as a workload, inside the same service mesh, identity, networking, and observability as containers.
-
-## Reference
-
-See the [workload reference](/reference/workload) page for additional information.
+<CardGroup cols={2}>
+  <Card title="Workload reference" icon="/icons/workload.svg" href="/reference/workload/general">
+    Every field: containers, options, endpoints, rollout, suspend, and tags.
+  </Card>
+  <Card title="Create a Workload" icon="plus" href="/guides/create-workload">
+    Deploy an image from the Console, the CLI, or a manifest.
+  </Card>
+  <Card title="Workload types" icon="shapes" href="/reference/workload/types">
+    What each type can expose, how it scales, and how it updates.
+  </Card>
+  <Card title="GVC (Global Virtual Cloud)" icon="/icons/gvc.svg" href="/concepts/gvc">
+    The locations a workload runs in, and the settings every workload in a GVC shares.
+  </Card>
+</CardGroup>
