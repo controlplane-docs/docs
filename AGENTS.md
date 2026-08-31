@@ -18,7 +18,7 @@ llms.txt            — AI-facing platform summary and full page index (source o
 skill.md            — Capability summary for AI tool integration (overrides Mintlify auto-generated)
 introduction.mdx    — Landing page
 whatis.mdx          — Platform overview
-concepts/           — Core concepts: org, GVC, workload, billing, access control
+concepts/           — Core concepts: org, GVC, workload, replica, deployment, location, identity, access control, billing, resource model
 reference/          — Detailed resource configuration and behavior
 guides/             — Step-by-step how-to guides for creating and configuring resources
 core/               — Platform fundamentals: auth, security, logs, audit trail, query
@@ -222,7 +222,7 @@ When moving or renaming pages, add a redirect entry in `docs.json` under the `re
 
 These are the most common sources of documentation errors:
 
-1. **Scale to zero** is ONLY for Serverless workloads with `rps` or `concurrency` strategies
+1. **Scale to zero**: Serverless supports it with any of its metrics; Standard and Stateful reach it only via KEDA; Cron and VM cannot scale to zero
 2. **Capacity AI** works on every workload type but does NOT work with CPU autoscaling, multi-metric autoscaling, or GPUs
 3. **Secret access** requires three steps: identity + policy + reference (all three mandatory)
 4. **Identities** are GVC-scoped, a workload can reference only one, but an identity can be shared across multiple workloads in the same GVC. One cloud account per provider
@@ -230,7 +230,7 @@ These are the most common sources of documentation errors:
 6. **Internal firewall default** is `none` by default (no inter-workload communication)
 7. **External firewall default** is disabled by default (both inbound and outbound)
 8. **Serverless Host header** is the canonical endpoint, not the custom domain
-9. **Cron workloads** deploy to all GVC locations with no location overrides
+9. **Cron workloads** deploy to all GVC locations; `suspend` in `spec.localOptions` is the only per-location override that applies
 10. **Images** must be `linux/amd64`
 11. **Orgs are immutable** — once created, an org cannot be deleted
 12. **`cpln workload log` does NOT exist** — use `cpln logs '{gvc="GVC", workload="WORKLOAD"}'` with LogQL syntax
