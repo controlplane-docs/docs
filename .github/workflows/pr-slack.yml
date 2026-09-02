@@ -15,7 +15,7 @@ permissions:
   deployments: read
 
 concurrency:
-  group: pr-slack-${{ github.event.pull_request.number }}-${{ github.event.action }}
+  group: pr-slack-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
@@ -115,6 +115,18 @@ jobs:
         run: |
           gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
             -f body="<!-- slack-thread-ts:${{ steps.post.outputs.ts }} -->"
+
+      - name: Add PR author to Slack thread
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            thread_ts: "${{ steps.post.outputs.ts }}"
+            text: ":memo: PR opened by ${{ steps.meta.outputs.author }}"
+            reply_broadcast: false
 
       - name: Wait for the Mintlify preview
         id: preview
@@ -304,6 +316,7 @@ jobs:
             | tr -d '\r\n' | slack_escape)
           author=$(jq -r '.pull_request.user.login' "$GITHUB_EVENT_PATH")
           action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
+          event_key=""
 
           case "$action" in
             review_requested)
@@ -317,30 +330,41 @@ jobs:
               ;;
             submitted)
               who=$(jq -r '.review.user.login' "$GITHUB_EVENT_PATH")
-              case "$(jq -r '.review.state' "$GITHUB_EVENT_PATH")" in
+              review_id=$(jq -r '.review.id' "$GITHUB_EVENT_PATH")
+              review_state=$(jq -r '.review.state' "$GITHUB_EVENT_PATH")
+              case "$review_state" in
                 approved)          text=":white_check_mark: $(slack_user "$who") approved" ;;
                 changes_requested) text=":warning: $(slack_user "$who") requested changes" ;;
                 *)                 echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
               esac
+              event_key="review-${review_id}-${review_state}"
               ;;
             closed)
-              approvers=""
-              while IFS= read -r approver; do
-                mention=$(slack_user "$approver")
-                if [ -z "$approvers" ]; then
-                  approvers="$mention"
-                else
-                  approvers="${approvers}, ${mention}"
+              posted_approval_ids=$(gh api "repos/$REPO/issues/$NUM/comments" --paginate \
+                --jq '.[].body | try capture("slack-event:review-(?<id>[0-9]+)-approved") catch empty | .id' \
+                | sort -u || true)
+              missing_approvals=""
+              while IFS=$'\t' read -r review_id approver; do
+                [ -n "$review_id" ] || continue
+                if ! grep -qx "$review_id" <<< "$posted_approval_ids"; then
+                  line=":white_check_mark: $(slack_user "$approver") approved"
+                  if [ -z "$missing_approvals" ]; then
+                    missing_approvals="$line"
+                  else
+                    missing_approvals="${missing_approvals}\\n${line}"
+                  fi
                 fi
               done < <(gh api "repos/$REPO/pulls/$NUM/reviews" --paginate \
-                --jq '[.[] | select(.state=="APPROVED") | .user.login] | unique | .[]')
+                --jq '[.[] | select(.state=="APPROVED")] | sort_by(.submitted_at) | .[] | [.id, .user.login] | @tsv')
+
               if [ "$(jq -r '.pull_request.merged' "$GITHUB_EVENT_PATH")" = "true" ]; then
                 by=$(jq -r '.pull_request.merged_by.login' "$GITHUB_EVENT_PATH")
                 text=":large_green_circle: *Merged* by $(slack_user "$by")"
               else
                 text=":red_circle: *Closed without merging*"
               fi
-              [ -n "$approvers" ] && text="${text} · approved by ${approvers}"
+              [ -n "$missing_approvals" ] && text="${missing_approvals}\\n${text}"
+              event_key="closed"
               echo "closed=true" >> "$GITHUB_OUTPUT"
               ;;
           esac
@@ -350,6 +374,7 @@ jobs:
             echo "title=$title"
             echo "author=$(slack_user "$author")"
             echo "text=$text"
+            echo "event_key=$event_key"
           } >> "$GITHUB_OUTPUT"
 
       - name: Post missing parent message
@@ -381,6 +406,19 @@ jobs:
         run: |
           gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
             -f body="<!-- slack-thread-ts:${{ steps.post_missing_parent.outputs.ts }} -->"
+
+      - name: Add PR author to missing Slack thread
+        if: steps.msg.outputs.parent_missing == 'true'
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel: "${{ vars.SLACK_CHANNEL_ID }}"
+            thread_ts: "${{ steps.post_missing_parent.outputs.ts }}"
+            text: ":memo: PR opened by ${{ steps.msg.outputs.author }}"
+            reply_broadcast: false
 
       - name: Build changed files message
         id: files
@@ -450,6 +488,14 @@ jobs:
             thread_ts: "${{ steps.msg.outputs.ts || steps.post_missing_parent.outputs.ts }}"
             text: "${{ steps.msg.outputs.text }}"
             reply_broadcast: false
+
+      - name: Stash Slack event marker on the PR
+        if: steps.msg.outputs.skip != 'true' && steps.msg.outputs.event_key != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            -f body="<!-- slack-event:${{ steps.msg.outputs.event_key }} -->"
 
       - name: Strike through the parent message
         if: steps.msg.outputs.closed == 'true'
