@@ -1,22 +1,25 @@
 ---
 title: Hermes Agent
-description: Deploy Hermes Agent by Nous Research on Control Plane using the Template Catalog. A self-hosted, model-agnostic AI agent wrapping any LLM with persistent memory, browser automation, an OpenAI-compatible gateway API, and a web dashboard.
-keywords: ['nous research', 'self-hosted agent', 'autonomous agent', 'llm wrapper', 'anthropic', 'claude', 'gpt-5', 'openrouter', 'vllm', 'lm studio', 'agent gateway', 'bearer token', 'reasoning effort', 'chatgpt alternative']
+description: Deploy Hermes Agent by Nous Research on Control Plane using the Template Catalog. A self-hosted, model-agnostic AI agent wrapping any LLM with persistent memory, chat-platform gateways (Telegram, WhatsApp), a pre-registered Control Plane MCP server, optional browser automation, external webhooks, an OpenAI-compatible gateway API, and a web dashboard.
+keywords: ['nous research', 'self-hosted agent', 'autonomous agent', 'llm wrapper', 'anthropic', 'claude', 'gpt-5', 'openrouter', 'vllm', 'lm studio', 'agent gateway', 'bearer token', 'reasoning effort', 'webhooks', 'browser automation', 'whatsapp', 'telegram', 'mcp', 'model context protocol', 'chatgpt alternative']
 ---
 
 ## Overview
 
-Hermes Agent is a self-hosted AI agent from Nous Research. You bring the model — an API key for Anthropic, OpenAI, or any OpenAI-compatible endpoint — and the agent brings the memory, tools, and interfaces around it. This template deploys the supervised gateway with an OpenAI-compatible API for your clients and a web dashboard, with all agent state on a persistent volume.
+Hermes Agent is a self-hosted AI agent from Nous Research. You bring the model — an API key for Anthropic, OpenAI, or any OpenAI-compatible endpoint — and the agent brings the memory, tools, and interfaces around it. This template deploys the supervised gateway with an OpenAI-compatible API for your clients, a web dashboard, optional browser automation, and optional external webhooks, with all agent state on a persistent volume.
 
 ### Architecture
 
-- **Hermes Agent** — A single-replica stateful workload running the supervised gateway. It serves the OpenAI-compatible API on port `8642` (bearer auth) and the web dashboard on port `9119` (basic auth). With public access enabled, the single canonical HTTPS endpoint fronts one of the two — `publicAccess.expose` picks which (API by default). Headless Chromium for browser automation is **not** in the image — Hermes downloads it via Playwright on first browser use (needs outbound internet; the first browser task is slow while it fetches).
+- **Hermes Agent** — A single-replica stateful workload running the supervised gateway. It serves the OpenAI-compatible API on port `8642` (bearer auth), the web dashboard on port `9119` (basic auth), and an optional HMAC-signed webhook listener on port `8644`. With public access enabled, the single canonical HTTPS endpoint fronts one of these — `publicAccess.expose` picks which (the dashboard by default).
+- **Chromium sidecar** *(optional)* — When `browser.enabled` is set, a second container running headless Chromium is added to the workload, exposing the Chrome DevTools Protocol (CDP) on loopback. The agent attaches to it so browser tools actually work. Off by default because it is a real CPU/memory cost.
+- **Control Plane MCP** *(pre-registered, on by default)* — With `cplnMcp.enabled`, the Control Plane MCP server is registered in the agent's config so it can manage resources in your cpln org. It stays inert until you authenticate it once via OAuth in the dashboard.
 - **Model** — External. Every completion is dispatched to your LLM provider using a key you supply; the workload holds no model weights.
 
 ### What Gets Created
 
-- **Stateful Hermes Agent Workload** — Single replica. Gateway API on port `8642` (bearer auth); web dashboard on port `9119` (basic auth). With public access enabled, `publicAccess.expose` selects which of the two the canonical HTTPS endpoint serves; the other stays internal-only.
-- **Volume Set** — 10 GiB persistent storage at `/opt/data` for the SQLite memory database, sessions, learned skills, and agent config. Supports optional autoscaling.
+- **Stateful Hermes Agent Workload** — Single replica. Gateway API on port `8642` (bearer auth), web dashboard on port `9119` (basic auth), and an optional webhook listener on port `8644` (HMAC-signed). With public access enabled, `publicAccess.expose` selects which one the canonical HTTPS endpoint serves; the others stay internal-only.
+- **Chromium Sidecar Container** *(optional)* — Added to the same workload when `browser.enabled: true`. Headless Chromium reachable by the agent over loopback CDP; no published port and no health probe.
+- **Volume Set** — 10 GiB persistent storage at `/opt/data` for the SQLite memory database, sessions, learned skills, agent config, and MCP OAuth tokens. Supports optional autoscaling.
 - **Identity & Policy** — An identity bound to the workload with `reveal` access to exactly the one prerequisite secret, and nothing else.
 
 <Note>
@@ -30,18 +33,21 @@ Hermes Agent needs an LLM API key and a dictionary secret that you create **befo
 <Steps>
   <Step title="Get an LLM API key">
     Obtain a key from your provider — Anthropic, OpenAI, or any OpenAI-compatible endpoint (OpenRouter, Ollama, vLLM, LM Studio, a proxy) reached via `provider: custom`.
+
+    **Anthropic keys must be workspace-scoped** — create the key inside a workspace in the Anthropic console. A default or identity-linked key fails every request with `HTTP 400: anthropic-workspace-id is required`; recreate it inside a workspace if you see that.
   </Step>
   <Step title="Generate a gateway API key">
     Generate the bearer token your clients will present to the gateway API. It **must be at least 16 characters** — generate one with `openssl rand -hex 32`.
   </Step>
   <Step title="Create a dictionary secret">
-    Create a [dictionary secret](/guides/create-secret/dictionary) holding the three values below. **Name the keys however you like** — map them with `secret.keys` at install, so an existing secret works unchanged. Pass the secret's name as `secret.name`.
+    Create a [dictionary secret](/guides/create-secret/dictionary) holding the values below. **Name the keys however you like** — map them with `secret.keys` at install, so an existing secret works unchanged. Pass the secret's name as `secret.name`.
 
     | Value | Required | Maps to |
     |---|---|---|
     | LLM API key for your provider | Yes | `secret.keys.apiKey` |
     | Bearer token clients present to the gateway API (≥16 characters) | Yes | `secret.keys.apiServerKey` |
     | Dashboard basic-auth password | When the dashboard is enabled | `secret.keys.dashboardPassword` |
+    | Webhook signing secret (HMAC) | Only when webhooks are enabled | `secret.keys.webhookSecret` |
 
     With the default key names — `my-hermes-secret` matches the chart's default `secret.name`, so no values override is needed:
 
@@ -49,14 +55,21 @@ Hermes Agent needs an LLM API key and a dictionary secret that you create **befo
     cpln secret create-dictionary --name my-hermes-secret \
       --entry "api-key=YOUR-LLM-API-KEY" \
       --entry "api-server-key=$(openssl rand -hex 32)" \
-      --entry "dashboard-password=YOUR-STRONG-PASSWORD"
+      --entry "dashboard-password=YOUR-STRONG-PASSWORD" \
+      --entry "webhook-secret=$(openssl rand -hex 32)"   # only needed if you enable webhooks
     ```
   </Step>
 </Steps>
 
+- **A Control Plane `domain`** — only if you want external webhooks reachable over a custom hostname while the dashboard or API stay public on the canonical endpoint. You create the domain and point it at the workload's webhook port; see [Webhooks](#webhooks) for the full steps. This is not needed for the canonical-endpoint webhook path (`publicAccess.expose: webhooks`).
+
 <Warning>
 Hermes rejects an API server key shorter than 16 characters. The gateway still starts, but the API never serves and the workload never becomes ready.
 </Warning>
+
+<Note>
+A missing prerequisite secret wedges the deployment **silently** — `cpln logs` returns nothing because the container never starts. If the workload never becomes ready, run `cpln workload get-deployments {release}-hermes-agent --gvc {gvc} -o yaml` and read `status.versions[].message`; it names the missing secret. Recovery is automatic once the secret exists (up to ~6 minutes), or force it with `cpln workload force-redeployment`.
+</Note>
 
 Once your secret exists, install the template using your preferred method:
 
@@ -89,40 +102,86 @@ The default `values.yaml` for this template:
 ```yaml
 image: nousresearch/hermes-agent:v2026.8.31
 
+# ─── LLM provider ─────────────────────────────────────────────────────────────
 model:
-  provider: anthropic # anthropic | openai | custom (any other OpenAI-compatible endpoint)
-  name: "" # model override — bare hyphenated provider model ID (e.g. claude-opus-4-6, gpt-5); empty = provider default
+  provider: anthropic # anthropic | openai | custom (any other OpenAI-compatible endpoint, e.g. OpenRouter)
+  name: "" # model override — use the provider's exact model ID (e.g. claude-opus-4-6, gpt-5; Anthropic IDs are hyphenated, never dotted). Bare name only — the chart adds the anthropic/ prefix itself. Empty = provider default
   baseUrl: "" # OpenAI-compatible endpoint; required when provider is "custom"
-  reasoningEffort: medium # none | low | medium | high — use "none" for non-reasoning models
+  reasoningEffort: medium # none | low | medium | high — use "none" for non-reasoning models (e.g. gpt-4o)
 
-secret: # the dictionary secret you created (see Prerequisites)
+# ─── Prerequisite secret ──────────────────────────────────────────────────────
+# A dictionary secret you create before installing (see README → Prerequisites).
+# Point each field below at the key in YOUR secret that holds that value.
+secret:
   name: my-hermes-secret # name of your existing dictionary secret
-  keys: # point each field at the key in YOUR secret that holds it
-    apiKey: api-key # LLM API key for your provider
-    apiServerKey: api-server-key # bearer token clients present to the gateway API
-    dashboardPassword: dashboard-password # dashboard password (used when dashboard.enabled)
+  keys:
+    apiKey: api-key # key holding the LLM API key for your provider
+    apiServerKey: api-server-key # key holding the bearer token clients present to the gateway API (>= 16 chars)
+    dashboardPassword: dashboard-password # key holding the dashboard password (used when dashboard.enabled)
+    webhookSecret: webhook-secret # key holding the webhook signing secret (used only when webhooks.enabled)
 
+# ─── Dashboard ────────────────────────────────────────────────────────────────
 dashboard:
-  enabled: true # web UI on port 9119 (internal by default)
+  enabled: true # web UI on port 9119
   username: admin # basic-auth username (password comes from the secret)
+  publicUrl: "" # custom-domain base URL for MCP OAuth callbacks + asset URLs. Empty = canonical endpoint (auto-set under expose: dashboard). Set only if you front the workload with your own domain
 
+# ─── Browser automation (optional headless-Chromium CDP sidecar) ──────────────
+# Browser tools are NON-functional on this image without a Chrome to attach to.
+# Enabling this adds a second container running headless Chromium and points the
+# agent at it over loopback CDP. It is a real cost (CPU/memory), so it is off by default.
+browser:
+  enabled: false
+  image: chromedp/headless-shell:151.0.7922.109 # community headless-shell (pin exact tag; confirm current stable at build)
+  cdpPort: 9222 # loopback CDP port; the app reaches the sidecar at http://127.0.0.1:<cdpPort>
+  resources:
+    minCpu: 250m
+    minMemory: 512Mi
+    maxCpu: 1000m # keep maxCpu <= 4x minCpu (stateful workload)
+    maxMemory: 1Gi
+
+# ─── Control Plane MCP (agent tools for your cpln org) ────────────────────────
+# Pre-registers the Control Plane MCP server so the agent can manage your cpln
+# resources. It shows up in the dashboard ready to authenticate — you click
+# Authenticate (OAuth) once and nothing reaches cpln until you do. Tokens persist
+# on the volume across restarts. The dashboard must be reachable to authenticate.
+cplnMcp:
+  enabled: true # register https://mcp.cpln.io as an MCP server; authenticate via OAuth in the dashboard
+
+# ─── Webhooks (optional external event ingestion) ─────────────────────────────
+# Expose externally 2 ways — canonical HTTPS (`publicAccess.expose: webhooks`) or a custom domain (keeps the dashboard public too). See README.
+webhooks:
+  enabled: false # turn on the webhook listener on port 8644 (WEBHOOK_ENABLED/PORT/SECRET); signing secret rides the prerequisite secret (secret.keys.webhookSecret)
+
+# ─── WhatsApp (optional personal WhatsApp bridge) ─────────────────────────────
+# Links the agent to a personal WhatsApp account via the image's built-in Baileys
+# bridge. Off by default. When on, the gateway installs the bridge's Node deps to
+# the volume on first pairing (~6s, needs egress to registry.npmjs.org) and you
+# pair by scanning a QR from the dashboard (or `hermes whatsapp`). Session state
+# persists on the volume. Set an allowlist after pairing — see the README.
+whatsapp:
+  enabled: false # enable the WhatsApp platform (WHATSAPP_ENABLED); pair via the dashboard QR after installing
+
+# ─── Resources ────────────────────────────────────────────────────────────────
 resources:
   minCpu: 500m # idle floor — maxCpu:minCpu ratio must stay under 4:1
   minMemory: 1Gi
-  maxCpu: 2000m # burst ceiling (headroom for on-demand browser automation)
+  maxCpu: 2000m # burst ceiling for heavy agent turns and tool work
   maxMemory: 4Gi
 
+# ─── Storage ──────────────────────────────────────────────────────────────────
 volumeset:
-  capacity: 10 # initial GiB (minimum 10) — memory DB, sessions, skills, config
+  capacity: 10 # Initial capacity in GiB (minimum is 10)
   autoscaling:
-    enabled: false # set true to auto-expand the volume as state grows
-    maxCapacity: 100 # ceiling in GiB when autoscaling is enabled
-    minFreePercentage: 10 # scale up when free space drops below this
-    scalingFactor: 1.2 # multiplier applied on each scale-up
+    enabled: false # Set to true to enable autoscaling
+    maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
+    minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
+    scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
 
+# ─── Access ───────────────────────────────────────────────────────────────────
 publicAccess:
-  enabled: false # expose the workload on the public canonical HTTPS endpoint
-  expose: api # api | dashboard — which surface the one canonical endpoint fronts
+  enabled: false # expose the workload on the public canonical HTTPS endpoint — read the README security note first
+  expose: dashboard # api | dashboard | webhooks — which surface the ONE canonical endpoint fronts. "dashboard" (default) = web UI (9119) public behind basic auth (use a strong password!); API stays internal. "api" = gateway API (8642) public. "webhooks" = webhook listener (8644) public over HTTPS
 
 internalAccess:
   type: same-gvc # none | same-gvc | same-org | workload-list
@@ -168,19 +227,47 @@ Hermes sends a reasoning effort with every request, and models that do not suppo
 ### Secret
 
 - `secret.name` — Name of the dictionary secret you created. See [Prerequisites](#prerequisites).
-- `secret.keys.apiKey` / `secret.keys.apiServerKey` / `secret.keys.dashboardPassword` — The key names **within your secret** that hold each value. Override these to match an existing secret rather than renaming its keys.
+- `secret.keys.apiKey` / `secret.keys.apiServerKey` / `secret.keys.dashboardPassword` / `secret.keys.webhookSecret` — The key names **within your secret** that hold each value. Override these to match an existing secret rather than renaming its keys. `webhookSecret` is only read when webhooks are enabled.
 
 ### Dashboard
 
-- `dashboard.enabled` — Serve the web dashboard on port `9119`. Internal by default; publish it on the canonical HTTPS endpoint with `publicAccess.expose: dashboard` (see [Access](#access)).
+- `dashboard.enabled` — Serve the web dashboard on port `9119`. Public on the canonical HTTPS endpoint under the default `publicAccess.expose: dashboard` (see [Access](#access)); otherwise internal-only.
 - `dashboard.username` — Basic-auth username. The password comes from your secret.
+- `dashboard.publicUrl` — Base URL used for MCP OAuth callbacks and asset URLs. Empty uses the canonical endpoint (auto-set under `expose: dashboard`). Set this only when you front the workload with your own custom domain, so callbacks and asset URLs use that domain instead of the canonical endpoint.
+
+### Browser sidecar
+
+- `browser.enabled` — Add a headless-Chromium sidecar so the agent's browser tools work. Off by default; it is a real CPU/memory cost.
+- `browser.image` — The pinned community headless-Chromium image ([`chromedp/headless-shell`](https://hub.docker.com/r/chromedp/headless-shell)).
+- `browser.cdpPort` — The loopback CDP port the app reaches the sidecar on.
+- `browser.resources` — The sidecar's own CPU/memory floor and ceiling. Keep `maxCpu` under 4× `minCpu` (stateful workload).
+
+See [Browser automation](#browser-automation) for how it works.
+
+### Control Plane MCP
+
+- `cplnMcp.enabled` — Pre-register the Control Plane MCP server (`https://mcp.cpln.io`) in the agent's config. On by default.
+
+The server shows up on the dashboard's MCP page ready to authenticate. It is **inert until you click Authenticate** (OAuth) — nothing reaches your cpln org before that. Once authenticated, the agent can manage resources in your org, and the OAuth session acts **as you**; tokens persist on the volume across restarts. Set `cplnMcp.enabled: false` to skip registering it. See [Connecting MCP servers that need OAuth](#connecting-mcp-servers-that-need-oauth).
+
+### Webhook listener
+
+- `webhooks.enabled` — Turn on the HMAC-signed webhook listener on port `8644`. Off by default. The signing secret comes from `secret.keys.webhookSecret`.
+
+See [Webhooks](#webhooks) for the two ways to expose the listener externally.
+
+### WhatsApp
+
+- `whatsapp.enabled` — Link the agent to a **personal** WhatsApp account via the image's built-in Baileys bridge. Off by default.
+
+When enabled, pair the account after install by scanning a QR — see [Messaging Platforms](#messaging-platforms). First pairing installs the bridge's Node dependencies to the volume (~6 s, one-time, reaching only `registry.npmjs.org` — covered by the default open outbound) and stores the session on the volume, so it survives restarts. The WhatsApp Cloud (business) API is a separate integration this template does not wire.
 
 ### Resources
 
 - `resources.minCpu` / `resources.minMemory` — The idle floor.
-- `resources.maxCpu` / `resources.maxMemory` — The burst ceiling, giving headroom for the on-demand headless browser.
+- `resources.maxCpu` / `resources.maxMemory` — The burst ceiling for heavy agent turns and tool work.
 
-The min→max spread is the elasticity: the workload idles at the floor and bursts toward the ceiling only while browser automation runs. Keep `maxCpu` under 4× `minCpu` — the platform rejects a wider ratio.
+The min→max spread is the elasticity: the workload idles at the floor and bursts toward the ceiling during heavy work. Keep `maxCpu` under 4× `minCpu` — the platform rejects a wider ratio. (The optional browser sidecar has its own separate `browser.resources` block.)
 
 <Note>
 Upgrading from 1.0.0: the ceiling keys were renamed from `cpu`/`memory` to `maxCpu`/`maxMemory`. Values that still carry the old names are refused at render — rename them before upgrading.
@@ -188,7 +275,7 @@ Upgrading from 1.0.0: the ceiling keys were renamed from `cpu`/`memory` to `maxC
 
 ### Storage
 
-- `volumeset.capacity` — Initial volume size in GiB (minimum 10) for the memory database, sessions, skills, and config.
+- `volumeset.capacity` — Initial volume size in GiB (minimum 10) for the memory database, sessions, skills, config, and MCP OAuth tokens.
 - `volumeset.autoscaling.enabled` — Automatically expand the volume as state grows. When enabled:
   - `maxCapacity` — Maximum volume size in GiB.
   - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
@@ -197,16 +284,19 @@ Upgrading from 1.0.0: the ceiling keys were renamed from `cpu`/`memory` to `maxC
 ### Access
 
 - `publicAccess.enabled` — Expose the workload on the public canonical HTTPS endpoint. Defaults to `false`. Read the security note below before enabling.
-- `publicAccess.expose` — Which surface the canonical endpoint fronts: `api` (default) or `dashboard`. A workload gets **one** canonical HTTPS endpoint, and it fronts a single port — this knob picks which. Only meaningful with `publicAccess.enabled: true`.
+- `publicAccess.expose` — Which surface the canonical endpoint fronts: `dashboard` (default), `api`, or `webhooks`. A workload gets **one** canonical HTTPS endpoint, and it fronts a single port — this knob picks which. Only meaningful with `publicAccess.enabled: true`.
 
-| `expose` | Canonical endpoint serves | The other surface |
+| `expose` | Canonical endpoint serves | The other surfaces |
 |---|---|---|
-| `api` (default) | Gateway API (`8642`), bearer auth | Dashboard stays internal — reach it via `cpln port-forward` |
-| `dashboard` | Web dashboard (`9119`) behind its basic-auth login | API loses its public endpoint; still reachable in-GVC at `{release}-hermes-agent.{gvc}.cpln.local:8642` |
+| `dashboard` (default) | Web dashboard (`9119`) behind its basic-auth login | API internal at `{release}-hermes-agent.{gvc}.cpln.local:8642`; webhooks (if on) internal |
+| `api` | Gateway API (`8642`), bearer auth | Dashboard internal |
+| `webhooks` | Webhook listener (`8644`) over HTTPS | API and dashboard internal |
 
 <Warning>
-`expose: dashboard` puts a **basic-auth login form on the internet** — the dashboard password in your secret must be strong (`openssl rand -hex 32`), because whoever logs in operates a terminal-capable agent. It also requires `dashboard.enabled: true`.
+The default `expose: dashboard` puts a **basic-auth login form on the internet** when you enable public access — the dashboard password in your secret must be strong (`openssl rand -hex 32`), because whoever logs in operates a terminal-capable agent. It also requires `dashboard.enabled: true`.
 </Warning>
+
+**Keeping the API internal is a valid, safer posture for event-driven deployments.** The gateway API is a terminal-capable agent behind a single bearer token, so `publicAccess.expose: webhooks` — exposing only the HMAC-signed webhook listener while the API stays on the private internal endpoint — is a deliberate hardening choice, not a limitation.
 
 - `internalAccess.type` — Internal firewall scope of the workload:
 
@@ -218,18 +308,19 @@ Upgrading from 1.0.0: the ceiling keys were renamed from `cpu`/`memory` to `maxC
 | `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
 
 <Warning>
-**`publicAccess.enabled: true` publishes a terminal-capable agent to the internet**, guarded only by your bearer token. The agent's terminal backend runs unsandboxed as the container user with full file access, so anyone holding the key can execute work inside the workload. It is off by default — before enabling it, use a long random API server key (`openssl rand -hex 32`) and prefer restricting reach via `internalAccess`.
+**`publicAccess.enabled: true` publishes a terminal-capable agent to the internet.** With the default `expose: dashboard` that is a basic-auth login form; with `expose: api` it is a bearer-guarded API. Either way, whoever gets in operates the agent with full file access as the container user. It is off by default — before enabling it, use a long random password/key (`openssl rand -hex 32`) and prefer restricting reach via `internalAccess`.
 </Warning>
 
 ## Connecting
 
 | Interface | Where | Auth |
 |---|---|---|
-| Gateway API (OpenAI-compatible) | From another workload: `{release}-hermes-agent.{gvc}.cpln.local:8642`. With `publicAccess.enabled: true` and `expose: api` (the default), also on the canonical HTTPS endpoint — read `status.canonicalEndpoint` from `cpln workload get {release}-hermes-agent -o yaml` | Bearer token (`secret.keys.apiServerKey`) |
-| Web dashboard | On the canonical HTTPS endpoint with `publicAccess.enabled: true` and `expose: dashboard` — the recommended way to use it from a browser. Internal by default: `cpln port-forward {release}-hermes-agent 9119:9119 --gvc {gvc}`, then `http://localhost:9119` | Basic auth (`dashboard.username` + the dashboard password from your secret) |
+| Web dashboard | Public on the canonical HTTPS endpoint with `publicAccess.enabled: true` (default `expose: dashboard`) — read `status.canonicalEndpoint` from `cpln workload get {release}-hermes-agent -o yaml`. Otherwise internal-only | Basic auth (`dashboard.username` + the dashboard password from your secret) |
+| Gateway API (OpenAI-compatible) | From another workload at `{release}-hermes-agent.{gvc}.cpln.local:8642`. Public on the canonical endpoint with `publicAccess.enabled: true` and `expose: api` | Bearer token (`secret.keys.apiServerKey`) |
+| Webhook listener | From another workload at `{release}-hermes-agent.{gvc}.cpln.local:8644`. Public via `expose: webhooks` (HTTPS on the canonical endpoint) or a custom domain routing `443 → :8644` (HTTPS, coexists with a public dashboard/API) | HMAC signature (the webhook secret) |
 
 <Note>
-`cpln port-forward` is fine for quick checks, but browser sessions through the tunnel degrade over time — the tunnel does not release connections when a browser disconnects, and a wedged browser is fixed only by fully quitting it. For regular browser use, set `publicAccess.expose: dashboard` instead.
+The dashboard's supported browser access is the public canonical endpoint (default `expose: dashboard`). A private install's dashboard is internal-only.
 </Note>
 
 Example request against the gateway API:
@@ -241,6 +332,92 @@ curl https://ENDPOINT/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"hello"}]}'
 ```
 
+## Browser automation
+
+The agent's browser tools cannot run on the Hermes image alone — it ships no launchable browser, and browser tool calls silently fall back to text-level page fetching (`web_extract`). Set **`browser.enabled: true`** and the chart adds a pinned headless-Chromium container ([`chromedp/headless-shell`](https://hub.docker.com/r/chromedp/headless-shell)) to the workload. Containers in one workload share a network namespace, so the agent reaches Chrome's DevTools Protocol on loopback (`http://127.0.0.1:9222`); the chart seeds `browser.cdp_url` there automatically. No extra setup, and the browser profile is ephemeral (fresh navigation per turn).
+
+- It is a **real cost** (a second container with its own CPU/memory floor), so it is off by default.
+- The sidecar has no published port and no health probe — CDP binds loopback only, which nothing outside the replica can reach.
+- Verified on this platform: with the sidecar enabled, the agent resolves the CDP websocket and drives a real page navigation (confirmed in `/opt/data/logs/agent.log`) rather than falling back to `web_extract`. If the browser is ever unavailable the agent quietly falls back again, so read the reply rather than assuming the tool ran.
+
+## Webhooks
+
+Set **`webhooks.enabled: true`** to turn on the listener on port `8644` (the chart also enables the `hermes webhook subscribe` CLI). **Each subscription carries its own HMAC signing secret**: `hermes webhook subscribe` auto-generates one and prints it at creation, or you can pass `--secret "$WEBHOOK_SECRET"` to reuse the shared secret from `secret.keys.webhookSecret` (exposed to the container as `$WEBHOOK_SECRET`). Add the `webhookSecret` key to your prerequisite secret before enabling webhooks. Sign each event as HMAC-SHA256 of the body in the `X-Webhook-Signature` header (the gateway recommends the timestamped `X-Webhook-Signature-V2` form for replay protection). There are two ways to expose the listener externally:
+
+| Path | How | Trade-offs |
+|---|---|---|
+| **`publicAccess.expose: webhooks`** | The canonical HTTPS endpoint fronts `8644`, TLS-terminated at the edge | Consumes the single canonical endpoint, so the dashboard/API cannot also be public at the same time |
+| **Custom domain** (recommended for coexistence) | A Control Plane `domain` resource routing `443 → :8644`, as a **prerequisite** you create (the chart can't own your DNS, same as a cloud account). An independent public front, so the dashboard/API stay on the canonical endpoint AND webhooks are reachable over real TLS — both public at once. Webhooks land at `https://<your-domain>/webhooks/<name>` | You own the DNS records and the domain resource. Verified working with a real Let's Encrypt certificate |
+
+Both paths are HTTPS. Use `expose: webhooks` when webhooks are the only public surface, or a **custom domain** to keep the dashboard/API public too.
+
+### Webhooks on a custom domain
+
+This is the only way to have the dashboard (or API) public on the canonical endpoint AND accept external HTTPS webhooks at the same time. The domain is a **prerequisite you own** — the chart never creates it (a `domain` is an org-level resource, so a chart that owned it would delete it on `helm uninstall`, and only you can add DNS records).
+
+<Note>
+`GET /` on the webhook domain returns `404` by design — the domain routes to the webhook listener (`8644`), which only serves `/webhooks/<name>`, not a root page. A 404 at the root means the domain is wired correctly, not that anything is broken.
+</Note>
+
+<Steps>
+  <Step title="Enable the listener">
+    Install or upgrade with `webhooks.enabled: true` and a `webhook-secret` key in your prerequisite secret. The dashboard stays on the canonical endpoint (default `publicAccess.expose: dashboard`); the listener runs internally on `8644`.
+  </Step>
+  <Step title="Create the domain resource">
+    Route `443` → the webhook port `8644` (`cpln apply -f domain.yaml`):
+
+    ```yaml
+    kind: domain
+    name: webhooks.example.com            # your subdomain
+    description: webhooks.example.com
+    spec:
+      dnsMode: cname                      # subdomain mode
+      certChallengeType: http01           # Let's Encrypt HTTP-01
+      acceptAllHosts: false
+      ports:
+        - number: 443
+          protocol: http2
+          routes:
+            - prefix: /
+              port: 8644                  # route to the webhook listener
+              workloadLink: //gvc/GVC/workload/RELEASE-hermes-agent
+          tls:
+            minProtocolVersion: TLSV1_2
+    ```
+  </Step>
+  <Step title="Add the two DNS records">
+    Read them back from `cpln domain get webhooks.example.com -o yaml` under `status.dnsConfig` (the CNAME target is the GVC alias):
+
+    | Record | Name | Value |
+    |---|---|---|
+    | Ownership (TXT) | `_cpln-webhooks` (i.e. `_cpln-<label>`) | your Control Plane org name |
+    | Routing (CNAME) | `webhooks` (the `<label>`) | `<gvcAlias>.cpln.app` (the GVC alias, from `cpln gvc get GVC`) |
+  </Step>
+  <Step title="Wait for the domain to reach ready">
+    Check `cpln domain get webhooks.example.com` — it passes through `pendingDnsConfig` → `pendingCertificate` → `ready` as Let's Encrypt issues over HTTP-01 (a minute or two once DNS resolves).
+  </Step>
+  <Step title="Register a subscription">
+    On the dashboard **Webhooks** page (or `hermes webhook subscribe <name> --events "*"`). Each subscription has its own HMAC secret; copy it, or pass `--secret "$WEBHOOK_SECRET"` to reuse the shared one.
+  </Step>
+  <Step title="Send a signed event">
+    Send to `https://webhooks.example.com/webhooks/<name>` — the body's HMAC-SHA256 in `X-Webhook-Signature`:
+
+    ```bash
+    SECRET='<the route secret>'
+    BODY='{"type":"ping"}'
+    SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')
+    curl -i -X POST https://webhooks.example.com/webhooks/<name> \
+      -H 'Content-Type: application/json' -H "X-Webhook-Signature: $SIG" -d "$BODY"
+    ```
+
+    A correct signature returns `200`/`202`; a wrong one returns `401`.
+  </Step>
+</Steps>
+
+<Warning>
+The dashboard and CLI always display the webhook URL as `http://localhost:8644/...`, no matter how you expose it. This is an upstream cosmetic bug — the app can't be told its own public URL. Ignore the displayed host; only the **path** matters. The same subscription is fully reachable and behaves identically at your real external base: take the `/webhooks/<name>` path and prepend your domain (or the canonical endpoint), dropping `localhost:8644`. So `http://localhost:8644/webhooks/myhook` shown in the UI is served at `https://<your-domain>/webhooks/myhook` — give external callers that.
+</Warning>
+
 ## Messaging Platforms
 
 Hermes supports chat-platform gateways such as Telegram, Discord, and Slack. These are **configured after install** using Hermes's own interactive setup — not through this template's values:
@@ -249,17 +426,42 @@ Hermes supports chat-platform gateways such as Telegram, Discord, and Slack. The
 cpln workload exec {release}-hermes-agent --gvc {gvc} --container hermes -- hermes gateway setup
 ```
 
-Follow the prompts for your platform; the configuration is stored on the data volume. See the [Hermes Agent documentation](https://github.com/NousResearch/hermes-agent) for each platform's requirements, such as bot tokens.
+Follow the prompts for your platform; the configuration is stored on the data volume. Notes from testing:
+
+- **Telegram** works out of the box — a bot token from `@BotFather` is all it needs.
+- **Slack** requires an app manifest. Two gotchas: Slack caps an app at **25 slash commands** but Hermes's generated manifest emits ~50 — trim it to 25 or fewer before creating the app, or Slack rejects the manifest. And Slack's user allowlist **fails closed when empty** — an empty allowlist silently rejects everyone, so set the allowed users explicitly.
+- **WhatsApp** (personal account) works via the image's built-in Baileys bridge when you set `whatsapp.enabled: true`. Pair it after install: open the dashboard's WhatsApp setup and scan the QR with WhatsApp on your phone (Settings → Linked devices → Link a device), or run `cpln workload exec {release}-hermes-agent --gvc {gvc} --container hermes -- hermes whatsapp` for a terminal QR. First pairing installs the bridge's dependencies to the volume (a few seconds, one-time) and stores the session on the volume, where it is retained across restarts. Once linked, Hermes runs **as** that WhatsApp account: when someone messages your linked number, Hermes replies with a **pairing code** that you approve on the dashboard **Pairing** page (or pre-authorize people with an allowlist during setup). The WhatsApp Cloud (business) API is a separate integration this template does not wire.
+
+See the [Hermes Agent documentation](https://github.com/NousResearch/hermes-agent) for each platform's requirements, such as bot tokens.
+
+<Warning>
+An OAuth-connected MCP server, and a connected chat platform, act **as the person who authenticated or paired it**. Chat requests can then invoke those tools with that person's permissions — for Control Plane's own MCP that includes creating and deleting real infrastructure. Connect write-capable MCP servers deliberately.
+</Warning>
+
+## Connecting MCP servers that need OAuth
+
+Many MCP servers authenticate with OAuth. **Control Plane's own MCP server (`https://mcp.cpln.io/mcp`) is pre-registered for you** (`cplnMcp.enabled: true`) — it appears on the dashboard's MCP page ready to authenticate, so you skip the "add server" step and go straight to **Authenticate**, a single OAuth click. For any other OAuth MCP server, add it on the MCP page with **Authentication: OAuth** first. Then:
+
+- **With `publicAccess.expose: dashboard`** (the default): click **Authenticate** — your browser goes to the provider, you sign in, and it redirects straight back to the dashboard. This works because the chart sets the dashboard's public URL automatically; tokens persist on the volume across restarts and redeploys.
+- **With a custom domain**, set `dashboard.publicUrl` to your domain's base URL so callbacks and asset URLs use it instead of the canonical endpoint.
+- **With `expose: api`** the dashboard has no public URL for OAuth callbacks, so use the one-time CLI flow instead: `cpln workload connect {release}-hermes-agent --gvc {gvc} --container hermes`, then `hermes mcp login <name>` — open the printed URL, and when it lands on a `127.0.0.1:27890/callback` connection error (expected), paste that full URL back into the shell.
+
+<Note>
+MCP auth state is not badged in the dashboard — the **Test** button (or `hermes mcp test`) is the truth for whether a server is authenticated.
+</Note>
 
 ## Important Notes
 
+- **`publicAccess.enabled: true` publishes a terminal-capable agent to the internet** — guarded by a basic-auth login (`expose: dashboard`) or a bearer token (`expose: api`). Whoever gets in operates the agent with full file access as the container user, so use a long random password/key (`openssl rand -hex 32`) and prefer restricting reach via `internalAccess`. It is off by default.
 - **The API server key must be at least 16 characters** — Hermes rejects anything shorter, and the workload will not become ready.
-- **The dashboard is internal by default** — reach it via `cpln port-forward` (see [Connecting](#connecting)). With the default `expose: api`, the public endpoint serves the **API only**, so browsing to it returns 404 at `/` by design — `GET /health` returning 200 is how to confirm the workload is up. Putting the dashboard on the internet instead is an explicit choice: `publicAccess.expose: dashboard`, which drops the API's public endpoint and demands a strong dashboard password.
-- **A dashboard login that hangs is almost always stale browser state, not the server** — port-forward tunnels that die mid-session leave wedged connections in the browser. Fully quit the browser and reopen (closing the tab is not enough); a private window also works, which is the tell.
-- **Single replica by design** — memory is a single-writer SQLite database and upstream forbids two gateways sharing one data directory. Do not scale up. State persists on the volume across restarts and the agent resumes; only in-flight work is lost.
+- **`browser.enabled` adds a second container with its own resource floor** — a real, ongoing cost. Leave it off unless the agent needs to drive a real browser.
+- **WhatsApp (personal) is opt-in** (`whatsapp.enabled: true`) and pairs via a QR after install — the bridge's dependencies install to the volume on first pairing and the session is stored on the volume, retained across restarts. It links your own WhatsApp account and runs as it; new people are gated by a pairing code you approve on the dashboard Pairing page (or an allowlist). The WhatsApp Cloud (business) API is not wired by this template. See [Messaging Platforms](#messaging-platforms).
+- **An OAuth-connected MCP server acts as the person who authenticated it** — for Control Plane's own MCP (pre-registered, `cplnMcp.enabled: true`) that includes creating and deleting real infrastructure. It stays inert until you authenticate it once via OAuth in the dashboard; connect write-capable MCP servers deliberately.
+- **Single replica by design** — memory is a single-writer SQLite database and upstream forbids two gateways sharing one data directory. Do not scale up. State persists on the volume across restarts and the agent resumes; only in-flight work and brief downtime are lost.
 - **The model is external** — cost and rate limits are governed by your LLM provider, not this workload.
 - **Failed model calls return HTTP 200** with the error inside the body (`"finish_reason": "error"`, `"hermes": {"failed": true}`). A client that checks only the HTTP status will read a provider failure as success — inspect the body, or the agent log at `/opt/data/logs/agent.log`.
-- **Keep `maxCpu` under 4× `minCpu`** — the platform rejects a wider ratio; raise `minCpu` if you raise `maxCpu`.
+- **Keep `maxCpu` under 4× `minCpu`** (both the app and browser blocks) — the platform rejects a wider ratio on a stateful workload.
+- **Access-knob changes take up to a couple of minutes to propagate** — after toggling `publicAccess`, re-poll rather than concluding it is broken.
 - **Rotating a value in your prerequisite secret does not reach a running workload** — `cpln://` references resolve at replica start and are never re-resolved, so the old credential keeps working silently. After any rotation, run `cpln workload force-redeployment {release}-hermes-agent --gvc {gvc}`.
 - **Resetting requires an uninstall** — changing the secret and redeploying does not wipe existing memory or config on the volume. `cpln helm uninstall` deletes the volume set.
 
