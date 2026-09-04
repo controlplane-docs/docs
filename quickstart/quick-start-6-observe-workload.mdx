@@ -1,0 +1,437 @@
+---
+title: '6. Observe your workload'
+description: 'Read the logs, metrics, and traces Control Plane collects for every workload without a code change, and follow one request from the frontend through the API.'
+keywords: ['observability', 'logs', 'metrics', 'tracing', 'traces', 'logql', 'promql', 'grafana', 'access log', 'request log', 'request id', 'traceparent', 'opentelemetry', 'tutorial', 'walkthrough']
+---
+
+## Overview
+
+Every [workload](/concepts/workload) on Control Plane arrives with its logs, metrics, and traces already collected. The sidecar in front of each [replica](/concepts/replica) writes a log line for every request it receives and every request it sends, reports request rate and latency as metrics, and, once tracing is on, records a span for each hop, so a request that crosses from the frontend to the API shows up as one trace. This part reads all three for the system you built, from every [location](/concepts/location) in one place.
+
+**What you'll do:**
+
+- Enable tracing on `quickstart-gvc`, sampling every request.
+- Follow one waitlist signup through the logs of both workloads by its request id.
+- Read the request rate and latency of the three workloads, in the Console and with a PromQL query.
+- Open one trace that spans `frontend` and `api` in Grafana.
+
+<Accordion title="Where the logs and traces come from">
+Each workload has three [log](/core/logs) streams per replica, all queried with LogQL:
+
+| Container | Lines |
+| --------- | ----- |
+| `frontend`, `api` (the container name) | What the application writes to stdout and stderr |
+| `_accesslog` | One line per request the workload received |
+| `_requestlog` | One line per request the workload sent |
+
+The sidecar stamps every request with an `x-request-id` header and writes the id into both log lines. The quickstart frontend forwards that header, together with the W3C `traceparent` header, on its call to the API, which is what ties the two workloads' lines and spans together.
+</Accordion>
+
+## Prerequisites
+
+- Completed [5. Add a database and wire its secret](/quickstart/quick-start-5-database-secrets), with `frontend` and `api` running and the waitlist stored in PostgreSQL.
+- For the CLI path: the CLI installed and logged in, as in part 2.
+
+## Step 1: Enable tracing on the GVC
+
+[Tracing](/reference/gvc#tracing) is configured on the [GVC](/concepts/gvc) or on the [org](/concepts/org), and a GVC setting takes precedence over the org's. The `Control Plane` provider stores the traces for you.
+
+<Tabs>
+
+<Tab title="Console">
+
+<Steps>
+
+<Step title="Open the tracing settings">
+Click `GVCs` in the left menu, open `quickstart-gvc`, and click `Tracing` in the left pane.
+</Step>
+
+<Step title="Turn it on">
+Switch on `Enable Tracing`, keep `Control Plane` as the `Provider`, and set `Sampling Percentage` to `100`, so every request is traced while you look.
+</Step>
+
+<Step title="Update">
+Click `Update` and reload the page. A `Traces` link appears in the left pane. A replica reads the tracing setting when it starts, so force a redeployment of `frontend` and `api`: open each workload, click `Actions`, then `Force Redeployment`.
+</Step>
+
+</Steps>
+
+</Tab>
+
+<Tab title="CLI">
+
+Create `tracing.yaml`:
+
+```yaml
+spec:
+  tracing:
+    provider:
+      controlplane: {}
+    sampling: 100
+```
+
+Apply it to the GVC:
+
+```bash
+cpln gvc patch quickstart-gvc -f tracing.yaml
+```
+
+A replica reads the tracing setting when it starts, so force a redeployment of the two workloads:
+
+```bash
+cpln workload force-redeployment frontend api --gvc quickstart-gvc
+```
+
+</Tab>
+
+<Tab title="Terraform">
+
+Add the tracing block to `cpln_gvc.quickstart` in your `main.tf`:
+
+```hcl
+  controlplane_tracing {
+    sampling = 100
+  }
+```
+
+Apply the change:
+
+```bash
+terraform apply
+```
+
+A replica reads the tracing setting when it starts, so force a redeployment of `frontend` and `api` with the CLI (`cpln workload force-redeployment frontend api --gvc quickstart-gvc`) or, in the Console, with `Actions` then `Force Redeployment` on each workload.
+
+</Tab>
+
+<Tab title="Pulumi">
+
+Add the tracing setting to the GVC:
+
+<Tabs>
+
+<Tab title="TypeScript">
+
+```typescript
+  controlplaneTracing: { sampling: 100 },
+```
+
+</Tab>
+
+<Tab title="Python">
+
+```python
+    controlplane_tracing=cpln.GvcControlplaneTracingArgs(sampling=100),
+```
+
+</Tab>
+
+<Tab title="Go">
+
+```go
+	ControlplaneTracing: &cpln.GvcControlplaneTracingArgs{
+		Sampling: pulumi.Float64(100),
+	},
+```
+
+</Tab>
+
+<Tab title="C#">
+
+```csharp
+        ControlplaneTracing = new GvcControlplaneTracingArgs { Sampling = 100 },
+```
+
+</Tab>
+
+</Tabs>
+
+Deploy the change:
+
+```bash
+pulumi up
+```
+
+A replica reads the tracing setting when it starts, so force a redeployment of `frontend` and `api` with the CLI (`cpln workload force-redeployment frontend api --gvc quickstart-gvc`) or, in the Console, with `Actions` then `Force Redeployment` on each workload.
+
+</Tab>
+
+</Tabs>
+
+## Step 2: Make a few requests
+
+Once `frontend` and `api` report `Ready` again, open the frontend's [canonical endpoint](/reference/workload/general#canonical-endpoint-global), reload it a couple of times, and join the waitlist with a new address. Every page load is one request to `frontend` and one call from `frontend` to `api`, and the signup is one more of each.
+
+## Step 3: Follow the signup through the logs
+
+The signup was one request from your browser that the frontend turned into calls to the API. The sidecar gave that request an id and wrote it into every line it logged for it, in both workloads, so one id finds the whole path of one user action. That is the search to run when a user reports that something failed.
+
+<Tabs>
+
+<Tab title="Console">
+
+<Steps>
+
+<Step title="Read the API's own log">
+Open the `api` workload and click `Logs` in the left pane. Click `Settings` and switch on `Show Labels`, so every line shows its location and replica. Select `api` under `Container`, add `|= "POST"` to the end of the query so it reads `{gvc="quickstart-gvc", workload="api", container="api"} |= "POST"`, and click `Query`. One line per signup comes back, written by the API in the location that served it:
+
+```text
+POST /signups 201 5ms
+```
+
+Remove the filter to see the rest of what the API writes: a `GET /signups 200 2ms` line per page load and, first in every replica's log, `api 5 listening on port 8080 in aws-us-west-2, storage: postgres at db-postgres.quickstart-db.cpln.local`, where the number is the workload's version.
+</Step>
+
+<Step title="Find the same call in the frontend's request log">
+Open the `frontend` workload, click `Logs`, select `Request Log` under `Container`, add `|= "POST"` to the end of the query, and click `Query`. One line comes back, the frontend's sidecar logging the call it made to the API for your signup:
+
+```text
+[2026-09-04T10:28:03.472Z] "POST /signups HTTP/1.1" 201 - via_upstream - "-" 27 110 88 88 "-" "node" "d9c301d7-a9e9-90ec-a508-326ffe5dd4fb" "api.quickstart-gvc.cpln.local:8080" "10.0.2.64:8080"
+```
+
+After the status come the bytes received and sent and the duration in milliseconds, then in quotes the address the call came from, the user agent (`node`, the frontend's server-side fetch), the request id, the host called, and the replica that answered. Copy the request id.
+</Step>
+
+<Step title="Search the whole GVC for that id">
+Replace the query with `{gvc="quickstart-gvc"} |= "d9c301d7-a9e9-90ec-a508-326ffe5dd4fb"`, using your id, select `Any Container`, make sure `Show Labels` is on under `Settings`, and click `Query`. Five lines come back, and the labels column names the workload and container of each:
+
+| Workload | Container | Line | What it is |
+| -------- | --------- | ---- | ---------- |
+| `frontend` | Access Log | `"POST / HTTP/1.1" 200` | Your browser submitting the form |
+| `frontend` | Request Log | `"POST /signups HTTP/1.1" 201` | The frontend storing the signup through the API |
+| `frontend` | Request Log | `"GET /signups HTTP/1.1" 200` | The frontend fetching the list again to render the page |
+| `api` | Access Log | `"POST /signups HTTP/1.1" 201` | The store call as the API's sidecar received it, with the frontend replica's address as the caller |
+| `api` | Access Log | `"GET /signups HTTP/1.1" 200` | The list call as the API's sidecar received it |
+
+The two API lines each carry two addresses at the end, the frontend replica that called and the API replica that answered; the frontend's request-log lines carry only the replica they called.
+</Step>
+
+</Steps>
+
+</Tab>
+
+<Tab title="CLI">
+
+Read the API's own log, filtered to the signup:
+
+```bash
+cpln logs '{gvc="quickstart-gvc", workload="api", container="api"} |= "POST"' --since 15m -o raw
+```
+
+```text
+POST /signups 201 5ms
+```
+
+One line per signup, written by the API in the location that served it. Drop the filter to see the rest of what the API writes: a `GET /signups 200 2ms` line per page load and, first in every replica's log, `api 5 listening on port 8080 in aws-us-west-2, storage: postgres at db-postgres.quickstart-db.cpln.local`, where the number is the workload's version.
+
+Find the same call in the frontend's request log, the calls its sidecar logged on the way out:
+
+```bash
+cpln logs '{gvc="quickstart-gvc", workload="frontend", container="_requestlog"} |= "POST"' --since 15m -o raw
+```
+
+```text
+[2026-09-04T10:28:03.472Z] "POST /signups HTTP/1.1" 201 - via_upstream - "-" 27 110 88 88 "-" "node" "d9c301d7-a9e9-90ec-a508-326ffe5dd4fb" "api.quickstart-gvc.cpln.local:8080" "10.0.2.64:8080"
+```
+
+After the status come the bytes received and sent and the duration in milliseconds, then in quotes the address the call came from, the user agent (`node`, the frontend's server-side fetch), the request id, the host called, and the replica that answered. Search the whole GVC for the request id:
+
+```bash
+cpln logs '{gvc="quickstart-gvc"} |= "d9c301d7-a9e9-90ec-a508-326ffe5dd4fb"' --since 15m
+```
+
+Five lines come back, each prefixed with its labels, which name the workload and the container:
+
+| Workload | Container | Line | What it is |
+| -------- | --------- | ---- | ---------- |
+| `frontend` | `_accesslog` | `"POST / HTTP/1.1" 200` | Your browser submitting the form |
+| `frontend` | `_requestlog` | `"POST /signups HTTP/1.1" 201` | The frontend storing the signup through the API |
+| `frontend` | `_requestlog` | `"GET /signups HTTP/1.1" 200` | The frontend fetching the list again to render the page |
+| `api` | `_accesslog` | `"POST /signups HTTP/1.1" 201` | The store call as the API's sidecar received it, with the frontend replica's address as the caller |
+| `api` | `_accesslog` | `"GET /signups HTTP/1.1" 200` | The list call as the API's sidecar received it |
+
+</Tab>
+
+</Tabs>
+
+## Step 4: Read the metrics
+
+<Tabs>
+
+<Tab title="Console">
+
+Open the `api` workload and click `Metrics` in the left pane. The `Summary` group charts `Request Latency 90th Percentile`, `Replica Count`, `CPU Used`, and `Memory Used`, per location; the groups below it, such as `Request Data`, `CPU`, and `Memory`, hold the rest of the [default metrics](/guides/default-metrics). `Metrics` under `Analyze` in the left menu shows the same charts for the whole org, filtered by GVC, workload, and location.
+
+</Tab>
+
+<Tab title="CLI">
+
+Metrics are queried with PromQL. The request rate of every workload in the GVC, per location:
+
+```bash
+cpln metrics query 'sum(requests_per_second{gvc="quickstart-gvc"}) by (workload, location)'
+```
+
+```text
++------------------------------------------------+----------+-------------------+
+|LABELS                                          |TIMESTAMP |VALUE              |
+|------------------------------------------------|----------|-------------------|
+|{location="aws-us-west-2", workload="api"}      |Now       |0.725072507250725  |
+|{location="aws-us-west-2", workload="frontend"} |Now       |0.475              |
+|{location="aws-us-west-2", workload="web"}      |Now       |0.25               |
+|{location="gcp-us-east1", workload="api"}       |Now       |0.7751356487385291 |
+|{location="gcp-us-east1", workload="frontend"}  |Now       |0.5                |
+|{location="gcp-us-east1", workload="web"}       |Now       |0.225              |
++------------------------------------------------+----------+-------------------+
+```
+
+The 95th percentile latency in milliseconds over the last five minutes, per workload:
+
+```bash
+cpln metrics query 'histogram_quantile(0.95, sum by (le, workload) (rate(request_duration_ms_bucket{gvc="quickstart-gvc"}[5m])))'
+```
+
+```text
++----------------------+----------+------------------+
+|LABELS                |TIMESTAMP |VALUE             |
+|----------------------|----------|------------------|
+|{workload="api"}      |Now       |93.89130434782608 |
+|{workload="frontend"} |Now       |99.21296296296296 |
+|{workload="web"}      |Now       |0.475             |
++----------------------+----------+------------------+
+```
+
+The other [default metrics](/guides/default-metrics), such as `cpu_used`, `mem_used`, and `replica_count`, are queried the same way.
+
+</Tab>
+
+</Tabs>
+
+## Step 5: Open the trace
+
+Open `quickstart-gvc` and click `Traces` in the left pane. Grafana opens in a new tab on the traces of the GVC from the last hour. Below the charts, the structure lists the path every request took: `frontend`, under it the call to `api.quickstart-gvc.cpln.local:8080/*`, and under that `api` serving it, each with the time it spent. That is one trace with three spans, two from the frontend's sidecar (the request it received and the call it made) and one from the API's sidecar.
+
+<Note>
+The sidecars join hops through the W3C `traceparent` header. The frontend forwards it on its call to the API, so the API's span lands in the same trace. A call made without it starts a new trace, and B3 headers such as `x-b3-traceid` are not read.
+</Note>
+
+## Verify
+
+- The GVC-wide log search for one request id returns five lines from `frontend` and `api`.
+- The request-rate query lists `web`, `frontend`, and `api` in both locations.
+- The trace structure in Grafana shows `api` beneath `frontend`.
+
+<Check>
+You followed one user action across two workloads by its request id, read the metrics every workload publishes, and opened a trace that spans the frontend and the API.
+</Check>
+
+## What you've learned
+
+- **Three log streams per workload**: the container's own output, the access log of requests it received, and the request log of requests it sent, queried with LogQL from every location in one place.
+- **One request id across the hop**: the sidecar stamps `x-request-id` on every request, and an application that forwards it lets one id find every line a user action produced in both workloads.
+- **Metrics without an agent**: request rate, latency, errors, CPU, memory, and replica counts are collected for every workload and queried with PromQL.
+- **Tracing is a GVC setting**: enable it once with a sampling percentage, and every sidecar in the GVC records a span per hop from the moment its replica starts. Set it on the org instead to cover every GVC.
+- **Trace context is `traceparent`**: an application that forwards `traceparent` and `tracestate` keeps its outgoing calls in the caller's trace.
+
+## Learn more
+
+<CardGroup cols={2}>
+  <Card title="Logs" icon="/icons/logs.svg" href="/core/logs">
+    LogQL, filters, live tail, and the queries behind the Logs page.
+  </Card>
+  <Card title="Default Metrics" icon="chart-line" href="/guides/default-metrics">
+    Every metric Control Plane publishes for orgs, workloads, volumes, and domains.
+  </Card>
+  <Card title="Tracing" icon="route" href="/reference/gvc#tracing">
+    Sampling, custom tags, and sending traces to your own OpenTelemetry collector.
+  </Card>
+  <Card title="External logging" icon="/icons/quota.svg" href="/external-logging/overview">
+    Ship the same logs to your own logging provider.
+  </Card>
+</CardGroup>
+
+## Clean up
+
+To remove everything the series has created:
+
+<Tabs>
+
+<Tab title="Console">
+
+<Steps>
+
+<Step title="Delete the domain, if you created one">
+Open `Domains`, select your domain, click `Actions`, then `Delete`, and confirm.
+</Step>
+
+<Step title="Delete the policy">
+Open `Policies`, select `api-db-policy`, click `Actions`, then `Delete`, and confirm.
+</Step>
+
+<Step title="Uninstall the database release">
+Under `Templates`, click `Releases`, open `db`, click `Actions`, then `Uninstall`, and confirm.
+</Step>
+
+<Step title="Delete the database GVC">
+Open `quickstart-db`, click `Actions`, then `Delete`, type the GVC name to confirm, and click `Delete`.
+</Step>
+
+<Step title="Delete the application GVC">
+Open `quickstart-gvc`, click `Actions`, then `Delete`, type the GVC name to confirm, and click `Delete`. `web`, `frontend`, `api`, `api-identity`, and the tracing setting go with it.
+</Step>
+
+<Step title="Delete the secret">
+Open `Secrets`, select `db-credentials`, click `Actions`, then `Delete`, and confirm.
+</Step>
+
+<Step title="Delete the images">
+Open `Images`, select `frontend`, and click `Actions`, then `Delete` to remove all its tags. Repeat for `api`.
+</Step>
+
+</Steps>
+
+</Tab>
+
+<Tab title="CLI">
+
+```bash
+cpln domain delete example.com
+cpln policy delete api-db-policy
+cpln helm uninstall db
+cpln gvc delete quickstart-db
+cpln gvc delete quickstart-gvc
+cpln secret delete db-credentials
+cpln image delete frontend:1.0
+cpln image delete frontend:1.1
+cpln image delete api:1.0
+```
+
+Replace `example.com` with your domain, or skip that line if you did not create one.
+
+</Tab>
+
+<Tab title="Terraform">
+
+```bash
+terraform destroy
+```
+
+The images were built by the CLI, so delete them with it: `cpln image delete frontend:1.0`, `cpln image delete frontend:1.1`, and `cpln image delete api:1.0`.
+
+</Tab>
+
+<Tab title="Pulumi">
+
+```bash
+pulumi destroy
+```
+
+The images were built by the CLI, so delete them with it: `cpln image delete frontend:1.0`, `cpln image delete frontend:1.1`, and `cpln image delete api:1.0`.
+
+</Tab>
+
+</Tabs>
+
+<Note>
+Uninstalling the release removes its volume set and the data on it. Remove the DNS records from your DNS provider after deleting the domain.
+</Note>
