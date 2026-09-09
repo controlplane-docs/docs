@@ -24,7 +24,7 @@ Control Plane is a hybrid platform for deploying and managing containerized work
 - AI Plugin: `controlplane-com/ai-plugin` (recommended for Claude Code, Codex, Antigravity CLI — bundles MCP Server with skills, agents, slash commands, and guardrails)
 - MCP Server: `https://mcp.cpln.io/mcp` (80+ tools for any MCP-compatible AI client; OAuth + per-org consent)
 - Docs: https://docs.controlplane.com (page index for AI agents: https://docs.controlplane.com/llms.txt)
-- Full CLI conventions and hallucination traps: https://docs.controlplane.com/cli-conventions.md
+- Full CLI conventions and hallucination traps: https://docs.controlplane.com/public/cli-conventions.md
 
 ## When to use this skill
 
@@ -61,7 +61,7 @@ Org (Organization) — top-level isolation boundary, globally unique name
 | **Workloads** | Deploy containers as serverless, standard, cron, or stateful | Primary deployment unit — most users start here |
 | **Template Catalog** | 30+ production-ready templates (Postgres, Redis, Kafka, MongoDB, etc.) | Need a database, queue, or common service — install instead of building from scratch |
 | **Managed Kubernetes (mk8s)** | Provision Kubernetes clusters across AWS, GCP, Azure, Hetzner, and more | Need a full Kubernetes cluster (teams deploy INTO mk8s clusters) |
-| **CPLN Platform (BYOK)** | Register existing Kubernetes clusters as Control Plane locations | Already have Kubernetes — want Control Plane workload management on top |
+| **CPLN BYOK** | Register existing Kubernetes clusters as Control Plane locations | Already have Kubernetes — want Control Plane workload management on top |
 | **Kubernetes Operator** | Manage Control Plane resources as Kubernetes CRDs (ArgoCD/GitOps) | Want Kubernetes-native GitOps for Control Plane infrastructure |
 | **Agents** | Secure tunnels to private networks (VPCs, on-prem, data centers) | Workloads need to reach private TCP endpoints behind firewalls |
 | **External Logging** | Ship logs to S3, CloudWatch, Coralogix, Datadog, Logz.io, Stackdriver | Compliance, long-term retention, or external log analysis |
@@ -126,7 +126,7 @@ A workload without firewall config cannot reach its database, be reached by user
 
 - **Workload type is immutable.** Changing type requires delete + recreate. Capture state first: `cpln workload get NAME --gvc GVC -o yaml-slim > NAME.bak.yaml`.
 - **Capacity AI** works on every workload type (on by default for Standard, Serverless, and Cron). It is incompatible with: CPU autoscaling, multi-metric autoscaling, GPUs.
-- **Cron** deploys to ALL GVC locations with no overrides. `spec.job` with `schedule` required; probes, autoscaling, `timeoutSeconds`, `debug` ignored. `capacityAI` applies and is on by default, taking effect at the next scheduled run.
+- **Cron** deploys to ALL GVC locations; `suspend` in `spec.localOptions` is the only per-location override that applies. `spec.job` with `schedule` required; probes, autoscaling, `timeoutSeconds`, `debug` ignored. `capacityAI` applies and is on by default, taking effect at the next scheduled run.
 - **Workload name** max 49 chars; cannot end with `-headless`.
 - For container name reservations, probe XOR rules, GPU constraints, and full validation, fetch [/reference/workload/general](https://docs.controlplane.com/reference/workload/general) when authoring manifests.
 
@@ -213,7 +213,7 @@ Stateful provisioning, large image pushes, mk8s creation, GVC location adds — 
 | Multi-metric (cpu/memory/rps) | No | Yes | Yes | No |
 | KEDA (custom metrics) | No | Yes | Yes | No |
 
-**Scale to zero** is ONLY for Serverless with `rps` or `concurrency`. Standard and Stateful can scale to zero only via KEDA. Cron cannot scale to zero. All other types require minScale ≥ 1.
+**Scale to zero**: Serverless supports it with any of its metrics. Standard and Stateful reach it only via KEDA. Cron and VM cannot scale to zero; they require minScale ≥ 1.
 
 | Strategy | Best for |
 | --- | --- |
@@ -282,7 +282,7 @@ Override per command: `--org`, `--gvc`, `--profile`.
 
 ### The verification rule
 
-**Never write a `cpln` command from memory.** Verify with `cpln <command> --help` or the MCP `cpln_suggest` tool. If a command is not in the resource command map below, assume it doesn't exist. Full conventions: https://docs.controlplane.com/cli-conventions.md
+**Never write a `cpln` command from memory.** Verify with `cpln <command> --help` or the MCP `cpln_suggest` tool. If a command is not in the resource command map below, assume it doesn't exist. Full conventions: https://docs.controlplane.com/public/cli-conventions.md
 
 ### Command structure
 
@@ -587,7 +587,7 @@ Before submitting:
 **Always-relevant alongside this skill:**
 
 - [llms.txt](https://docs.controlplane.com/llms.txt) — comprehensive page index for AI agents
-- [cli-conventions.md](https://docs.controlplane.com/cli-conventions.md) — full CLI structure, shared flags, resource command map
+- [cli-conventions.md](https://docs.controlplane.com/public/cli-conventions.md) — full CLI structure, shared flags, resource command map
 
 **Fetch when authoring manifests for that resource:**
 
