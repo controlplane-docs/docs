@@ -116,7 +116,7 @@ Some `create` commands (gvc, policy, group) accept `--query-match`, `--query-tag
 | **mk8s** | org | **No create** | `dashboard`, `join`, `kubeconfig` |
 | **user** | org | No create | `invite` |
 | **org** | — | **No delete** (immutable) | — |
-| **profile** | local | get, delete, update | `login`, `set-default`, `token`. Note: `update` creates if not exists (alias: `create`) |
+| **profile** | local | get, delete, update | `create`, `login`, `set-default`, `token`. Note: `create` and `update` are the same operation, each creating the profile when it does not exist |
 | **helm** | gvc | get | `install`, `upgrade`, `template`, `rollback`, `uninstall`, `list`, `history` |
 | **stack** | gvc | — | `deploy`, `manifest`, `rm` |
 | **location** | org | Partial | `install`, `uninstall` |

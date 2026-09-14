@@ -317,7 +317,7 @@ Resource commands: `cpln <resource> <action> [REF] [--flags]`. Standalone comman
 | **mk8s** | org | **No create** | `dashboard`, `join`, `kubeconfig` |
 | **user** | org | No create | `invite` |
 | **org** | — | **No delete** (immutable) | — |
-| **profile** | local | get, delete, update | `login`, `set-default`, `token` |
+| **profile** | local | get, delete, update | `create`, `login`, `set-default`, `token` |
 | **helm** | gvc | get | `install`, `upgrade`, `template`, `rollback`, `uninstall`, `list`, `history` |
 | **stack** | gvc | — | `deploy`, `manifest`, `rm` |
 | **location** | org | Partial | `install`, `uninstall` |

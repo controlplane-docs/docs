@@ -213,9 +213,18 @@ cpln helm upgrade my-release ./my-chart
 
 The CLI:
 1. Renders the updated chart
-2. Applies new and modified resources
-3. Deletes resources removed from the chart (unless they have `helm.sh/resource-policy: keep`)
-4. Updates the release state
+2. Prints the cleanup plan: the resources the chart no longer declares and what happens to each of them
+3. Applies new and modified resources
+4. Deletes the resources the chart no longer declares, skipping any that carry `helm.sh/resource-policy: keep`, that belong to another release, or that are a GVC still holding something
+5. Updates the release state
+
+The plan is printed before anything is written, so a surprising deletion is visible in time to cancel:
+
+```text
+Cleanup will delete 2 resources the chart no longer declares once the new revision is applied:
+  /org/my-org/gvc/my-gvc/workload/old-api
+  /org/my-org/gvc/staging-gvc (only if it holds nothing by then)
+```
 
 ### Install or upgrade
 
@@ -233,6 +242,65 @@ Use the same release name **and chart name** to ensure proper tracking of resour
 ERROR: UPGRADE FAILED: cannot upgrade with different chart name
 ```
 </Warning>
+
+## Moving a release between GVCs
+
+An upgrade or rollback that moves a release out of a GVC is refused before anything is written, because cleanup would then delete every resource the release still has there, volume sets and the data on them included:
+
+```text
+ERROR: This upgrade would move release 'my-release' out of GVC 'old-gvc' and into GVC 'new-gvc'.
+Cleanup would then permanently delete 3 leftover resources in GVC 'old-gvc', including volume set 'data' and the data on it:
+  /org/my-org/gvc/old-gvc/workload/api
+  /org/my-org/gvc/old-gvc/volumeset/data
+  /org/my-org/gvc/old-gvc/identity/api-identity
+Nothing has been written.
+To upgrade in place, run the same command with --gvc old-gvc, the GVC the release currently lives in.
+To move the release into GVC 'new-gvc', install it there as a new release, migrate the data across, then uninstall this one.
+Pass --delete-leftover-resources to proceed anyway.
+```
+
+A chart that stops declaring a GVC together with everything it had in it is an ordinary removal, not a move, and is not refused.
+
+<CardGroup cols={2}>
+  <Card title="Upgrade in place" icon="arrows-rotate">
+    Run the same command with `--gvc` pointing at the GVC the release already lives in. Nothing is stranded and nothing is deleted.
+  </Card>
+  <Card title="Move deliberately" icon="right-left">
+    Install the chart into the new GVC as a separate release, migrate the data across, then uninstall the old release.
+  </Card>
+</CardGroup>
+
+To delete what the release would leave behind and go ahead with the move, pass `--delete-leftover-resources` on `upgrade` or `rollback`:
+
+```bash
+cpln helm upgrade my-release ./my-chart --gvc new-gvc --delete-leftover-resources
+```
+
+The refusal becomes a warning, and cleanup deletes the stranded resources.
+
+<Warning>
+`--delete-leftover-resources` deletes volume sets and the data on them. Snapshot or copy anything you need first.
+</Warning>
+
+### GVCs the chart stops declaring
+
+A GVC is deleted only once it holds nothing. If it still holds anything by the time cleanup reaches it, whether the release put it there or not, it is left in place and the CLI lists what is inside:
+
+```text
+Skipped deletion of /org/my-org/gvc/old-gvc because it still holds 2 resources that release 'my-release' does not own:
+  /org/my-org/gvc/old-gvc/workload/other-app
+  /org/my-org/gvc/old-gvc/volumeset/other-data
+  If you no longer need them either, 'cpln gvc delete old-gvc --org my-org' deletes it together with everything still in it; add --force if it holds a volume set.
+```
+
+`--delete-leftover-resources` does not change this. It only decides whether a release may strand its own resources in a GVC it is leaving.
+
+A GVC the release still places resources in is never deleted, however many revisions ago the chart stopped declaring it. The release simply stops managing it:
+
+```text
+The release stops managing 1 GVC the chart no longer declares, and cleanup leaves it in place:
+  /org/my-org/gvc/my-gvc
+```
 
 ## Manage revision history
 
@@ -374,15 +442,31 @@ cpln helm get manifest my-release --revision 2
 
 ## Uninstall a release
 
-Remove all resources and delete the release:
+Remove the resources the release created and delete the release:
 
 ```bash
 cpln helm uninstall my-release
 ```
 
-This deletes:
-- All resources tracked by the release
-- The release state secret
+This deletes every resource tracked by the release, then the release state secret.
+
+Some resources are deliberately left in place, and each one is reported with its reason:
+
+| Left in place | Why |
+|---|---|
+| A resource tagged `helm.sh/resource-policy: keep` | The chart asked for it to outlive the release. |
+| A resource whose `cpln/release` tag is missing or names another release | It is no longer this release's to delete. |
+| A GVC the newest completed revision no longer declares | The release stopped managing that GVC before the uninstall. |
+| A GVC still holding resources the release does not own | Deleting it would take those with it. |
+| A GVC the platform refuses to delete | The platform's reason is printed, for example a volume set still inside it. |
+
+A skipped GVC is reported with the command that deletes it by hand, once you no longer need what is inside:
+
+```text
+Skipped deletion of /org/my-org/gvc/my-gvc because the latest revision of release 'my-release' does not declare it, so the release no longer manages it. When you no longer need it, 'cpln gvc delete my-gvc --org my-org' deletes it together with everything still in it; add --force if it holds a volume set.
+```
+
+Every resource the uninstall leaves in place loses its `cpln/release` tag, so nothing still claims to belong to a release that is gone. Only that tag is removed: `helm.sh/resource-policy: keep` and your own tags stay as they are.
 
 ## Template preview
 
@@ -485,8 +569,10 @@ tags:
 Resources with this tag are skipped during cleanup operations. The CLI will print a message confirming the resource was preserved:
 
 ```text
-Skipped deletion of /org/{org}/gvc/{gvc}/volumeset/persistent-data because it has resource-policy=keep
+Skipped deletion of /org/my-org/gvc/my-gvc/volumeset/persistent-data because it has the 'helm.sh/resource-policy' tag set to 'keep'
 ```
+
+A kept resource also counts as foreign when cleanup considers deleting the GVC around it, so the GVC stays too.
 
 ## Chart notes
 
@@ -560,7 +646,19 @@ cpln helm install prod-release ./my-chart -f values-prod.yaml
 </Accordion>
 
 <Accordion title="Resources not deleted on upgrade">
-  Ensure you're using the same release name. Resources are only tracked within a single release. Also check if the resources have the `helm.sh/resource-policy: keep` tag, which prevents deletion.
+  Ensure you're using the same release name. Resources are only tracked within a single release. Also check if the resources have the `helm.sh/resource-policy: keep` tag, which prevents deletion. A resource whose `cpln/release` tag was removed or reassigned to another release is skipped too, and so is a GVC that still holds anything. Each skip is printed with its reason.
+</Accordion>
+
+<Accordion title="Upgrade or rollback refused: it would move the release out of a GVC">
+  ```text
+  ERROR: This upgrade would move release 'my-release' out of GVC 'old-gvc' and into GVC 'new-gvc'.
+  ```
+
+  Cleanup would delete everything the release still has in the GVC it leaves. Upgrade in place with `--gvc old-gvc`, or install into the new GVC as a separate release and migrate the data across. Pass `--delete-leftover-resources` to delete the stranded resources and go ahead with the move. See [Moving a release between GVCs](#moving-a-release-between-gvcs).
+</Accordion>
+
+<Accordion title="A GVC was not deleted">
+  A GVC is deleted only when it holds nothing at that point, and only while the release still manages it. If it holds anything, the release no longer declares it, or the platform refuses the deletion, it is left in place and the reason is printed, along with the `cpln gvc delete` command that removes it by hand.
 </Accordion>
 
 <Accordion title="Rollback fails">
