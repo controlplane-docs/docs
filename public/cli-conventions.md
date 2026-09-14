@@ -196,7 +196,7 @@ cpln logs '{gvc="GVC", workload="WORKLOAD"}' --org ORG --tail
 
 | Type | Command | Required Flags |
 |------|---------|---------------|
-| Opaque | `create-opaque` | `--file` or `--payload` |
+| Opaque | `create-opaque` | `--file` (use `--file -` for stdin) |
 | Dictionary | `create-dictionary` | `--entry KEY=VAL` (repeatable) |
 | Username/Password | `create-userpass` | `--username`, `--password` |
 | AWS | `create-aws` | `--access-key`, `--secret-key` |
