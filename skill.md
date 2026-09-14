@@ -67,7 +67,7 @@ Org (Organization) — top-level isolation boundary, globally unique name
 | **External Logging** | Ship logs to S3, CloudWatch, Coralogix, Datadog, Logz.io, Stackdriver | Compliance, long-term retention, or external log analysis |
 | **Domains** | Custom domain routing with auto-TLS, geo-routing, path-based routing | Expose workloads on your own domain with CNAME or NS delegation |
 | **AI Plugin** | Plugin for Claude Code, Codex, and Antigravity CLI — bundles the MCP Server plus skills, agents, slash commands, and guardrails | Recommended path for AI-assisted infrastructure management when your tool supports plugins |
-| **MCP Server** | 80+ tools for AI agents to manage infrastructure programmatically; OAuth + per-org consent | Any MCP-compatible AI client (Cursor, Claude Web, Claude Desktop, VS Code, Antigravity, Amp, OpenCode) |
+| **MCP Server** | 80+ tools for AI agents to manage infrastructure programmatically; OAuth + per-org consent | Any MCP-compatible AI client (Cursor, Claude Web, Claude Desktop, ChatGPT, VS Code, Antigravity, Amp, OpenCode) |
 
 ## Guardrails — read these first
 
