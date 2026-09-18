@@ -1,7 +1,7 @@
 ---
 title: Volume Set
 description: "Persistent storage volumes for stateful workloads. Covers filesystem types (ext4, xfs, shared), autoscaling, snapshots, and capacity management."
-keywords: ['pv', 'pvc', 'block storage', 'shared filesystem', 'efs', 'nfs', 'volume set spec', 'wal', 'backup', 'snapshot policy', 'storageclass', 'replicated volume']
+keywords: ['pv', 'pvc', 'block storage', 'shared filesystem', 'efs', 'nfs', 'volume set spec', 'wal', 'backup', 'snapshot policy', 'storageclass', 'replicated volume', 'copyVolume', 'migrate volume']
 ---
 
 ## Overview
@@ -27,12 +27,14 @@ The shared filesystem does not support:
   - `restoreVolume`
   - `deleteVolume`
   - `shrinkVolume`
+  - `copyVolume`
 
 ### Capacity and Billing
 
 - When a volume is created, it will have an initial capacity defined by the spec of your volume set.
 - Volume capacity can be increased by sending an `expandVolume` command.
 - Volume capacity can be decreased using the `shrinkVolume` command, but this causes data loss (see [Volume Shrinkage](#volume-shrinkage) below).
+- A volume's data can be copied to another location, or into another volume set, using the `copyVolume` command (see [Volume Copy](#volume-copy) below).
 - The bill for a volume set is calculated by summing the reserved GB of all volumes.
 ## Autoscaling
 
@@ -510,6 +512,78 @@ For example:
 }
 ```
 
+## Volume Copy
+
+A `copyVolume` command copies the data in one volume to another location. Adding a location to a [GVC](/reference/gvc) provisions an empty volume there, so a copy is how an existing volume's data reaches a new location. The destination can be the same volume set or a volume in a different volume set, including one in another GVC.
+
+The copy never modifies the source volume. It always replaces the destination volume:
+
+- Any storage device at the destination volume index is deleted and replaced with a new one holding the copied data.
+- The new storage device is sized to match the source volume.
+- If a workload replica in the destination location uses the destination volume, that replica is restarted so it binds to the new storage device.
+- If the destination location has no volume at that index yet, the copy creates it.
+
+<Warning>
+
+**`copyVolume` deletes whatever the destination volume held.** The command is refused unless `acknowledgeDestinationVolumeDeletion` is `true`, even when the volume set reports no storage device at the destination.
+
+</Warning>
+
+<Warning>
+
+**A copy from a running replica is not crash-consistent.** When a workload replica is using the source volume, data is read from that replica while it keeps writing. For a consistent copy, [suspend](/reference/workload/general#suspend) the source workload first. When no replica uses the source volume, the copy runs through a dedicated pod instead.
+
+</Warning>
+
+<Info>The `copyVolume` command is only available for `ext4` and `xfs` filesystems. It is not supported for `shared` filesystems. The console does not create `copyVolume` commands yet; use the API or `cpln rest post`.</Info>
+
+### copyVolume
+
+Spec:
+
+- `location`: the location to copy from.
+- `targetLocation`: the location to copy to. It must differ from `location` unless `targetVolumeSet` names another volume set.
+- `volumeIndex`: the index of the volume to copy. The copy lands at the same index at the destination.
+- `acknowledgeDestinationVolumeDeletion`: must be `true`. Confirms that the destination volume is replaced.
+- `targetVolumeSet` (optional): the volume set to copy into, in the same org. Accepts `//volumeset/<name>` for a volume set in the same GVC, or `//gvc/<gvc>/volumeset/<name>` for one in another GVC. Defaults to the volume set the command is sent to.
+
+Requirements:
+
+- The command is sent to the source volume set, and the caller needs `exec.copyVolume` on it. When `targetVolumeSet` is set, the caller also needs `exec.copyVolume` on the destination volume set.
+- The destination volume set's GVC must include `targetLocation`.
+- A copy cannot start while another command that replaces or deletes the same volume (`restoreVolume`, `expandVolume`, `shrinkVolume`, `copyVolume` or `deleteVolume`) is running at either end.
+
+Copy a volume to another location in the same volume set:
+
+```json copyVolume Command
+{
+  "type": "copyVolume",
+  "spec": {
+    "location": "aws-us-west-2",
+    "targetLocation": "gcp-us-east1",
+    "volumeIndex": 0,
+    "acknowledgeDestinationVolumeDeletion": true
+  }
+}
+```
+
+Copy a volume into a volume set in another GVC:
+
+```json copyVolume Command (another volume set)
+{
+  "type": "copyVolume",
+  "spec": {
+    "location": "aws-us-west-2",
+    "targetLocation": "gcp-us-east1",
+    "volumeIndex": 0,
+    "targetVolumeSet": "//gvc/my-other-gvc/volumeset/my-volume-set",
+    "acknowledgeDestinationVolumeDeletion": true
+  }
+}
+```
+
+While the copy runs, the command's `status` reports progress in `bulkSyncProgressPercent`, `bulkSyncRate` and `bulkSyncEta`. The command's `lifecycleStage` becomes `completed` when the destination volume holds the copy. For a step-by-step walkthrough, see [Copy volume data between locations](/guides/copy-volume-data).
+
 ## Volume Deletion
 
 To delete a volume, issue a `deleteVolume` command.
@@ -653,14 +727,16 @@ The permissions below are used to define [policies](/reference/policy) together 
 | create                    | Create new volumesets                     |                                                                                                                                                          |
 | delete                    | Delete existing volumesets                |                                                                                                                                                          |
 | edit                      | Modify existing volumesets                | view                                                                                                                                                     |
-| exec                      | Execute commands                          | exec.restoreVolume, exec.createVolumeSnapshot, exec.expandVolume, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.shrinkVolume                        |
+| exec                      | Execute commands                          | exec.restoreVolume, exec.createVolumeSnapshot, exec.expandVolume, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.deleteOrphanedVolume               |
+| exec.copyVolume           | Copy a volume into another location or volume set (replaces the destination volume) |                                                                                                        |
 | exec.createVolumeSnapshot | Create a snapshot of a volume             |                                                                                                                                                          |
 | exec.deleteVolume         | Delete a volume                           |                                                                                                                                                          |
+| exec.deleteOrphanedVolume | Delete a volume which is no longer in the cluster |                                                                                                                                          |
 | exec.deleteVolumeSnapshot | Delete a volume snapshot                  |                                                                                                                                                          |
 | exec.expandVolume         | Increase the storage capacity of a volume |                                                                                                                                                          |
 | exec.restoreVolume        | Restore a volume to a snapshot            |                                                                                                                                                          |
 | exec.shrinkVolume         | Shrink a volume (causes data loss)        |                                                                                                                                                          |
-| manage                    | Full access                               | create, delete, edit, exec, exec.createVolumeSnapshot, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.expandVolume, exec.restoreVolume, exec.shrinkVolume, manage, view |
+| manage                    | Full access                               | create, delete, edit, exec, exec.copyVolume, exec.createVolumeSnapshot, exec.deleteOrphanedVolume, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.expandVolume, exec.restoreVolume, exec.shrinkVolume, manage, view |
 | view                      | Read-only access                          |                                                                                                                                                          |
 
 ## Access Report

@@ -134,7 +134,7 @@ A workload without firewall config cannot reach its database, be reached by user
 
 Before any destructive operation, present a structured summary AND wait for explicit confirmation — **even when permissions auto-approve.** Permission mode is tool-prompt UX; this is conversation-level safety, independent.
 
-- **Always destructive**: any `cpln <resource> delete`, `gvc delete-all-workloads`, `volumeset shrink`, `volumeset snapshot delete`, `volumeset volume delete`.
+- **Always destructive**: any `cpln <resource> delete`, `gvc delete-all-workloads`, `volumeset shrink`, `volumeset snapshot delete`, `volumeset volume delete`, and a `copyVolume` command (it replaces the destination volume).
 - **Service-disrupting**: `policy remove-binding` (breaks runtime access), `serviceaccount remove-key` (breaks CI/CD), `group remove-member` (locks users out), `gvc remove-location` (forces redeployment).
 - **Implicit destructive (immutability traps)**: org delete impossible; workload type/name immutable (rename via `cpln workload clone OLD --name NEW --gvc GVC`); volume set `fileSystemType` and `performanceClass` immutable; `cpln apply` of a renamed resource creates a new one (old must be deleted with `cpln delete --file ...`).
 
@@ -532,7 +532,7 @@ CNAME records → `cpln.app`. NS records → `ns1.cpln.cloud`, `ns2.cpln.cloud`,
 
 Stateful only. Mount via `cpln://volumeset/NAME` with `recoveryPolicy: retain` (default) or `recycle`.
 
-| Filesystem | Access | Binding | Snapshots / shrink / delete / restore |
+| Filesystem | Access | Binding | Snapshots / shrink / copy / delete / restore |
 | --- | --- | --- | :-: |
 | `ext4` | RWO | 1 stateful workload | Yes |
 | `xfs` | RWO | 1 stateful workload | Yes |
