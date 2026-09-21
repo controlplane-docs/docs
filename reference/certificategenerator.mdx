@@ -1,0 +1,227 @@
+---
+title: Certificate Generator
+description: Issue domain certificates through your own ACME certificate authority and DNS provider instead of the built-in Let's Encrypt flow, including wildcard certificates for CNAME domains.
+keywords: ['acme', 'cert-manager', 'issuer', 'letsencrypt', 'zerossl', 'google trust services', 'external account binding', 'eab', 'route53', 'cloud dns', 'azure dns', 'cloudflare', 'dns01', 'http01', 'wildcard certificate']
+---
+
+## Certificate Generator Overview
+
+A certificate generator is an org-level resource that defines how certificates for [domains](/reference/domain) are obtained. By default, Control Plane issues every domain certificate from Let's Encrypt and solves the ACME challenge itself, which requires you to delegate `_acme-challenge` records to Control Plane for wildcard certificates.
+
+A certificate generator lets you choose instead:
+
+- **Which certificate authority signs the certificate**, using any CA that speaks the ACME protocol, for example Let's Encrypt, ZeroSSL, Google Trust Services, Sectigo, or DigiCert.
+- **How the challenge is solved**, either over HTTP on the domain itself, or by writing DNS records into a zone you control at Route53, Google Cloud DNS, Azure DNS, or Cloudflare.
+
+A domain opts in by referencing a generator through `spec.certificateGeneratorLink`. Domains without that link keep the built-in behavior.
+
+<Tip>
+  The most common reason to use a generator is a `cname` domain with subdomain-based routing. Without a generator, such a domain needs a [custom server certificate](/reference/domain#custom-server-certificate) because Control Plane cannot solve a DNS challenge in a zone it does not host. With a `dns01` generator, Control Plane issues the wildcard certificate itself using your DNS credentials.
+</Tip>
+
+## Providers
+
+Only approved provider types can be configured. The `spec.provider` property currently accepts:
+
+| Provider | Description                                                                                          |
+| :------- | :--------------------------------------------------------------------------------------------------- |
+| `acme`   | Any certificate authority implementing the ACME protocol (RFC 8555). Configured under `spec.acme`. |
+
+### ACME Settings
+
+| Property                                          | Required | Description                                                                                                                     |
+| :------------------------------------------------ | :------- | :------------------------------------------------------------------------------------------------------------------------------ |
+| `acme.server`                                     | Yes      | The ACME directory URL of the CA. Must use `https`. Example: `https://acme-v02.api.letsencrypt.org/directory`.                  |
+| `acme.email`                                      | No       | Contact email registered with the ACME account.                                                                                 |
+| `acme.externalAccountBinding.keyId`               | No       | Key identifier issued by the CA. Required by most commercial CAs.                                                               |
+| `acme.externalAccountBinding.secretLink`          | No       | Link to an `opaque` [secret](/reference/secret) whose payload is the HMAC key exactly as issued by the CA, with `encoding: plain`. |
+| `acme.challenge`                                  | Yes      | Exactly one of `http01` or `dns01`. See [Challenge Types](#challenge-types).                                                    |
+
+<Info>
+  External account binding ties the new ACME account to an account you already hold with the CA. Let's Encrypt does not use it. ZeroSSL, Google Trust Services, Sectigo, DigiCert and similar CAs reject registrations without it.
+</Info>
+
+## Challenge Types
+
+### HTTP-01 (`challenge.http01`)
+
+The CA verifies control of the domain over HTTP on the domain itself. Control Plane answers the challenge, so no DNS credentials are needed. Set it to an empty object:
+
+```yaml
+challenge:
+  http01: {}
+```
+
+An HTTP-01 generator can only issue certificates for the exact domain name. It cannot be used for domains that need a wildcard certificate: `ns` mode domains, domains with `workloadLink`, and `cname` domains with `gvcLink`.
+
+### DNS-01 (`challenge.dns01`)
+
+The CA verifies control of the domain through a `_acme-challenge` TXT record that Control Plane writes into your DNS zone using the credentials you provide. This is required for wildcard certificates. Set `dns01.provider` and the matching configuration block:
+
+| Provider     | Configuration                                                                                        | Secret type | Credential requirements                                        |
+| :----------- | :--------------------------------------------------------------------------------------------------- | :---------- | :------------------------------------------------------------- |
+| `route53`    | `region` (required), `hostedZoneId` (optional), `secretLink`                                         | `aws`       | Access key allowed to change TXT records in the hosted zone. `roleArn` in the secret is assumed if present. |
+| `cloudDns`   | `project` (required), `secretLink`                                                                   | `gcp`       | Service account key with the DNS Administrator role.           |
+| `azureDns`   | `resourceGroupName` (required), `hostedZoneName` (optional), `secretLink`                            | `azure-sdk` | Service principal with DNS Zone Contributor on the zone. Tenant, subscription and client IDs are read from the secret. |
+| `cloudflare` | `secretLink`                                                                                         | `opaque`    | Payload is an API **token** with Zone DNS Edit and Zone Zone Read on the zone. The Global API Key is not supported. |
+
+When `hostedZoneId` or `hostedZoneName` is omitted, the zone is discovered from the domain name.
+
+<Warning>
+  The secret type must match the provider. Referencing an `opaque` secret from `route53`, for example, is rejected with `Incompatible secret ... a secret of type aws is required`. The caller must also hold the `use` permission on every referenced secret.
+</Warning>
+
+## Certificate Generator Configuration Example
+
+<Tabs>
+  <Tab title="YAML">
+    ```yaml
+    kind: certificategenerator
+    name: cloudflare-zerossl
+    description: ZeroSSL certificates, challenges solved in our Cloudflare zones
+    spec:
+      provider: acme
+      acme:
+        server: https://acme.zerossl.com/v2/DV90
+        email: ops@example.com
+        externalAccountBinding:
+          keyId: abc123
+          secretLink: /org/example-org/secret/zerossl-eab
+        challenge:
+          dns01:
+            provider: cloudflare
+            cloudflare:
+              secretLink: /org/example-org/secret/cloudflare-dns-token
+    ```
+  </Tab>
+  <Tab title="JSON">
+    ```json
+    {
+      "kind": "certificategenerator",
+      "name": "cloudflare-zerossl",
+      "description": "ZeroSSL certificates, challenges solved in our Cloudflare zones",
+      "spec": {
+        "provider": "acme",
+        "acme": {
+          "server": "https://acme.zerossl.com/v2/DV90",
+          "email": "ops@example.com",
+          "externalAccountBinding": {
+            "keyId": "abc123",
+            "secretLink": "/org/example-org/secret/zerossl-eab"
+          },
+          "challenge": {
+            "dns01": {
+              "provider": "cloudflare",
+              "cloudflare": {
+                "secretLink": "/org/example-org/secret/cloudflare-dns-token"
+              }
+            }
+          }
+        }
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+A Route53 generator against Let's Encrypt needs no account binding:
+
+```yaml
+kind: certificategenerator
+name: route53-letsencrypt
+spec:
+  provider: acme
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    challenge:
+      dns01:
+        provider: route53
+        route53:
+          region: us-east-1
+          secretLink: /org/example-org/secret/route53-dns
+```
+
+## Using a Certificate Generator from a Domain
+
+Set `spec.certificateGeneratorLink` on the [domain](/reference/domain). The generator decides the challenge type, so `certChallengeType` must not be set.
+
+```yaml
+kind: domain
+name: apps.example.com
+spec:
+  dnsMode: cname
+  gvcLink: //gvc/example-gvc
+  certificateGeneratorLink: //certificategenerator/cloudflare-zerossl
+```
+
+This domain receives a wildcard certificate covering `*.apps.example.com` and `apps.example.com` without a custom server certificate and without delegating `_acme-challenge` records to Control Plane.
+
+**Constraints:**
+
+- `certChallengeType` cannot be combined with `certificateGeneratorLink`.
+- `tls.serverCertificate.secretLink` cannot be combined with `certificateGeneratorLink` on any port.
+- [Internal domains](/reference/domain#internal-domains) do not support generators.
+- An HTTP-01 generator is rejected for `ns` mode domains, domains with `workloadLink`, and `cname` domains with `gvcLink`, because all of them need a wildcard certificate.
+- The caller needs the `use` permission on the generator when the link is set or changed. Later edits to other domain properties do not require it.
+
+### DNS Records for Generator Domains
+
+For a `cname` domain using a `dns01` generator, create only the routing records listed in the domain's `status.dnsConfig`, for example one CNAME per workload for subdomain-based routing. The `_acme-challenge` CNAME delegation used by the built-in `dns01` flow is not needed: the TXT record is written into your zone by Control Plane and removed after validation.
+
+If the zone sits behind a proxying CDN such as Cloudflare, set the routing records to DNS-only so that TLS terminates at Control Plane with the generated certificate.
+
+<Note>
+  Check the CAA records of the domain. A CAA record that only permits `letsencrypt.org` blocks issuance from any other CA, and the failure is reported on the domain status.
+</Note>
+
+## Status
+
+Control Plane registers an ACME account with the CA as soon as the generator is created. The result is reported in `status`:
+
+```json
+{
+  "kind": "certificategenerator",
+  "name": "cloudflare-zerossl",
+  "status": {
+    "ready": true,
+    "lastUpdated": "2026-09-21T08:49:59.679Z"
+  }
+}
+```
+
+| Property      | Description                                                                                                        |
+| :------------ | :----------------------------------------------------------------------------------------------------------------- |
+| `ready`       | `true` once the ACME account is registered and the generator can issue certificates.                               |
+| `message`     | Present while `ready` is `false`. Carries the reason, for example invalid DNS credentials or an unreachable CA.      |
+| `lastUpdated` | Timestamp of the last status change.                                                                                |
+
+Issuance problems for an individual domain, such as a rejected challenge or a CAA restriction, are reported on that domain's status, not on the generator.
+
+## Immutable Properties
+
+The provider, the challenge type (`http01` versus `dns01`) and `acme.server` fix the ACME account and cannot be changed after creation. Attempts are rejected with `spec.acme.server cannot be changed after creation because it fixes the ACME account`. Create a new generator and move the domains over instead. Credentials, the email address, the DNS provider details and the account binding can be updated in place.
+
+## Deleting a Certificate Generator
+
+A generator cannot be deleted while a domain references it, and a secret cannot be deleted while a generator references it. Both requests fail with a `usedBy` list naming the dependents. Remove the references first.
+
+Deleting a generator removes its ACME account registration from Control Plane.
+
+## Permissions
+
+The permissions available for the `certificategenerator` resource type:
+
+| Permission | Description                                                     | Implies              |
+| :--------- | :-------------------------------------------------------------- | :------------------- |
+| `create`   | Create new certificate generators                               |                      |
+| `edit`     | Modify existing certificate generators                          | `view`               |
+| `delete`   | Delete certificate generators                                   |                      |
+| `view`     | Read-only access                                                |                      |
+| `use`      | Reference a certificate generator from a domain                 |                      |
+| `manage`   | Full access                                                     | all                  |
+
+Creating or editing a generator additionally requires `use` on every secret it references. Members of the built-in `superusers` group hold `manage`, and members of `viewers` hold `view`, through the `superusers-certificategenerator` and `viewers-certificategenerator` policies.
+
+## Quota
+
+Each org can hold up to 10 certificate generators. The `certificategenerators` [quota](/reference/quota) can be raised on request.
