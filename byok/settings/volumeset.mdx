@@ -1,7 +1,7 @@
 ---
 title: Volume Set Settings
-description: Configure volume set storage class suffixes to use custom CSI-compatible storage solutions in BYOK environments.
-keywords: ['storageclasssuffix', 'persistent volume', 'pvc', 'storageclass', 'csi driver', 'k8s storage', 'gp3', 'ebs', 'block storage', 'performanceclass']
+description: Configure volume set storage class suffixes for custom CSI-compatible storage in BYOK environments, and set up shared file system volume sets with your own object storage.
+keywords: ['storageclasssuffix', 'persistent volume', 'pvc', 'storageclass', 'csi driver', 'k8s storage', 'gp3', 'ebs', 'block storage', 'performanceclass', 'juicefs', 'shared file system', 'fileSystemType shared', 'rwx', 's3', 'minio', 'azure blob', 'gcs']
 ---
 
 When using a volume set in a BYOK environment, there are some additional configuration settings available.
@@ -9,3 +9,130 @@ When using a volume set in a BYOK environment, there are some additional configu
 ## Storage Class Suffix
 
 You can specify a `spec.storageClassSuffix` in a volume set. When this property is set, Control Plane will look for a storage class including this suffix. Storage classes are constructed by combining `spec.performanceClass`, `spec.fileSystemType`, and (optionally) the `spec.storageClassSuffix`. If a storage class including the suffix cannot be found, Control Plane falls back to the storage class excluding the suffix. This allows BYOK users to utilize any CSI-compatible storage solution they wish.
+
+## Shared File System
+
+A volume set with `fileSystemType: shared` stores its data with [JuiceFS](https://juicefs.com): file data goes to an object storage bucket, and file metadata goes to a Redis metadata engine. On cloud locations, Control Plane sets both up. On a BYOK location, you set them up once per cluster, and then shared volume sets work like they do anywhere else.
+
+Everything below lives in the `juicefs` namespace, which Control Plane creates on every BYOK cluster. Until the setup is done, a shared volume set gets no volume in that location, and the actuator logs `JuiceFS configmap "juicefs" not found in namespace "juicefs". Shared filesystem volumes are not available. For BYOK clusters, create the configmap with your object storage configuration.`
+
+The cluster's nodes must be able to reach both the object storage endpoint and the metadata engine.
+
+### 1. Install JuiceFS
+
+Set `juicefs.enabled` to `true` in the cluster's [agent settings](/byok/settings/agent#juicefs). That installs, in the `juicefs` namespace:
+
+- the JuiceFS CSI driver (`csi.juicefs.com`);
+- a Redis metadata engine, `juicefs-redis`, with three replicas monitored by a three-node Sentinel. It uses three 4Gi PersistentVolumeClaims on the cluster's default StorageClass, so the cluster needs one.
+
+How to set the flag:
+
+- **Kubernetes cluster not managed by Control Plane:** add `"juicefs": {"enabled": true}` at the top level of the JSON in the `cluster.json` key of the `cpln-byok-current` configmap in the `kube-system` namespace.
+- **[Managed Kubernetes](/mk8s/add-ons/byok) cluster:** set `spec.addOns.byok.config.juicefs.enabled` to `true`.
+
+### 2. Create the object storage credentials
+
+Create a bucket in your object storage, then create a Secret with credentials for it in the `juicefs` namespace. The Secret must have the keys `accessKey` and `secretKey`:
+
+| Storage | `accessKey` | `secretKey` |
+| :--- | :--- | :--- |
+| Amazon S3, or any S3-compatible store | Access key ID | Secret access key |
+| MinIO | Access key | Secret key |
+| Azure Blob Storage | Storage account name | Storage account key |
+
+```bash
+kubectl create secret generic juicefs -n juicefs \
+  --from-literal=accessKey=ACCESS_KEY \
+  --from-literal=secretKey=SECRET_KEY
+```
+
+For Google Cloud Storage, create a Secret that holds a service account key file instead. The `juicefs` Secret isn't read for GCS, but `secretName` must still name a Secret.
+
+```bash
+kubectl create secret generic juicefs-gcs-creds -n juicefs --from-file=credentials.json=KEY_FILE.json
+kubectl create secret generic juicefs -n juicefs
+```
+
+### 3. Create the juicefs configmap
+
+Create a ConfigMap named `juicefs` in the `juicefs` namespace:
+
+| Key | Required | Description |
+| :--- | :--- | :--- |
+| `storage` | Yes | The JuiceFS storage type: `s3`, `minio`, `wasb` (Azure Blob Storage), or `gs` (Google Cloud Storage). |
+| `bucket` | Yes | The bucket endpoint, in the format JuiceFS expects for that storage type. See the examples below. |
+| `metadataUrl` | Yes | The Redis URL of the metadata engine: the bundled Redis from step 1, or your own Redis (standalone or Sentinel). It must not have a query string, because Control Plane appends a separate `?prefix=` for each volume set. |
+| `secretName` | Yes | The name of the Secret from step 2. |
+| `gcsCredsSecretName` | For `gs` | The name of the Secret that holds the service account key file. |
+| `gcsCredsFileName` | No | The key file's name in that Secret. Defaults to `credentials.json`. |
+| `gcsCredsPath` | No | Where the key file is mounted. Defaults to `/root/.config/gcloud`. |
+| `envs` | No | A JSON object of extra environment variables for JuiceFS, such as `{"AWS_DEFAULT_REGION": "us-east-1"}` for an S3-compatible store that needs a region. It must be valid JSON: invalid JSON stops shared volume sets from being provisioned. |
+
+The bundled Redis from step 1 has this `metadataUrl`:
+
+```text
+redis://juicefs-redis,juicefs-redis-sentinel-0.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-1.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-2.juicefs-redis-sentinel.juicefs:26379/1
+```
+
+<CodeGroup>
+
+```yaml Amazon S3
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: juicefs
+  namespace: juicefs
+data:
+  storage: s3
+  bucket: https://MY_BUCKET.s3.us-east-1.amazonaws.com
+  metadataUrl: redis://juicefs-redis,juicefs-redis-sentinel-0.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-1.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-2.juicefs-redis-sentinel.juicefs:26379/1
+  secretName: juicefs
+```
+
+```yaml MinIO
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: juicefs
+  namespace: juicefs
+data:
+  storage: minio
+  bucket: http://minio.minio.svc.cluster.local:9000/MY_BUCKET
+  metadataUrl: redis://juicefs-redis,juicefs-redis-sentinel-0.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-1.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-2.juicefs-redis-sentinel.juicefs:26379/1
+  secretName: juicefs
+```
+
+```yaml Azure Blob Storage
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: juicefs
+  namespace: juicefs
+data:
+  storage: wasb
+  bucket: https://MY_CONTAINER.core.windows.net
+  metadataUrl: redis://juicefs-redis,juicefs-redis-sentinel-0.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-1.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-2.juicefs-redis-sentinel.juicefs:26379/1
+  secretName: juicefs
+```
+
+```yaml Google Cloud Storage
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: juicefs
+  namespace: juicefs
+data:
+  storage: gs
+  bucket: gs://MY_BUCKET
+  metadataUrl: redis://juicefs-redis,juicefs-redis-sentinel-0.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-1.juicefs-redis-sentinel.juicefs,juicefs-redis-sentinel-2.juicefs-redis-sentinel.juicefs:26379/1
+  secretName: juicefs
+  gcsCredsSecretName: juicefs-gcs-creds
+```
+
+</CodeGroup>
+
+### 4. Verify
+
+Create a volume set with `fileSystemType: shared` in a GVC that includes the BYOK location, and mount it in a workload. The file system is formatted the first time a workload mounts the volume set, and the workload's pods start once the mount succeeds.
+
+If `metadataUrl` or `secretName` is missing from the ConfigMap, the actuator logs `JuiceFS configmap is missing required field "KEY"`. Other mistakes, such as a wrong `storage` or `bucket` or bad credentials, show up in the logs of the JuiceFS mount pods in the `juicefs` namespace, while the workload's pods stay in `ContainerCreating` waiting for their volume.
