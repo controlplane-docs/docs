@@ -1,7 +1,7 @@
 ---
 title: 'Command'
 description: 'An asynchronous operation on a workload or volume set, such as running a cron workload now or expanding a volume. Create one, then follow its lifecycle stage until it completes, fails, or is cancelled.'
-keywords: ['-command', 'lifecycleStage', 'async operation', 'imperative action', 'runCronWorkload', 'stopReplica', 'volume set command', 'cancel command', 'cancellation-requested', 'job']
+keywords: ['-command', 'lifecycleStage', 'async operation', 'imperative action', 'runCronWorkload', 'stopReplica', 'volume set command', 'command status', 'cancellation-requested', 'job']
 ---
 
 Most of Control Plane is declarative: you describe a workload or volume set, and Control Plane keeps the running system matching the description. Some operations don't fit that model because they are one-off actions, like running a cron workload right now, stopping one replica, or expanding a volume. A command is the resource for those actions. You create it, Control Plane carries it out in the background, and the command records how far it got.
@@ -15,22 +15,22 @@ A command belongs to the resource it acts on and is created at that resource's `
 | [Workload](/concepts/workload) | `/org/ORG/gvc/GVC/workload/WORKLOAD/-command` | [`runCronWorkload`](/reference/workload/types#run-now), [`stopReplica`](/reference/workload/general#stop-a-replica) |
 | [Volume set](/reference/volumeset) | `/org/ORG/gvc/GVC/volumeset/VOLUME_SET/-command` | The volume, snapshot, and restore commands in [volume set commands](/reference/volumeset#commands) |
 
-Creating a command returns `201 Created` with a `Location` header that links to the new command. The work has started, but it hasn't finished: poll the command to see where it is.
+Creating a command returns `201 Created` with a `Location` header that links to the new command. The work has started, but it hasn't finished: poll the command to see where it is. Creating a workload command requires the matching `exec` [permission](/reference/workload/security#permissions), such as `exec.runCronWorkload`.
 
 ## Lifecycle
 
-The `lifecycleStage` field shows where a command is. It starts at `pending` and ends in one of the three final stages.
+The `lifecycleStage` field shows where a command is. It starts at `pending` and normally ends in one of the three final stages.
 
 | Stage | Meaning |
 | --- | --- |
 | `pending` | Accepted, not yet started. |
 | `running` | Control Plane is carrying it out. |
-| `cancellation-requested` | You asked to cancel it, and Control Plane is undoing what the command already created. |
-| `cancelled` | Final. Cancelled, and everything it created has been removed. |
+| `cancellation-requested` | Control Plane decided to stop the command, for example because a cron run passed its `activeDeadlineSeconds`, and is removing what the command created. It normally ends in `cancelled`, but can still end in `completed` or `failed` if the work finished first. |
+| `cancelled` | Final. Stopped, and everything it created has been removed. |
 | `completed` | Final. Finished successfully. |
 | `failed` | Final. It didn't finish. The command's `status` holds type-specific details. |
 
-A command in a final stage never changes again. `completed` means the action itself succeeded, not just the request. For example, a `runCronWorkload` command completes only when the job it started has finished.
+`completed` means the action itself succeeded, not just the request. For example, a `runCronWorkload` command completes only when the job it started has finished. `completed` and `cancelled` are permanent. In rare cases, a `failed` command is corrected to `completed` once Control Plane sees the work actually finished.
 
 ## Working with Commands
 
@@ -48,28 +48,24 @@ EOF
 cpln rest post /org/my-org/gvc/my-gvc/workload/my-cron-workload/-command --file run-now.yaml
 ```
 
-**List** a resource's commands, or **get** one by its ID:
+**List** a resource's commands, or **get** one by its ID. The list is paginated, and `?lifecycleStage=STAGE` narrows it to one stage:
 
 ```bash
 cpln rest get /org/my-org/gvc/my-gvc/workload/my-cron-workload/-command
+cpln rest get "/org/my-org/gvc/my-gvc/workload/my-cron-workload/-command?lifecycleStage=running"
 cpln rest get /org/my-org/gvc/my-gvc/workload/my-cron-workload/-command/COMMAND_ID
 ```
 
-**Cancel** a command that hasn't reached a final stage by setting its stage to `cancellation-requested`:
-
-```bash
-echo '{"lifecycleStage": "cancellation-requested"}' | \
-  cpln rest patch /org/my-org/gvc/my-gvc/workload/my-cron-workload/-command/COMMAND_ID --file -
-```
-
-Control Plane then removes whatever the command already created, such as the job and replica of a `runCronWorkload`, and moves the command to `cancelled`. Cancelling is the only change you can make to an existing command. Every other stage change is made by Control Plane.
+Only Control Plane moves a command between stages. To stop a `runCronWorkload` run that is in progress, [stop its replica](/reference/workload/general#stop-a-replica): that deletes the run's job and marks its command `cancelled`.
 
 ## Gotchas
 
 - **A `201` doesn't mean the action finished.** It means the command was accepted. Read `lifecycleStage` until it reaches `completed`, `failed`, or `cancelled`.
-- **Not every command can be cancelled.** `stopReplica` can't be cancelled, and cancelling it is rejected with `Command type 'stopReplica' does not support cancellation`. Cancelling a command that is already in a final stage is rejected too.
-- **Conflicting commands are rejected.** Control Plane won't start a command that clashes with one already in progress on the same target, such as a second `stopReplica` for the same replica.
-- **Commands can't be deleted.** A finished command stays as a record of what ran. To stop one in progress, cancel it.
+- **A command is read-only once created.** A `PATCH` from a user or service account is rejected with `403 Cannot modify commands`, and a `DELETE` isn't allowed. A command stays as a record of what ran until the workload or volume set it belongs to is deleted, which deletes its commands too.
+- **Some commands conflict, and they conflict in different ways.**
+  - A second `stopReplica` for the same replica is rejected with `400` while the first is still in progress.
+  - A volume set command that overlaps one already in progress on the same volume is rejected with `409`. The exception is `deleteVolume`, which fails the overlapping commands instead.
+  - `runCronWorkload` has no such check, so a second on-demand run starts alongside the first.
 
 ## Learn More
 
