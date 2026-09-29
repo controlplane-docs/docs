@@ -1,8 +1,8 @@
 ---
-title: 'pgEdge Distributed PostgreSQL'
+title: 'pgEdge'
 icon: /template-catalog/templates/icons/pgedge.png
-description: 'Deploy a pgEdge active-active distributed PostgreSQL cluster on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, locations, Spock multi-master replication, pgcat pooling and routing, backups to S3 or GCS, and migrating from template version 1.x.'
-keywords: ['active-active database', 'multi-master replication', 'geo-distributed sql', 'multi-region database', 'logical replication', 'replicate_ddl', 'repset_add_table', 'last-update-wins', 'conflict resolution', 'read write splitting', 'connection pooler', 'cockroachdb alternative', 'write anywhere']
+description: 'Deploy a pgEdge active-active distributed PostgreSQL cluster on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, locations, Spock multi-master replication, pgcat pooling and routing, the per-location HAProxy failover tier, backups to S3 or GCS, and migrating from template version 1.x.'
+keywords: ['active-active database', 'multi-master replication', 'geo-distributed sql', 'multi-region database', 'logical replication', 'replicate_ddl', 'repset_add_table', 'last-update-wins', 'conflict resolution', 'read write splitting', 'connection pooler', 'haproxy failover', 'automatic failover', 'high availability postgres', 'cockroachdb alternative', 'write anywhere']
 ---
 
 <Warning>
@@ -22,17 +22,19 @@ Database credentials are **not** template values. pgEdge reads its username, pas
 ### Architecture
 
 - **pgEdge** — Stateful workload running PostgreSQL 17 with the Spock extension. All nodes are active writers connected in a full-mesh replication ring. Each replica gets its own persistent volume.
-- **pgcat** — Connection pooler providing a single virtual endpoint for applications. Sends writes to one designated node and spreads reads across the others.
+- **HAProxy failover tier** *(per location, on by default)* — Sits in front of the nodes and gives each location's pgcat a single stable target. It routes to the local node and, when the local nodes are unhealthy, fails over — first to another local node, then to a remote location — so a client keeps serving through a node failure. Disable with `proxy.enabled: false` to have pgcat connect to the nodes directly.
+- **pgcat** — Connection pooler providing a per-location virtual endpoint for applications. With the failover tier on (default) it pools the local HAProxy and node selection is HAProxy's job; with it off it pools the pgEdge nodes directly.
 - **Spock** — Multi-master logical replication extension included in the pgEdge image. Handles cross-node replication with last-update-wins conflict resolution.
 
 ### What Gets Created
 
 - **Stateful pgEdge Workload** — PostgreSQL 17 with the Spock extension. One set of replicas per configured location, each replica individually addressable through replica-direct DNS.
-- **Standard pgcat Workload** — Connection pooler that routes application traffic to pgEdge nodes. Runs `pgcat.minReplicas` to `pgcat.maxReplicas` replicas in each configured location and autoscales on RPS.
+- **Standard HAProxy Failover Workload** *(per location, on by default)* — Sits between pgcat and the pgEdge nodes, giving each location's pgcat a single stable target and failing traffic over to another node — local first, then remote — when the local nodes are unhealthy. Runs `proxy.minReplicas` to `proxy.maxReplicas` replicas in each configured location. Omitted entirely when `proxy.enabled: false`.
+- **Standard pgcat Workload** — Connection pooler that routes application traffic to the pgEdge nodes (or, with the failover tier on, to the local HAProxy). Runs `pgcat.minReplicas` to `pgcat.maxReplicas` replicas in each configured location and autoscales on RPS.
 - **Cron Backup Workload** *(optional)* — Runs `pg_dump` on a schedule and uploads the result to AWS S3 or GCS. Suspended in every location except the first one you configure.
 - **Volume Set** — ext4 general-purpose SSD volumes with 7-day snapshots and a final snapshot on deletion. One volume per replica.
 - **Identity & Two Policies** — An identity bound to the workloads, with `reveal` on this release's secrets and on your credentials secret, plus `view` on the one GVC you install into so each node can confirm at boot that the GVC really has every location you listed. When backup is enabled, the identity also carries the cloud account and IAM policy.
-- **Secrets** — An opaque secret holding the pgEdge node startup script, an opaque secret holding the pgcat startup script, and, only when backup is enabled, a dictionary secret holding the backup destination. Your credentials secret is created by you and is never part of the release.
+- **Secrets** — An opaque secret holding the pgEdge node startup script, an opaque secret holding the pgcat startup script, an opaque secret holding the HAProxy startup script (when the failover tier is on), and, only when backup is enabled, a dictionary secret holding the backup destination. Your credentials secret is created by you and is never part of the release.
 
 <Note>
 **This template does not create a GVC.** Every resource lands in the GVC you install into, so `cpln workload exec`, `cpln logs` and uninstalling all work against that GVC, and uninstalling can never delete it. Nothing runs in a GVC location you did not list in `locations`.
@@ -246,10 +248,31 @@ volumeset:
     minFreePercentage: 10  # Minimum free percentage to trigger scaling
     scalingFactor: 1.2  # How much to scale up when triggered
 
+# ─── Request flow:  app → pgcat (pooler) → HAProxy (failover) → pgEdge node ─────
+# pgcat pools connections; HAProxy picks the node. Both run one set per location.
+
+# HAProxy failover tier. Each location's HAProxy serves its own node and fails
+# over to another local node (then a remote location) if the local ones are
+# unhealthy, so a client keeps serving through a node failure. On by default;
+# proxy.enabled: false has pgcat connect to the pgEdge nodes directly.
+proxy:
+  enabled: true
+  image: haproxy:3.0.28  # pinned exact; Debian variant (perl needed by the startup gate)
+  resources:
+    cpu: 100m
+    memory: 128Mi
+  minReplicas: 2         # per location
+  maxReplicas: 2         # per location
+
+# Connection pooler. With the failover tier on (default) pgcat pools ONE backend,
+# the local HAProxy, so `routing` below is ignored. With proxy.enabled: false pgcat
+# pools the pgEdge nodes directly and `routing` chooses how (see pgcat Settings in
+# the README): local = pool this location's nodes; single-writer = one global writer.
 pgcat:
   image: ghcr.io/postgresml/pgcat:v1.2.0 # pinned: `latest` makes installs non-reproducible
   poolMode: transaction  # options: session, transaction, statement
   defaultPoolSize: 25    # Real Postgres connections pgcat maintains per pool
+  routing: local         # local | single-writer — ignored when proxy.enabled (default)
   resources:
     cpu: 500m
     memory: 256Mi
@@ -342,6 +365,23 @@ internal_access:
 Version 2.0.1 adds this release's pgEdge and pgcat workloads to the list automatically, and the backup workload as well when `backup.enabled` is `true`. **List only your own client workloads** — anything of the release's you add by hand is de-duplicated rather than repeated. If you are on 2.0.0 with `workload-list`, upgrade to 2.0.1 and then verify replication with `SELECT subscription_name, status FROM spock.sub_show_status();` on every node.
 </Warning>
 
+### HAProxy Failover Tier
+
+The request flow is `app → pgcat (pooler) → HAProxy (failover) → pgEdge node`. pgcat pools connections; HAProxy picks the node. Both run one set per location, and the client endpoint stays the pgcat one.
+
+Each location's HAProxy sends traffic to **its own** location's `replica-0` and, if that node is unhealthy, fails over in order to the other local nodes, then to a remote location — so a client keeps serving through a node failure. It is on by default; set `proxy.enabled: false` to have pgcat connect to the nodes directly (the pre-2.2.0 shape).
+
+```yaml
+proxy:
+  enabled: true          # set false to have pgcat connect to the pgEdge nodes directly
+  image: haproxy:3.0.28  # pinned exact; Debian variant (perl needed by the startup gate)
+  resources:
+    cpu: 100m
+    memory: 128Mi
+  minReplicas: 2         # per location
+  maxReplicas: 2         # per location
+```
+
 ### pgcat Pool Modes
 
 pgcat multiplexes application connections into a smaller pool of real database connections, reducing overhead and protecting Postgres from connection exhaustion. `defaultPoolSize` sets how many real Postgres connections pgcat maintains per pool.
@@ -354,7 +394,10 @@ pgcat multiplexes application connections into a smaller pool of real database c
 
 ### pgcat Read and Write Routing
 
-pgcat parses each query, sends writes to `replica-0` of your first configured location, and sends reads to the other nodes. A single-node cluster has no other node, so that one node serves reads as well — otherwise every `SELECT` would fail with `AllServersDown`. This switches on node count alone and needs no configuration.
+**With the failover tier on (the default), `routing` does not apply** — pgcat pools a single backend, the local HAProxy, and all node selection is HAProxy's. The two modes below take effect only with `proxy.enabled: false`, where pgcat pools the pgEdge nodes directly and parses each query to split reads from writes.
+
+- **`local` (default)** — each location's pgcat pools **only that location's nodes**: the local `replica-0` is the write target, and the other local replicas serve reads. Every region reads *and* writes locally, so this is true active/active, and losing one location does not stop writes in the others. With a single node in a location, that node serves reads too.
+- **`single-writer`** — every pgcat, in every location, pools the **whole cluster** with a single write target (`replica-0` of your first location); reads go to the other nodes. Use this only if your application cannot tolerate multi-master last-update-wins conflict resolution and needs one write target. Writes stop if the first location is down (the write target lives there), and reads are served cross-region.
 
 <Warning>
 **Routing is decided by statement shape, not by what the statement does.** A data-modifying CTE such as `WITH ins AS (INSERT ... RETURNING *) SELECT * FROM ins` is classified as a read and routed to a replica. Every node accepts writes, so the write still succeeds — but "writes go to the primary" is a heuristic, not a guarantee. Send anything whose placement matters through a connection you know reaches the node you intend.
@@ -366,7 +409,7 @@ pgcat parses each query, sends writes to `replica-0` of your first configured lo
 
 ## Connecting
 
-Connect through pgcat for all application traffic. Use the fully-qualified `.GVC_NAME.cpln.local` form — the bare workload name does not resolve reliably from every workload type.
+Connect through pgcat for all application traffic. With the failover tier on (default), a per-location HAProxy sits behind pgcat and handles node failover — the endpoint below is unchanged. Use the fully-qualified `.GVC_NAME.cpln.local` form — the bare workload name does not resolve reliably from every workload type.
 
 | | |
 |---|---|
