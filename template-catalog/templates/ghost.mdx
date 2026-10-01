@@ -1,40 +1,72 @@
 ---
 title: Ghost
 icon: /template-catalog/templates/icons/ghost.png
-description: Deploy Ghost, the open-source publishing platform for blogs, newsletters, and paid memberships, on Control Plane. Covers the bundled MySQL 8 database, persistent content storage, public HTTPS access, SMTP email, and optional scheduled database backups.
-keywords: ['ghost', 'blog', 'blogging platform', 'cms', 'wordpress alternative', 'substack alternative', 'medium alternative', 'newsletter platform', 'paid memberships', 'headless cms', 'mysql', 'smtp', 'self-hosted publishing']
+description: Deploy Ghost on Control Plane. Open-source publishing platform for blogs, newsletters and paid memberships, as a single-replica Ghost 6 workload with a bundled MySQL 8 database, persistent content volume, public HTTPS endpoint, optional SMTP and scheduled database backups. Needs an existing GVC.
+keywords: ['blogging platform', 'cms', 'wordpress alternative', 'substack alternative', 'medium alternative', 'headless cms', 'content api', 'admin api', 'self-hosted publishing', 'mysqldump', 'staff 2fa', 'custom domain']
 ---
 
 ## Overview
 
-Ghost is the open-source publishing platform for professional blogs, newsletters, and paid memberships, with a first-class editor and REST Content/Admin APIs. This template deploys a single stateful Ghost workload backed by a bundled MySQL 8 database, with durable content storage, an HTTPS public site, optional SMTP email, and optional scheduled database backups to object storage.
+Ghost is the open-source publishing platform for professional blogs, newsletters, and paid memberships, with a first-class editor and REST Content/Admin APIs. This template deploys a single stateful Ghost workload backed by a bundled MySQL 8 database, with a durable content volume, an HTTPS public site on the auto-assigned canonical endpoint, optional SMTP email, and optional scheduled database backups to object storage.
 
-### Architecture
-
-- **Ghost** — Stateful, single-replica workload serving the site, editor, and Content/Admin APIs on port `2368`. Boots through a startup script that sets the public `url` from the canonical endpoint.
-- **MySQL 8** — Backing database provisioned from the [mysql](/template-catalog/templates/mysql) template as a subchart (image pinned to `mysql:8` — the only database Ghost supports) and connected to Ghost automatically.
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have — it does not create one.
+</Note>
 
 ### What Gets Created
 
-- **Stateful Ghost Workload** — The Ghost server with configurable CPU and memory.
-- **Stateful MySQL Workload** — Single-replica MySQL 8, automatically connected to Ghost.
-- **Volume Sets** — A persistent volume set for Ghost content (`/var/lib/ghost/content`: uploaded images, themes, logs, adapters) and one for MySQL data.
-- **Secrets** — An opaque secret holding the startup script and the MySQL credentials secret.
-- **Identity & Policy** — An identity bound to the Ghost workload with `reveal` access scoped to exactly the secrets it mounts (plus your SMTP secret when mail is enabled).
-- **Cron Backup Workload** *(optional)* — Scheduled MySQL dumps to object storage, created only when `mysql.backup.enabled` is `true`.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-ghost` | Ghost server — site, editor and Content/Admin APIs on port `2368` (stateful, 1 replica, container `ghost`) | — |
+| Volume Set | `RELEASE_NAME-ghost-vs` | Content directory at `/var/lib/ghost/content`: uploaded images, themes, logs, adapters | — |
+| Secret | `RELEASE_NAME-ghost-start` | Startup script that sets Ghost's `url` and hands off to the image entrypoint | — |
+| Identity & Policy | `RELEASE_NAME-ghost-identity`, `RELEASE_NAME-ghost-policy` | `reveal` on exactly the startup script, the MySQL credentials secret, and your SMTP secret when `mail.secretName` is set | — |
+| Workload | `RELEASE_NAME-mysql` | MySQL 8 database (stateful, 1 replica, container `mysql`, port `3306`) from the bundled [mysql](/template-catalog/templates/mysql) subchart | — |
+| Volume Set | `RELEASE_NAME-mysql-vs` | MySQL data directory at `/var/lib/mysql` | — |
+| Secret | `RELEASE_NAME-mysql-config` | Dictionary secret the chart writes from `mysql.config` — keys `database`, `user`, `password`, `rootPassword` | — |
+| Identity & Policy | `RELEASE_NAME-mysql-identity`, `RELEASE_NAME-mysql-policy` | `reveal` on the MySQL credentials secret; carries the cloud-account binding when backups are on | — |
+| Workload | `RELEASE_NAME-mysql-backup` | Cron job running a scheduled `mysqldump` to S3 or GCS | `mysql.backup.enabled: true` |
+| Workload | `RELEASE_NAME-mysql-phpmyadmin` | phpMyAdmin console, published to the internet with the root password in its environment | `mysql.enablePhpMyAdmin: true` |
 
 ## Prerequisites
 
-None for a default install — it deploys with a working MySQL 8 backend and an auto-assigned HTTPS endpoint. Two optional features need setup before installing:
+None for a default install — it deploys with a working MySQL 8 backend and an auto-assigned HTTPS endpoint. The two bundled database passwords ship as `change-me-…` placeholders and **must** be changed at install time; see [Installation](#installation).
 
-- **SMTP email** — for member sign-in links and newsletters, create a dictionary secret with keys `user` and `password` first (see [Mail](#mail-smtp)).
-- **Database backups** — an AWS S3 or GCS bucket plus a Control Plane Cloud Account (see [Backing Up](#backing-up)).
+Two optional features need setup before you install:
 
-Install using your preferred method:
+<Steps>
+  <Step title="SMTP credentials (optional)">
+    Member sign-in links, staff invitations and newsletters are sent over SMTP, and SMTP is off until `mail.secretName` names a [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `user` and `password`. Secrets are org-level, so no GVC flag is involved:
+
+    ```bash
+    cpln secret create-dictionary --name SECRET_NAME \
+      --entry user=smtp-username \
+      --entry password='YOUR-SMTP-PASSWORD'
+    ```
+
+    Set `mail.secretName` to this name, together with `mail.host` and `mail.from` — see [Mail (SMTP)](#mail-smtp).
+  </Step>
+  <Step title="Backup bucket and Cloud Account (optional)">
+    Scheduled database dumps need an S3 or GCS bucket plus a Control Plane Cloud Account. See [Backing Up](#backing-up).
+  </Step>
+</Steps>
+
+<Warning>
+Create the SMTP secret **before** installing with `mail.secretName` set. A name that points at a secret which does not exist installs "successfully" and then wedges silently: `cpln logs` shows nothing, and the only place the missing secret is named is `status.versions[].message` in `cpln workload get-deployments RELEASE_NAME-ghost --gvc GVC_NAME -o yaml`. The workload recovers on its own once the secret exists, or immediately after `cpln workload force-redeployment RELEASE_NAME-ghost --gvc GVC_NAME`.
+</Warning>
+
+## Installation
+
+A default install needs only the two database passwords — leave neither on its `change-me-…` placeholder:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/ghost \
+  --version 1.2.0 --gvc GVC_NAME \
+  --set mysql.config.password='YOUR-STRONG-PASSWORD' \
+  --set mysql.config.rootPassword='YOUR-STRONG-ROOT-PASSWORD'
+```
+
+Or install using your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -60,26 +92,51 @@ Install using your preferred method:
 
 ## Configuration
 
-Key configuration values (see the template's `values.yaml` for the complete set):
+### Ghost Application
 
 ```yaml
 image: ghost:6.54.1-alpine # official Docker Hub image (library/ghost)
 
 resources: # Ghost (Node) app — single instance
-  cpu: 500m
-  memory: 1024Mi
+  maxCpu: 500m
+  maxMemory: 1024Mi
   minCpu: 250m
   minMemory: 512Mi
 
-# Persistent content: uploaded images, themes, logs, adapters
+# Persistent content: uploaded images, themes, logs, adapters (mounted at /var/lib/ghost/content)
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
+```
 
-# Public URL Ghost uses to build links and emails. Leave empty to auto-derive
-# the canonical *.cpln.app endpoint. Set to your custom domain once attached.
+The resource block exposes both a floor and a ceiling, so the ceiling is named `maxCpu` / `maxMemory` — the bare `cpu` / `memory` names from template version 1.0.0 are refused at render (see [Upgrading from 1.0.0](#upgrading-from-1-0-0)). Media, themes and logs live on the content volume set; posts, members and settings live in MySQL.
+
+### Site URL
+
+```yaml
+# Public URL Ghost uses to build links and emails. Leave empty to auto-derive the
+# canonical *.cpln.app endpoint. Set to your custom domain once attached.
 publicUrl: "" # e.g. https://blog.example.com
+```
 
-# Mail (SMTP) — optional. DISABLED while secretName is empty (email off).
+Ghost bakes its `url` into every page link, feed and email, and rejects admin requests whose origin does not match it, so it must be the address visitors actually use. The template sets it at container start through the `RELEASE_NAME-ghost-start` script, in this order:
+
+| Condition | `url` Ghost runs with |
+|---|---|
+| `publicUrl` is set | Exactly that value, including the `https://` scheme |
+| `publicUrl` empty, `publicAccess.enabled: true` (default) | The workload's canonical `*.cpln.app` endpoint, read at runtime |
+| `publicUrl` empty, `publicAccess.enabled: false` | `http://RELEASE_NAME-ghost.GVC_NAME.cpln.local:2368` |
+
+Once you [attach a custom domain](/guides/configure-domain) to the `RELEASE_NAME-ghost` workload, set `publicUrl` to it (for example `https://blog.example.com`) and upgrade the release. The new value lands in the startup-script secret, not in the workload spec, so the running container keeps the old URL until it restarts — force a redeployment after the upgrade:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-ghost --gvc GVC_NAME
+```
+
+### Mail (SMTP)
+
+```yaml
+# Member sign-in links & newsletters. DISABLED while secretName is empty (email off).
+# Prerequisite: create a dictionary secret with keys `user` and `password` BEFORE install.
 mail:
   secretName: "" # e.g. my-ghost-smtp (dictionary secret with keys: user, password)
   host: ""       # e.g. smtp.mailgun.org
@@ -87,24 +144,56 @@ mail:
   secure: false  # true for port 465
   from: ""       # e.g. "Ghost <noreply@example.com>"
 
+# Ghost 6 emails a 2FA code to staff on every new-device admin login, which needs
+# SMTP. Default off so /ghost admin is reachable without mail; set true only after
+# configuring mail above (enabling it without SMTP wedges admin login).
+staffDeviceVerification: false
+```
+
+- `mail.secretName` — Name of the prerequisite dictionary secret (keys `user`, `password`) created in [Prerequisites](#prerequisites). Empty keeps email fully off; set, it turns on Ghost's SMTP transport and grants the Ghost identity `reveal` on exactly this secret. `mail.host` and `mail.from` are then required — the chart refuses to render without them.
+- `mail.port` / `mail.secure` — `587` with `secure: false` for STARTTLS (default), or `465` with `secure: true` for implicit TLS.
+- `mail.from` — The From address for outgoing mail, for example `"Ghost <noreply@example.com>"`.
+- `staffDeviceVerification` — Ghost 6 emails staff a 6-digit code on every admin sign-in from a new device. It defaults to `false` here so `/ghost` stays reachable on a mail-less install; the chart refuses `true` while `mail.secretName` is empty. Set it to `true` once SMTP works.
+
+The SMTP credentials are read when the container starts. After changing the secret's value, force a redeployment of `RELEASE_NAME-ghost` so Ghost picks up the new credentials.
+
+### Access
+
+```yaml
 publicAccess:
   enabled: true # HTTPS site via the canonical *.cpln.app endpoint
 
 internalAccess:
   type: same-gvc # options: none, same-gvc, same-org, workload-list
   workloads: []  # only used when type is same-gvc or workload-list
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
-# Backing database: MySQL 8 (bundled via the mysql template)
+- `publicAccess.enabled` — Serve the site and the `/ghost` admin over HTTPS on the auto-assigned `*.cpln.app` canonical endpoint (default). Set to `false` for an internal-only instance: Ghost then runs with the internal `cpln.local` URL from the [Site URL](#site-url) table and is reachable only per `internalAccess`.
+- `internalAccess.type` — Which workloads can reach Ghost on port `2368` over the internal network:
+
+| Type | Description |
+|------|-------------|
+| `none` | No internal access. |
+| `same-gvc` | Allow access from all workloads in the same GVC (default). |
+| `same-org` | Allow access from all workloads in the same organization. |
+| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
+
+### Backing Database
+
+```yaml
+# Ghost supports ONLY MySQL 8 (not MySQL 9, not MariaDB) — image pinned to mysql:8.
 mysql:
-  image: mysql:8 # Ghost supports ONLY MySQL 8 — do not change to 9 or MariaDB
-  enablePhpMyAdmin: false
+  image: mysql:8
+  enablePhpMyAdmin: false # keep the footprint to Ghost + its DB
   config:
     db: ghost
     user: ghost
-    password: change-me-ghost-db       # change before installing
+    password: change-me-ghost-db      # change before installing
     rootPassword: change-me-mysql-root # change before installing
   resources:
-    minCpu: 150m
+    minCpu: 150m        # keep cpu:minCpu ratio under the platform's 4:1 (500/150 = 3.3:1)
     maxCpu: 500m
     minMemory: 256Mi
     maxMemory: 1024Mi
@@ -112,10 +201,16 @@ mysql:
     capacity: 10 # initial capacity in GiB (minimum is 10)
   internalAccess:
     type: same-gvc
+  # Scheduled DB backups to object storage (off by default) — pass-through to the
+  # mysql template's native backup. See README "Storage setup" for provider setup.
   backup:
-    enabled: false        # scheduled DB dumps to object storage — see Backing Up
+    enabled: false
+    image: ghcr.io/controlplane-com/backup-images/mysql-backup:1.0.0 # works with all MySQL versions
     schedule: "0 2 * * *" # daily at 2am UTC
-    provider: aws         # aws or gcp
+    resources:
+      cpu: 100m
+      memory: 128Mi
+    provider: aws # aws or gcp
     aws:
       bucket: my-backup-bucket
       region: us-east-1
@@ -128,71 +223,62 @@ mysql:
       prefix: ghost/backups
 ```
 
-### Ghost Application
-
-- `image` — The official Ghost image from Docker Hub (`library/ghost`, Alpine variant).
-- `resources` — CPU and memory bounds for the Ghost workload.
-- `volumeset.capacity` — Initial content volume size in GiB (minimum 10). Holds uploaded images, themes, logs, and adapters at `/var/lib/ghost/content`.
-
-### Site URL
-
-- `publicUrl` — The public URL Ghost uses to build page links and email links. Leave empty (default) to auto-derive the canonical `*.cpln.app` endpoint at boot. Set it to your custom domain (e.g. `https://blog.example.com`) once you attach one, so links and emails point at the right host.
-
-### Mail (SMTP)
-
-Email powers member sign-in links, staff invitations, and newsletters. It is **off by default** — the entire mail configuration is gated on `mail.secretName` being non-empty. To enable it, create a dictionary secret with your SMTP credentials **before** installing:
-
-```bash
-cpln secret create-dictionary --name my-ghost-smtp \
-  --entry user=smtp-username --entry password=smtp-password
-```
-
-Then set:
-
-- `mail.secretName` — The name of the dictionary secret (keys `user` and `password`). The template grants the Ghost identity `reveal` on exactly this secret.
-- `mail.host` — Your SMTP server hostname (e.g. `smtp.mailgun.org`).
-- `mail.port` / `mail.secure` — `587` with `secure: false` for STARTTLS (default), or `465` with `secure: true` for SSL.
-- `mail.from` — The From address for outgoing mail (e.g. `"Ghost <noreply@example.com>"`).
-
-### Access
-
-- `publicAccess.enabled` — Serve the site and admin over HTTPS on the auto-assigned `*.cpln.app` canonical endpoint (default). Set to `false` for an internal-only instance — Ghost then derives its URL from the internal DNS name.
-- `internalAccess.type` — Controls which workloads can reach Ghost over the internal network:
-
-| Type | Description |
-|------|-------------|
-| `none` | No internal access. |
-| `same-gvc` | Allow access from all workloads in the same GVC (default). |
-| `same-org` | Allow access from all workloads in the same organization. |
-| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
-
-### Backing Database
-
-- `mysql.image` — Pinned to `mysql:8`. Ghost supports **only MySQL 8** — not MySQL 9 and not MariaDB. Do not change this.
-- `mysql.config.db` / `user` / `password` / `rootPassword` — Credentials for the bundled MySQL, applied on first startup. **Change both passwords before installing.**
-- `mysql.resources` / `mysql.volumeset.capacity` — CPU/memory bounds and initial volume size for the MySQL workload.
-- `mysql.internalAccess.type` — Controls which workloads can reach MySQL directly.
-- `mysql.enablePhpMyAdmin` — Off by default to keep the footprint to Ghost plus its database.
+- `mysql.image` — Pinned to `mysql:8`. Ghost supports **only MySQL 8** — not MySQL 9 and not MariaDB. Do not change it.
+- `mysql.config.db` / `user` / `password` / `rootPassword` — The database, user and passwords the chart writes into the `RELEASE_NAME-mysql-config` secret and MySQL applies on first boot. **Both passwords must be changed before installing** — the `change-me-…` defaults are published in the public template repository, and an install that keeps them runs with a known password. They are internal to the release: Ghost reads them from the secret, and nothing outside the GVC can reach the database.
+- `mysql.resources` / `mysql.volumeset.capacity` — CPU and memory bounds and the initial data volume size in GiB (minimum 10). The reservation-to-limit ratio is tuned to the platform's cap for stateful workloads; keep it when you raise the limits.
+- `mysql.internalAccess.type` — Which workloads can reach MySQL directly on port `3306`, using the same four types as Ghost's `internalAccess`.
+- `mysql.enablePhpMyAdmin` — Off by default. When `true`, the subchart adds a `RELEASE_NAME-mysql-phpmyadmin` workload that is **open to the whole internet** and carries the root password in its environment. Leave it off on a public site.
+- `mysql.backup.*` — Scheduled dumps to S3 or GCS, off by default. See [Backing Up](#backing-up) for the bucket, Cloud Account and IAM setup.
 
 <Note>
-MySQL credentials are only applied on first startup when the data directory is empty. Changing them in values after the initial deployment has no effect on the running database. To fully reset, `helm uninstall` (which deletes the volume sets) and reinstall.
+MySQL applies `mysql.config.*` only on first startup, when the data directory is empty. Changing a password in values after the initial deployment does not change the running database — change it inside MySQL with `ALTER USER` and upgrade the release so the secret matches. To fully reset, `cpln helm uninstall RELEASE_NAME --gvc GVC_NAME` (which deletes both volume sets and all data) and reinstall, or install under a new release name.
 </Note>
 
 ## Connecting
 
-| Access | Endpoint | Notes |
+| What | Address | Notes |
 |---|---|---|
-| Public site | `https://<canonical>.cpln.app` | Auto-assigned when `publicAccess.enabled`. Find it under `status.canonicalEndpoint` (`cpln workload get <release>-ghost -o yaml`). |
-| Admin panel | `https://<canonical>.cpln.app/ghost` | The Ghost editor and settings. |
-| Owner account | First visit to `/ghost` | Created via the setup wizard on first visit — there are no bootstrap credentials. |
-| Internal (in-GVC) | `http://<release>-ghost.<gvc>.cpln.local:2368` | Reachable from other workloads per `internalAccess.type`. Send an `X-Forwarded-Proto: https` header — Ghost redirects plain-HTTP requests to its configured URL. |
-| Database | `<release>-mysql.<gvc>.cpln.local:3306` | Credentials live in the `<release>-mysql-config` secret. |
+| Public site | `https://CANONICAL_ENDPOINT` | Assigned automatically when `publicAccess.enabled: true`. Read it from `status.canonicalEndpoint` in `cpln workload get RELEASE_NAME-ghost --gvc GVC_NAME -o yaml`. |
+| Admin panel | `https://CANONICAL_ENDPOINT/ghost` | Editor, settings, members and staff. The owner account is created here on first visit — see [First Run](#first-run). |
+| Internal (same GVC) | `http://RELEASE_NAME-ghost.GVC_NAME.cpln.local:2368` | Subject to `internalAccess.type`. With public access on, Ghost redirects plain-HTTP requests to its HTTPS `url` unless the request carries `X-Forwarded-Proto: https`. |
+| Database | `RELEASE_NAME-mysql.GVC_NAME.cpln.local:3306` | Subject to `mysql.internalAccess.type`. Credentials: `cpln secret reveal RELEASE_NAME-mysql-config -o yaml` (keys `database`, `user`, `password`, `rootPassword`). |
 
-After deploy, open `https://<canonical>.cpln.app/ghost` in a browser to create the owner account, then start publishing. Until the owner exists, the site serves the default theme with no admin user.
+Verify the site is serving once the workload reports ready — the default theme answers `200` before any owner exists:
 
-## Backing Up
+```bash
+cpln workload get RELEASE_NAME-ghost --gvc GVC_NAME -o yaml   # status.canonicalEndpoint
+curl -s -o /dev/null -w '%{http_code}\n' https://CANONICAL_ENDPOINT/
+```
 
-Database backups are optional and disabled by default. When enabled, a cron workload runs a scheduled `mysqldump` of the Ghost database and uploads it (gzipped) to your bucket under the configured prefix. Enable with `mysql.backup.enabled: true`, pick a `mysql.backup.provider`, and complete the storage setup below **before** installing.
+With `publicAccess.enabled: false` there is no canonical endpoint; reach port `2368` from another workload in the GVC, or from your machine with `cpln port-forward RELEASE_NAME-ghost 2368:2368 --gvc GVC_NAME`. Driving the `/ghost` admin through that tunnel has not been verified for this template — Ghost's `url` is then the internal `cpln.local` address, and its admin checks requests against it.
+
+### First Run
+
+Ghost ships no bootstrap credentials. The first visitor to `/ghost` creates the owner account.
+
+<Steps>
+  <Step title="Wait for both workloads to report ready">
+    MySQL initializes first; Ghost runs its database migrations and starts serving. Ghost retries its database connection until MySQL is up, so early connection errors in its log during a first install are expected.
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-ghost --gvc GVC_NAME -o yaml
+    ```
+  </Step>
+  <Step title="Open the admin and create the owner">
+    Browse to `https://CANONICAL_ENDPOINT/ghost` and complete the setup form — site title, your name, email and password. Do this right after install: until the owner exists the site is public with the default theme and anyone who reaches `/ghost` can claim it.
+  </Step>
+  <Step title="Configure mail before inviting anyone">
+    Staff invitations, member sign-in links and newsletters are delivered only by email. Configure [Mail (SMTP)](#mail-smtp) first, then set `staffDeviceVerification: true` if you want the emailed sign-in code on new devices.
+  </Step>
+</Steps>
+
+## Operations
+
+### Backing Up
+
+Two things hold your data: the MySQL database (posts, pages, members, settings, staff accounts) and the content volume set (uploaded images, themes). A database dump does not include media.
+
+**Scheduled database dumps** are off by default. When `mysql.backup.enabled: true`, the `RELEASE_NAME-mysql-backup` cron workload runs `mysqldump` on `mysql.backup.schedule` and uploads a gzipped archive named `mysql-TIMESTAMP.sql.gz` under `mysql.backup.*.prefix` in your bucket. Pick a `mysql.backup.provider` and complete the storage setup **before** enabling it:
 
 <Tabs>
   <Tab title="AWS S3">
@@ -204,14 +290,14 @@ Database backups are optional and disabled by default. When enabled, a cron work
         If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `mysql.backup.aws.cloudAccountName` to its name.
       </Step>
       <Step title="Create a bucket-scoped IAM policy">
-        Create an IAM policy granting the required S3 actions on the bucket, and set `mysql.backup.aws.policyName` to its name:
+        Create an IAM policy granting the required S3 actions on the bucket (replace `YOUR_BUCKET_NAME`), and set `mysql.backup.aws.policyName` to its name. The template attaches it to the MySQL identity:
 
         ```json
         {
           "Version": "2012-10-17",
           "Statement": [
-            { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": "arn:aws:s3:::my-backup-bucket" },
-            { "Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"], "Resource": "arn:aws:s3:::my-backup-bucket/*" }
+            { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME" },
+            { "Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"], "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME/*" }
           ]
         }
         ```
@@ -224,31 +310,145 @@ Database backups are optional and disabled by default. When enabled, a cron work
         Create a GCS bucket. Set `mysql.backup.gcp.bucket` to its name.
       </Step>
       <Step title="Set up a Cloud Account">
-        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your GCP project and grant its service account **Storage Object Admin** (`roles/storage.objectAdmin`) on the bucket. Set `mysql.backup.gcp.cloudAccountName` to its name.
+        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your GCP project and grant its service account **Storage Object Admin** (`roles/storage.objectAdmin`) on the bucket. Set `mysql.backup.gcp.cloudAccountName` to its name — the template binds that role on exactly that bucket.
       </Step>
     </Steps>
   </Tab>
 </Tabs>
 
-### Restoring a Backup
-
-Backups are standard gzipped `mysqldump` archives named `mysql-<timestamp>.sql.gz`. To restore, download the archive from your bucket and load it into a MySQL 8 instance:
+**Content volume.** The `RELEASE_NAME-ghost-vs` volume set keeps a final snapshot for 7 days when it is deleted. Take a snapshot before a theme change or an upgrade:
 
 ```bash
-gunzip -c mysql-<timestamp>.sql.gz | mysql -u root -p
+cpln volumeset snapshot create RELEASE_NAME-ghost-vs --gvc GVC_NAME --snapshot-name before-upgrade
+cpln volumeset snapshot get RELEASE_NAME-ghost-vs --gvc GVC_NAME
 ```
 
-The dump recreates the full `ghost` database — posts, members, settings, and users. Uploaded images and themes live on the Ghost content volume set, not in the database, so a database restore covers content and configuration but not media files.
+**Ad-hoc dump without a bucket.** `mysqldump` is in the `mysql:8` image. Binary output through `cpln workload exec` is not byte-safe, so wrap the stream in base64 on both sides; the root password is already in the container's environment:
+
+```bash
+cpln workload exec RELEASE_NAME-mysql --gvc GVC_NAME --container mysql --quiet -- \
+  sh -c 'mysqldump -u root -p"$MYSQL_ROOT_PASSWORD" --single-transaction --set-gtid-purged=OFF --databases ghost | base64' \
+  | base64 -d > ghost.sql
+```
+
+This ad-hoc command has **not been run against a live install of this template** — try it on a throwaway release before relying on it.
+
+### Restoring a Backup
+
+<Warning>
+This restore procedure was written against the chart's configuration and the backup image's dump format. It has **not been exercised against a live install of this template** — rehearse it on a throwaway release before you need it, and treat any step that errors as a stop.
+</Warning>
+
+Scheduled dumps are gzipped plain-SQL `mysqldump` output of the `ghost` database. Download the archive from your bucket (`aws s3 cp` or `gsutil cp`), then stream it into the running MySQL through `cpln workload exec`. Stdin is off by default on `exec`, so pass `--stdin`, and base64-wrap the stream so nothing is altered in transit:
+
+```bash
+gunzip -c mysql-TIMESTAMP.sql.gz \
+  | sed '/^SET @@GLOBAL.GTID_PURGED/d' \
+  | base64 \
+  | cpln workload exec RELEASE_NAME-mysql --gvc GVC_NAME --container mysql --stdin -- \
+      sh -c 'base64 -d | mysql -u root -p"$MYSQL_ROOT_PASSWORD" ghost'
+```
+
+Then restart Ghost so it drops its in-memory settings and reads the restored database:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-ghost --gvc GVC_NAME
+```
+
+The dump restores posts, members, settings and staff accounts. Uploaded images and themes are on the content volume set, not in the database — restore those from a volume set snapshot (`cpln volumeset snapshot restore` has not been exercised for this template; check `cpln volumeset snapshot restore --help`) or re-upload them.
+
+### Upgrading from 1.0.0
+
+Template version 1.1.0 renamed the Ghost resource ceiling from `cpu` / `memory` to `maxCpu` / `maxMemory`, because the block also exposes `minCpu` / `minMemory` and the bare names left it ambiguous which number was the limit. Rename the two keys in your values before upgrading:
+
+```yaml
+resources:
+  maxCpu: 500m
+  maxMemory: 1024Mi
+  minCpu: 250m
+  minMemory: 512Mi
+```
+
+An upgrade that still carries the old names is refused at render and your running release is left untouched:
+
+```text
+Error: ... ghost: resources.cpu was RENAMED to resources.maxCpu. A block exposing both a reservation
+and a limit names the limit maxCpu/maxMemory, so the bare name is no longer read and would be silently
+ignored. Rename it in your values.
+```
+
+Blocks that expose only a limit (`mysql.backup.resources`) keep the bare `cpu` / `memory` names.
+
+### Upgrading from 1.1.0
+
+Template version 1.2.0 adds `staffDeviceVerification` (default `false`), which turns off the emailed sign-in code Ghost 6 requires on every new-device admin login. On a 1.1.0 install without SMTP that code could never be delivered and `/ghost` was unreachable from a new browser; after the upgrade admin login works without mail. If you have SMTP configured and want the check back, set `staffDeviceVerification: true`.
+
+The first `cpln helm upgrade` after an install can restart the bundled MySQL even when no database value changed, so run it during a quiet period.
+
+### Scaling and Availability
+
+Ghost is single-replica by design and this template has no `replicas` knob: Ghost holds scheduler, job-queue and cache state in-process and has no upstream support for running more than one instance against the same database. Both workloads are pinned to one replica.
+
+Durability comes from the two volume sets and, optionally, scheduled database dumps. A restart or upgrade is a brief interruption of the one replica; put a CDN in front of a busy public site to absorb it. Raise `resources.maxCpu` / `resources.maxMemory` (and the `mysql.resources` counterparts, keeping the reservation ratio) to scale vertically.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Upgrade fails with resources.cpu was RENAMED to resources.maxCpu">
+    **Symptom:** `cpln helm upgrade` from template version 1.0.0 stops at render with `ghost: resources.cpu was RENAMED to resources.maxCpu` (or the `resources.memory` equivalent). Nothing is changed on the platform.
+
+    **Cause:** Your values still use the 1.0.0 key names.
+
+    **Fix:** Rename `resources.cpu` to `resources.maxCpu` and `resources.memory` to `resources.maxMemory`, then upgrade again. See [Upgrading from 1.0.0](#upgrading-from-1-0-0).
+  </Accordion>
+  <Accordion title="Render refused with staffDeviceVerification requires SMTP">
+    **Symptom:** Install or upgrade fails with `ghost: staffDeviceVerification requires SMTP — set mail.secretName (Ghost emails the 2FA code) or leave staffDeviceVerification: false`.
+
+    **Cause:** `staffDeviceVerification: true` with `mail.secretName` empty. Ghost would email a code it has no way to send, and admin login would never complete.
+
+    **Fix:** Configure [Mail (SMTP)](#mail-smtp) first, or set `staffDeviceVerification: false`.
+  </Accordion>
+  <Accordion title="Admin login asks for an emailed code that never arrives">
+    **Symptom:** Signing in at `/ghost` from a new browser prompts for a 6-digit code and no email arrives; the browser shows a server error on submit.
+
+    **Cause:** You are on template version 1.1.0 or earlier without SMTP, or on 1.2.0 with `staffDeviceVerification: true` and a mail configuration that does not deliver.
+
+    **Fix:** Upgrade to 1.2.0 (the default turns the check off) or fix the SMTP settings and credentials in `mail.*`; after changing the secret's value, run `cpln workload force-redeployment RELEASE_NAME-ghost --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Ghost workload never becomes ready and cpln logs shows nothing">
+    **Symptom:** `RELEASE_NAME-ghost` stays not ready after install with `mail.secretName` set, and `cpln logs` returns no lines for it.
+
+    **Cause:** The SMTP secret named in `mail.secretName` does not exist, so the container never starts.
+
+    **Fix:** Read `status.versions[].message` in `cpln workload get-deployments RELEASE_NAME-ghost --gvc GVC_NAME -o yaml` — it names the missing secret. Create it as shown in [Prerequisites](#prerequisites); the workload recovers on its own, or immediately after `cpln workload force-redeployment RELEASE_NAME-ghost --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Links and emails still point at the cpln.app address after adding a custom domain">
+    **Symptom:** The site answers on your domain, but generated links, the RSS feed and emails use the `*.cpln.app` endpoint — or the admin reports `access denied from url`.
+
+    **Cause:** `publicUrl` is empty (Ghost derived the canonical endpoint), or it was changed but the container has not restarted — the value lives in the startup-script secret, which is read only at container start.
+
+    **Fix:** Set `publicUrl` to the full `https://` address visitors use, upgrade the release, then run `cpln workload force-redeployment RELEASE_NAME-ghost --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Changed a database password in values but MySQL still uses the old one">
+    **Symptom:** After `cpln helm upgrade` with a new `mysql.config.password` or `rootPassword`, Ghost fails to authenticate with `Access denied for user`.
+
+    **Cause:** MySQL applies `mysql.config.*` only when the data directory is first initialized. The upgrade changed the secret, so Ghost now sends a password the database never learned.
+
+    **Fix:** Either change the password inside MySQL to match the new value (`ALTER USER 'ghost'@'%' IDENTIFIED BY '...'` via `cpln workload exec RELEASE_NAME-mysql --gvc GVC_NAME --container mysql -- mysql -u root -p ...`), or put the old value back in values and upgrade again. A clean reset is uninstall (deletes both volume sets) and reinstall.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Single replica by design.** Ghost has no upstream clustering support, so there is no `replicas` knob. Durability comes from the MySQL backend, the content volume set, and optional scheduled backups. Put a CDN in front of a busy public site to absorb the brief blip during a restart or upgrade.
-- **MySQL 8 only.** Ghost does not support MySQL 9 or MariaDB — keep `mysql.image: mysql:8`.
-- **Create the owner account first.** After deploy, visit `/ghost` to run the setup wizard. Until then the site is public with the default theme and no admin exists.
-- **Change both database passwords before installing.** They seed the database on first boot and cannot be changed by editing values afterward — uninstalling (which deletes the volume sets) and reinstalling is the reset path.
-- **SMTP is a prerequisite secret, not a value.** Create the dictionary secret (keys `user`, `password`) before install and reference it via `mail.secretName`. Leaving it empty keeps email fully off.
-- **Set `publicUrl` when using a custom domain** so page links and emails point at the right host. Empty auto-derives the canonical `*.cpln.app` endpoint.
-- **Content survives redeploys** under the same release name — posts and settings in MySQL, media on the content volume set. Uninstalling deletes both volume sets and all data.
+- **Change both `mysql.config` passwords at install time** — the `change-me-…` defaults are public, and they seed the database on first boot; later value edits do not change the stored passwords.
+- **Create the owner account right after install** — until someone completes the form at `/ghost`, the public site has no admin and anyone who reaches it can claim ownership.
+- **MySQL 8 only** — keep `mysql.image: mysql:8`; Ghost does not support MySQL 9 or MariaDB.
+- **SMTP is a prerequisite secret, not a value** — create the dictionary secret (keys `user`, `password`) before installing with `mail.secretName` set; a missing secret wedges the deployment silently.
+- **Set `publicUrl` when you attach a custom domain**, then force a redeployment of `RELEASE_NAME-ghost` — links and emails use whatever `url` the container started with.
+- **`staffDeviceVerification: true` requires working SMTP** — the chart refuses it otherwise, and a mis-delivering mail setup locks staff out of `/ghost` from new devices.
+- **Single replica by design** — there is no `replicas` knob; expect a brief interruption on restart or upgrade, and the first upgrade after install can restart the bundled MySQL.
+- **Leave `mysql.enablePhpMyAdmin` off on a public site** — the console it adds is open to the internet and holds the root password.
+- **Data survives redeploys under the same release name** — content in `RELEASE_NAME-ghost-vs`, the database in `RELEASE_NAME-mysql-vs`. `cpln helm uninstall` deletes both; a database dump does not include uploaded media.
 
 ## External References
 
@@ -257,10 +457,13 @@ The dump recreates the full `ghost` database — posts, members, settings, and u
     Official Ghost product documentation
   </Card>
   <Card title="Configuration Reference" href="https://docs.ghost.org/config" icon="sliders">
-    Full reference of Ghost configuration options
+    The url, mail and security options this template sets
   </Card>
   <Card title="Supported Databases" href="https://docs.ghost.org/faq/supported-databases" icon="database">
     Why Ghost requires MySQL 8
+  </Card>
+  <Card title="Device Verification and Email 2FA" href="https://ghost.org/changelog/2fa/" icon="shield-halved">
+    The staff sign-in code that staffDeviceVerification controls
   </Card>
   <Card title="Official Docker Image" href="https://hub.docker.com/_/ghost" icon="docker">
     The library/ghost image on Docker Hub
