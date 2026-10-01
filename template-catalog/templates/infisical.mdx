@@ -1,60 +1,89 @@
 ---
 title: Infisical
 icon: /template-catalog/templates/icons/infisical.png
-description: Deploy Infisical on Control Plane using the Template Catalog. An open-source secrets-management platform — store, version, scope, and serve application secrets through a web UI and REST API — backed by PostgreSQL and HA Redis. Covers the prerequisite root-of-trust secret, admin bootstrap, SMTP, scaling, and access.
-keywords: ['infisical', 'secrets management', 'secret manager', 'vault alternative', 'hashicorp vault alternative', 'doppler alternative', 'secrets vault', 'env vars', 'secret rotation', 'api keys', 'self-hosted secrets', 'encryption key', 'postgresql', 'redis sentinel']
+description: Deploy Infisical, the open-source secrets-management platform with a web UI and REST API, on Control Plane. Single or multi-replica server over bundled PostgreSQL and Sentinel-backed HA Redis. Needs an existing GVC and a pre-created ENCRYPTION_KEY + AUTH_SECRET dictionary secret.
+keywords: ['secret manager', 'vault alternative', 'hashicorp vault alternative', 'doppler alternative', 'secrets vault', 'env vars', 'api keys', 'self-hosted secrets', 'secret versioning', 'redis sentinel', 'server admin console', 'signup mode']
 ---
 
 ## Overview
 
-Infisical is an open-source secrets-management platform: store, version, scope, and serve application secrets through a web UI and REST API, with projects, environments, and access controls. This template deploys a stateless Infisical server tier backed by PostgreSQL (the durable secret store) and HA Redis with Sentinel (cache and background-job queues).
+Infisical is an open-source secrets-management platform: store, version, scope, and serve application secrets through a web UI and REST API, with projects, environments, and access controls. This template deploys a stateless Infisical server tier (UI and API on port `8080`) backed by a bundled PostgreSQL that holds every stored secret, and a bundled highly-available Redis with Sentinel for its cache and background-job queues. The default is a single server replica; `infisical.replicas` scales the server tier out over the shared database and cache.
 
-### Architecture
-
-- **Infisical server** — A stateless `standard` workload serving the web UI and API on port `8080` from the standalone image. Runs its database migrations automatically on boot; scale with `infisical.replicas` (a startup lock ensures migrations run exactly once even when multiple replicas boot concurrently).
-- **PostgreSQL** ([postgres](/template-catalog/templates/postgres) subchart) — The durable store for all secrets, versions, projects, and users.
-- **Redis + Sentinel** ([redis](/template-catalog/templates/redis) subchart) — Cache and background-job queues, deployed HA (3 Redis + 3 Sentinel replicas, master `mymaster`). The server connects Sentinel-aware, so Redis failover is transparent. **Required** — Infisical will not boot without Redis.
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have — it does not create or manage a GVC.
+</Note>
 
 ### What Gets Created
 
-- **Standard Infisical Workload** — One or more stateless replicas serving the UI and API on port `8080`.
-- **Stateful PostgreSQL Workload** — Single-replica Postgres with a persistent volume set for all Infisical data.
-- **Redis Workloads** — A Redis master-replica set plus Redis Sentinel for cache and job queues.
-- **DB-credentials Secret** — A template-created dictionary secret used to assemble the server's `DB_CONNECTION_URI`.
-- **Identity & Policy** — An identity bound to the server with least-privilege `reveal` on exactly the secrets it mounts, including your prerequisite secret.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-infisical` | Infisical server: web UI and REST API on port `8080`, runs its database migrations on boot (standard, `infisical.replicas` replicas) | — |
+| Workload | `RELEASE_NAME-postgres` | Bundled PostgreSQL from the [postgres](/template-catalog/templates/postgres) template — every secret, version, project, environment, and user (stateful, 1 replica) | — |
+| Workload | `RELEASE_NAME-redis` | Bundled Redis data nodes from the [redis](/template-catalog/templates/redis) template — cache and job queues (stateful, 3 replicas) | — |
+| Workload | `RELEASE_NAME-sentinel` | Redis Sentinel monitoring master `mymaster`, so the server follows a Redis failover without reconfiguration (stateful, 3 replicas) | — |
+| Workload | `RELEASE_NAME-postgres-backup` | Cron job that dumps the database to object storage on a schedule | `postgres.backup.enabled: true` |
+| Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory, with 7-day snapshots | — |
+| Secret | `RELEASE_NAME-infisical-db` | Dictionary secret the chart creates with the PostgreSQL username and password the server uses to assemble `DB_CONNECTION_URI` | — |
+| Secret | the name in `postgres.config.credentialsSecretName` | Dictionary secret the chart creates (`username`, `password`, `database`) and hands to the bundled PostgreSQL | — |
+| Secret | `RELEASE_NAME-redis-config`, `RELEASE_NAME-sentinel-config` | Redis and Sentinel configuration files for the bundled cache | — |
+| Secret | `RELEASE_NAME-redis-auth-password` | Redis password, created by the bundled redis template and wired into the server as `REDIS_PASSWORD` | `redis.redis.auth.password.enabled: true` |
+| Identity | `RELEASE_NAME-infisical-identity` | Bound to the server workload | — |
+| Policy | `RELEASE_NAME-infisical-policy` | Grants that identity `reveal` on exactly the secrets the server reads: its database secret, your root-of-trust secret, and the SMTP and Redis password secrets when configured | — |
+| Identity | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-redis-identity`, `RELEASE_NAME-sentinel-identity` | Bound to the bundled PostgreSQL (and its backup job), Redis, and Sentinel workloads | — |
+| Policy | `RELEASE_NAME-pg-policy`, `RELEASE_NAME-redis-policy`, `RELEASE_NAME-sentinel-policy` | Grant each bundled identity `reveal` on its own configuration or credentials secrets only | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+Your root-of-trust secret holding `ENCRYPTION_KEY` and `AUTH_SECRET` is **not** created by the template — see [Prerequisites](#prerequisites).
 
 ## Prerequisites
 
-**You must create a dictionary secret before installing.** The server references it by name (`secrets.name`, default `my-infisical-secrets`) and the deployment wedges until the secret exists. Create it first as a **dictionary** secret holding Infisical's root-of-trust keys:
+Infisical encrypts every stored secret with an `ENCRYPTION_KEY` and signs every session and token with an `AUTH_SECRET`. Both are long-lived root-of-trust values, so you supply them through a [dictionary secret](/guides/create-secret/dictionary) created **before** installing; neither value ever passes through Helm values.
 
-- `ENCRYPTION_KEY` — a 16-byte hex key (`openssl rand -hex 16`) that encrypts every secret stored in Infisical.
-- `AUTH_SECRET` — a 32-byte base64 key (`openssl rand -base64 32`) that signs sessions and tokens.
+<Steps>
+  <Step title="Create the root-of-trust secret">
+    A dictionary secret with exactly two keys: `ENCRYPTION_KEY`, a 16-byte hex string, and `AUTH_SECRET`, a 32-byte base64 string.
+
+    ```bash
+    cpln secret create-dictionary --name INFISICAL_KEYS_SECRET_NAME \
+      --entry ENCRYPTION_KEY="$(openssl rand -hex 16)" \
+      --entry AUTH_SECRET="$(openssl rand -base64 32)"
+    ```
+
+    Set `secrets.name` to this name. Secrets are org-level, so no GVC flag is involved.
+  </Step>
+  <Step title="Back both values up outside Control Plane">
+    Both keys are write-once. `ENCRYPTION_KEY` cannot be rotated without losing the data it protects — every secret stored in Infisical is encrypted with it, and a changed key makes all of them unreadable. Rotating `AUTH_SECRET` invalidates every session and token. Keep a copy of both somewhere safe, so a rebuilt install can read an existing database or a restored backup.
+  </Step>
+</Steps>
 
 <Warning>
-Both keys are **write-once — never rotate them**. Rotating `ENCRYPTION_KEY` corrupts every stored secret; rotating `AUTH_SECRET` invalidates all sessions.
+Create the secret **before** installing. Installing without it reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-infisical --gvc GVC_NAME -o yaml
+```
+
+The message reads `The secret INFISICAL_KEYS_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Creating the secret lets the deployment recover on its own; `cpln workload force-redeployment RELEASE_NAME-infisical --gvc GVC_NAME` skips the wait.
 </Warning>
 
-Create the secret with the CLI:
+Everything else works with the defaults. Two optional features need their own setup first:
+
+- **Authenticated SMTP** — a dictionary secret holding `SMTP_USERNAME` and `SMTP_PASSWORD`. See [Email](#email).
+- **Scheduled database backups** — a bucket and cloud account (or S3-compatible credentials) for the bundled PostgreSQL. See [Backing Up](#backing-up).
+
+## Installation
+
+Once the root-of-trust secret exists, install from the marketplace registry, pointing `secrets.name` at it and replacing the bundled database password:
 
 ```bash
-cpln secret create-dictionary --name my-infisical-secrets \
-  --entry ENCRYPTION_KEY=$(openssl rand -hex 16) \
-  --entry AUTH_SECRET=$(openssl rand -base64 32)
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/infisical \
+  --version 1.1.0 --gvc GVC_NAME \
+  --set secrets.name=INFISICAL_KEYS_SECRET_NAME \
+  --set postgres.credentials.password='YOUR-STRONG-DB-PASSWORD'
 ```
 
-**Optional, only for authenticated SMTP:** a dictionary secret with `SMTP_USERNAME` and `SMTP_PASSWORD`, referenced via `smtp.auth.secretName`. Leave `smtp.auth.secretName` empty for unauthenticated relays and mail catchers.
+Installing a second Infisical release in the same org? Also set `postgres.config.credentialsSecretName` to a name no other release uses — secret names are org-wide.
 
-```bash
-cpln secret create-dictionary --name my-infisical-smtp \
-  --entry SMTP_USERNAME=apikey \
-  --entry SMTP_PASSWORD=your-smtp-password
-```
-
-Install the template using your preferred method:
+Other ways to install and manage the template:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -80,141 +109,387 @@ Install the template using your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Infisical Server
 
 ```yaml
 infisical:
-  # Standalone image: bundles the API + web UI on :8080 and runs DB migrations on boot.
-  image: infisical/infisical:v0.162.14
-  replicas: 1                 # 1 = proven single-replica shape; 2+ = HA tier (stateless app over shared pg+redis)
-  siteUrl: ""                 # empty = derive from the canonical *.cpln.app endpoint; set (with https://) for a custom domain
+  image: infisical/infisical:v0.162.14 # standalone image: API + web UI on :8080, runs DB migrations on boot; pin a released tag
+  replicas: 1 # proven single-replica shape; set >=2 for the HA tier (stateless app over shared pg+redis)
+  siteUrl: "" # public base URL for links, cookies, callbacks; empty = derive from the canonical endpoint; set WITH https:// for a custom domain
   resources:
     minCpu: 250m
     maxCpu: 1000m
     minMemory: 512Mi
-    maxMemory: 2Gi
+    maxMemory: 2Gi # keep at 2Gi: boot migrations run out of memory at 1Gi on a cold multi-replica boot
+```
 
-# Prerequisite dictionary secret — MUST EXIST BEFORE INSTALL (see Prerequisites).
+### Prerequisite Secret
+
+```yaml
 secrets:
-  name: my-infisical-secrets  # holds ENCRYPTION_KEY + AUTH_SECRET (both write-once)
+  name: my-infisical-secrets # dictionary secret with ENCRYPTION_KEY + AUTH_SECRET — MUST exist before install; both keys are write-once
+```
 
-# SMTP / email (optional; off by default)
+### Email
+
+SMTP is off by default and a default install works without it — the first visitor signs up with a password and becomes the server admin. Email invitations, address verification, and password reset need it on.
+
+```yaml
 smtp:
-  enabled: false              # true = enable email invites, verification, password reset
-  host: smtp.example.com
-  port: 587
-  fromAddress: no-reply@example.com
-  fromName: Infisical
-  requireTls: true            # STARTTLS; set false for a plaintext mail catcher
+  enabled: false # true = enable email invites, verification, password reset
+  host: smtp.example.com # SMTP server host (required when enabled)
+  port: 587 # SMTP server port
+  fromAddress: no-reply@example.com # envelope From address (required when enabled)
+  fromName: Infisical # display name on outbound mail
+  requireTls: true # STARTTLS required; set false for a plaintext mail catcher (e.g. Mailpit :1025)
   auth:
-    secretName: ""            # optional dictionary secret with SMTP_USERNAME + SMTP_PASSWORD; empty = no auth
+    secretName: "" # optional dictionary secret with SMTP_USERNAME + SMTP_PASSWORD; empty = no auth
+```
 
+For an authenticated relay, create the credentials secret before enabling it and set `smtp.auth.secretName` to its name. The server identity is granted `reveal` on exactly that secret.
+
+```bash
+cpln secret create-dictionary --name SMTP_SECRET_NAME \
+  --entry SMTP_USERNAME=YOUR-SMTP-USERNAME \
+  --entry SMTP_PASSWORD='YOUR-SMTP-PASSWORD'
+```
+
+A running replica reads the secret only when it starts, so after changing the SMTP credentials force a redeployment with `cpln workload force-redeployment RELEASE_NAME-infisical --gvc GVC_NAME`.
+
+### Access
+
+```yaml
 publicAccess:
-  enabled: true               # HTTPS UI + API on the auto *.cpln.app endpoint; false = internal-only
+  enabled: true # HTTPS UI + API on the auto *.cpln.app endpoint; false = internal-only
 internalAccess:
-  type: same-gvc              # options: none, same-gvc, same-org, workload-list
-  workloads: []               # used only with workload-list
+  type: same-gvc # none | same-gvc | same-org | workload-list
+  workloads: [] # used only with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
-# PostgreSQL — durable secret store
+| `internalAccess.type` | Who can reach the server over the internal network |
+|---|---|
+| `none` | No workload |
+| `same-gvc` | Every workload in the same GVC (default) |
+| `same-org` | Every workload in the same org |
+| `workload-list` | Only the workloads listed in `internalAccess.workloads` |
+
+A change to either access knob takes a couple of minutes to take effect after the upgrade reports success.
+
+### Bundled PostgreSQL
+
+The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. The chart builds the credentials secret from `postgres.credentials.*` for you — nothing to create before installing.
+
+```yaml
 postgres:
   image: postgres:18
-  credentials: # the chart writes these into the secret named below — nothing for you to create
+  credentials: # the chart writes these into the secret named below
     username: infisical
-    password: change-me-infisical-pg   # change before installing
+    password: change-me-infisical-pg # change before installing — seeds the database on first boot
     database: infisical
   config:
-    credentialsSecretName: my-infisical-db-credentials # secret names are org-wide — give each release its own
+    credentialsSecretName: my-infisical-db-credentials # chart-created; secret names are org-wide, so give each release its own
   resources:
     minCpu: 250m
     maxCpu: 1000m
     minMemory: 512Mi
     maxMemory: 1Gi
   volumeset:
-    capacity: 10              # initial capacity in GiB (minimum is 10)
+    capacity: 10 # GiB (minimum 10)
+  backup:
+    enabled: false # scheduled pg_dumpall to object storage — see Backing Up
+    schedule: "0 2 * * *" # daily at 02:00 UTC
+    provider: aws # aws | gcp | minio
+```
 
-# Redis + Sentinel (HA) — cache + job queues; REQUIRED
+### Bundled Redis
+
+Redis is required — the server does not boot without it, so there is no toggle to disable it. The bundled [redis](/template-catalog/templates/redis) template runs three data nodes and three Sentinels; the server connects through Sentinel (`REDIS_SENTINEL_HOSTS`, master `mymaster`), so a Redis failover is transparent to it. Redis holds only cache and queue state, never stored secrets, and runs without persistence.
+
+```yaml
 redis:
   redis:
     image: redis:7.4
     replicas: 3
     auth:
       password:
-        enabled: false        # true = require AUTH; the password is wired into Infisical as REDIS_PASSWORD
-        value: change-me-infisical-redis
+        enabled: false # true = require AUTH on the data nodes; the password is wired into Infisical as REDIS_PASSWORD
+        value: change-me-infisical-redis # used only when enabled is true — change it then
+    resources:
+      cpu: 200m
+      memory: 256Mi
+      minCpu: 80m
+      minMemory: 128Mi
   sentinel:
     image: redis:7.4
     replicas: 3
+    resources:
+      cpu: 200m
+      memory: 256Mi
+      minCpu: 80m
+      minMemory: 128Mi
 ```
 
-### Infisical server
-
-- `infisical.image` — The standalone Infisical image (API + web UI in one container). Pin a concrete tag.
-- `infisical.replicas` — Number of stateless server replicas. `1` is the proven single-replica shape; `2` or more gives an HA tier over the shared PostgreSQL and Redis, with zero-downtime rolling restarts. Boot migrations are serialized by a startup lock, so they run exactly once no matter how many replicas start at once.
-- `infisical.siteUrl` — The public base URL Infisical advertises in links, cookies, and callbacks. Leave empty to derive it automatically from the canonical `*.cpln.app` endpoint; set it (including `https://`) only when you front the workload with a custom domain.
-- `infisical.resources` — CPU and memory per replica. Keep `maxMemory` at `2Gi` — a cold multi-replica boot runs out of memory at `1Gi`.
-
-### Prerequisite secret
-
-- `secrets.name` — Name of the user-created dictionary secret holding `ENCRYPTION_KEY` and `AUTH_SECRET`. It must exist **before** install — see [Prerequisites](#prerequisites).
-
-### SMTP / email
-
-Off by default — the zero-config install works via the no-email admin-signup bootstrap. Enable it for email invites, address verification, and password reset:
-
-- `smtp.enabled` — Turn email on. `smtp.host` and `smtp.fromAddress` are required when enabled.
-- `smtp.requireTls` — STARTTLS is required by default; set `false` only for a plaintext mail catcher (e.g. Mailpit on port `1025`).
-- `smtp.auth.secretName` — Name of an optional dictionary secret with `SMTP_USERNAME` and `SMTP_PASSWORD` for authenticated SMTP. Empty means no authentication; when set, the workload is granted `reveal` on exactly that secret.
-
-### Access
-
-- `publicAccess.enabled` — Serve the UI and API on the canonical `*.cpln.app` HTTPS endpoint (default). Set to `false` for an internal-only instance.
-- `internalAccess.type` — Internal firewall scope of the server workload:
-
-| Type | Description |
-|------|-------------|
-| `none` | No internal access. |
-| `same-gvc` | Allow access from all workloads in the same GVC (default). |
-| `same-org` | Allow access from all workloads in the same organization. |
-| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
-
-### PostgreSQL
-
-- `postgres.credentials.password` — The bundled database password. **Change it before installing.**
-- `postgres.config.credentialsSecretName` — Name of the dictionary secret the chart creates from those three values and hands to the bundled PostgreSQL. Secret names are organization-wide, so give each release its own name; a second release left on the default is **refused at install** and creates nothing, leaving the first release untouched.
-- `postgres.volumeset.capacity` — Initial volume size in GiB (minimum 10).
-
-PostgreSQL stores everything: secrets, versions, projects, environments, and users.
-
-### Redis
-
-- `redis.redis.auth.password.enabled` — When `false` (default), Redis runs authless with the same-GVC firewall as the boundary. Set to `true` to require AUTH on the data nodes; the master password is then wired into Infisical as `REDIS_PASSWORD` (Sentinels stay authless). Both paths are tested end to end, including Sentinel monitoring the auth-protected master.
-- `redis.redis.replicas` / `redis.sentinel.replicas` — Redis and Sentinel replica counts (3 + 3 by default).
-
-Redis is required — Infisical will not boot without it, so the template hard-wires the dependency (no enable/disable toggle).
+Leave Sentinel authentication off: the server authenticates only to the data nodes, and the chart refuses to render if `redis.sentinel.auth` is enabled.
 
 ## Connecting
 
-| Target | Address | Credentials |
+| What | Address | Notes |
 |---|---|---|
-| Public UI + API | `https://<canonical>.cpln.app` | first sign-up becomes super-admin |
-| Internal (same GVC) | `http://{release}-infisical.{gvc}.cpln.local:8080` | account login / API token |
-| Health check | `GET /api/status` | none |
+| Public UI and API | `https://<canonical>.cpln.app` | Assigned automatically while `publicAccess.enabled` is `true`. Read it from `status.canonicalEndpoint` with `cpln workload get RELEASE_NAME-infisical --gvc GVC_NAME -o yaml`. |
+| Health | `GET /api/status` | Unauthenticated, on the same host; also the readiness and liveness probe. |
+| Internal API (same GVC) | `http://RELEASE_NAME-infisical.GVC_NAME.cpln.local:8080` | For other workloads using the Infisical SDK, CLI, or agent; reachable per `internalAccess.type`. |
+| Login | The account created on first run | Infisical ships no default account. |
+| PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | `username` / `password` / `database` from `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `postgres.config.credentialsSecretName`. |
+| Redis Sentinel | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Master name `mymaster`; data nodes are unauthenticated unless `redis.redis.auth.password.enabled` is `true`. |
 
-The canonical `*.cpln.app` hostname appears under `status.canonicalEndpoint` (`cpln workload get {release}-infisical -o yaml`).
+With `publicAccess.enabled: false` there is no public endpoint; reach the UI from your machine through a tunnel instead and open `http://localhost:8080`:
+
+```bash
+cpln port-forward RELEASE_NAME-infisical 8080:8080 --gvc GVC_NAME
+```
+
+### First Run
+
+Infisical ships no default account: the first person to sign up becomes the server administrator, and with public access on that form is open to anyone who can reach the endpoint.
+
+<Steps>
+  <Step title="Wait for the server workload to report ready">
+    PostgreSQL and Redis come up first; the server then runs its database migrations and starts serving. While it waits for the database its logs may show `Boot up migration failed` retries — they stop once the migrations complete.
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-infisical --gvc GVC_NAME -o yaml
+    ```
+  </Step>
+  <Step title="Open the endpoint and sign up">
+    Browse to the canonical endpoint (or the port-forward URL) and create your account. Do this as soon as the workload is ready — this first account is the server administrator.
+  </Step>
+  <Step title="Close open sign-ups">
+    Open **Server Console** from the top navigation (visible only to server administrators) and set **Signup mode** to **Disabled**, so nobody else can create an account directly. Configure [Email](#email) before inviting your team — invitations are delivered by email.
+  </Step>
+</Steps>
+
+## Operations
+
+### Backing Up
+
+Scheduled backups of the bundled PostgreSQL are off by default. Enabling `postgres.backup.enabled: true` adds one cron workload, `RELEASE_NAME-postgres-backup`, that runs `pg_dumpall` on the schedule and uploads a gzipped dump to your bucket under the configured prefix. Pick a `postgres.backup.provider` and complete the matching setup **before** installing or upgrading with it on.
+
+<Tabs>
+  <Tab title="AWS S3">
+    ```yaml
+    postgres:
+      backup:
+        enabled: true
+        provider: aws
+        aws:
+          bucket: my-postgres-bucket
+          region: us-east-1
+          cloudAccountName: my-s3-cloud-account
+          policyName: my-postgres-backup-policy # bucket-scoped IAM policy
+          prefix: postgres/backups
+    ```
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create an S3 bucket. Set `postgres.backup.aws.bucket` and `postgres.backup.aws.region` to match.
+      </Step>
+      <Step title="Set up a cloud account">
+        If you do not have one, [create a cloud account](/guides/create-cloud-account) for the AWS account holding the bucket. Set `postgres.backup.aws.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        Create an IAM policy with the JSON below (replace `YOUR_BUCKET_NAME`) and set `postgres.backup.aws.policyName` to its name. The template attaches it to the bundled PostgreSQL identity and nothing else:
+
+        ```json
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion",
+                "s3:GetBucketLocation",
+                "s3:AbortMultipartUpload",
+                "s3:ListBucketMultipartUploads",
+                "s3:ListMultipartUploadParts"
+              ],
+              "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+              ]
+            }
+          ]
+        }
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    ```yaml
+    postgres:
+      backup:
+        enabled: true
+        provider: gcp
+        gcp:
+          bucket: my-postgres-bucket
+          cloudAccountName: my-gcs-cloud-account
+          prefix: postgres/backups
+    ```
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create a GCS bucket. Set `postgres.backup.gcp.bucket` to its name.
+      </Step>
+      <Step title="Set up a cloud account">
+        [Create a cloud account](/guides/create-cloud-account) for the GCP project holding the bucket and set `postgres.backup.gcp.cloudAccountName` to its name.
+      </Step>
+      <Step title="Grant storage access">
+        Grant the cloud account's service account the **Storage Admin** (`roles/storage.admin`) role on the project. The chart additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket in `postgres.backup.gcp.bucket`.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="MinIO / S3-compatible">
+    ```yaml
+    postgres:
+      backup:
+        enabled: true
+        provider: minio
+        minio:
+          endpoint: http://my-minio-workload:9000 # S3 API address including the port
+          bucket: my-postgres-bucket
+          credentialsSecretName: my-postgres-minio-credentials # dictionary secret with accessKey + secretKey
+          prefix: postgres/backups
+    ```
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create the bucket on your server. Set `postgres.backup.minio.bucket` to its name and `postgres.backup.minio.endpoint` to the S3 API address including the port — for the [MinIO](/template-catalog/templates/minio) template in the same GVC, `http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000`.
+      </Step>
+      <Step title="Create the credentials secret">
+        Create a dictionary secret with the server's keys and set `postgres.backup.minio.credentialsSecretName` to its name. No cloud account is involved.
+
+        ```bash
+        cpln secret create-dictionary --name BACKUP_MINIO_SECRET_NAME \
+          --entry accessKey=YOUR-ACCESS-KEY \
+          --entry secretKey='YOUR-SECRET-KEY'
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
 
 <Warning>
-**The first account to sign up becomes the super-admin.** There are no admin bootstrap variables — with public access enabled, create your admin account immediately after install, then disable open sign-ups in the Admin panel.
+A zero-length backup object is a failed run, not a backup. If the dump cannot reach the database, the upload still writes a near-empty gzip under a normal timestamped filename. Check the object size before you rely on one.
 </Warning>
+
+The dump is useless without the `ENCRYPTION_KEY` it was written under — every secret in it is encrypted with that key, which lives only in the secret you created. Back that secret up alongside the database. The PostgreSQL volume set `RELEASE_NAME-pg-vs` also keeps 7 days of [volume set snapshots](/reference/volumeset) and takes a final snapshot when the release is uninstalled.
+
+### Restoring a Backup
+
+Each backup is a gzipped plain-SQL `pg_dumpall` archive. Restoring means replaying that SQL into the bundled PostgreSQL, then starting a server whose `secrets.name` holds the **same** `ENCRYPTION_KEY` and `AUTH_SECRET` the dump was written under. The one transport that carries a dump into the container intact is `cpln workload exec` with `--stdin` and a `base64` wrapper on both ends — raw binary piped through exec is corrupted:
+
+```bash
+gunzip -c BACKUP_FILE.sql.gz | base64 | cpln workload exec RELEASE_NAME-postgres --gvc GVC_NAME \
+  --container postgresql --stdin --quiet -- sh -c 'base64 -d | psql -U "$POSTGRES_USER" -d postgres'
+```
+
+Two constraints make this a planned operation: the archive contains `CREATE ROLE` and `CREATE DATABASE` statements, so a straight replay collides with the database the server already created and migrated on first boot; and no server replica may be connected while you drop and recreate that database before the replay.
+
+<Warning>
+This restore path has not been exercised against this template end to end. Rehearse it on a throwaway release before you depend on it. Restoring from a volume set snapshot is likewise unverified here.
+</Warning>
+
+### Upgrading from 1.0.0
+
+Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. Infisical absorbed that change rather than passing it on — the chart now creates the credentials secret itself — so there is **no new prerequisite**, only a rename of three keys:
+
+| Removed key (1.0.0) | Replacement (1.1.0) |
+|---|---|
+| `postgres.config.username` | `postgres.credentials.username` |
+| `postgres.config.password` | `postgres.credentials.password` |
+| `postgres.config.database` | `postgres.credentials.database` |
+
+Move the three keys, keep the same values so the running database still matches, and upgrade in place. A values file that still carries an old key fails the render with the **postgres template's** message, which tells you to create a dictionary secret yourself — ignore that advice here; this template creates it.
+
+<Note>
+The first `helm upgrade` after an install can restart the bundled PostgreSQL even when its values are unchanged, so expect a brief interruption.
+</Note>
+
+### Scaling and Availability
+
+`infisical.replicas` sets how many server replicas run. The server is stateless over the shared PostgreSQL and Redis, so replicas need no peer discovery or sticky sessions, and two or more give near-zero-downtime rolling restarts. Every replica runs the database migrations on boot; a migration lock serializes them so they run exactly once no matter how many replicas start together.
+
+```yaml
+infisical:
+  replicas: 2
+```
+
+Keep `infisical.resources.maxMemory` at `2Gi` when scaling out — a cold multi-replica boot running migrations runs out of memory at `1Gi`.
+
+The bundled Redis is already highly available (three data nodes, three Sentinels, automatic failover). The bundled PostgreSQL is a single instance on a persistent volume: a node failure reschedules it and reattaches the same volume, so the exposure is minutes of downtime, not data loss. Stored secrets live only in PostgreSQL and survive restarts, redeploys, and upgrades under the same release name.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Deployment never becomes ready and the logs are empty">
+    **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-infisical --gvc GVC_NAME -o yaml` shows `The secret INFISICAL_KEYS_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
+
+    **Cause:** The root-of-trust secret named by `secrets.name` does not exist (or, with SMTP auth on, the secret named by `smtp.auth.secretName` does not).
+
+    **Fix:** Create it (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-infisical --gvc GVC_NAME` skips the wait.
+  </Accordion>
+  <Accordion title="Logs show Boot up migration failed during first boot">
+    **Symptom:** `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-infisical"}' --limit 50 --since 10m` shows repeated `Boot up migration failed` lines shortly after install, and the workload is not yet ready.
+
+    **Cause:** The server started before the bundled PostgreSQL finished initializing and is retrying its migrations.
+
+    **Fix:** Nothing — the retries stop once the database accepts connections and the workload becomes ready. If the lines keep coming, check `RELEASE_NAME-postgres` with `cpln workload get-deployments RELEASE_NAME-postgres --gvc GVC_NAME -o yaml`.
+  </Accordion>
+  <Accordion title="Second install refused as managed by a different release">
+    **Symptom:** Installing a second Infisical release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
+
+    **Cause:** Both releases use the same `postgres.config.credentialsSecretName`. Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
+
+    **Fix:** Set `postgres.config.credentialsSecretName` to a distinct name for the second release and install again.
+  </Accordion>
+  <Accordion title="Upgrade from 1.0.0 fails with config.username was REMOVED in postgres 3.4.0">
+    **Symptom:** The render fails with `config.username was REMOVED in postgres 3.4.0` (or the same message for `config.password` / `config.database`) and tells you to create a dictionary secret.
+
+    **Cause:** Your values file still carries `postgres.config.username`, `postgres.config.password`, or `postgres.config.database`.
+
+    **Fix:** Rename them to `postgres.credentials.*` as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0). Do not create a secret yourself — this template creates it.
+  </Accordion>
+  <Accordion title="Render fails because redis.sentinel.auth must stay disabled">
+    **Symptom:** `infisical: redis.sentinel.auth must stay disabled — Infisical authenticates only the data nodes (REDIS_PASSWORD), not the sentinels`.
+
+    **Cause:** `redis.sentinel.auth.password.enabled` or `redis.sentinel.auth.fromSecret.enabled` is `true`.
+
+    **Fix:** Turn Sentinel authentication off. To require a password on the data nodes, set `redis.redis.auth.password.enabled: true` and a value for `redis.redis.auth.password.value` instead.
+  </Accordion>
+  <Accordion title="Login does not stick or links point at the wrong host">
+    **Symptom:** Signing in returns you to the login page, or emails and UI links use a host other than the one you browse to.
+
+    **Cause:** The URL the server advertises (`SITE_URL`) does not match the host you reach it on — typically a custom domain in front of the workload while `infisical.siteUrl` is still empty and derives the canonical endpoint.
+
+    **Fix:** Set `infisical.siteUrl` to the URL users actually open, including `https://`, and upgrade the release.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **The prerequisite secret must exist before install** — `secrets.name` is a dictionary secret with `ENCRYPTION_KEY` and `AUTH_SECRET`. A missing secret wedges the deployment and makes it look broken.
-- **`ENCRYPTION_KEY` and `AUTH_SECRET` are write-once — never rotate them.** `ENCRYPTION_KEY` encrypts every stored secret; `AUTH_SECRET` signs all sessions.
-- **The first account to sign up becomes super-admin** — create it immediately after install, then disable open sign-ups in the Admin panel.
-- **Redis is required, not optional** — Infisical will not boot without it (authless behind the same-GVC firewall by default).
-- **Keep `infisical.resources.maxMemory` at `2Gi`** — a cold boot with `replicas` ≥ 2 runs out of memory at `1Gi`.
-- **Stored secrets live in PostgreSQL and survive an app restart or reinstall** — to wipe all data you must also reinstall the PostgreSQL dependency (which deletes its volume set).
-- **First boot takes roughly 2–5 minutes** — the server waits for PostgreSQL to finish initializing and runs its migrations, logging transient `Boot up migration failed` retries in the meantime. This self-heals; the workload becomes ready once migrations complete.
+- **Create the root-of-trust secret before installing** — `secrets.name` must name an existing dictionary secret with `ENCRYPTION_KEY` and `AUTH_SECRET`. A missing secret wedges the deployment silently.
+- **`ENCRYPTION_KEY` and `AUTH_SECRET` are write-once — never rotate them.** A changed `ENCRYPTION_KEY` makes every stored secret unreadable; a changed `AUTH_SECRET` invalidates every session. Back both up outside Control Plane.
+- **Sign up right after install** — the first account becomes the server administrator and the form is open to anyone who can reach the endpoint. Then set **Signup mode** to **Disabled** in the Server Console.
+- **Redis is required, not optional** — the server does not boot without it, and Sentinel authentication must stay off.
+- **Keep `infisical.resources.maxMemory` at `2Gi`** — a cold boot with `infisical.replicas` of 2 or more runs out of memory at `1Gi`.
+- **Change `postgres.credentials.password` before installing** — it seeds the database on first boot and is not updated by later value edits.
+- **Give each release its own `postgres.config.credentialsSecretName`** — secret names are org-wide, and a second release on the same name is refused at install.
+- **A database backup is only as good as the key** — a restored dump is unreadable without the `ENCRYPTION_KEY` it was written under.
+- **Uninstalling deletes the PostgreSQL volume set** and every stored secret in it; your root-of-trust secret is yours and survives.
 - **Set `smtp.requireTls: false` only for a plaintext mail catcher** — real providers on port `587` need it left `true`.
 
 ## External References
@@ -229,8 +504,8 @@ The canonical `*.cpln.app` hostname appears under `status.canonicalEndpoint` (`c
   <Card title="Standalone Deployment" icon="server" href="https://infisical.com/docs/self-hosting/deployment-options/standalone-infisical">
     The standalone image this template deploys
   </Card>
-  <Card title="Email Service Setup" icon="envelope" href="https://infisical.com/docs/self-hosting/configuration/envars#email-service">
-    SMTP setup for invites, verification, and password reset
+  <Card title="Server Admin Console" icon="user-shield" href="https://infisical.com/docs/documentation/platform/admin-panel/server-admin">
+    Signup mode and other instance-wide settings
   </Card>
   <Card title="Infisical Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/infisical">
     View the source files, default values, and chart definition
