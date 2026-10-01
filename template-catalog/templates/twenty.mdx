@@ -1,71 +1,98 @@
 ---
 title: Twenty
 icon: /template-catalog/templates/icons/twenty.png
-description: Deploy Twenty on Control Plane using the Template Catalog. Open-source CRM with customizable objects, pipelines, and views, a background job worker, a bundled Redis queue, and a single-instance or highly available PostgreSQL backing store.
-keywords: ['twenty', 'crm', 'salesforce alternative', 'hubspot alternative', 'pipedrive alternative', 'attio alternative', 'open source crm', 'contact management', 'sales pipeline', 'customer records', 'graphql api', 'background worker', 'agpl']
+description: Deploy Twenty on Control Plane. Open-source CRM with customizable objects, pipelines and views, a background worker, bundled Redis and PostgreSQL — single-instance by default or highly available with one flag. Needs an existing GVC and an opaque secret holding the app key.
+keywords: ['salesforce alternative', 'hubspot alternative', 'pipedrive alternative', 'attio alternative', 'contact management', 'sales pipeline', 'customer records', 'graphql api', 'rest api', 'bullmq', 'workflows', 'agpl', 'twenty template']
 ---
 
 ## Overview
 
-Twenty is an open-source CRM — a self-hosted alternative to Salesforce, HubSpot, and Pipedrive — with customizable objects, pipelines, views, and workflows behind a REST and GraphQL API. This template deploys the Twenty server on port `3000`, a background worker that runs its job queues and cron jobs, a bundled Redis, and a PostgreSQL backing store that is a single instance by default or a highly available Patroni cluster when you opt in.
+Twenty is an open-source CRM — a self-hosted alternative to Salesforce, HubSpot and Pipedrive — with customizable objects, pipelines, views and workflows behind a REST and GraphQL API. This template deploys the Twenty server (React front end plus NestJS API on port `3000`), a background worker that drains its job queues and runs its cron jobs, a bundled single-node Redis, and a PostgreSQL database that is a single instance by default or a highly available Patroni cluster with one flag. Attachments go to a shared persistent volume or to an S3 bucket you own. Twenty is AGPL-3.0 licensed; the template runs the unmodified upstream image.
 
-### Architecture
-
-- **Twenty server** — A stateful workload running the official image, serving the React front end, the REST API, and the GraphQL API on port `3000`. It scales horizontally through `twenty.replicas`.
-- **Background worker** — A second workload from the same image running `yarn worker:prod`. It processes the BullMQ queues (entity events, webhooks, workflow triggers, file maintenance) and runs the registered cron jobs. It is always exactly one replica.
-- **Redis** — A bundled single-node Redis with AOF persistence and a `noeviction` memory policy, deployed by this chart. Twenty does not boot without it: the queues and the cache both live here, and an evicted key would silently drop queued jobs.
-- **PostgreSQL (single instance, default)** — The [postgres](/template-catalog/templates/postgres) template as a subchart, running PostgreSQL 18. Holds every record, workspace, and workspace-level schema.
-- **PostgreSQL (highly available, optional)** — The [postgres-highly-available](/template-catalog/templates/postgres-highly-available) template instead, running PostgreSQL 17: 3× Patroni PostgreSQL with automatic failover, 3× etcd, and an HAProxy leader endpoint that Twenty connects through.
-- **Attachment storage** — Either a shared persistent volume mounted by both the server and the worker (default), or an S3 bucket you own.
+<Note>
+This template does not create a GVC. It deploys into an existing [GVC](/reference/gvc) that you already have; pass it with `--gvc GVC_NAME`.
+</Note>
 
 ### What Gets Created
 
-- **Stateful Twenty Workload** — The Twenty server on port `3000` (`{release}-twenty`), with `twenty.replicas` replicas and configurable CPU and memory.
-- **Standard Worker Workload** — The background worker (`{release}-twenty-worker`), pinned to one replica, with no inbound access at all.
-- **Stateful Redis Workload** — The bundled single-node Redis (`{release}-twenty-redis`) with password authentication.
-- **Database Workloads** — Single mode: one stateful PostgreSQL workload. HA mode: a stateful Patroni PostgreSQL workload, a stateful etcd workload, and a standard HAProxy leader-routing workload.
-- **Volume Sets** — A shared (read-write-many) attachment volume set mounted by both the server and the worker at `/app/packages/twenty-server/.local-storage` (only when `storage.type` is `local`), one for the Redis AOF file at `/data`, and the database subchart's data volumes.
-- **Secrets** — A dictionary secret (`{release}-twenty-creds`) holding the bundled Redis password used to assemble `REDIS_URL`, and an opaque secret (`{release}-twenty-worker-start`) holding the worker's start script. Your prerequisite app-key secret is *not* created by the template — see [Prerequisites](#prerequisites).
-- **Identity & Policy** — One identity shared by the server, worker, and Redis workloads, and a policy granting it `reveal` on exactly the secrets they read: the credentials secret, the worker start script, the active database's credentials secret, your app-key secret, and — when configured — the rotation fallback and S3 static-key secrets. In keyless S3 mode the identity also carries the cloud account link and your bucket-scoped IAM policy.
-- **Cron Backup Workload** *(optional)* — Created inside the backing PostgreSQL store when database backups are enabled.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-twenty` | Twenty server — UI, REST and GraphQL API (stateful, `twenty.replicas` replicas, port `3000`) | — |
+| Workload | `RELEASE_NAME-twenty-worker` | Background worker — job queues and cron jobs (standard, fixed at 1 replica, no inbound access) | — |
+| Workload | `RELEASE_NAME-twenty-redis` | Bundled Redis — job queues and cache (stateful, fixed at 1 replica, port `6379`) | — |
+| Workload | `RELEASE_NAME-postgres` | Single-instance PostgreSQL 18 (stateful) | `postgres.enabled: true` (default) |
+| Workload | `RELEASE_NAME-postgres-backup` | Scheduled logical database backup (cron) | `postgres.backup.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL 17 cluster (stateful, `postgresHA.replicas` replicas) | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-etcd` | etcd consensus store for Patroni (stateful) | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy leader endpoint Twenty connects to (standard) | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha-backup` | Scheduled logical database backup (cron) | `postgresHA.backup.enabled: true` with `mode: logical` |
+| Volume Set | `RELEASE_NAME-twenty-storage` | Shared (read-write-many) attachment storage mounted by the server and the worker at `/app/packages/twenty-server/.local-storage` | `storage.type: local` (default) |
+| Volume Set | `RELEASE_NAME-twenty-redis-vs` | Redis append-only file at `/data` | — |
+| Volume Set | `RELEASE_NAME-pg-vs` | Single-instance database data | `postgres.enabled: true` (default) |
+| Volume Set | `RELEASE_NAME-postgres-ha-vs`, `RELEASE_NAME-etcd-vs` | Database and etcd data, one volume per replica | `postgresHA.enabled: true` |
+| Secret | `my-twenty-db-credentials` | Dictionary secret with the database `username`, `password` and `database`, built by this template from `postgres.credentials.*`; the name comes from `postgres.config.credentialsSecretName` or `postgresHA.config.credentialsSecretName` | — |
+| Secret | `RELEASE_NAME-twenty-creds` | Dictionary secret holding the bundled Redis password | — |
+| Secret | `RELEASE_NAME-twenty-server-start`, `RELEASE_NAME-twenty-worker-start` | Start scripts for the server and worker containers | — |
+| Secret | `RELEASE_NAME-etcd-startup`, `RELEASE_NAME-patroni-startup`, `RELEASE_NAME-postgres-proxy-startup`, `RELEASE_NAME-wal-g-backup-script` | Start scripts of the highly available database | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-postgres-config` | Non-sensitive backup settings of the highly available database | `postgresHA.backup.enabled: true` |
+| Identity | `RELEASE_NAME-twenty-identity` | Shared by the server, worker and Redis workloads; carries the AWS cloud account link in keyless S3 mode | — |
+| Policy | `RELEASE_NAME-twenty-policy` | Grants the identity `reveal` on exactly the secrets Twenty reads, including your prerequisite secrets | — |
+| Identity, Policy | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-pg-policy` | Single-instance database identity and its secret access | `postgres.enabled: true` (default) |
+| Identity, Policy | `RELEASE_NAME-postgres-ha-identity`, `RELEASE_NAME-postgres-ha-policy`, `RELEASE_NAME-etcd-identity`, `RELEASE_NAME-etcd-policy` | Database and etcd identities and their secret access | `postgresHA.enabled: true` |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+Your app key secret (see [Prerequisites](#prerequisites)) is **not** created by the template.
 
 ## Prerequisites
 
-Twenty encrypts stored OAuth tokens, TOTP secrets, and app variables, and signs its auth tokens, with a single app key that you supply through an [opaque secret](/guides/create-secret/opaque) created **before** installing. The value is never passed through Helm values.
+Twenty encrypts stored OAuth tokens, TOTP secrets and app variables, and signs its auth tokens, with one app key that you supply through an [opaque secret](/guides/create-secret/opaque) created **before** installing. The value never passes through Helm values; the template hands it to Twenty as both `APP_SECRET` and `ENCRYPTION_KEY`.
 
 <Steps>
   <Step title="Create the app key secret">
-    The payload is a single random string:
+    The payload is a single random string. Secrets are org-level, so no `--gvc` flag is involved:
 
     ```bash
-    printf '%s' "$(openssl rand -base64 32)" | \
-      cpln secret create-opaque --name my-twenty-app-secret --encoding plain -f -
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name APP_KEY_SECRET_NAME --encoding plain -f -
     ```
 
-    Use `printf` rather than `echo` so the payload carries no trailing newline.
-  </Step>
-  <Step title="Point the template at it">
-    Set `secrets.name` to the secret's name (default `my-twenty-app-secret`). Secrets are org-level, so no GVC flag is involved. The template supplies the value to Twenty as both `APP_SECRET` and `ENCRYPTION_KEY`.
+    Set `secrets.name` to this name.
   </Step>
   <Step title="Back the value up">
-    Store a copy somewhere safe, outside Control Plane.
+    Store a copy outside Control Plane. The key is effectively write-once: changing `secrets.name` without pointing `secrets.fallbackName` at the previous key makes stored OAuth tokens, TOTP secrets and app variables undecryptable and logs everyone out. See [Rotating the App Key](#rotating-the-app-key).
+  </Step>
+  <Step title="Choose the two bundled passwords">
+    The database password (`postgres.credentials.password`) and the Redis password (`redis.auth.password`) ship as `change-me-…` placeholders that the template uses as-is. Pick strong values and pass them at install time. Both are embedded in connection URLs, so use only letters, digits, `-` and `_`; the chart refuses to render anything else. The database password seeds the database on first boot and is not changed by later value edits.
   </Step>
 </Steps>
 
 <Warning>
-Create the secret **before** installing. Without it the deployment sits waiting on a secret that does not exist and never becomes ready, which looks like a broken install. Treat the key as write-once: changing `secrets.name` without also setting `secrets.fallbackName` to the previous key makes stored OAuth tokens, TOTP secrets, and app variables undecryptable and logs everyone out. See [Rotating the App Key](#rotating-the-app-key).
+**If the app key secret does not exist at install time, the deployment wedges silently.** `cpln logs` returns zero lines — the container never starts, so it has nothing to log. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-twenty --gvc GVC_NAME -o yaml
+```
+
+Note this is `get-deployments` — plain `cpln workload get` has no `versions` field. Creating the secret repairs the deployment on its own after several minutes, or force a redeployment to skip the wait.
 </Warning>
 
-Everything else works with the defaults. Two optional features need their own setup first:
+Everything else works with the defaults. Three optional features need their own setup first:
 
-- **S3 attachment storage** — an existing bucket plus either a Control Plane cloud account (AWS) or a static-key secret (S3-compatible servers). See [Attachment Storage](#attachment-storage). Required if you plan to run more than one replica.
-- **Database backups** — a bucket and provider access set up beforehand. See [Backing Up](#backing-up).
+- **S3 attachment storage** — an existing bucket plus either a Control Plane cloud account (AWS S3) or a static-key dictionary secret (S3-compatible servers). See [Attachment Storage](#attachment-storage). Required for more than one server replica.
+- **Database backups** — a bucket and access setup for AWS S3, Google Cloud Storage or an S3-compatible server. See [Backing Up](#backing-up).
+- **App key rotation** — a second opaque secret holding the previous key, referenced by `secrets.fallbackName` for the duration of the rotation. See [Rotating the App Key](#rotating-the-app-key).
 
-Once your app key secret exists, install the template using your preferred method:
+## Installation
+
+Once the app key secret exists, install into your existing GVC with the two bundled passwords set:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/twenty \
+  --version 1.3.0 --gvc GVC_NAME \
+  --set secrets.name=APP_KEY_SECRET_NAME \
+  --set postgres.credentials.password='YOUR-STRONG-DB-PASSWORD' \
+  --set redis.auth.password='YOUR-STRONG-REDIS-PASSWORD'
+```
+
+To install using another method, follow the instructions for it:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -89,209 +116,115 @@ Once your app key secret exists, install the template using your preferred metho
     </Card>
 </CardGroup>
 
-## Choosing a Database Mode
-
-Exactly one of the two backing stores must be enabled — the chart enforces this at render. Twenty is wired to the active database automatically, including for its boot migrations, and both modes create the `uuid-ossp` and `unaccent` extensions on first boot.
-
-| | `postgres` (default) | `postgresHA` |
-|---|---|---|
-| What runs | One single-replica PostgreSQL workload | 3× Patroni PostgreSQL, 3× etcd, HAProxy leader endpoint |
-| PostgreSQL major | 18 | 17 |
-| Database failover | None | Automatic (Patroni leader election) |
-| First install to ready | ~4 minutes | ~9 minutes |
-| Best for | Development and lightweight installs | Production |
-
-The two paths run **different PostgreSQL majors**, so pick the mode before you have data: moving an existing database between them is a `pg_dump` and restore, not a values change. To use HA mode, set `postgres.enabled: false` and `postgresHA.enabled: true`.
-
-## First Run
-
-Twenty ships no default account, and the first person to sign up creates the workspace and becomes its full administrator.
-
-<Steps>
-  <Step title="Wait out the first boot">
-    PostgreSQL and Redis come up first, then Twenty creates its schemas, installs the `uuid-ossp` and `unaccent` extensions, and runs its migrations before it starts serving. Expect roughly 4 minutes on the single-instance database and roughly 9 minutes in HA mode, where the server retries against the HAProxy endpoint until Patroni has elected a leader.
-  </Step>
-  <Step title="Ignore the first minute of log noise">
-    Every fresh install logs `error: relation "core.appToken" does not exist` and similar lines for about a minute, along with `[DatabaseConfigDriver] [INIT] Failed to load config variables from database, falling back to environment variables`. These are containers reading the schema while it is still being created; they stop on their own once migrations finish.
-  </Step>
-  <Step title="Sign up immediately">
-    Browse to the canonical `*.cpln.app` endpoint of the `{release}-twenty` workload and create the first account. It becomes the workspace administrator with full admin-panel access.
-  </Step>
-  <Step title="Finish configuration inside the app">
-    SMTP, AI provider keys, rate limits, and OAuth/SSO are not template values. Set them in **Settings → Admin Panel → Configuration Variables**; changes take effect within about 15 seconds.
-  </Step>
-</Steps>
-
-<Warning>
-Do not abort a slow first install. The Twenty server does not listen on port `3000` until its boot migrations complete, and in HA mode the container deliberately restarts while it waits for the Patroni leader. Give it the full window above before investigating.
-</Warning>
-
 ## Configuration
 
-The default `values.yaml` for this template:
-
-```yaml
-twenty:
-  image: twentycrm/twenty:v2.26.1
-  replicas: 1 # >1 REQUIRES storage.type: s3 and moves boot migrations to the worker
-  serverUrl: "" # public base URL; empty = the platform canonical endpoint
-  dbPoolMaxConnections: 10 # PostgreSQL connections per pool, per process
-  resources:
-    minCpu: 250m
-    maxCpu: 1000m
-    minMemory: 512Mi
-    maxMemory: 2Gi # headroom for first-boot migrations and upgrade backfills
-
-worker: # same image, `yarn worker:prod`; always exactly one replica
-  resources:
-    minCpu: 250m
-    maxCpu: 1000m
-    minMemory: 512Mi
-    maxMemory: 2Gi
-
-secrets:
-  name: my-twenty-app-secret # opaque secret holding the app key — MUST exist before install
-  fallbackName: "" # opaque secret holding the PREVIOUS key, only during a rotation
-
-storage:
-  type: local # local | s3 (s3 required for twenty.replicas > 1)
-  local:
-    volumeset:
-      capacity: 10 # GiB (minimum 10); mounted at /app/packages/twenty-server/.local-storage
-  s3:
-    bucket: my-twenty-bucket
-    region: us-east-1
-    endpoint: "" # set for S3-compatible servers (e.g. http://my-minio:9000)
-    cloudAccountName: my-s3-cloud-account # keyless AWS auth; used only when auth.secretName is empty
-    policyName: my-twenty-s3-policy # your pre-created bucket-scoped IAM policy
-    auth:
-      secretName: "" # dictionary secret with STORAGE_S3_ACCESS_KEY_ID + STORAGE_S3_SECRET_ACCESS_KEY; S3-compatible servers only
-
-publicAccess:
-  enabled: true # HTTPS UI + API on the auto *.cpln.app endpoint; false = internal-only
-
-internalAccess:
-  type: same-gvc # options: none, same-gvc, same-org, workload-list
-  workloads: [] # used only with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
-
-redis: # bundled single node — job queues + cache (required)
-  image: redis:8.10.0
-  auth:
-    password: change-me-twenty-redis # change before installing; letters, digits, - and _ only
-  resources:
-    minCpu: 100m
-    maxCpu: 400m
-    minMemory: 256Mi
-    maxMemory: 512Mi
-  volumeset:
-    capacity: 10 # GiB (minimum 10); AOF at /data
-
-postgres: # single instance (default) — PostgreSQL 18
-  enabled: true
-  image: postgres:18
-  credentials: # the chart writes these into the secret named below — nothing for you to create
-    username: twenty
-    password: change-me-twenty-db # change before installing; letters, digits, - and _ only
-    database: twenty
-  config:
-    credentialsSecretName: my-twenty-db-credentials # secret names are org-wide — give each release its own
-  resources:
-    minCpu: 250m
-    maxCpu: 1000m
-    minMemory: 512Mi
-    maxMemory: 1Gi
-  volumeset:
-    capacity: 10 # GiB (minimum 10)
-  backup:
-    enabled: false # see Backing Up; provider: aws | gcp | minio
-
-postgresHA: # highly available (opt-in) — PostgreSQL 17
-  enabled: false
-  postgres:
-    username: twenty
-    password: change-me-twenty-db # change before installing; letters, digits, - and _ only
-    database: twenty
-  replicas: 3
-  resources:
-    minCpu: 500m
-    maxCpu: 1000m
-    minMemory: 1Gi
-    maxMemory: 2Gi
-  volumeset:
-    capacity: 10 # GiB per replica (minimum 10)
-  backup:
-    enabled: false # see Backing Up; mode: logical | wal-g, provider: aws | gcp | minio
-```
+Each subsection shows the shipped defaults for one top-level values area.
 
 ### Twenty Server
 
-- `image` — The official Twenty image. The Docker tag keeps its leading `v`.
-- `replicas` — Number of server replicas. Anything above `1` requires `storage.type: s3`; the chart fails the render with a clear message otherwise. See [Scaling](#scaling).
-- `serverUrl` — The public base URL Twenty uses as its front-end origin and for auth callbacks, including the `https://` scheme. Leave it empty to use the workload's canonical endpoint; set it when you serve Twenty on a custom domain. A value that does not match the URL browsers actually use breaks authentication and CORS with opaque errors.
-- `dbPoolMaxConnections` — PostgreSQL connections per pool, per process. Raise it and `replicas` together with care: the database has a finite connection limit, and the worker holds its own pools.
-- `resources` — CPU and memory bounds for the server container. The memory ceiling leaves headroom for the first-boot migrations and upgrade backfills.
+```yaml
+twenty:
+  # One image serves the React front end and the NestJS API on :3000.
+  # Docker tag keeps the leading "v"; Chart appVersion drops it.
+  image: twentycrm/twenty:v2.26.1
+  # Stateless web tier. >1 REQUIRES storage.type: s3 and moves boot migrations
+  # to the worker (they must run in exactly one container).
+  replicas: 1
+  # Public base URL. MUST match the URL browsers use or auth/CORS fail with
+  # opaque errors. Empty = the platform canonical endpoint. Set WITH https://
+  # only for a custom domain.
+  serverUrl: ""
+  # Postgres connections per pool, per process. Raise replicas and this together
+  # with care — the database has a finite connection limit.
+  dbPoolMaxConnections: 10
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 2Gi   # headroom for first-boot migrations and upgrade backfills
+```
+
+Both the server and the worker run `twenty.image`. Leave `twenty.serverUrl` empty on a public install: the server then advertises its own canonical endpoint, and the worker advertises the server's — never its own. Set it, with the scheme, whenever browsers open Twenty at any other address: a custom domain (`https://crm.example.com`), or the address you reach through a port-forward on a private install (`http://localhost:3000`). Twenty compares the browser origin against `SERVER_URL`, so a mismatch breaks sign-in and CORS with opaque errors.
 
 ### Background Worker
 
-The worker runs the same image with `yarn worker:prod` and is always exactly one replica — it registers the repeatable cron jobs, and it owns the boot migrations whenever `twenty.replicas` is above `1`. There is no `worker.replicas` knob; only `worker.resources` is configurable.
+```yaml
+# Same image, `yarn worker:prod`. Always exactly one replica: it owns cron
+# registration, and boot migrations when twenty.replicas > 1.
+worker:
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 2Gi
+```
 
-The worker exposes no port and accepts no inbound traffic. Records created in the UI enqueue jobs that it drains: with the worker stopped, jobs pile up in Redis and complete as soon as it comes back.
+The worker drains the job queues (entity events, webhooks, workflow triggers, file maintenance) and runs the registered cron jobs. It is a fixed single replica with no `worker.replicas` knob, exposes no port and accepts no inbound traffic. It has no probes, so it reports `ready` as soon as it is scheduled — read its logs rather than its readiness:
 
-### Rotating the App Key
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-twenty-worker"}' --limit 50 --since 10m
+```
 
-`secrets.name` points at the opaque secret holding the current app key. `secrets.fallbackName` points at a second opaque secret holding the **previous** key, and exists only for the duration of a rotation — with it set, rows encrypted under the old key stay readable while new writes use the new key.
+### App Key Secret
 
-<Steps>
-  <Step title="Create the new key secret">
-    ```bash
-    printf '%s' "$(openssl rand -base64 32)" | \
-      cpln secret create-opaque --name my-twenty-app-secret-2 --encoding plain -f -
-    ```
-  </Step>
-  <Step title="Upgrade with both names set">
-    Set `secrets.name` to the new secret and `secrets.fallbackName` to the old one. The identity is granted `reveal` on exactly those two secrets, plus the ones the template creates.
-  </Step>
-  <Step title="Let the rollout finish">
-    The server re-runs its boot migrations during this rollout, so it takes about as long as a first install. Sessions issued under the old key keep working, and existing records stay readable.
-  </Step>
-</Steps>
+```yaml
+secrets:
+  name: my-twenty-app-secret
+  # Optional: opaque secret holding the PREVIOUS key, only during a rotation
+  # (e.g. my-twenty-app-secret-old). Empty = no fallback.
+  fallbackName: ""
+```
 
-<Warning>
-Never change `secrets.name` without setting `secrets.fallbackName` to the previous key. Stored OAuth tokens, TOTP secrets, and app variables are encrypted with the old value and become undecryptable, and every user is logged out.
-</Warning>
+`secrets.name` is the prerequisite opaque secret from [Prerequisites](#prerequisites). `secrets.fallbackName` is set only while rotating the key — see [Rotating the App Key](#rotating-the-app-key).
 
 ### Attachment Storage
 
-`storage.type` decides where uploaded files and attachments are kept.
+```yaml
+storage:
+  # local uses a SHARED (read-write-many) volumeset mounted by both the server
+  # and the worker, so file-maintenance jobs see uploads. Shared volumes support
+  # expand only — no snapshots — and live in one location, so s3 is still the
+  # durable choice for production and is required for twenty.replicas > 1.
+  type: local                 # local | s3
+  local:
+    volumeset:
+      capacity: 10            # GiB (minimum 10); mounted at /app/packages/twenty-server/.local-storage
+  s3:
+    bucket: my-twenty-bucket
+    region: us-east-1
+    endpoint: ""              # set for S3-compatible servers (e.g. http://my-minio:9000)
+    # Keyless auth (AWS, preferred): Control Plane cloud account + your
+    # pre-created IAM policy scoped to the bucket (JSON below).
+    # Used only when auth.secretName is empty.
+    cloudAccountName: my-s3-cloud-account
+    policyName: my-twenty-s3-policy
+    auth:
+      # Static-key dictionary secret (STORAGE_S3_ACCESS_KEY_ID +
+      # STORAGE_S3_SECRET_ACCESS_KEY) — ONLY for S3-compatible servers
+      # (requires endpoint set). AWS S3 is always keyless via the cloud account.
+      secretName: ""
+```
 
 <Tabs>
   <Tab title="Shared volume (default)">
-    Attachments are written to a **shared (read-write-many) volume set** mounted at `/app/packages/twenty-server/.local-storage` by both the server and the worker, so the worker's file-maintenance jobs see what the server uploaded, and vice versa. Files survive restarts, redeploys, and upgrades under the same release name.
-
-    ```yaml
-    storage:
-      type: local
-      local:
-        volumeset:
-          capacity: 10 # initial capacity in GiB (minimum is 10)
-    ```
+    Attachments are written to a **shared (read-write-many) volume set** mounted at `/app/packages/twenty-server/.local-storage` by both the server and the worker, so the worker's file-maintenance jobs see what the server uploaded. Files survive restarts, redeploys and upgrades under the same release name.
 
     <Warning>
-    Shared volume sets support **expansion only — they cannot be snapshotted**, and they exist in a single location. For production, `storage.type: s3` is the durable choice. Local storage also works only with a single replica; the chart refuses to render `twenty.replicas` above `1` with it.
+    Shared volume sets support **expansion only — they cannot be snapshotted** — and exist in a single location. For production, `storage.type: s3` is the durable choice, and it is required for `twenty.replicas` above `1`; the chart refuses to render that combination with local storage.
     </Warning>
   </Tab>
   <Tab title="AWS S3 (keyless)">
-    AWS S3 uses a Control Plane cloud identity: no credentials are stored, and the workload's identity vends temporary credentials at runtime. This is the only supported way to reach AWS S3 — the chart rejects static keys unless `storage.s3.endpoint` is set.
+    AWS S3 uses a Control Plane cloud account: no access keys exist anywhere, and the Twenty identity authenticates through the account at runtime. This is the only supported way to reach AWS S3 — the chart rejects static keys unless `storage.s3.endpoint` is set.
 
     <Steps>
       <Step title="Create a bucket">
         Create an S3 bucket. Set `storage.s3.bucket` and `storage.s3.region` to match.
       </Step>
-      <Step title="Set up a Cloud Account">
-        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `storage.s3.cloudAccountName` to its name.
+      <Step title="Set up a cloud account">
+        If you do not have one, [create a cloud account](/guides/create-cloud-account) for your AWS account. Set `storage.s3.cloudAccountName` to its name.
       </Step>
       <Step title="Create a bucket-scoped IAM policy">
-        Create an AWS IAM policy with the JSON below (replace `YOUR_BUCKET_NAME` with your bucket), then set `storage.s3.policyName` to the policy's name:
+        Create an AWS IAM policy with the JSON below (replace `YOUR_BUCKET_NAME`), then set `storage.s3.policyName` to the policy's name:
 
         ```json
         {
@@ -314,126 +247,255 @@ Never change `secrets.name` without setting `secrets.fallbackName` to the previo
         }
         ```
       </Step>
-      <Step title="Leave the key secret empty">
-        Keep `storage.s3.auth.secretName` empty. The template then attaches the cloud account and your policy to the Twenty identity, and no access keys exist anywhere.
+      <Step title="Switch the storage type">
+        Set `storage.type: s3` and leave `storage.s3.auth.secretName` empty. The template attaches the cloud account and your policy to the Twenty identity.
       </Step>
     </Steps>
 
-    Twenty also writes its app-registration assets into the bucket at boot, so expect a few objects there before anyone uploads an attachment.
+    Twenty writes its app-registration assets into the bucket at boot, so expect a few objects there before anyone uploads an attachment.
   </Tab>
   <Tab title="S3-compatible (MinIO and others)">
-    S3-compatible servers cannot federate with a cloud account, so they use static access keys held in a dictionary secret.
+    S3-compatible servers use static access keys held in a dictionary secret you create before installing.
 
     <Steps>
       <Step title="Create a bucket">
-        Create the bucket on your server. For the [MinIO](/template-catalog/templates/minio) template deployed in the same GVC, the S3 API address is `http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000`.
+        Create the bucket on your server. For the [MinIO](/template-catalog/templates/minio) template deployed in the same GVC, the S3 API address is `http://RELEASE_NAME-minio.GVC_NAME.cpln.local:9000`.
       </Step>
       <Step title="Set the endpoint">
-        Set `storage.s3.endpoint` to the S3 API address including scheme and port, and `storage.s3.bucket` to the bucket name.
+        Set `storage.type: s3`, `storage.s3.endpoint` to the S3 API address including scheme and port, and `storage.s3.bucket` to the bucket name.
       </Step>
       <Step title="Create the key secret">
-        Create a dictionary secret with the server's credentials and set `storage.s3.auth.secretName` to its name:
+        Create a dictionary secret with the server's credentials and set `storage.s3.auth.secretName` to its name. The Twenty identity is granted `reveal` on exactly this secret.
 
         ```bash
-        cpln secret create-dictionary --name my-twenty-s3-keys \
+        cpln secret create-dictionary --name STORAGE_KEYS_SECRET_NAME \
           --entry STORAGE_S3_ACCESS_KEY_ID=YOUR_ACCESS_KEY \
           --entry STORAGE_S3_SECRET_ACCESS_KEY=YOUR_SECRET_KEY
         ```
-
-        The Twenty identity is granted `reveal` on exactly this secret.
       </Step>
     </Steps>
   </Tab>
 </Tabs>
 
-### Scaling
-
-`twenty.replicas` sets how many server replicas run behind the endpoint. The worker stays at one replica regardless.
-
-```yaml
-twenty:
-  replicas: 2
-storage:
-  type: s3
-  s3:
-    bucket: my-twenty-bucket
-    region: us-east-1
-    cloudAccountName: my-s3-cloud-account
-    policyName: my-twenty-s3-policy
-```
-
-Boot migrations must run in exactly one container, and the template places them automatically — you do not configure this:
-
-| `twenty.replicas` | Who migrates | What the others do |
-|---|---|---|
-| `1` (default) | The server | The worker skips migrations and cron registration |
-| `2` or more | The single worker | Every server replica skips both |
-
-<Note>
-Because the worker owns migrations at two or more replicas, a **cold** multi-replica install serves errors for a minute or two while the worker creates the schema — the servers are up before the database is ready for them. This affects first installs only; upgrades of an existing release have a populated schema already.
-</Note>
-
-At two replicas, a rolling upgrade served **508 of 508** health checks successfully with no failures, and force-stopping one replica served **198 of 198** requests while the replacement came back — the rollout keeps at most one replica out at a time.
-
-<Warning>
-`twenty.replicas` above `1` requires `storage.type: s3`. The chart refuses to render the combination with local storage.
-</Warning>
-
 ### Access
 
-- `publicAccess.enabled` — Serve the UI and API on the auto-assigned `*.cpln.app` HTTPS endpoint (default). Set to `false` for an internal-only instance: external requests are then refused with a `403`, and in-GVC callers still reach it per `internalAccess`. Firewall changes take a couple of minutes to propagate.
-- `internalAccess.type` — Controls which workloads can reach Twenty over the internal network:
+```yaml
+publicAccess:
+  enabled: true               # HTTPS UI + API on the auto *.cpln.app endpoint; false = internal-only
+internalAccess:
+  type: same-gvc              # none | same-gvc | same-org | workload-list
+  workloads: []               # used only with workload-list
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
+
+Public access is on by default. Set `publicAccess.enabled: false` for an internal-only instance — external requests are then refused, and in-GVC callers still reach it according to `internalAccess.type`:
 
 | Type | Description |
 |------|-------------|
 | `none` | No internal access. |
 | `same-gvc` | Allow access from all workloads in the same GVC (default). |
-| `same-org` | Allow access from all workloads in the same organization. |
-| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
+| `same-org` | Allow access from all workloads in the same org. |
+| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads`. |
 
-The bundled Redis and the database are never publicly reachable; they accept in-GVC traffic only.
+The worker and the bundled Redis are never publicly reachable: the worker accepts no inbound traffic, and Redis accepts only same-GVC traffic. A change to either access knob takes a few minutes to take effect.
 
 ### Redis
 
-The bundled Redis carries Twenty's BullMQ job queues and its cache, and Twenty does not boot without it.
+```yaml
+redis:
+  image: redis:8.10.0
+  auth:
+    password: change-me-twenty-redis   # template-managed; wired into REDIS_URL — letters/digits/-/_ only
+  resources:
+    minCpu: 100m
+    maxCpu: 400m
+    minMemory: 256Mi
+    maxMemory: 512Mi
+  volumeset:
+    capacity: 10              # GiB (minimum 10); AOF at /data
+```
 
-- `redis.image` — The Redis image to run.
-- `redis.auth.password` — Password for the bundled Redis, wired into `REDIS_URL`. **Change it before installing.** Use only letters, digits, `-`, and `_`: the value is embedded in a URL. Authentication is required — an unauthenticated or wrong-password client is refused.
-- `redis.resources` / `redis.volumeset.capacity` — CPU and memory bounds and the volume size for the AOF file at `/data`. Queue state is restored from the AOF after a restart.
-
-<Note>
-Redis runs with `maxmemory-policy noeviction` and `appendonly yes`, and this is deliberate: an evicted key would silently drop queued jobs. Around a Redis restart the server logs connection-reset errors and recovers on its own.
-</Note>
+Redis is required — Twenty does not boot without `REDIS_URL` — and it runs as a single node with persistence on and eviction disabled, so a queued job is never dropped. Twenty accepts only a plain `redis://` URL, which is why the Sentinel-based [redis](/template-catalog/templates/redis) template is not used here. Change `redis.auth.password` before installing; only letters, digits, `-` and `_` are accepted because the value is embedded in a connection URL.
 
 ### Database
 
-Enable exactly one of `postgres` (single instance, default) or `postgresHA` (highly available) — see [Choosing a Database Mode](#choosing-a-database-mode). In both modes, **change the database password before installing** (`postgres.credentials.password` / `postgres.credentials.password`); it seeds the database on first boot and cannot be changed by editing values afterwards. Use only letters, digits, `-`, and `_` — the password is embedded in the connection URL.
+Enable exactly one of `postgres` (single instance, default) and `postgresHA` (highly available) — the chart refuses to render with both or neither. Twenty is wired to the active database automatically: the single instance directly, or the HAProxy leader endpoint in HA mode. In **both** modes the database credentials come from `postgres.credentials.*`: this template writes them into a dictionary secret named by `postgres.config.credentialsSecretName` or `postgresHA.config.credentialsSecretName` and hands that name to the bundled database. There is nothing for you to create.
 
-If you run more than one release of this template in the same organization, give each its own `postgres.config.credentialsSecretName`. Secret names are organization-wide, so a second release left on the default name is **refused at install** and creates nothing — the first release is unaffected.
+```yaml
+# ─── Database: Single-instance PostgreSQL 18 (default) ────────────
+# One Postgres workload — the light default. Disable this and enable postgresHA
+# for a redundant database tier.
+postgres:
+  enabled: true
+  image: postgres:18          # PostgreSQL 18 (the HA path below runs 17 — the majors differ)
+  # Credentials for the bundled database — internal plumbing no human types elsewhere.
+  # Twenty CREATES the dictionary secret named by config.credentialsSecretName below out
+  # of these three values, so there is nothing for you to create before installing.
+  credentials:
+    username: twenty
+    password: change-me-twenty-db     # change before install; letters/digits/-/_ only (it is embedded in a URL)
+    database: twenty
+  config:
+    # Name of the dictionary secret this chart creates and the bundled postgres reads.
+    # Secret names are org-wide: give each twenty release its own name. A second
+    # release left on this name is REFUSED at install (it is owned by the first
+    # release) — nothing is shared, overwritten or deleted.
+    credentialsSecretName: my-twenty-db-credentials
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 1Gi
+  volumeset:
+    capacity: 10              # GiB (minimum 10)
 
-Twenty connects to the single instance directly, or to the HAProxy leader endpoint in HA mode, and creates the `uuid-ossp` and `unaccent` extensions itself on first boot. `postgres.resources` / `postgresHA.resources` and the `volumeset.capacity` values (GiB, minimum 10, per replica in HA mode) size the backing store.
+  backup:                     # optional database backups — see Backing Up
+    enabled: false
+    image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0   # tag must match the postgres major above
+    schedule: "0 2 * * *"
+    resources:
+      cpu: 100m
+      memory: 128Mi
+    provider: aws             # options: aws, gcp, minio
+    aws:
+      bucket: my-twenty-pg-backup-bucket
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account
+      policyName: my-twenty-pg-backup-policy
+      prefix: postgres/backups
+    gcp:
+      bucket: my-twenty-pg-backup-bucket
+      cloudAccountName: my-gcs-cloud-account
+      prefix: postgres/backups
+    minio:
+      endpoint: http://my-minio-workload:9000
+      bucket: my-twenty-pg-backup-bucket
+      # REQUIRED prerequisite dictionary secret holding `accessKey` and `secretKey`,
+      # only when this backup is enabled with provider: minio. See Backing Up.
+      credentialsSecretName: my-twenty-minio-credentials
+      prefix: postgres/backups
+
+# ─── Database: Highly Available PostgreSQL 17 (opt-in) ────────────
+# Deploys the postgres-highly-available template: 3 Patroni replicas, 3 etcd
+# replicas, and an HAProxy leader endpoint Twenty connects to. Enable this and
+# set postgres.enabled: false.
+postgresHA:
+  enabled: false
+  config:
+    # Name of the dictionary secret this chart creates and the bundled
+    # postgres-highly-available reads. Since pgHA 2.5.0 the subchart creates no
+    # credentials secret of its own, so both stores are fed the same one, built
+    # from postgres.credentials.* above.
+    credentialsSecretName: my-twenty-db-credentials
+  replicas: 3
+  resources:
+    minCpu: 500m
+    maxCpu: 1000m
+    minMemory: 1Gi
+    maxMemory: 2Gi
+  volumeset:
+    capacity: 10              # GiB per replica (minimum 10)
+
+  backup:                     # optional database backups — see Backing Up
+    enabled: false
+    mode: logical             # logical or wal-g
+    resources:
+      cpu: 100m
+      memory: 128Mi
+    logical:
+      image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
+      schedule: "0 2 * * *"
+    walg:
+      intervalSeconds: 21600
+    provider: aws             # options: aws, gcp, minio
+    aws:
+      bucket: my-twenty-pg-backup-bucket
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account
+      policyName: my-twenty-pg-backup-policy
+      prefix: postgres/backups
+    gcp:
+      bucket: my-twenty-pg-backup-bucket
+      cloudAccountName: my-gcs-cloud-account
+      prefix: postgres/backups
+    minio:
+      endpoint: http://my-minio-workload:9000
+      bucket: my-twenty-pg-backup-bucket
+      # REQUIRED PREREQUISITE SECRET when provider is `minio` — a `dictionary`
+      # secret holding exactly `accessKey` and `secretKey`. See Backing Up.
+      credentialsSecretName: my-twenty-minio-credentials
+      prefix: postgres/backups
+```
+
+The other keys of the bundled [postgres](/template-catalog/templates/postgres) and [postgres-highly-available](/template-catalog/templates/postgres-highly-available) templates are available under `postgres.*` and `postgresHA.*`, with one exception: `postgresHA.proxy.enabled` must stay `true`, because the HAProxy endpoint is the address Twenty connects to.
 
 <Warning>
-**Template version `1.0.0` did not compact the etcd cluster inside the bundled highly available database**, so etcd's backend grows with time alone and goes read-only once it reaches its 2 GiB quota — after roughly 110 days — taking PostgreSQL failover with it. Only installs running the HA database are affected (`postgresHA.enabled`, which is off by default here); see [etcd History Compaction](/template-catalog/templates/postgres-highly-available#etcd-history-compaction) for the mechanism and the symptoms. Upgrade to `1.0.1` or later to turn compaction on: that stops further growth but cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade.
+Choose the database mode **before** you have data. The two paths run different PostgreSQL majors (18 and 17) on separate volume sets, so flipping `postgres.enabled` / `postgresHA.enabled` on a live release points Twenty at a different, empty database — your existing records are orphaned, not migrated. Moving between the modes is a dump and restore.
+</Warning>
+
+<Warning>
+Secret names are org-wide, and the credentials secret is created by this template in both modes. If you run more than one release of this template in the same org, give each its own `postgres.config.credentialsSecretName` (or `postgresHA.config.credentialsSecretName`). A second release left on the default name is **refused at install** with `cannot be updated because it is being managed by a different release` and creates nothing; the first release is unaffected.
 </Warning>
 
 ## Connecting
 
-| What | Value |
-|---|---|
-| Public UI / API | `https://<canonical>.cpln.app` — `status.canonicalEndpoint` of `{release}-twenty` (`cpln workload get {release}-twenty -o yaml`) |
-| GraphQL — workspace records | `POST https://<canonical>.cpln.app/graphql` |
-| GraphQL — auth and core | `POST https://<canonical>.cpln.app/metadata` |
-| Health check | `GET https://<canonical>.cpln.app/healthz` — unauthenticated |
-| Internal (same GVC) | `http://{release}-twenty.{gvc}.cpln.local:3000` |
-| Login | The first account created after install — there is no seeded user |
-| Redis (internal) | `{release}-twenty-redis.{gvc}.cpln.local:6379`, password from `redis.auth.password` |
-| PostgreSQL (internal, single mode) | `{release}-postgres.{gvc}.cpln.local:5432`, credentials from `postgres.config` |
-| PostgreSQL (internal, HA mode) | `{release}-postgres-ha-proxy.{gvc}.cpln.local:5432`, credentials from `postgresHA.postgres` |
+| What | Address | Notes |
+|---|---|---|
+| Web UI and REST API | `https://<canonical>.cpln.app` | `status.canonicalEndpoint` of `RELEASE_NAME-twenty` — see the command below |
+| GraphQL — workspace records | `POST https://<canonical>.cpln.app/graphql` | Authenticated with an API key or a user session |
+| GraphQL — auth and core | `POST https://<canonical>.cpln.app/metadata` | Same authentication |
+| Health check | `GET https://<canonical>.cpln.app/healthz` | Unauthenticated; the readiness and liveness probe |
+| Internal (same GVC) | `http://RELEASE_NAME-twenty.GVC_NAME.cpln.local:3000` | Subject to `internalAccess.type` |
+| Login | The first account created after install | See [First Run](#first-run) |
+| PostgreSQL (single-instance mode) | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | Credentials in the secret named by `postgres.config.credentialsSecretName` |
+| PostgreSQL (HA mode) | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432` | Credentials in the secret named by `postgresHA.config.credentialsSecretName` |
+| Redis | `RELEASE_NAME-twenty-redis.GVC_NAME.cpln.local:6379` | Password in the `redisPassword` key of `RELEASE_NAME-twenty-creds` |
 
-## Backing Up
+Read the public hostname and the stored credentials:
 
-Database backups are optional and disabled by default. When enabled, a scheduled job runs inside the backing PostgreSQL store and uploads to your bucket under the configured prefix — covering every record, workspace, and user, but not the attachments on the storage volume set (use `storage.type: s3` for durable attachments). Enable with `postgres.backup.enabled` or `postgresHA.backup.enabled`, matching your database mode, and complete the storage setup for your provider **before** installing. The values below are shown under `backup.*` — set them within the enabled database block.
+```bash
+cpln workload get RELEASE_NAME-twenty --gvc GVC_NAME -o yaml        # status.canonicalEndpoint
+cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml               # the name you set in *.config.credentialsSecretName
+cpln secret reveal RELEASE_NAME-twenty-creds -o yaml                # redisPassword
+```
+
+To verify the server from your machine without going through the public endpoint, forward port `3000` and query the health route:
+
+```bash
+cpln port-forward RELEASE_NAME-twenty 3000:3000 --gvc GVC_NAME
+curl -s http://localhost:3000/healthz
+```
+
+On an install with `publicAccess.enabled: false`, the same port-forward is how you reach the UI in a browser at `http://localhost:3000` — and `twenty.serverUrl` must then be set to that address, because Twenty checks the browser origin against it.
+
+### First Run
+
+Twenty ships no default account. The first person to sign up creates the workspace and becomes its full administrator.
+
+<Steps>
+  <Step title="Wait for the server workload to report ready">
+    A first install takes several minutes: the database and Redis come up first, then the server waits for a live PostgreSQL, runs its boot migrations and only then starts listening on port `3000`. Every fresh install logs `relation "core.appToken" does not exist` and similar lines early in the boot — the migration framework probing for tables it has not created yet — and the readiness probe may report a transient failure during the migration window. Both stop on their own once migrations finish; do not abort the install.
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-twenty --gvc GVC_NAME -o yaml
+    ```
+  </Step>
+  <Step title="Sign up immediately">
+    Browse to the canonical endpoint of `RELEASE_NAME-twenty` and create the first account. On a public endpoint, whoever reaches the URL first owns the CRM — sign up as soon as the workload is ready, or install with `publicAccess.enabled: false` and reach the sign-up page through a port-forward (set `twenty.serverUrl` to `http://localhost:3000` for that session).
+  </Step>
+  <Step title="Finish configuration inside the app">
+    SMTP, AI provider keys, rate limits and OAuth/SSO are not template values. Set them in **Settings → Admin Panel → Configuration Variables**; they are stored in the database and apply without a redeploy.
+  </Step>
+</Steps>
+
+## Operations
+
+### Backing Up
+
+Database backups are optional and off by default. They cover the PostgreSQL database — every record, workspace and user. Attachments are not included: in S3 mode they live in your bucket, in local mode on the `RELEASE_NAME-twenty-storage` volume set, which cannot be snapshotted.
+
+Enable backups with `postgres.backup.enabled: true` or `postgresHA.backup.enabled: true` (matching your database mode) and complete the storage setup for your provider **before** installing. The keys below are shown as `backup.*`; set them inside the enabled database block.
 
 <Tabs>
   <Tab title="AWS S3">
@@ -441,21 +503,11 @@ Database backups are optional and disabled by default. When enabled, a scheduled
       <Step title="Create a bucket">
         Create an S3 bucket. Set `backup.aws.bucket` and `backup.aws.region` to match.
       </Step>
-      <Step title="Set up a Cloud Account">
-        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `backup.aws.cloudAccountName` to its name.
+      <Step title="Set up a cloud account">
+        If you do not have one, [create a cloud account](/guides/create-cloud-account) for your AWS account. Set `backup.aws.cloudAccountName` to its name.
       </Step>
       <Step title="Create a bucket-scoped IAM policy">
-        Create an IAM policy granting the required S3 actions on the bucket, and set `backup.aws.policyName` to its name:
-
-        ```json
-        {
-          "Version": "2012-10-17",
-          "Statement": [
-            { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": "arn:aws:s3:::my-backup-bucket" },
-            { "Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"], "Resource": "arn:aws:s3:::my-backup-bucket/*" }
-          ]
-        }
-        ```
+        Create an AWS IAM policy with the same bucket-scoped JSON shown under [Attachment Storage](#attachment-storage) (replace `YOUR_BUCKET_NAME` with the backup bucket), then set `backup.aws.policyName` to the policy's name.
       </Step>
     </Steps>
   </Tab>
@@ -464,40 +516,241 @@ Database backups are optional and disabled by default. When enabled, a scheduled
       <Step title="Create a bucket">
         Create a GCS bucket. Set `backup.gcp.bucket` to its name.
       </Step>
-      <Step title="Set up a Cloud Account">
-        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your GCP project and grant its service account **Storage Object Admin** (`roles/storage.objectAdmin`) on the bucket. Set `backup.gcp.cloudAccountName` to its name.
+      <Step title="Set up a cloud account">
+        If you do not have one, [create a cloud account](/guides/create-cloud-account) for your GCP project. Set `backup.gcp.cloudAccountName` to its name — access is keyless.
+      </Step>
+      <Step title="Grant bucket access">
+        Grant the `Storage Object Admin` role (`roles/storage.objectAdmin`) on that bucket — not on the whole project — to the service account created for the cloud account.
       </Step>
     </Steps>
   </Tab>
-  <Tab title="S3-compatible (MinIO)">
+  <Tab title="S3-compatible (MinIO and others)">
     <Steps>
       <Step title="Create a bucket">
         Create your bucket on the server. Set `backup.minio.bucket` to its name.
       </Step>
-      <Step title="Set the endpoint and credentials">
-        Set `backup.minio.endpoint` to the S3 API address including port. No Cloud Account is required — the credentials authenticate directly. The two backing stores take these differently. In HA mode (`postgresHA`), set `backup.minio.accessKey` and `backup.minio.secretKey` to credentials with access to the bucket. In single-instance mode (`postgres`), those two values were removed: create a [dictionary secret](/guides/create-secret/dictionary) holding the keys `accessKey` and `secretKey`, and set `backup.minio.credentialsSecretName` to its name — see [MinIO backup prerequisites](/template-catalog/templates/postgres#minio) for the exact command.
+      <Step title="Set the endpoint">
+        Set `backup.minio.endpoint` to the S3 API address including scheme and port. For the [MinIO](/template-catalog/templates/minio) template deployed in the same GVC, this is `http://RELEASE_NAME-minio.GVC_NAME.cpln.local:9000`. No cloud account is involved.
+      </Step>
+      <Step title="Create the credentials secret">
+        In both database modes the server's keys are a prerequisite [dictionary secret](/guides/create-secret/dictionary) holding exactly `accessKey` and `secretKey`. Create it before installing and set `backup.minio.credentialsSecretName` to its name:
+
+        ```bash
+        cpln secret create-dictionary --name MINIO_BACKUP_SECRET_NAME \
+          --entry accessKey=YOUR_ACCESS_KEY \
+          --entry secretKey=YOUR_SECRET_KEY
+        ```
       </Step>
     </Steps>
   </Tab>
 </Tabs>
 
-In HA mode, `postgresHA.backup.mode` selects `logical` (scheduled `pg_dump`) or `wal-g` (continuous WAL archiving). The single-instance path takes a `postgres.backup.schedule` cron expression. The full per-provider walkthrough, including restores, lives in the backing [postgres](/template-catalog/templates/postgres) and [postgres-highly-available](/template-catalog/templates/postgres-highly-available) template documentation.
+Single-instance mode takes scheduled logical dumps through the `RELEASE_NAME-postgres-backup` cron workload on `backup.schedule`. In HA mode, `backup.mode` selects `logical` (a scheduled dump run by `RELEASE_NAME-postgres-ha-backup`) or `wal-g` (continuous WAL archiving every `backup.walg.intervalSeconds`). `backup.*.prefix` is the key prefix within the bucket; schedules are cron expressions in UTC.
+
+### Restoring a Backup
+
+The database restore is the one documented for the bundled database: [Restoring a Backup](/template-catalog/templates/postgres#restoring-a-backup) on the postgres page, or [Restoring a Backup](/template-catalog/templates/postgres-highly-available#restoring-a-backup) on the postgres-highly-available page (logical and WAL-G). In HA mode, connect through `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local` so the restore targets the current leader; use the username and password from the secret named by `*.config.credentialsSecretName`.
+
+Three Twenty-specific points:
+
+- The server and worker must not be writing to the database while a dump is replayed. After the restore, force a redeployment of both so they reconnect:
+
+  ```bash
+  cpln workload force-redeployment RELEASE_NAME-twenty --gvc GVC_NAME
+  cpln workload force-redeployment RELEASE_NAME-twenty-worker --gvc GVC_NAME
+  ```
+
+- Attachments are restored separately: copy them back into the bucket (S3 mode) or onto the `RELEASE_NAME-twenty-storage` volume set (local mode).
+- Keep the app key from your prerequisite secret with the backup. A dump restored under a different `ENCRYPTION_KEY` cannot decrypt the OAuth tokens, TOTP secrets and app variables it contains.
+
+<Warning>
+This restore path has **not** been exercised against a Twenty install. The database procedure is the bundled template's own; rehearse it on a test release before you depend on it.
+</Warning>
+
+### Rotating the App Key
+
+`secrets.name` points at the opaque secret holding the current app key. `secrets.fallbackName` points at a second opaque secret holding the **previous** key and exists only for a rotation: Twenty uses it as `FALLBACK_ENCRYPTION_KEY`, a verification-only key that keeps rows encrypted under the old key readable while new writes use the new key.
+
+<Steps>
+  <Step title="Create the new key secret">
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name NEW_APP_KEY_SECRET_NAME --encoding plain -f -
+    ```
+  </Step>
+  <Step title="Upgrade with both names set">
+    Run `helm upgrade` with `secrets.name` pointing at the new secret and `secrets.fallbackName` at the old one. The identity is granted `reveal` on exactly those two secrets plus the ones the template creates.
+
+    ```yaml
+    secrets:
+      name: NEW_APP_KEY_SECRET_NAME
+      fallbackName: APP_KEY_SECRET_NAME
+    ```
+  </Step>
+  <Step title="Let the rollout finish">
+    The server re-runs its boot migrations during this rollout, so it takes about as long as a first install. Sessions issued under the old key keep working and existing records stay readable. Twenty's documentation does not say that rows are re-encrypted under the new key, so do not clear `secrets.fallbackName` on an assumption — keep both secrets until you have confirmed the old key is no longer needed.
+  </Step>
+</Steps>
+
+<Warning>
+Never change `secrets.name` without setting `secrets.fallbackName` to the previous key. Stored OAuth tokens, TOTP secrets and app variables are encrypted with the old value and become undecryptable, and every user is logged out.
+</Warning>
+
+### Upgrading From 1.0.0
+
+Version `1.0.1` only updates the bundled highly available database to a release that compacts its etcd cluster. Without compaction, etcd's backend grows with time alone and eventually goes read-only, taking PostgreSQL failover with it. Only installs running the HA database (`postgresHA.enabled: true`, off by default here) are affected — see [etcd History Compaction](/template-catalog/templates/postgres-highly-available#etcd-history-compaction) for the mechanism and the symptoms. Compaction stops further growth but cannot shrink a backend that has already grown.
+
+### Upgrading From 1.0.1 or Earlier
+
+Version `1.1.0` changed the single-instance database path:
+
+- `postgres.config.username`, `postgres.config.password` and `postgres.config.database` moved to `postgres.credentials.username`, `postgres.credentials.password` and `postgres.credentials.database`. The new `postgres.config.credentialsSecretName` names the dictionary secret this template now creates from those three values. Carrying the old keys fails the render with `config.username was REMOVED in postgres 3.4.0` — move the three keys and you are done, and ignore that message's advice to create a secret yourself.
+- `postgres.backup.minio.accessKey` and `postgres.backup.minio.secretKey` were replaced by `postgres.backup.minio.credentialsSecretName`, a prerequisite dictionary secret holding `accessKey` and `secretKey` — see [Backing Up](#backing-up).
+
+Keep `postgres.credentials.*` equal to the values your database was initialised with; the running database still enforces them.
+
+### Upgrading From 1.1.0 or Earlier
+
+Version `1.2.0` moved the highly available database to `postgres-highly-available` 2.5.0, which no longer creates its own credentials secret:
+
+- `postgresHA.postgres.username`, `postgresHA.postgres.password` and `postgresHA.postgres.database` were removed. Carrying them fails the render with `the postgres block was REMOVED in 2.5.0`. Delete the block.
+- In HA mode the credentials now come from `postgres.credentials.*` — the same keys the single-instance path uses — and this template writes them into the secret named by the new `postgresHA.config.credentialsSecretName`.
+
+<Warning>
+**Use the credentials your cluster already has.** Set `postgres.credentials.username`, `postgres.credentials.password` and `postgres.credentials.database` to exactly the values your `postgresHA.postgres.*` block held. The database was initialised with them and still enforces them; putting new values in the secret does not change the running database — it gives Twenty a password that no longer works.
+</Warning>
+
+### Upgrading From 1.2.0 or Earlier
+
+Version `1.2.1` replaced `postgresHA.backup.minio.accessKey` and `postgresHA.backup.minio.secretKey` with `postgresHA.backup.minio.credentialsSecretName`, a prerequisite dictionary secret holding `accessKey` and `secretKey`. Only installs backing up the HA database to an S3-compatible server are affected — see [Backing Up](#backing-up) for the secret.
+
+Version `1.3.0` changes no values. It makes the server and worker wait for a live PostgreSQL before running boot migrations, which fixes a first-install failure where the containers could start against a database that was not yet accepting connections.
+
+### Scaling and Availability
+
+- **Server tier** — `twenty.replicas` sets how many server replicas run behind the endpoint. Anything above `1` requires `storage.type: s3`; the chart refuses to render the combination with local storage.
+
+  ```yaml
+  twenty:
+    replicas: 2
+  storage:
+    type: s3
+    s3:
+      bucket: my-twenty-bucket
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account
+      policyName: my-twenty-s3-policy
+  ```
+
+- **Boot migrations run in exactly one container**, and the template places them automatically:
+
+  | `twenty.replicas` | Who migrates | What the others do |
+  |---|---|---|
+  | `1` (default) | The server | The worker skips migrations and cron registration |
+  | `2` or more | The single worker | Every server replica skips both |
+
+  Because the worker owns migrations above one replica, a **fresh** multi-replica install serves errors until the worker has created the schema. Upgrades of an existing release already have a populated schema.
+- **Worker and Redis** — both are fixed at one replica by design: the worker owns cron registration, and Twenty accepts only a plain `redis://` URL. A Redis restart stalls background jobs briefly; the UI stays up.
+- **Database** — the opt-in `postgresHA` path keeps serving through a replica failure and a rolling restart; the default `postgres` path has no failover. The mode is an install-time choice.
+- **Helm upgrades** — the first `helm upgrade` after an install can restart the bundled database and Redis even when their values did not change; upgrade in a quiet window.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The deployment never starts and cpln logs is empty">
+    **Symptom:** `RELEASE_NAME-twenty` and `RELEASE_NAME-twenty-worker` never reach ready, and `cpln logs` returns zero lines.
+
+    **Cause:** a secret referenced by name does not exist — usually the app key secret (`secrets.name`), or the fallback or S3 key secret when those are set. The container never starts, so there is nothing to log.
+
+    **Fix:** read `status.versions[].message`, which names the missing secret, then create it. The deployment recovers on its own after several minutes, or force a redeployment to skip the wait.
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-twenty --gvc GVC_NAME -o yaml
+    cpln workload force-redeployment RELEASE_NAME-twenty --gvc GVC_NAME
+    ```
+  </Accordion>
+  <Accordion title="First boot logs relation core.appToken does not exist">
+    **Symptom:** a fresh install logs `error: relation "core.appToken" does not exist` and similar lines, and the readiness probe reports a transient failure.
+
+    **Cause:** the migration framework probes for its state tables before creating them. This is expected on every fresh install and stops once the boot migrations finish.
+
+    **Fix:** none — wait for the server to report ready. If the server never does, read its log for a migration error:
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-twenty"} |= "ERROR"' --limit 50 --since 10m
+    ```
+  </Accordion>
+  <Accordion title="The server logs waiting for Postgres and then exits for restart">
+    **Symptom:** the server or worker log repeats `twenty: waiting for Postgres... (attempt N)` and ends with `twenty: Postgres not ready after 250s; exiting for restart`.
+
+    **Cause:** the start script waits for the database to answer a real PostgreSQL handshake before running migrations, and the database was not accepting connections within its window. On a first HA install this can happen once while the cluster elects a leader; a database that never comes up is a different problem.
+
+    **Fix:** the container restarts and retries on its own. If it keeps happening, check the database workload — `RELEASE_NAME-postgres` or `RELEASE_NAME-postgres-ha` — with `cpln workload get-deployments` and its logs.
+  </Accordion>
+  <Accordion title="Sign-in fails or the browser reports CORS errors">
+    **Symptom:** the UI loads but sign-in loops or fails, and the browser console shows CORS or origin errors.
+
+    **Cause:** the address in the browser does not match `SERVER_URL`. This happens with a custom domain, or when reaching a private install through a port-forward, while `twenty.serverUrl` is empty.
+
+    **Fix:** set `twenty.serverUrl` to exactly the URL browsers use, including the scheme (`https://crm.example.com`, or `http://localhost:3000` for a port-forward), and run `helm upgrade`.
+  </Accordion>
+  <Accordion title="Render fails because replicas above 1 require s3 storage">
+    **Symptom:** `helm install` or `helm upgrade` fails before anything is applied, citing `twenty.replicas > 1 requires storage.type: s3`.
+
+    **Cause:** local attachments live on a volume set, which does not serve more than one server replica.
+
+    **Fix:** complete the S3 setup under [Attachment Storage](#attachment-storage) and set `storage.type: s3`, or keep `twenty.replicas: 1`.
+  </Accordion>
+  <Accordion title="Render fails because static keys are only for S3-compatible servers">
+    **Symptom:** the render fails citing `static keys (storage.s3.auth.secretName) are only for S3-compatible servers`.
+
+    **Cause:** `storage.s3.auth.secretName` is set but `storage.s3.endpoint` is empty. AWS S3 is keyless only.
+
+    **Fix:** for AWS S3, clear `storage.s3.auth.secretName` and use `storage.s3.cloudAccountName` plus `storage.s3.policyName`; for an S3-compatible server, set `storage.s3.endpoint`.
+  </Accordion>
+  <Accordion title="Render fails with config.username was REMOVED in postgres 3.4.0">
+    **Symptom:** `helm upgrade` fails before anything is applied, citing `config.username was REMOVED in postgres 3.4.0`.
+
+    **Cause:** your values still carry the `1.0.x` single-instance keys `postgres.config.username`, `postgres.config.password` or `postgres.config.database`.
+
+    **Fix:** move the three keys to `postgres.credentials.*` as described in [Upgrading From 1.0.1 or Earlier](#upgrading-from-1-0-1-or-earlier). Do not create a secret yourself — this template creates it.
+  </Accordion>
+  <Accordion title="Render fails with the postgres block was REMOVED in 2.5.0">
+    **Symptom:** `helm upgrade` fails before anything is applied, citing `the postgres block was REMOVED in 2.5.0`.
+
+    **Cause:** your values still carry `postgresHA.postgres.username`, `postgresHA.postgres.password` or `postgresHA.postgres.database` from version `1.1.0` or earlier.
+
+    **Fix:** delete the `postgresHA.postgres` block and put the same three values under `postgres.credentials.*` — see [Upgrading From 1.1.0 or Earlier](#upgrading-from-1-1-0-or-earlier).
+  </Accordion>
+  <Accordion title="A second release is refused at install as managed by a different release">
+    **Symptom:** installing a second Twenty release in the same org fails with `cannot be updated because it is being managed by a different release`, and nothing is created.
+
+    **Cause:** both releases use the same `credentialsSecretName`. Secret names are org-wide, and the first release owns that secret.
+
+    **Fix:** give the second release its own `postgres.config.credentialsSecretName` (or `postgresHA.config.credentialsSecretName`). The first release is unaffected.
+  </Accordion>
+  <Accordion title="Render fails because the database password contains other characters">
+    **Symptom:** the render fails citing `the database password must contain only letters, digits, '-' and '_'` or the same message for `redis.auth.password`.
+
+    **Cause:** both passwords are embedded in connection URLs, and other characters break the URL.
+
+    **Fix:** choose a password made of letters, digits, `-` and `_` only. For the database password this must be done before the first install — it seeds the database and is not changed by later value edits.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Create the app key secret before installing** — `secrets.name` must point at an existing opaque secret (plain encoding). Without it the deployment waits on a secret that does not exist and looks broken.
-- **The app key is effectively write-once** — rotate it only with `secrets.fallbackName` set to the previous key, or stored OAuth tokens, TOTP secrets, and app variables become undecryptable and everyone is logged out.
-- **Sign up immediately after install** — there is no seeded account, and on a public endpoint the first visitor to sign up becomes the workspace administrator. Set `publicAccess.enabled: false` until you are ready if that is a concern.
-- **First boot is slow and noisy, and that is expected** — about 4 minutes on the single-instance database and about 9 in HA mode, with `relation "core.…" does not exist` errors for roughly the first minute. Do not abort the install.
-- **The single-instance and HA paths run different PostgreSQL majors** — 18 and 17 respectively. Choose before you have data; switching is a dump and restore.
-- **`twenty.replicas` above `1` requires `storage.type: s3`** — the shared local volume set lives in one location and cannot be snapshotted, so S3 is the production recommendation regardless of replica count.
+- **Create the app key secret before installing** — `secrets.name` must point at an existing opaque secret (plain encoding). Without it the deployment wedges silently; see [Prerequisites](#prerequisites).
+- **The app key is effectively write-once** — rotate it only with `secrets.fallbackName` set to the previous key, or stored OAuth tokens, TOTP secrets and app variables become undecryptable and everyone is logged out.
+- **Sign up immediately after install** — there is no seeded account, and on a public endpoint the first visitor to sign up becomes the workspace administrator. Install with `publicAccess.enabled: false` until you are ready if that is a concern.
+- **Set `twenty.serverUrl` whenever browsers open Twenty at anything other than its canonical endpoint** — a custom domain or a port-forward — with the scheme. A mismatch breaks sign-in and CORS with opaque errors.
+- **Change `postgres.credentials.password` and `redis.auth.password` before installing** — both are embedded in connection URLs, so use only letters, digits, `-` and `_`; the database password seeds the database on first boot and is not changed by later value edits.
+- **Choose the database mode before you have data** — the single-instance and HA paths run PostgreSQL 18 and 17 respectively on separate volume sets; switching is a dump and restore, not a values change.
+- **`twenty.replicas` above `1` requires `storage.type: s3`** — the shared local volume set cannot be snapshotted and lives in one location, so S3 is the production recommendation regardless of replica count.
 - **AWS S3 is keyless only** — use a cloud account plus a bucket-scoped IAM policy. Static keys are accepted only when `storage.s3.endpoint` points at an S3-compatible server.
-- **Change `postgres.credentials.password` and `redis.auth.password` before installing** — both seed their component on first boot, and both are embedded in connection URLs, so use only letters, digits, `-`, and `_`.
-- **Set `twenty.serverUrl` when Twenty sits behind a custom domain**, with the scheme (`https://crm.example.com`). A mismatch with the URL browsers use breaks auth callbacks and CORS with opaque errors.
-- **SMTP, AI provider keys, rate limits, and OAuth/SSO are not values knobs** — configure them in **Settings → Admin Panel → Configuration Variables** inside the app.
+- **Give each release its own `credentialsSecretName`** — secret names are org-wide, and a second release on the default name is refused at install.
+- **SMTP, AI provider keys, rate limits and OAuth/SSO are not values knobs** — configure them in **Settings → Admin Panel → Configuration Variables** inside the app.
 - **Foreign data wrappers ("remote objects") are unavailable** — that feature needs upstream's custom PostgreSQL image, which this template does not deploy.
 - **Data survives restarts and upgrades; uninstalling deletes it** — records live in the database volume set and local attachments in the storage volume set, and both go with the release. Your prerequisite app key secret is yours and survives an uninstall.
-- **Twenty is licensed under the AGPL** — this template deploys the open-source edition.
 
 ## External References
 
@@ -507,9 +760,6 @@ In HA mode, `postgresHA.backup.mode` selects `logical` (scheduled `pg_dump`) or 
   </Card>
   <Card title="Self-Hosting Setup" icon="server" href="https://docs.twenty.com/developers/self-host/capabilities/setup">
     Configuration variables and the in-app admin panel
-  </Card>
-  <Card title="Upgrade Guide" icon="arrow-up" href="https://docs.twenty.com/developers/self-host/capabilities/upgrade-guide">
-    Moving an existing deployment to a newer release
   </Card>
   <Card title="REST and GraphQL API" icon="code" href="https://docs.twenty.com/developers/extend/api">
     Query and mutate CRM records over HTTP
