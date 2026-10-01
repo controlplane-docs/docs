@@ -1,122 +1,139 @@
 ---
 title: Tyk
 icon: /template-catalog/templates/icons/tyk.png
-description: Deploy Tyk on Control Plane using the Template Catalog. An API gateway with authentication, rate limiting, quotas and analytics, backed by Redis Sentinel, with the admin API key held in a prerequisite secret and no public access by default.
-keywords: ['api gateway', 'kong alternative', 'apigee alternative', 'developer portal', 'oauth gateway', 'api auth', 'api throttle', 'api management', 'gateway proxy', 'master keys', 'prerequisite secret', 'redis sentinel']
+description: Tyk open-source API gateway (auth, rate limiting, quotas) as an autoscaling stateless workload over a bundled Redis and Sentinel store, deployed into an existing GVC. An admin API key secret must exist first, plus secrets for your API definitions and policies.
+keywords: ['api gateway', 'kong alternative', 'apigee alternative', 'oauth gateway', 'api auth', 'api throttle', 'rate limiting', 'api management', 'gateway proxy', 'master keys', 'prerequisite secret', 'redis sentinel']
 ---
 
 ## Overview
 
-Tyk is an open-source API management platform that controls, secures, and monitors API traffic. This template deploys a Tyk Gateway workload on Control Plane alongside Redis and Redis Sentinel, which back the gateway's token, rate-limit, quota, and analytics storage.
-
-Your API definitions and policies come from Control Plane secrets you control, and the Gateway Control API key — the credential that creates and revokes every API key on the gateway — comes from an [opaque secret](/guides/create-secret/opaque) you create before installing.
-
-<Warning>
-**Version 1.3.0 is a security fix. Read [Upgrading From 1.2.1 or Earlier](#upgrading-from-1-2-1-or-earlier) before you upgrade.** Versions up to 1.2.1 shipped three defaults that compounded: the Gateway Control API key was the `values.yaml` value `mysecret`, `externalAccess` defaulted to `true` so that API was on the public internet, and `TYK_GW_ALLOWMASTERKEYS` was hardcoded to `true` so a key created with no `access_rights` reached every API on the gateway. One guessed word yielded a key to everything. In 1.3.0 the admin key moved to a prerequisite secret, external access defaults to off, master keys are a knob that defaults to off, and `internalAccess.type` now defaults to `same-gvc` instead of `none` — **those last three change the behavior of an existing install when you upgrade, and the internal-access change widens in-GVC reachability rather than narrowing it.**
-</Warning>
+Tyk is an open-source API gateway that fronts your APIs with authentication, rate limiting, quotas and analytics. This template deploys the open-source Tyk Gateway as a stateless, autoscaling workload whose API definitions and policies come from Control Plane secrets you control, backed by the bundled [Redis](/template-catalog/templates/redis) template running Redis with Sentinel as the token, rate-limit and quota store. There is no dashboard: APIs are defined as JSON files and keys are managed through the Gateway Control API.
 
 <Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
+This template deploys into an existing [GVC](/reference/gvc) that you already have — it does not create or manage a GVC. Every workload below runs in each location of that GVC.
 </Note>
 
 ### What Gets Created
 
-- **Standard Tyk Gateway Workload** (`RELEASE_NAME-tyk-api-gateway`) — the gateway process, autoscaling between `minScale` and `maxScale` replicas on CPU. API definitions and policies are mounted from your secrets at startup.
-- **Redis and Redis Sentinel** — the [Redis](/template-catalog/templates/redis) template (v3.4.2) is deployed as a subchart, creating a Redis workload, a Sentinel workload, their volume sets, their config and password secrets, and an identity and policy for each (`RELEASE_NAME-redis-identity`, `RELEASE_NAME-sentinel-identity`, `RELEASE_NAME-redis-policy`, `RELEASE_NAME-sentinel-policy`). The gateway connects through Sentinel, not to Redis directly.
-- **Identity & Policy** — an identity (`RELEASE_NAME-tyk-identity`) bound to the gateway with `reveal` on exactly the secrets it mounts: your admin secret, your API and policy secrets when set, and the bundled Redis and Sentinel password secrets.
-- **No template-created credential secret** — the admin API key lives only in the prerequisite secret you create.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-tyk-api-gateway` | Tyk Gateway serving proxied APIs and the Gateway Control API under `/tyk/` on one HTTP port, `8080` by default (standard, autoscales 1 to 3 replicas on CPU) | — |
+| Workload | `RELEASE_NAME-redis` | Redis token, rate-limit, quota and analytics store (stateful, 2 replicas, port `6379`) | — |
+| Workload | `RELEASE_NAME-sentinel` | Redis Sentinel for automatic Redis failover; the gateway connects through Sentinel (stateful, 3 replicas, port `26379`) | — |
+| Volume set | `RELEASE_NAME-redis-vs`, `RELEASE_NAME-sentinel-vs` | Redis data and Sentinel state (10 GiB per replica to start, daily snapshots kept 7 days) | `redis.redis.persistence.enabled`, `redis.sentinel.persistence.enabled` (both on by default) |
+| Secret | `RELEASE_NAME-redis-auth-password`, `RELEASE_NAME-sentinel-auth-password` | Redis and Sentinel passwords, created by the chart from `redis.redis.auth.password.value` and `redis.sentinel.auth.password.value` | `auth.password.enabled` (on by default) |
+| Secret | `RELEASE_NAME-redis-config`, `RELEASE_NAME-sentinel-config` | Redis and Sentinel configuration | — |
+| Identity / Policy | `RELEASE_NAME-tyk-identity`, `RELEASE_NAME-tyk-api-gateway-policy` | `reveal` on exactly the secrets the gateway reads: your admin, API and policy secrets, and the Redis and Sentinel password secrets | — |
+| Identity / Policy | `RELEASE_NAME-redis-identity`, `RELEASE_NAME-redis-policy`, `RELEASE_NAME-sentinel-identity`, `RELEASE_NAME-sentinel-policy` | The Redis tier's own identities and policies | — |
+
+The admin API key, your API definitions and your policies are **prerequisite secrets you create yourself**; the chart references them by name and never creates, modifies or deletes them.
 
 ## Prerequisites
 
-**The admin secret must exist before you install**, and you will normally want the API and policy secrets too. All are referenced by name only, so none of their contents pass through Helm values or land in the release.
+Three secrets are referenced by name, and each one named in your values must exist before you install. Secrets are org-level, so no `--gvc` flag is involved.
 
-### 1. Admin API Key (Required)
+<Steps>
+  <Step title="Create the admin API key secret (required)">
+    An [opaque secret](/guides/create-secret/opaque) holding the key for the Gateway Control API under `/tyk/`, sent as the `X-Tyk-Authorization` header. Whoever holds it can create, list and revoke every API key on the gateway, so generate a strong random value:
 
-This is `TYK_GW_SECRET`, the key for the Gateway Control API served under `/tyk/*` and sent as the `X-Tyk-Authorization` header. Whoever holds it can create, list, and revoke every API key on the gateway, so generate a strong random value:
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name ADMIN_SECRET_NAME --encoding plain -f -
+    ```
 
-```bash
-printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name my-tyk-admin-secret --encoding plain -f -
-```
+    Set `adminSecretName` to this name. The chart refuses to render without it.
+  </Step>
+  <Step title="Create the API definitions secret">
+    A [dictionary secret](/guides/create-secret/dictionary) whose keys are `*.json` filenames and whose values are Tyk API definitions, mounted at `/opt/tyk-gateway/apps`. Each definition's `proxy.target_url` points at the upstream it fronts — for a workload in the same GVC, use its fully qualified internal address. Because the values are multi-line JSON, write a manifest:
 
-Set `adminSecretName` to the name you used. The chart refuses to render without it.
+    ```yaml
+    kind: secret
+    name: APIS_SECRET_NAME
+    type: dictionary
+    data:
+      app1.json: >-
+        { "api_id": "app1", "name": "app1", "org_id": "default", "use_keyless":
+        true, "use_jwt": false, "disable_rate_limit": true, "definition": {
+        "location": "header", "key": "version" }, "version_data": { "not_versioned":
+        true, "versions": { "Default": { "name": "Default", "use_extended_paths":
+        true } } }, "proxy": { "listen_path": "/app1", "target_url":
+        "http://app1.GVC_NAME.cpln.local:8080", "strip_listen_path": true },
+        "active": true}
+    ```
 
-### 2. API Definitions (Optional)
+    Then apply it:
 
-A [dictionary secret](/guides/create-secret/dictionary) whose keys are `*.json` filenames and whose values are Tyk API definitions, mounted at `/opt/tyk-gateway/apps`. Because the values are multi-line JSON, write a manifest and apply it:
+    ```bash
+    cpln apply -f apis.yaml
+    ```
 
-```yaml
-kind: secret
-name: my-tyk-apis
-description: my-tyk-apis
-tags: {}
-type: dictionary
-data:
-  app1.json: >-
-    { "api_id": "app1", "name": "app1", "org_id": "default", "use_keyless":
-    true, "use_jwt": false, "disable_rate_limit": true, "definition": {
-    "location": "header", "key": "version" }, "version_data": { "not_versioned":
-    true, "versions": { "Default": { "name": "Default", "use_extended_paths":
-    true } } }, "proxy": { "listen_path": "/app1", "target_url":
-    "http://app1.example-gvc.cpln.local:80", "strip_listen_path": true },
-    "active": true}
-```
+    Set `apiSecretName` to this name. Setting it to `""` omits the mount — but then the gateway serves the demo API baked into the image instead of nothing (see [Troubleshooting](#troubleshooting)).
+  </Step>
+  <Step title="Create the policies secret">
+    An [opaque secret](/guides/create-secret/opaque) with encoding `plain`, holding a single JSON object of policies keyed by policy ID, mounted at `/opt/tyk-gateway/policies/policies.json`:
 
-```bash
-cpln apply -f my-tyk-apis.yaml
-```
-
-Set `apiSecretName` to the name you used.
-
-<Warning>
-**Leaving `apiSecretName` empty does not serve nothing — it serves Tyk's demo API.** With no definitions mounted, the gateway falls back to the API definitions baked into the upstream image and boots serving `Tyk Test API`. The install looks entirely healthy — the workload is ready and `/hello` reports `redis: pass` — while serving none of your APIs. Set the secret, or expect the vendor demo endpoint on your listener.
-</Warning>
-
-### 3. Policies (Optional)
-
-An [opaque secret](/guides/create-secret/opaque) with encoding `plain`, holding a single JSON object of policies keyed by policy ID, mounted at `/opt/tyk-gateway/policies/policies.json`:
-
-```yaml
-kind: secret
-name: my-tyk-policies
-description: my-tyk-policies
-tags: {}
-type: opaque
-data:
-  encoding: plain
-  payload: |-
-    {
-      "app1-rate-limit": {
-        "org_id": "default",
-        "active": true,
-        "rate": 20,
-        "per": 100,
-        "quota_max": 0,
-        "quota_renewal_rate": 0,
-        "quota_remaining": 0,
-        "access_rights": {
-          "app1": {
-            "api_id": "app1",
-            "api_name": "app1",
-            "versions": ["Default"]
+    ```yaml
+    kind: secret
+    name: POLICIES_SECRET_NAME
+    type: opaque
+    data:
+      encoding: plain
+      payload: |-
+        {
+          "app1-rate-limit": {
+            "org_id": "default",
+            "active": true,
+            "rate": 20,
+            "per": 100,
+            "quota_max": 0,
+            "quota_renewal_rate": 0,
+            "quota_remaining": 0,
+            "access_rights": {
+              "app1": {
+                "api_id": "app1",
+                "api_name": "app1",
+                "versions": ["Default"]
+              }
+            }
           }
         }
-      }
-    }
-```
+    ```
 
-```bash
-cpln apply -f my-tyk-policies.yaml
-```
+    ```bash
+    cpln apply -f policies.yaml
+    ```
 
-Set `policySecretName` to the name you used, or leave it `""` to run with no policies. You can edit both secrets independently after install, as long as their names stay the same.
+    Set `policySecretName` to this name, or set it to `""` to run with no policies.
+  </Step>
+  <Step title="Choose the Redis and Sentinel passwords">
+    The bundled Redis serves only this gateway, so its passwords are Helm values the chart turns into secrets — nothing to create. They ship as the placeholders `change-me-tyk-redis` and `change-me-tyk-sentinel` and are used exactly as written, so set `redis.redis.auth.password.value` and `redis.sentinel.auth.password.value` to values of your own.
+  </Step>
+</Steps>
 
 <Warning>
-**A missing prerequisite secret wedges the install rather than failing it.** `cpln helm install` still exits 0 and reports success, every resource is created, and the gateway then never becomes ready — with no container logs at all, because the container never started. The only place the reason appears is `cpln workload get-deployments RELEASE_NAME-tyk-api-gateway --gvc GVC_NAME`, as `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Create the secrets first and check the deployment rather than trusting the Helm output.
+**A missing prerequisite secret wedges the install rather than failing it.** `apiSecretName` and `policySecretName` default to the names `my-tyk-apis` and `my-tyk-policies`, so they must exist too unless you set them to `""`. `cpln helm install` reports success and every resource is created, but the gateway container never starts — so `cpln logs` returns **zero lines**. The only place the missing secret is named is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-tyk-api-gateway --gvc GVC_NAME -o yaml
+```
+
+The message reads `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` It is `get-deployments` — plain `cpln workload get` has no `versions` key. Create the missing secret and the deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-tyk-api-gateway --gvc GVC_NAME` to skip the wait.
 </Warning>
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+Once the secrets exist, install the template into your GVC, naming the secrets and replacing the two password placeholders:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/tyk \
+  --version 1.3.0 --gvc GVC_NAME \
+  --set adminSecretName=ADMIN_SECRET_NAME \
+  --set apiSecretName=APIS_SECRET_NAME \
+  --set policySecretName=POLICIES_SECRET_NAME \
+  --set redis.redis.auth.password.value='YOUR-STRONG-REDIS-PASSWORD' \
+  --set redis.sentinel.auth.password.value='YOUR-STRONG-SENTINEL-PASSWORD'
+```
+
+Prefer a values file (`--values`) over `--set` for the passwords if you do not want them in your shell history.
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -142,31 +159,38 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Image and Port
 
 ```yaml
 image: tykio/tyk-gateway:v5.10.0
 
 listenPort: 8080 # REQUIRED - the port the gateway listens on
+```
 
-# ─── Prerequisite secrets ─────────────────────────────────────────────────────
-# All three must EXIST BEFORE INSTALL. See README Prerequisites for the exact
-# `cpln secret create-*` commands.
+The chart refuses to render if `listenPort` is one of the container ports Control Plane reserves.
 
-# The admin secret is the Gateway Control API key (X-Tyk-Authorization on /tyk/*),
-# which creates, lists and revokes API keys — so it never transits Helm values.
+### API Definitions and Policies
+
+```yaml
 adminSecretName: my-tyk-admin-secret # REQUIRED - opaque secret (encoding: plain) holding the admin API key
 
-# These two are OPTIONAL — set either to "" to omit it. But note what happens if
-# you omit the APIs: the gateway falls back to the demo API definitions baked
-# into the upstream image and will happily serve "Tyk Test API" instead of
-# nothing, which looks like a working install until you notice it is not yours.
 apiSecretName: my-tyk-apis # dictionary secret holding your API definition JSON files; "" = serve the image's demo APIs
 policySecretName: my-tyk-policies # opaque secret holding your policies JSON; "" = no policies
+```
 
-# ─── Gateway ──────────────────────────────────────────────────────────────────
+Definitions and policies are read when the gateway starts. To change them, see [Updating API Definitions and Policies](#updating-api-definitions-and-policies).
+
+### Master Keys
+
+```yaml
 allowMasterKeys: false # true lets a key created with no access_rights reach EVERY API on this gateway
+```
 
+With the default `false`, every key created through `/tyk/keys` must carry an `access_rights` entry naming the APIs it may reach. Requests that omit it are refused — see [Troubleshooting](#troubleshooting) for the exact responses.
+
+### Resources and Autoscaling
+
+```yaml
 resources:
   cpu: 50m
   memory: 128Mi
@@ -179,17 +203,33 @@ autoscaling:
   target: 100
 
 multiZone: false # OPTIONAL - Deploys replicas across multiple zones (confirm availability in your location)
+```
 
-# ─── Access ───────────────────────────────────────────────────────────────────
+### Access
+
+```yaml
 externalAccess: false # true publishes the gateway — INCLUDING its /tyk admin API — to the internet
 internalAccess: # OPTIONAL - Sets the internal firewall scope
   type: same-gvc # options: none, same-gvc, same-org, workload-list
   workloads: [] # used with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
-# ─── Bundled Redis + Sentinel ─────────────────────────────────────────────────
-# Tyk's token, rate-limit and analytics store. It serves this gateway only and is
-# never reachable from outside the GVC, so the passwords are template plumbing —
-# but they are used AS-IS, so change them before installing.
+| Type | Description |
+|------|-------------|
+| `none` | No internal access allowed |
+| `same-gvc` | Allow access from all workloads in the same GVC |
+| `same-org` | Allow access from all workloads in the same organization |
+| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads` |
+
+The chart refuses to render with `externalAccess: false` and `internalAccess.type: none` together, since nothing could reach the gateway. An access change takes up to a few minutes to take effect after an upgrade.
+
+<Warning>
+**`externalAccess: true` puts the Tyk admin API on the public internet.** The Gateway Control API under `/tyk/` is served on the same port as your proxied APIs and cannot be split onto another listener, so publishing the gateway publishes key management with it and the admin secret becomes the only thing in front of it.
+</Warning>
+
+### Redis and Sentinel
+
+```yaml
 redis:
   redis:
     resources:
@@ -219,153 +259,192 @@ redis:
       enabled: true
 ```
 
-### API Definitions and Policies
-
-- `apiSecretName` — name of the dictionary secret holding your API definitions. Each key is a JSON filename mounted at `/opt/tyk-gateway/apps`. Set to `""` to omit the mount — but see the demo-API warning in [Prerequisites](#2-api-definitions-optional).
-- `policySecretName` — name of the opaque secret holding your policies JSON, mounted at `/opt/tyk-gateway/policies/policies.json`. Set to `""` to run with no policies.
-- `listenPort` — the port the gateway listens on. Control Plane reserves a set of container ports; the chart refuses to render on one of them rather than letting the workload be rejected at apply time.
-
-Both secrets are read at boot. After editing either one, redeploy the gateway workload or call `/tyk/reload` for the change to take effect.
-
-### Master Keys
-
-- `allowMasterKeys` — when `true`, a key created through `/tyk/keys` with no `access_rights` section can call **every** API on this gateway. **Defaults to `false`**, matching upstream Tyk.
-
-<Warning>
-**This default changed in 1.3.0 and it will break key-creation requests that used to work.** Versions up to 1.2.1 hardcoded master keys on, so any request that POSTed a bare session object was silently granted blanket access. With `allowMasterKeys: false`, the same request is refused — the exact response depends on the endpoint:
-
-| Request | Response |
-|---|---|
-| `POST /tyk/keys/create` with `"access_rights": {}` | `400` — `Failed to create key, keys must have at least one Access Rights record set.` |
-| `POST /tyk/keys/{custom-key}` with `"access_rights": {}` | `500` — `Failed to create key, ensure security settings are correct.` |
-
-In both cases the gateway logs the real reason: `Master keys disallowed in configuration, key not added.` with `err="master keys disabled"`. The fix is to give each key an `access_rights` entry naming the APIs it may reach; setting `allowMasterKeys: true` restores the old behavior and the old exposure.
-</Warning>
-
-### Access
-
-- `externalAccess` — when `true`, the gateway's external inbound firewall opens to `0.0.0.0/0` and Control Plane assigns a `*.cpln.app` canonical endpoint. **Defaults to `false`.**
-- `internalAccess.type` — which workloads inside Control Plane may reach the gateway. **Defaults to `same-gvc`.**
-- `internalAccess.workloads` — list of workload links, used only when `type` is `workload-list`.
-
-| Type | Description |
-|------|-------------|
-| `none` | No internal access allowed |
-| `same-gvc` | Allow access from all workloads in the same GVC |
-| `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads` |
-
-<Warning>
-**`externalAccess: true` puts the Tyk admin API on the public internet.** `/tyk/*` is served on the same port as your proxied APIs and cannot be split onto another listener, so publishing the gateway publishes its key-management API with it and the admin secret becomes the only thing in front of it. Prefer leaving it `false` and reaching the gateway from inside the GVC.
-</Warning>
-
-<Note>
-Setting `externalAccess: false` together with `internalAccess.type: none` would leave nothing able to reach the gateway, so the chart fails the render with a message naming both knobs instead of installing something unreachable.
-
-**An access change takes up to a couple of minutes to take effect.** Enabling external access was measured at 30 seconds from upgrade to the first `200`, and closing internal access at about 32 seconds; re-poll before concluding a knob did nothing. Note that a request blocked by the internal firewall **times out** rather than returning `403` — a hang is what a correctly closed internal firewall looks like here, not a sign that the gateway is down.
-</Note>
-
-### Resources and Autoscaling
-
-- `resources.cpu` / `resources.memory` — CPU and memory allocated to the gateway workload.
-- `autoscaling.minScale` / `autoscaling.maxScale` — minimum and maximum number of gateway replicas.
-- `autoscaling.metric` — scaling metric (`cpu` by default).
-- `autoscaling.target` — target metric value that triggers a scale-up.
-- `autoscaling.scaleToZeroDelay` — seconds of inactivity before scaling to zero (only applies when `minScale` is `0`).
-- `multiZone` — when `true`, spreads replicas across availability zones within the location.
-
-### Redis and Sentinel
-
-The bundled Redis is configured under the `redis` key; see the [Redis template](/template-catalog/templates/redis) for full configuration details.
-
-- `redis.redis.replicas` — number of Redis replicas.
-- `redis.sentinel.replicas` — number of Sentinel replicas; 3 is the default and the recommended minimum for failover.
-- `redis.redis.persistence.enabled` / `redis.sentinel.persistence.enabled` — persist data and Sentinel state to volume sets.
-- `redis.redis.auth.password.value` / `redis.sentinel.auth.password.value` — the Redis and Sentinel passwords.
-
-This Redis serves only this gateway and is never reachable from outside the GVC, so its passwords remain Helm values rather than prerequisite secrets. **They are used exactly as written**, so replace both `change-me-…` placeholders before installing.
+Replace both `change-me-…` passwords before installing. Keys under `redis` are passed to the bundled [Redis template](/template-catalog/templates/redis); see its page for the full set.
 
 ### Outbound Connectivity
 
-The gateway ships with an empty outbound firewall (`outboundAllowCIDR: []`), so it cannot open connections to the public internet.
-
-<Warning>
-**Every API's `target_url` must point at an upstream inside the same GVC**, addressed over internal DNS — for example `http://my-app.GVC_NAME.cpln.local:8080`. GVC-internal traffic is governed by the destination workload's internal firewall rather than by the gateway's egress, so in-GVC proxying works normally with egress closed. To proxy to an API on the public internet, add `outboundAllowCIDR` or `outboundAllowHostname` to the gateway workload; there is no value for it in the chart.
-</Warning>
+The gateway's outbound firewall is closed and there is no value to open it. Every API's `target_url` must point at an upstream in the same GVC, addressed by its fully qualified internal name — for example `http://WORKLOAD_NAME.GVC_NAME.cpln.local:8080`, where the port is the upstream workload's container port. The upstream workload's own internal firewall must admit the gateway. Proxying to an API on the public internet requires adding `outboundAllowCIDR` or `outboundAllowHostname` to the gateway workload yourself.
 
 ## Connecting
 
-| Path | Address | Notes |
+| What | Address | Notes |
 |------|---------|-------|
-| Public gateway | `https://CANONICAL_ENDPOINT` | Only when `externalAccess` is `true`. Read the endpoint from `status.canonicalEndpoint` in `cpln workload get RELEASE_NAME-tyk-api-gateway --gvc GVC_NAME -o yaml`. |
-| Internal gateway | `http://RELEASE_NAME-tyk-api-gateway.GVC_NAME.cpln.local:8080` | Subject to `internalAccess.type`. Use `listenPort` if you changed it. |
-| Proxied API | `GATEWAY_ADDRESS/LISTEN_PATH` | `listen_path` comes from each API definition, e.g. `/app1`. |
-| Admin API | `GATEWAY_ADDRESS/tyk/keys`, `/tyk/apis`, `/tyk/reload` | Send the header `X-Tyk-Authorization` set to the payload of your `adminSecretName` secret. |
-| Health check | `GATEWAY_ADDRESS/hello` | Reports gateway version and Redis connectivity. |
-| Redis and Sentinel | `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379`, `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Internal only; passwords are the `redis.*.auth.password.value` values. |
+| Public gateway | `https://CANONICAL_ENDPOINT` | Only when `externalAccess: true`. Read the endpoint from `status.canonicalEndpoint` in `cpln workload get RELEASE_NAME-tyk-api-gateway --gvc GVC_NAME -o yaml`. |
+| Internal gateway | `http://RELEASE_NAME-tyk-api-gateway.GVC_NAME.cpln.local:8080` | Subject to `internalAccess.type`. Use your `listenPort` if you changed it. |
+| Proxied API | `GATEWAY_ADDRESS/LISTEN_PATH` | `listen_path` comes from each API definition, for example `/app1`. |
+| Gateway Control API | `GATEWAY_ADDRESS/tyk/keys`, `/tyk/apis`, `/tyk/reload` | Send the header `X-Tyk-Authorization` set to the payload of your admin secret. |
+| Health check | `GATEWAY_ADDRESS/hello` | Reports gateway status and Redis connectivity. |
+| Redis and Sentinel | `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379`, `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Internal only; the gateway reaches Redis through Sentinel. |
 
-Reveal the admin key when you need it:
+Read the admin key from its secret when you need it (it appears as `payload`):
 
 ```bash
-cpln secret reveal my-tyk-admin-secret
+cpln secret reveal ADMIN_SECRET_NAME -o yaml
 ```
 
-### Ports
+To check the gateway without opening it to the internet, forward its port to your machine:
 
-| Port | Protocol | Description |
-|------|----------|-------------|
-| `8080` | HTTP | API traffic and the admin API under `/tyk/` |
+```bash
+cpln port-forward RELEASE_NAME-tyk-api-gateway 8080:8080 --gvc GVC_NAME
+```
 
-## Upgrading From 1.2.1 or Earlier
+Then, in a second terminal, call the health check and list the loaded APIs, passing the admin key in the header:
 
-<Warning>
-**Three defaults change behavior on upgrade: the gateway stops being reachable from the internet, key-creation requests without `access_rights` start failing, and the internal firewall opens from `none` to `same-gvc` so every workload in the GVC can now reach the gateway.** None is a fault; all three will surprise you if you have not planned for them — set `internalAccess.type` explicitly if you want the old, closed behavior.
-</Warning>
+```bash
+curl http://127.0.0.1:8080/hello
+curl -H "X-Tyk-Authorization: ADMIN_KEY" http://127.0.0.1:8080/tyk/apis
+```
+
+A healthy gateway reports `redis` as `pass` in the `/hello` response, and `/tyk/apis` lists the definitions from your API secret.
+
+## Operations
+
+### Backing Up
+
+The API definitions and policies live only in your own secrets, so keep their manifests in version control. Keys issued through the Gateway Control API, plus rate-limit and quota counters, live in the bundled Redis, whose volume sets take a daily snapshot kept for 7 days. Uninstalling the release deletes those volume sets.
+
+### Restoring a Backup
+
+Restoring the bundled Redis from a volume-set snapshot has not been verified for this template. If you depend on keys issued through the Gateway Control API, keep a record of them outside the gateway so you can reissue them.
+
+### Updating API Definitions and Policies
+
+Re-apply the edited manifest, then force a redeployment — a running gateway does not pick up a changed secret on its own:
+
+```bash
+cpln apply -f apis.yaml
+cpln workload force-redeployment RELEASE_NAME-tyk-api-gateway --gvc GVC_NAME
+```
+
+Keep the secret names unchanged; the release references them by name. Calling `/tyk/reload` instead reloads only the replica that answers the request, so a redeployment is the reliable path when more than one replica is running.
+
+### Upgrading from 1.2.1 or Earlier
+
+Version 1.3.0 is a security fix. Versions up to 1.2.1 shipped the Gateway Control API key as the `values.yaml` value `mysecret`, published the gateway to the internet by default, and hardcoded master keys on — so one guessed word yielded a key to every API.
 
 | Behavior | 1.2.1 and earlier | 1.3.0 |
 |---|---|---|
 | Admin API key | `adminSecret` value, defaulting to `mysecret` | `adminSecretName`, naming an opaque secret you create |
 | External access | `externalAccess`, defaulting to `true` | `externalAccess`, defaulting to `false` |
 | Internal access | `internalAccess.type`, defaulting to `none` | `internalAccess.type`, defaulting to `same-gvc` |
-| Master keys | Hardcoded on, no knob | `allowMasterKeys`, defaulting to `false` |
+| Master keys | Hardcoded on, no value | `allowMasterKeys`, defaulting to `false` |
 | Redis and Sentinel passwords | `myRedisPassword` / `mySentinelPassword` | `change-me-tyk-redis` / `change-me-tyk-sentinel` placeholders |
-| Chart-created secret | A dictionary secret holding the admin key | None for the admin key — only the bundled Redis and Sentinel secrets |
 
-What to do before upgrading:
+<Warning>
+**Three defaults change behavior on upgrade:** the gateway stops being reachable from the internet, key-creation requests without `access_rights` start failing, and the internal firewall opens from `none` to `same-gvc` so every workload in the GVC can reach the gateway. Set each one explicitly if you want the old behavior. An in-place upgrade from 1.2.1 has not been verified end to end, so try it on a non-production release first.
+</Warning>
 
 <Steps>
   <Step title="Create the admin key secret">
-    The gateway will not start without it. Use a freshly generated value rather than carrying `mysecret` forward — it has been published in a public repository for the life of the earlier versions, and any key minted with it should be considered compromised:
+    Use a freshly generated value — `mysecret` was published in a public repository, so treat any key minted under it as compromised and plan to reissue it:
 
     ```bash
-    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name my-tyk-admin-secret --encoding plain -f -
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name ADMIN_SECRET_NAME --encoding plain -f -
     ```
 
-    Set `adminSecretName` to that name and remove `adminSecret` from your values — it no longer exists in the chart. Every client calling `/tyk/*` needs the new value in its `X-Tyk-Authorization` header.
+    Set `adminSecretName` to that name and drop `adminSecret` from your values; it no longer exists in the chart. Every client calling `/tyk/` needs the new value.
   </Step>
-  <Step title="Decide whether the gateway should stay public">
-    If clients outside Control Plane call your APIs, set `externalAccess: true` explicitly — and understand that this also republishes `/tyk/*`. If every caller is inside the GVC, do nothing and the default `same-gvc` covers them.
+  <Step title="Decide whether the gateway stays public">
+    If clients outside Control Plane call your APIs, set `externalAccess: true` explicitly, knowing it also publishes `/tyk/`. If every caller is inside the GVC, the default `same-gvc` covers them.
   </Step>
-  <Step title="Audit any key created without access rights">
-    Under the old hardcoded setting, such keys reach every API on the gateway. List them with `GET /tyk/keys`, then reissue each one with an `access_rights` entry naming only the APIs it needs. Requests that create bare keys now fail — see [Master Keys](#master-keys) for the exact responses.
+  <Step title="Audit keys created without access rights">
+    Under the old hardcoded setting such keys reach every API. List keys with `GET /tyk/keys` and reissue each with an `access_rights` entry naming only the APIs it needs.
   </Step>
   <Step title="Set the Redis and Sentinel passwords">
-    The placeholder defaults are used verbatim if you leave them, so set both `redis.redis.auth.password.value` and `redis.sentinel.auth.password.value` to values of your own.
+    Set `redis.redis.auth.password.value` and `redis.sentinel.auth.password.value` to values of your own; the placeholders are used verbatim otherwise.
+  </Step>
+  <Step title="Run the upgrade">
+    ```bash
+    cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/tyk \
+      --version 1.3.0 --gvc GVC_NAME \
+      --set adminSecretName=ADMIN_SECRET_NAME
+    ```
+
+    Carry over the rest of your values (API and policy secret names, passwords, access settings) with `--values` or further `--set` flags.
   </Step>
 </Steps>
 
+### Scaling and Availability
+
+The gateway is stateless and autoscales between `autoscaling.minScale` and `autoscaling.maxScale` replicas on CPU; raise `minScale` to `2` or more to keep a replica serving while another restarts. Redis runs 2 replicas behind 3 Sentinels, which promote a new Redis primary if the current one fails. Set `multiZone: true` to spread gateway replicas across availability zones where the location supports it.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The gateway never starts after install while helm reported success">
+    **Symptom:** `cpln helm install` succeeded, but `RELEASE_NAME-tyk-api-gateway` has no running containers and `cpln logs` returns nothing.
+
+    **Cause:** A secret named in `adminSecretName`, `apiSecretName` or `policySecretName` does not exist. The defaults `my-tyk-apis` and `my-tyk-policies` count — they must exist unless set to `""`.
+
+    **Fix:** Read the message naming the secret, then create it:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-tyk-api-gateway --gvc GVC_NAME -o yaml
+    ```
+
+    Once the secret exists the deployment recovers on its own, or run `cpln workload force-redeployment RELEASE_NAME-tyk-api-gateway --gvc GVC_NAME` to skip the wait.
+  </Accordion>
+  <Accordion title="The gateway serves Tyk Test API instead of my APIs">
+    **Symptom:** The install looks healthy, but `/tyk/apis` lists `Tyk Test API` and none of your definitions.
+
+    **Cause:** `apiSecretName` is `""`, so no definitions are mounted and the gateway falls back to the demo API baked into the upstream image.
+
+    **Fix:** Create the API definitions secret, set `apiSecretName` to its name with `cpln helm upgrade`, and confirm with `GET /tyk/apis`.
+  </Accordion>
+  <Accordion title="Creating a key returns 400 or 500">
+    **Symptom:** A key-creation request that sends `"access_rights": {}` is refused:
+
+    | Request | Response |
+    |---|---|
+    | `POST /tyk/keys/create` | `400` — `Failed to create key, keys must have at least one Access Rights record set.` |
+    | `POST /tyk/keys/{custom-key}` | `500` — `Failed to create key, ensure security settings are correct.` |
+
+    **Cause:** `allowMasterKeys` is `false`, so a key with no access rights is rejected. The gateway log names the reason: `Master keys disallowed in configuration, key not added.`
+
+    **Fix:** Give the key an `access_rights` entry naming the APIs it may reach. Setting `allowMasterKeys: true` restores blanket keys and the exposure that comes with them. To see the log line:
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-tyk-api-gateway"} |= "Master keys"' --limit 50 --since 10m
+    ```
+  </Accordion>
+  <Accordion title="An API pointing at a public upstream fails">
+    **Symptom:** Requests to an API whose `target_url` is outside Control Plane fail, while APIs pointing at workloads in the GVC work.
+
+    **Cause:** The gateway's outbound firewall is closed.
+
+    **Fix:** Point `target_url` at an in-GVC upstream using its fully qualified `.GVC_NAME.cpln.local` name, or add `outboundAllowCIDR` or `outboundAllowHostname` to the gateway workload yourself.
+  </Accordion>
+  <Accordion title="Requests from another workload hang">
+    **Symptom:** A call from another workload to the internal gateway address times out instead of returning an error.
+
+    **Cause:** The gateway's internal firewall does not admit the caller — a blocked internal request hangs rather than returning `403`.
+
+    **Fix:** Widen `internalAccess.type`, or add the caller to `internalAccess.workloads` with `type: workload-list`, then allow a few minutes for the change to take effect.
+  </Accordion>
+  <Accordion title="An edited API definition or policy has no effect">
+    **Symptom:** You re-applied the API or policy secret, but the gateway still serves the old configuration.
+
+    **Cause:** Definitions and policies are read when the gateway starts, and a running replica does not pick up a changed secret.
+
+    **Fix:** Force a redeployment, as in [Updating API Definitions and Policies](#updating-api-definitions-and-policies).
+  </Accordion>
+  <Accordion title="The workload is ready but requests fail just after start">
+    **Symptom:** A newly started replica reports ready, but `/hello` does not yet report `redis` as `pass` and the log shows `storage: Redis is either down or was not configured`.
+
+    **Cause:** The gateway declares no health probes, so ready means the container started, not that it has connected to Redis.
+
+    **Fix:** Wait and re-check `GET /hello`. Expect the same short gap whenever an autoscaled replica starts.
+  </Accordion>
+</AccordionGroup>
+
 ## Important Notes
 
-- **Create the admin secret before installing.** A missing secret does not fail the install — Helm reports success and the gateway then sits at zero replicas with no container logs at all.
-- **`externalAccess: true` publishes the admin API**, because `/tyk/*` shares the listener with your proxied APIs. The admin secret is then the only control in front of key creation and revocation.
-- **`allowMasterKeys: true` grants blanket access.** Any key created without `access_rights` reaches every API on the gateway. Leave it `false` unless you have a specific reason.
-- **Leaving `apiSecretName` empty serves Tyk's demo API**, not an empty gateway. The install looks healthy while none of your APIs are loaded.
-- **Egress is closed**, so every `target_url` must resolve to an in-GVC `*.cpln.local` host.
-- **Change the bundled Redis and Sentinel passwords** — they ship as `change-me-…` placeholders and are used exactly as written.
-- **The gateway declares no health probes, so `ready: true` arrives before it can serve.** A workload was ready roughly 30 seconds before it had connected to Redis, logging `storage: Redis is either down or was not configured` in between. Use `GET /hello` and check that `redis` reports `pass` rather than trusting the readiness signal, and expect the same gap when an autoscaled replica starts.
-- **Access changes take up to a couple of minutes to propagate.** A change that appears to do nothing has usually just not settled yet.
-- **The first `helm upgrade` after an install restarts the bundled Redis**, briefly interrupting rate-limit and key lookups even when nothing changed. Later no-op upgrades do not.
-- **The prerequisite secrets are not owned by the release** — your admin, API, and policy secrets survive `cpln helm uninstall` and must be deleted manually if you no longer need them.
+- **Create the prerequisite secrets before installing**, including `apiSecretName` and `policySecretName` unless you set them to `""`.
+- **Leave `externalAccess` off unless you need it** — enabling it also publishes the Gateway Control API under `/tyk/`.
+- **Leave `allowMasterKeys` off** — with it on, any key created without `access_rights` reaches every API on the gateway.
+- **Change the Redis and Sentinel passwords** — they ship as `change-me-…` placeholders and are used exactly as written.
+- **Force a redeployment after changing a prerequisite secret**, including after rotating the admin key — the running gateway keeps the old value until it restarts.
+- **Your prerequisite secrets survive `cpln helm uninstall`** — delete them yourself if you no longer need them.
 
 ## External References
 
