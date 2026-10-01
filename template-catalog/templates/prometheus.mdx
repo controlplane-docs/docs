@@ -1,92 +1,76 @@
 ---
 title: Prometheus
 icon: /template-catalog/templates/icons/prometheus.png
-description: Deploy Prometheus on Control Plane using the Template Catalog. A self-hosted metrics database with remote-write ingest, durable TSDB storage, and an optional Thanos sidecar for Store API federation and object-storage block upload.
-keywords: ['metrics storage', 'time series database', 'promql', 'monitoring', 'remote_write receiver', 'scrape configs', 'thanos store api', 'grafana datasource', 'observability', 'mimir alternative', 'ha prometheus', 'prometheus template']
+description: Deploy Prometheus on Control Plane into an existing GVC as a single-instance, internal-only metrics database with remote-write ingest, a persistent TSDB volume and an optional Thanos sidecar for Store API and bucket upload. Nothing must exist first; object storage needs a bucket.
+keywords: ['metrics storage', 'time series database', 'promql', 'monitoring', 'remote_write receiver', 'scrape configs', 'thanos store api', 'thanos sidecar', 'grafana datasource', 'observability', 'mimir alternative', 'ha prometheus', 'prometheus template']
 ---
-
-<Warning>
-**Version 1.2.0 moves the MinIO object-storage credentials out of values.** They were plain values that landed in your Helm release. They are now a `dictionary` secret you create before installing, holding `accessKey` and `secretKey`. Only affects installs using MinIO for long-term storage.
-</Warning>
 
 ## Overview
 
-Prometheus is the standard open-source metrics database. This template deploys a single Prometheus server with the remote-write receiver enabled and a durable TSDB volume: your own senders push metrics in via Prometheus `remote_write` (or Prometheus scrapes targets you configure), and anything that speaks PromQL — your own Grafana, dashboards, scripts — queries them back. An optional co-located Thanos sidecar (on by default) exposes the Store API for a Thanos Query tier and can upload TSDB blocks to your object bucket for long-term durability.
+Prometheus is the standard open-source metrics database. This template deploys one Prometheus server with the remote-write receiver enabled and its TSDB on a persistent volume: your own senders push metrics in with Prometheus `remote_write`, or Prometheus scrapes targets you configure, and anything that speaks PromQL (your own Grafana, dashboards, scripts) queries them back. An optional Thanos sidecar in the same workload, on by default, exposes the Thanos Store API for a Thanos Query tier and can upload TSDB blocks to your own bucket.
+
+Use it when you want metrics data you own, or metrics from sources outside your workloads; Control Plane's built-in metrics keep collecting and dashboarding your workloads either way.
 
 <Note>
-This is a **self-hosted metrics store for your own metrics from your own sources**. It is separate from — and not a replacement for — Control Plane's built-in observability, which continues to collect and dashboard your workloads' metrics natively.
+This template does not create a GVC. It deploys into an existing GVC that you already have.
 </Note>
-
-### Architecture
-
-- **Prometheus** — A single-replica stateful workload. Scrape and remote-write ingest plus PromQL query, all on port `9095` — Prometheus's usual port `9090` is reserved by the platform, so this template runs it on `9095` instead. High availability is achieved by installing the template twice (see [High Availability](#high-availability)).
-- **Thanos sidecar** *(optional, default on)* — A second container in the same workload. Serves the Thanos Store API (gRPC) on `10901` and HTTP health/metrics on `10902`, and uploads TSDB blocks to object storage when enabled.
-- **Object storage** *(optional)* — The sidecar ships completed TSDB blocks to your S3, GCS, or S3-compatible bucket; history beyond local retention lives in the bucket.
 
 ### What Gets Created
 
-- **Stateful Prometheus Workload** — Serves remote-write ingest and PromQL query on port `9095`; includes the Thanos sidecar container when enabled.
-- **Volume Set** — 20 GiB at `/prometheus` for the TSDB, shared read-only with the sidecar.
-- **Secrets** — An opaque secret holding the rendered `prometheus.yml`, mounted as a file; a second secret holds the Thanos bucket configuration when object storage is enabled.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to exactly the template's secrets (plus any remote-write password secrets you name), and cloud access scoped to exactly your bucket (AWS and GCP backends) when object storage is enabled.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-prometheus` | Prometheus server (stateful, 1 replica): scrape, remote-write ingest, PromQL and the web UI on port `9095`; container `thanos-sidecar` adds the Store API on `10901` and health on `10902` | Sidecar: `thanos.sidecar.enabled: true` (default) |
+| Volume set | `RELEASE_NAME-prometheus-vs` | TSDB at `/prometheus` (20 GiB, final snapshot on delete, kept 7 days), shared with the sidecar | — |
+| Secret | `RELEASE_NAME-prometheus-config` | The rendered `prometheus.yml`, mounted as a file | — |
+| Secret | `RELEASE_NAME-prometheus-objstore` | Thanos bucket configuration | `thanos.objectStorage.enabled: true` |
+| Identity | `RELEASE_NAME-prometheus-identity` | Workload identity; carries bucket access through your cloud account for AWS and GCP | — |
+| Policy | `RELEASE_NAME-prometheus-policy` | `reveal` on exactly the template's secrets plus any secrets you name | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+Prometheus listens on `9095` rather than its usual `9090`, which is reserved by the platform. There is no public endpoint: Prometheus has no authentication of its own.
 
 ## Prerequisites
 
-None for a default install. Two optional features have prerequisites:
+None for a default install. Two optional features need a secret you create first. Secrets are org-level, so no GVC flag is involved.
 
-- **Remote write with basic auth** — an opaque secret per endpoint holding the password (set `remoteWrite[].basicAuth.passwordSecretName` to its name). The secret must exist **before** install — the template references it by name only and never stores the password in values.
-- **Object storage** (`thanos.objectStorage`) — an existing bucket and access setup for it. Complete the steps for your chosen backend below.
+<Steps>
+  <Step title="Optional - remote write with basic auth">
+    For each `remoteWrite` entry that uses basic auth, create an [opaque secret](/guides/create-secret/opaque) holding the password:
 
-<Tabs>
-  <Tab title="AWS S3">
-    AWS S3 uses a Control Plane cloud identity — no credentials are stored; the workload's identity vends temporary credentials at runtime.
+    ```bash
+    printf '%s' 'YOUR-REMOTE-WRITE-PASSWORD' | cpln secret create-opaque --name REMOTE_WRITE_PASSWORD_SECRET_NAME --encoding plain -f -
+    ```
 
-    <Steps>
-      <Step title="Create a bucket">
-        Create an S3 bucket. Set `thanos.objectStorage.aws.bucket` and `thanos.objectStorage.aws.region` to match.
-      </Step>
-      <Step title="Set up a Cloud Account">
-        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `thanos.objectStorage.aws.cloudAccountName` to its name.
-      </Step>
-      <Step title="Create a bucket-scoped IAM policy">
-        Create an AWS IAM policy granting `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on the bucket and its objects (the template's README includes the full policy JSON). Set `thanos.objectStorage.aws.policyName` to the policy's name (bare name, not ARN).
-      </Step>
-    </Steps>
-  </Tab>
-  <Tab title="Google Cloud Storage">
-    Google Cloud Storage uses a Control Plane cloud identity — no credentials are stored.
+    Set `remoteWrite[].basicAuth.passwordSecretName` to this name.
+  </Step>
+  <Step title="Optional - object storage">
+    Uploading TSDB blocks to a bucket needs the bucket and its access set up first, and an S3-compatible server also needs a credentials secret. The per-provider steps are under [Backing Up](#backing-up).
+  </Step>
+</Steps>
 
-    <Steps>
-      <Step title="Create a bucket">
-        Create a GCS bucket. Set `thanos.objectStorage.gcp.bucket` to its name.
-      </Step>
-      <Step title="Set up a Cloud Account">
-        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your GCP project. Set `thanos.objectStorage.gcp.cloudAccountName` to its name.
-      </Step>
-      <Step title="Confirm bucket access">
-        No policy to author — the template grants the workload identity `roles/storage.objectAdmin` scoped to the bucket automatically.
-      </Step>
-    </Steps>
-  </Tab>
-  <Tab title="S3-compatible (MinIO, R2, Wasabi)">
-    Any S3-compatible server uses static access credentials, since these cannot federate with a cloud account.
+<Warning>
+**A secret named in values but missing wedges the deployment silently.** `cpln helm install` still succeeds and the workload never becomes ready. `cpln logs` returns nothing at all, because the container never ran. The only place the reason appears is `status.versions[].message`, which names the missing secret:
 
-    <Steps>
-      <Step title="Create a bucket">
-        Create your bucket on the server and credentials that can read and write it. Set `thanos.objectStorage.minio.bucket`, `thanos.objectStorage.minio.accessKey`, and `thanos.objectStorage.minio.accessSecret` to match.
-      </Step>
-      <Step title="Set the endpoint">
-        Set `thanos.objectStorage.minio.endpoint` to the S3 API address as `host:port` with **no scheme** (e.g. `my-minio:9000`), and `thanos.objectStorage.minio.insecure: true` when the endpoint is plain HTTP.
-      </Step>
-    </Steps>
-  </Tab>
-</Tabs>
+```bash
+cpln workload get-deployments RELEASE_NAME-prometheus --gvc GVC_NAME -o yaml
+```
 
-Install the template using your preferred method:
+Note this is `get-deployments`; plain `cpln workload get` has no `versions` key. Create the missing secret and the deployment recovers on its own, or force a redeployment to skip the wait:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-prometheus --gvc GVC_NAME
+```
+</Warning>
+
+## Installation
+
+A default install needs no values at all:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/prometheus \
+  --version 1.2.0 --gvc GVC_NAME
+```
+
+Or follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -112,89 +96,43 @@ Install the template using your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Prometheus Server
 
 ```yaml
 image: prom/prometheus:v3.13.1
 
 resources: # Prometheus server; memory scales with active series
-  cpu: 1000m
-  memory: 2Gi
   minCpu: 500m
+  maxCpu: 1000m
   minMemory: 1Gi
-
-retention:
-  time: 15d # how long samples are kept on the local volume
-  size: "" # optional local size cap, e.g. 15GB — empty means no cap
-
-volumeset:
-  capacity: 20 # GiB — TSDB volume mounted at /prometheus
-
-scrapeInterval: 30s # global scrape interval (self-scrape and extraScrapeConfigs)
-externalLabels: {} # identity labels on all uploaded/forwarded series, e.g. region: us-east-1, replica: a
-extraScrapeConfigs: "" # raw YAML list of additional scrape_configs entries
-
-remoteWrite: [] # entries: url (required) + optional basicAuth
-# - url: http://my-mimir.my-gvc.cpln.local:8080/api/v1/push
-#   basicAuth:
-#     username: my-user
-#     passwordSecretName: my-remote-write-password # opaque secret, must exist BEFORE install
-
-thanos:
-  sidecar:
-    enabled: true # co-located sidecar exposing the Store API (gRPC :10901) for a Thanos Query tier
-    image: quay.io/thanos/thanos:v0.42.2
-    resources:
-      cpu: 250m
-      memory: 512Mi
-      minCpu: 100m
-      minMemory: 128Mi
-  objectStorage:
-    enabled: false # sidecar uploads TSDB blocks to your bucket; requires thanos.sidecar.enabled
-    type: aws # options: aws, gcp, minio
-    blockDuration: 2h # advanced: TSDB block interval (min=max disables local compaction)
-
-    aws: # AWS S3 — keyless via Control Plane cloud identity
-      bucket: my-prometheus-bucket # bucket must already exist
-      region: us-east-1
-      cloudAccountName: my-s3-cloud-account # Control Plane AWS cloud account
-      policyName: my-prometheus-s3-policy # custom bucket-scoped IAM policy (bare name)
-
-    gcp: # Google Cloud Storage — keyless via Control Plane cloud identity
-      bucket: my-prometheus-bucket # bucket must already exist
-      cloudAccountName: my-gcs-cloud-account # Control Plane GCP cloud account
-
-    minio: # Any S3-compatible server (MinIO, R2, Wasabi, …) — static keys + endpoint
-      endpoint: my-minio:9000 # host:port, NO scheme
-      insecure: true # true when the endpoint is plain HTTP
-      bucket: my-prometheus-bucket # bucket must already exist
-      region: us-east-1
-      accessKey: my-minio-username
-      accessSecret: my-minio-password
-
-internalAccess:
-  type: same-gvc # options: none, same-gvc, same-org, workload-list
-  workloads: [] # with workload-list, e.g. //gvc/GVC/workload/NAME — cross-GVC callers allowed
+  maxMemory: 2Gi
 ```
 
-### Resources
-
-- `image` — The Prometheus container image.
-- `resources` — CPU and memory for the Prometheus container. Memory scales with the number of active series.
+The block exposes both a reservation and a limit, so the limit is named `maxCpu` / `maxMemory`. Raise `maxMemory` as your number of active series grows.
 
 ### TSDB and Retention
 
-- `retention.time` — How long samples are kept on the local volume (e.g. `15d`, `30d`, `1y`).
-- `retention.size` — Optional local size cap (e.g. `15GB`); empty means no cap.
-- `volumeset.capacity` — Volume size in GiB for the TSDB at `/prometheus`.
+```yaml
+retention:
+  time: 15d # how long samples are kept on the local volume
+  size: "" # optional local size cap, e.g. 15GB — empty means no cap
+volumeset:
+  capacity: 20 # GiB — TSDB volume mounted at /prometheus
+```
 
-With object storage enabled, local retention is only the near-term window — history beyond it lives in your bucket and is served by your Thanos query tier.
+With object storage enabled, local retention is only the near-term window; older history lives in your bucket. Keep `retention.time` at least three times `thanos.objectStorage.blockDuration` so every block stays on the volume long enough to upload.
 
 ### Metrics
 
-- `scrapeInterval` — Global scrape interval, applied to the self-scrape and any `extraScrapeConfigs` jobs.
-- `externalLabels` — Identity labels attached to all uploaded and forwarded series. The template always injects a baseline `prometheus: <workload-name>` label; your keys merge over it (overriding `prometheus` is allowed — required for the [HA pair recipe](#high-availability)).
-- `extraScrapeConfigs` — A raw YAML list of additional Prometheus `scrape_configs` entries, for example:
+```yaml
+scrapeInterval: 30s # global scrape interval (self-scrape and extraScrapeConfigs)
+externalLabels: {} # identity labels on all uploaded/forwarded series, e.g. region: us-east-1, replica: a
+extraScrapeConfigs: "" # raw YAML list of additional scrape_configs entries (see README)
+```
+
+The template always adds the external label `prometheus: RELEASE_NAME-prometheus`. Your `externalLabels` keys merge over it, and overriding `prometheus` is allowed (the [HA pair](#high-availability) needs it). External labels are attached only to data leaving the server (remote write, the Store API, uploads), never to local query results.
+
+To scrape your own workloads, set `extraScrapeConfigs` to a raw YAML list of `scrape_configs` entries:
 
 ```yaml
 extraScrapeConfigs: |
@@ -203,9 +141,19 @@ extraScrapeConfigs: |
       - targets: ["my-app.my-gvc.cpln.local:8080"]
 ```
 
+Use the fully qualified `WORKLOAD_NAME.GVC_NAME.cpln.local` form for every target inside Control Plane.
+
 ### Remote Write
 
-`remoteWrite` pushes this server's metrics to any Prometheus-remote-write-compatible store — for example this catalog's Grafana Mimir template — and is the recommended shape when the Thanos sidecar is disabled:
+```yaml
+remoteWrite: [] # entries: url (required) + optional basicAuth
+# - url: http://my-mimir.my-gvc.cpln.local:8080/api/v1/push
+#   basicAuth:
+#     username: my-user
+#     passwordSecretName: my-remote-write-password # opaque secret, must exist BEFORE install
+```
+
+`remoteWrite` pushes this server's metrics to any Prometheus-remote-write-compatible store, for example this catalog's [Grafana Mimir](/template-catalog/templates/mimir) template. It is the recommended shape when the Thanos sidecar is off:
 
 ```yaml
 thanos:
@@ -213,56 +161,103 @@ thanos:
     enabled: false
 remoteWrite:
   - url: http://my-mimir.my-gvc.cpln.local:8080/api/v1/push
-    basicAuth: # optional
+    basicAuth:
       username: my-user
       passwordSecretName: my-remote-write-password # opaque secret, must exist BEFORE install
 ```
 
-The password is never stored in values — `passwordSecretName` names an opaque secret you create before install; the template mounts it as a `password_file` and grants the workload identity `reveal` on exactly that secret.
+`basicAuth` is optional. When set, both `username` and `passwordSecretName` are required; the password lives only in the opaque secret from [Prerequisites](#prerequisites), and the workload identity gets `reveal` on exactly that secret.
 
 ### Thanos Sidecar and Object Storage
 
-- `thanos.sidecar.enabled` — Runs the Thanos sidecar next to Prometheus, exposing the Store API (gRPC `10901`) so a Thanos Query tier can fan out queries to this server. Disable it when you forward metrics with `remoteWrite` instead.
-- `thanos.objectStorage.enabled` — The sidecar uploads completed TSDB blocks to your bucket (recommended for production durability). Requires `thanos.sidecar.enabled`.
-- `thanos.objectStorage.blockDuration` — Advanced: the TSDB block interval; the template pins min and max block duration to this value, which disables local compaction so blocks ship cleanly.
+```yaml
+thanos:
+  sidecar:
+    enabled: true # co-located sidecar exposing the Store API (gRPC :10901) for a Thanos Query tier
+    image: quay.io/thanos/thanos:v0.42.2
+    resources:
+      minCpu: 100m
+      maxCpu: 250m
+      minMemory: 128Mi
+      maxMemory: 512Mi
+  # Sidecar uploads TSDB blocks to a bucket — recommended for production durability.
+  objectStorage:
+    enabled: false # requires thanos.sidecar.enabled
+    type: aws # options: aws, gcp, minio
+    blockDuration: 2h # advanced: TSDB block interval (min=max disables local compaction)
 
-Set `thanos.objectStorage.type` to `aws`, `gcp`, or `minio`, and configure that block. AWS and GCP use a Control Plane cloud identity — no credentials are stored. See [Prerequisites](#prerequisites) for the per-backend setup steps.
+    # AWS S3 — keyless via Control Plane cloud identity.
+    aws:
+      bucket: my-prometheus-bucket # bucket must already exist
+      region: us-east-1
+      cloudAccountName: my-s3-cloud-account # Control Plane AWS cloud account
+      policyName: my-prometheus-s3-policy # custom IAM policy granting bucket access (bare name)
 
-| Field | Backends | Description |
-|---|---|---|
-| `bucket` | all | Target bucket. Must already exist. |
-| `region` | `aws`, `minio` | Bucket region. |
-| `cloudAccountName` | `aws`, `gcp` | Control Plane cloud account granting bucket access. |
-| `policyName` | `aws` | Bare name of the custom bucket-scoped IAM policy. |
-| `endpoint` | `minio` | S3 API address as `host:port` — no scheme. |
-| `insecure` | `minio` | `true` when the endpoint is plain HTTP. |
-| `accessKey` / `accessSecret` | `minio` | Static credentials with access to the bucket. |
+    # Google Cloud Storage — keyless via Control Plane cloud identity.
+    gcp:
+      bucket: my-prometheus-bucket # bucket must already exist
+      cloudAccountName: my-gcs-cloud-account # Control Plane GCP cloud account
 
-### Internal Access
+    # Any S3-compatible server (MinIO, R2, Wasabi, …) — static keys + endpoint.
+    minio:
+      endpoint: my-minio:9000 # host:port, NO scheme
+      insecure: true # true when the endpoint is plain HTTP
+      bucket: my-prometheus-bucket # bucket must already exist
+      region: us-east-1
+      # REQUIRED PREREQUISITE SECRET when type is `minio` — a `dictionary` secret
+      # holding exactly `accessKey` and `secretKey`. They are passed to the Thanos
+      # sidecar as AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY rather than written
+      # into objstore.yml, because a cpln:// reference inside a config file is
+      # never resolved.
+      credentialsSecretName: my-prometheus-minio-credentials
+```
 
-Prometheus is **internal-only by design** — it has no built-in authentication, so this template never exposes a public endpoint. `internalAccess.type` controls which workloads can reach it:
+Turn the sidecar off when you forward metrics with `remoteWrite` instead. `thanos.objectStorage.enabled: true` is refused at render unless the sidecar is on, because the sidecar performs the uploads. Set `type` and fill in only that provider's block; the setup steps per provider are under [Backing Up](#backing-up).
 
-| Type | Description |
-|------|-------------|
-| `none` | No internal access allowed |
-| `same-gvc` | Allow access from all workloads in the same GVC |
-| `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from specific workloads listed in `workloads` |
+### Access
 
-`workloads` entries take the form `//gvc/GVC_NAME/workload/WORKLOAD_NAME` and may name workloads in **other GVCs** — use this (or `same-org`) to allow a Thanos Query tier in another GVC to reach the Store API.
+```yaml
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # with workload-list, e.g. //gvc/GVC/workload/NAME — cross-GVC callers allowed
+```
 
-To serve clients outside Control Plane, front Prometheus with your own authenticating proxy behind a custom domain — that proxy is yours to build and operate; the template does not provide one.
+| `internalAccess.type` | Description |
+|---|---|
+| `none` | No internal access. |
+| `same-gvc` | Allow access from all workloads in the same GVC (default). |
+| `same-org` | Allow access from all workloads in the same org. |
+| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads`, which may be in other GVCs. |
+
+Entries in `internalAccess.workloads` take the form `//gvc/GVC_NAME/workload/WORKLOAD_NAME`. Use `same-org` or `workload-list` to let a Thanos Query tier in another GVC reach the Store API. Access changes are not instantaneous; re-test after a pause rather than concluding a setting did not work.
+
+There is deliberately no public access option. To serve clients outside Control Plane, put your own authenticating proxy in front of Prometheus; the template does not provide one.
 
 ## Connecting
 
-Prometheus serves everything on port `9095` — its usual port `9090` is reserved by the platform, so point senders and datasources at `9095`:
+Everything is internal. Prometheus serves ingest, PromQL and its web UI on port `9095`; the Thanos sidecar serves the Store API on `10901`.
 
-| What | Value |
-|---|---|
-| Remote-write ingest (from your senders) | `http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095/api/v1/write` |
-| PromQL / Grafana datasource | `http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095` |
-| Thanos Store API (same GVC) | `RELEASE_NAME-prometheus:10901` |
-| Thanos Store API (cross-GVC) | `RELEASE_NAME-prometheus.GVC_NAME.cpln.local:10901` |
+| What | Address | Notes |
+|---|---|---|
+| Remote-write ingest | `http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095/api/v1/write` | Point your senders here |
+| PromQL query and Grafana datasource | `http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095` | For example the [Grafana](/template-catalog/templates/grafana) template in the same GVC |
+| Web UI | `http://localhost:9095/query` through a port-forward | Expression browser; also `/targets`, `/config` and `/tsdb-status` |
+| Thanos Store API | `RELEASE_NAME-prometheus.GVC_NAME.cpln.local:10901` | gRPC, `host:port` with no scheme; only with the sidecar on |
+| Credentials | None | Prometheus has no authentication; `internalAccess` decides who can connect |
+
+Always use the fully qualified hostname. To open the web UI from your machine, start a port-forward and leave it running:
+
+```bash
+cpln port-forward RELEASE_NAME-prometheus 9095:9095 --gvc GVC_NAME
+```
+
+Then, in a second terminal, check that the server is ready before you open `http://localhost:9095/query` in a browser:
+
+```bash
+curl -s http://localhost:9095/-/ready
+```
+
+The **Targets** page (`/targets`) shows every scrape target and the exact error when a scrape fails; it is the first place to look when an expected metric never appears. **Configuration** (`/config`) shows the running `prometheus.yml`, which confirms your `extraScrapeConfigs` landed.
 
 To push metrics here from another Prometheus:
 
@@ -271,29 +266,169 @@ remote_write:
   - url: http://RELEASE_NAME-prometheus.GVC_NAME.cpln.local:9095/api/v1/write
 ```
 
-A Thanos Query tier — such as this catalog's Thanos template — adds this server as a store endpoint. From another GVC, use the same service-level address (this workload is single-replica, so it reaches the one replica directly) and allow the caller via `internalAccess` (`same-org`, or `workload-list` naming the query workload). Cross-location internal traffic incurs egress charges — co-locate the query tier with its stores where practical.
+A Thanos Query tier, such as this catalog's [Thanos](/template-catalog/templates/thanos) template, adds `RELEASE_NAME-prometheus.GVC_NAME.cpln.local:10901` as a store endpoint. Traffic between locations is billed as egress, so keep the query tier near its stores where practical.
 
-## High Availability
+## Operations
 
-Prometheus has no cluster mode, so this template deliberately has no replicas knob — a second replica of the same install would just double-count. The upstream HA pattern is two independent, identically-configured instances deduplicated at query time. Install the template twice (e.g. releases `prom-a` and `prom-b`) with identical values except `externalLabels`:
+### Backing Up
 
-```yaml
-# prom-a                  # prom-b
-externalLabels:           externalLabels:
-  prometheus: my-prom       prometheus: my-prom
-  replica: a                replica: b
+The volume set keeps a final snapshot for 7 days when the release is uninstalled; there are no scheduled snapshots. For durable history, turn on object storage: the Thanos sidecar uploads each completed TSDB block to your bucket. Set `thanos.objectStorage.enabled: true`, set `thanos.objectStorage.type`, then complete the steps for that provider.
+
+<Tabs>
+  <Tab title="AWS S3">
+    AWS uses a Control Plane cloud identity, so no keys are stored.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create an S3 bucket, for example `my-prometheus-bucket`. Set `thanos.objectStorage.aws.bucket` and `thanos.objectStorage.aws.region` to match.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        In AWS IAM, create a policy, for example `my-prometheus-s3-policy`, scoped to that bucket:
+
+        ```json
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+              "Resource": [
+                "arn:aws:s3:::my-prometheus-bucket",
+                "arn:aws:s3:::my-prometheus-bucket/*"
+              ]
+            }
+          ]
+        }
+        ```
+
+        Set `thanos.objectStorage.aws.policyName` to the policy name (the bare name, not the ARN).
+      </Step>
+      <Step title="Create a cloud account">
+        If you do not have one, [create a Control Plane cloud account](/guides/create-cloud-account) for your AWS account. Set `thanos.objectStorage.aws.cloudAccountName` to its name.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    GCS uses a Control Plane cloud identity, so no keys are stored.
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create a GCS bucket. Set `thanos.objectStorage.gcp.bucket` to its name.
+      </Step>
+      <Step title="Create a cloud account">
+        If you do not have one, [create a Control Plane cloud account](/guides/create-cloud-account) for your GCP project. Set `thanos.objectStorage.gcp.cloudAccountName` to its name.
+      </Step>
+      <Step title="Bucket access">
+        Nothing to author: the template grants the workload identity `roles/storage.objectAdmin` on exactly that bucket.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="S3-compatible (MinIO, R2, Wasabi)">
+    An S3-compatible server uses static keys, which you keep in a secret.
+
+    <Steps>
+      <Step title="Create a bucket and credentials">
+        Create the bucket on your server, and an access key pair that can read and write it. Set `thanos.objectStorage.minio.bucket` and `thanos.objectStorage.minio.region` to match.
+      </Step>
+      <Step title="Create the credentials secret">
+        Create a [dictionary secret](/guides/create-secret/dictionary) with exactly the keys `accessKey` and `secretKey`:
+
+        ```bash
+        cpln secret create-dictionary --name MINIO_CREDENTIALS_SECRET_NAME \
+          --entry accessKey='YOUR-ACCESS-KEY' \
+          --entry secretKey='YOUR-SECRET-KEY'
+        ```
+
+        Set `thanos.objectStorage.minio.credentialsSecretName` to this name. It must exist before you install or upgrade.
+      </Step>
+      <Step title="Set the endpoint">
+        Set `thanos.objectStorage.minio.endpoint` to the S3 API address as `host:port` with no scheme, for example `my-minio.my-gvc.cpln.local:9000`. An endpoint containing `://` is refused at render. Set `thanos.objectStorage.minio.insecure: true` when the endpoint is plain HTTP.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+Nothing is uploaded until the first block completes, which takes at least one `blockDuration` after install. Do not change `blockDuration` unless you know you need to.
+
+### Restoring a Backup
+
+No restore procedure has been verified for this template. Blocks in your bucket are not loaded back into this server; they are meant to be read by a Thanos object-storage tier such as the [Thanos](/template-catalog/templates/thanos) template's. Restoring the volume set's final snapshot into a new install is likewise unverified.
+
+### Upgrading from 1.0.0
+
+Version 1.1.0 renamed the resource limits in both blocks: `resources.cpu` and `resources.memory` became `resources.maxCpu` and `resources.maxMemory`, and the same for `thanos.sidecar.resources`. The old names are not read any more, so rename them in your values file or the defaults apply. Upgrade in place:
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/prometheus \
+  --version 1.2.0 --gvc GVC_NAME
 ```
 
-Senders dual-write to both endpoints; a Thanos Query tier dedups via `--query.replica-label=replica`. Overriding `prometheus` to a shared value is required so the two label sets differ only in `replica`.
+### Upgrading from 1.1.0
+
+Version 1.2.0 moves the S3-compatible (`minio`) object-storage keys out of values. `thanos.objectStorage.minio.accessKey` and `thanos.objectStorage.minio.accessSecret` are gone; create the dictionary secret from the S3-compatible tab under [Backing Up](#backing-up) and set `thanos.objectStorage.minio.credentialsSecretName` to its name. A values file that still carries the old keys is refused at render with:
+
+```text
+prometheus: minio.accessKey and minio.accessSecret were REMOVED — they are now a `dictionary` secret you create, named by minio.credentialsSecretName, holding the keys `accessKey` and `secretKey`. Delete them from your values.
+```
+
+AWS and GCP installs are unaffected. Create the secret first, remove the old keys, then run the upgrade command above.
+
+### High Availability
+
+Prometheus has no cluster mode, so the template has no replicas setting: one install is one server. The upstream HA pattern is two independent, identically configured servers deduplicated at query time. Install the template twice, for example as releases `prom-a` and `prom-b`, with identical values except `externalLabels`.
+
+Values for `prom-a`:
+
+```yaml
+externalLabels:
+  prometheus: my-prom
+  replica: a
+```
+
+Values for `prom-b`:
+
+```yaml
+externalLabels:
+  prometheus: my-prom
+  replica: b
+```
+
+Senders write to both servers, and a Thanos Query tier deduplicates on the `replica` label (the default of the Thanos template's `queryReplicaLabels`). Both installs must override `prometheus` to the same value so their label sets differ only in `replica`.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="An expected metric never appears">
+    Open the **Targets** page (`/targets`) through a port-forward. It lists each scrape target, its last scrape and the exact scrape error. Then check **Configuration** (`/config`) to confirm your `extraScrapeConfigs` entry is in the running config, and that the target uses a fully qualified `WORKLOAD_NAME.GVC_NAME.cpln.local` address.
+  </Accordion>
+  <Accordion title="Not ready for a long time after a restart">
+    After a restart Prometheus replays its write-ahead log, and `/-/ready` returns `503` until that finishes. On a large TSDB this can take minutes. It is normal recovery, not a failure; wait rather than redeploying.
+  </Accordion>
+  <Accordion title="External labels do not show in queries">
+    Expected. External labels are attached only to data leaving the server through remote write, the Store API or bucket uploads, never to local query results.
+  </Accordion>
+  <Accordion title="No blocks in the bucket yet">
+    Blocks are cut every `thanos.objectStorage.blockDuration` (default `2h`), so the first upload happens only after the first block completes. If it still has not appeared after that, read the sidecar logs:
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-prometheus"} |= "ERROR"' --limit 50 --since 10m
+    ```
+  </Accordion>
+  <Accordion title="A Thanos Query tier in another GVC cannot reach the Store API">
+    Set `internalAccess.type` to `same-org`, or to `workload-list` with the caller's full link `//gvc/GVC_NAME/workload/WORKLOAD_NAME`. Use the fully qualified address `RELEASE_NAME-prometheus.GVC_NAME.cpln.local:10901` with no scheme.
+  </Accordion>
+  <Accordion title="Upgrade refused with minio.accessKey and minio.accessSecret were REMOVED">
+    Your values still carry the pre-1.2.0 keys. Follow [Upgrading from 1.1.0](#upgrading-from-1-1-0).
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Prometheus has no built-in authentication, so this template never exposes a public endpoint.** To serve clients outside Control Plane, front it with your own authenticating proxy behind a custom domain.
-- **Remote-write password secrets must exist before install** — a missing `passwordSecretName` secret wedges the deployment waiting on it.
-- **Config changes ship via `helm upgrade`** (workload redeploy) — there is no hot reload.
-- **With object storage enabled, keep `retention.time` at least 3× `blockDuration`** (the default `15d`/`2h` satisfies this) — the sidecar needs blocks on the local volume long enough to upload them.
-- **The TSDB survives reinstall** — the volume is retained with a final snapshot, and local data resumes when a new install binds it.
-- **After a restart, readiness can take minutes on a large TSDB** — WAL replay holds the readiness endpoint at 503; this is normal recovery, not a failure.
+- **Do not open Prometheus to the internet without your own authentication in front.** Anyone who can reach port `9095` can read every metric and run any PromQL.
+- **Create every secret you name before installing**; a missing one wedges the deployment with nothing in `cpln logs`.
+- **Configuration changes apply only through `helm upgrade`**, which redeploys the workload; there is no hot reload.
+- **With object storage on, keep `retention.time` at least three times `blockDuration`**; the defaults `15d` and `2h` satisfy this.
+- **Uninstalling deletes the volume set**; only its final snapshot, kept 7 days, and anything already uploaded to your bucket remain.
 
 ## External References
 
@@ -309,9 +444,6 @@ Senders dual-write to both endpoints; a Thanos Query tier dedups via `--query.re
     </Card>
     <Card title="Thanos Sidecar" icon="server" href="https://thanos.io/tip/components/sidecar.md/">
     Store API and block-upload sidecar reference
-    </Card>
-    <Card title="Prometheus (GitHub)" icon="github" href="https://github.com/prometheus/prometheus">
-    Source code and releases
     </Card>
     <Card title="Prometheus Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/prometheus">
     View the source files, default values, and chart definition
