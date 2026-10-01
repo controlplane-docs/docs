@@ -1,62 +1,51 @@
 ---
 title: External Secret Syncer
 icon: /template-catalog/templates/icons/ess.png
-description: Deploy External Secret Syncer on Control Plane using the Template Catalog. Covers configuration, scaling, and syncing secrets from AWS, Vault, GCP Secret Manager, 1Password, Doppler, and Infisical.
-keywords: ['ess', 'secret sync', 'aws secrets manager', 'azure key vault', 'gcp secret manager', 'hashicorp vault', 'secret rotation', 'ssm parameter store', 'external secrets operator', 'secret refresh', 'infisical']
+description: Deploy the External Secret Syncer (ESS) on Control Plane to keep Control Plane secrets in sync with Vault, AWS, GCP Secret Manager, 1Password, Doppler or Infisical. A single syncer workload in an existing GVC; your sync.yaml must exist as an opaque secret before install.
+keywords: ['ess', 'external secret syncer', 'secret sync', 'aws secrets manager', 'ssm parameter store', 'gcp secret manager', 'hashicorp vault', '1password', 'doppler', 'infisical', 'secret rotation', 'external secrets operator alternative', 'secret refresh']
 ---
 
 ## Overview
 
-The External Secret Syncer (ESS) continuously syncs secrets and parameters from external providers into Control Plane secrets. This template deploys ESS as a workload that polls your configured providers on a set interval and creates or updates Control Plane secrets to match.
+The External Secret Syncer (ESS) keeps Control Plane secrets in step with an external secret store. It polls each configured provider on an interval and creates or updates the matching Control Plane secret, so your workloads consume ordinary Control Plane secrets while the source of truth stays in HashiCorp Vault, AWS Secrets Manager, AWS Parameter Store, GCP Secret Manager, 1Password, 1Password Connect, Doppler or Infisical.
 
-The sync configuration is **not** a template value. It carries provider credentials — a Vault token, AWS access keys, a 1Password service-account token — so you supply it as an opaque secret holding your whole `sync.yaml`.
+Your provider connections and the list of secrets to sync live in a `sync.yaml` file that you store as an opaque secret before installing. It carries provider credentials, so it is never a Helm value. Every secret ESS writes is tagged `syncer.cpln.io/source` with the ESS workload, and ESS refuses to overwrite a secret tagged by a different ESS instance.
 
-<Warning>
-**Template version 2.1.0 is a breaking security change.** `essConfig` was removed, and an install or upgrade that still sets it now fails at render. If you are running 2.0.x, read [Upgrading From 2.0.x](#upgrading-from-2-0-x) before you touch the release.
-</Warning>
-
-### How It Works
-
-ESS runs as a workload on Control Plane. Your provider configuration and secrets list are stored in a Control Plane secret and mounted into the workload as `sync.yaml`. On startup, ESS schedules a polling loop for each configured secret. At each interval, it fetches the latest value from the external provider and creates or updates the corresponding Control Plane secret via the API.
-
-ESS tags every secret it manages with `syncer.cpln.io/source` (set to the workload path). This prevents two ESS instances from accidentally overwriting each other's secrets. ESS only creates and updates secrets — it never deletes them, so removing a secret from `sync.yaml` leaves the existing Control Plane secret in place.
-
-ESS watches its config file and automatically restarts when changes are detected (every ~5 seconds). No workload restart is needed after updating the config secret.
-
-### Supported Providers
-
-- [AWS Systems Manager Parameter Store](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html)
-- [AWS Secrets Manager](https://aws.amazon.com/secrets-manager/)
-- [HashiCorp Vault](https://www.hashicorp.com/en/products/vault)
-- [GCP Secret Manager](https://cloud.google.com/security/products/secret-manager)
-- [1Password](https://1password.com/)
-- [1Password Connect](https://developer.1password.com/docs/connect/)
-- [Doppler](https://www.doppler.com/)
-- [Infisical](https://infisical.com/)
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have.
+</Note>
 
 ### What Gets Created
 
-- **Standard ESS Workload** — An ESS container with a readiness probe on `/about`.
-- **Identity & Policy** — An identity bound to the workload with `manage` permissions on all secrets, allowing ESS to create and update Control Plane secrets.
-- **Secret** — An opaque secret containing the sync configuration (`sync.yaml`) with providers and secret mappings.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-ess` | The syncer (standard, 1 to 3 replicas on CPU), admin API on port `3004`, health check `GET /about` | — |
+| Identity | `RELEASE_NAME-ess-identity` | Workload identity ESS calls the Control Plane API as | — |
+| Policy | `RELEASE_NAME-ess-policy` | Grants the identity `manage` on **every secret in the org** (`targetKind: secret`, `target: all`) | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+The template creates no secret of its own: it mounts the secret named by `configSecretName` at `/usr/src/app/sync.yaml`. The identity carries no cloud-provider binding, so every provider authenticates with the credentials you put in `sync.yaml`.
 
 ## Prerequisites
 
-1. A secret or parameter stored in one of the [supported providers](#supported-providers).
-2. Credentials with read access to the desired secret (API token, IAM keys, etc.). Alternatively, you can use a cloud access [identity](/reference/identity) instead of supplying keys directly.
-
-**Your sync configuration must exist as an `opaque` secret before you install.** It carries those provider
-credentials, so it is not a template value — a value would put every one of them in the Helm release. It is
-also a configuration *file*, and a `cpln://secret` reference inside a file is never resolved, so individual
-keys cannot be swapped out either. The whole file is therefore yours.
+**One opaque secret holding your entire `sync.yaml` must exist before you install.** Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
+  <Step title="Gather read-only provider credentials">
+    ESS only reads from your providers. Create a credential scoped to the secrets you want synced:
+
+    | Provider | Credential in `sync.yaml` | Access ESS needs |
+    |---|---|---|
+    | HashiCorp Vault | `vault.token` | Read on the paths you sync |
+    | AWS Parameter Store | `accessKeyId` and `secretAccessKey` | `ssm:GetParameter` on the parameters you sync |
+    | AWS Secrets Manager | `accessKeyId` and `secretAccessKey` | `secretsmanager:GetSecretValue` on the secrets you sync |
+    | GCP Secret Manager | `credentials.clientEmail` and `credentials.privateKey` of a service account | Secret Accessor on the secrets you sync, plus permission to list secrets for `dictionaryFromProject` and `discoverAllSecrets` |
+    | 1Password | `serviceAccountToken` | A service account with read access to the vaults you sync |
+    | 1Password Connect | `serverURL` and `token` | A Connect token for your Connect server |
+    | Doppler | `accessToken` | A Doppler service token (`dp.st.…`) |
+    | Infisical | `clientId`, `clientSecret` and `projectId` | An Infisical machine identity with read access to the project |
+  </Step>
   <Step title="Write your sync.yaml">
-    The `providers` and `secrets` schema is documented under [Configuration](#configuration).
+    A minimal file that syncs one Vault value into an opaque Control Plane secret. The full schema is under [Configuration](#configuration).
 
     ```yaml
     # sync.yaml
@@ -69,34 +58,45 @@ keys cannot be swapped out either. The whole file is therefore yours.
     secrets:
       - name: my-app-secret
         provider: my-vault
-        type: opaque
-        path: secret/data/my-app
-        key: password
+        opaque:
+          path: /v1/secret/data/my-app
+          parse: data.password
     ```
   </Step>
-  <Step title="Create the secret and point the chart at it">
+  <Step title="Store it as an opaque secret">
     ```bash
-    cpln secret create-opaque --name my-ess-config --encoding plain -f sync.yaml
+    cat sync.yaml | cpln secret create-opaque --name SECRET_NAME --encoding plain -f -
     ```
 
-    Set `configSecretName` to the name you used. Secret names are org-wide, so give each release its own.
+    Set `configSecretName` to this name. Secret names are org-wide, so give each release its own. Read it back any time with:
+
+    ```bash
+    cpln secret reveal SECRET_NAME -o yaml
+    ```
   </Step>
 </Steps>
 
 <Warning>
-**If the secret does not exist at install time, the deployment wedges silently.** `cpln logs` returns **zero
-lines** — the container never starts, so it has nothing to log. Read `status.versions[].message` instead:
+**If the secret does not exist at install time, the deployment wedges silently.** `cpln logs` returns zero lines, because the container never starts. The missing secret is named only in `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-ess --gvc GVC_NAME -o yaml
 ```
 
-Use `get-deployments` — plain `cpln workload get` has no `versions` key.
+Use `get-deployments`; plain `cpln workload get` has no `versions` key. The deployment recovers on its own once the secret exists, or force a redeployment to skip the wait.
 </Warning>
 
-### Installation
+## Installation
 
-To install, follow the instructions for your preferred method:
+Once the secret exists, install from the marketplace registry with its name:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/ess \
+  --version 2.1.0 --gvc GVC_NAME \
+  --set configSecretName=SECRET_NAME
+```
+
+Or follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -120,12 +120,266 @@ To install, follow the instructions for your preferred method:
     </Card>
 </CardGroup>
 
-## Upgrading From 2.0.x
+## Configuration
 
-Version 2.1.0 removes `essConfig`. The **schema is unchanged** — migrating is a verbatim lift of that block into a file, minus the top-level `essConfig:` wrapper.
+### Image and Resources
+
+```yaml
+image: ghcr.io/controlplane-com/cpln-build/external-secret-syncer:v2.0.0
+
+resources:
+  cpu: 200m
+  memory: 256Mi
+```
+
+`resources` sets the container limits. Change `image` only when moving to a newer ESS release.
+
+### Admin API Access
+
+```yaml
+port: 3004
+
+allowedIp:
+  - 1.2.3.4 # Replace with your IP
+```
+
+`port` is the ESS admin API, used by the `/about` health check. `allowedIp` lists the CIDRs that may reach the admin API on its public endpoint; the shipped `1.2.3.4` is a placeholder that admits nobody. Other workloads in the GVC cannot reach the admin API.
+
+### Sync Configuration Secret
+
+```yaml
+configSecretName: my-ess-config
+```
+
+`configSecretName` names the opaque secret holding your `sync.yaml` (see [Prerequisites](#prerequisites)). The rest of this section is the schema of that file: a `providers` list and a `secrets` list.
+
+#### Providers
+
+Each provider has a unique `name` and exactly one provider block. An optional `syncInterval` sets the default interval for every secret that uses it.
+
+```yaml
+providers:
+  # HashiCorp Vault
+  - name: my-vault
+    vault:
+      address: https://my-vault.com:8200   # required
+      token: YOUR-VAULT-TOKEN              # required
+    syncInterval: 1m                       # optional
+
+  # AWS Parameter Store
+  - name: my-aws-ssm
+    awsParameterStore:
+      region: us-east-1
+      accessKeyId: YOUR-ACCESS-KEY
+      secretAccessKey: YOUR-SECRET-KEY
+
+  # AWS Secrets Manager
+  - name: my-aws-secrets-manager
+    awsSecretsManager:
+      region: us-east-1
+      accessKeyId: YOUR-ACCESS-KEY
+      secretAccessKey: YOUR-SECRET-KEY
+
+  # GCP Secret Manager
+  - name: my-gcp
+    gcpSecretManager:
+      projectId: 123456789876
+      credentials:
+        clientEmail: YOUR-SERVICE-ACCOUNT-EMAIL
+        privateKey: YOUR-PRIVATE-KEY
+
+  # 1Password
+  - name: my-1password
+    onePassword:
+      serviceAccountToken: YOUR-TOKEN
+      integrationName: my-ess              # optional
+      integrationVersion: 1.0.0            # optional
+
+  # 1Password Connect
+  - name: my-1password-connect
+    onePasswordConnect:
+      serverURL: https://my-connect-server.example.com   # required
+      token: YOUR-TOKEN                                  # required
+
+  # Doppler
+  - name: my-doppler
+    doppler:
+      accessToken: YOUR-TOKEN              # a Doppler service token (dp.st....)
+
+  # Infisical
+  - name: my-infisical
+    infisical:
+      clientId: YOUR-CLIENT-ID             # required, from an Infisical machine identity
+      clientSecret: YOUR-CLIENT-SECRET     # required
+      projectId: YOUR-PROJECT-ID           # required
+```
+
+The template's identity has no AWS or GCP binding, so supply the access keys or service-account credentials shown above for the AWS and GCP providers.
+
+#### Secrets
+
+Each entry in `secrets` writes one Control Plane secret. It needs a `name` (the Control Plane secret to create or update), a `provider` that matches a provider `name`, an optional `syncInterval`, and exactly one of the sync types below.
+
+**`opaque`** stores one value as an opaque secret. Use the shorthand when you need only a path:
+
+```yaml
+secrets:
+  - name: my-secret
+    provider: my-vault
+    opaque: /v1/secret/data/myapp
+```
+
+Or the long form for options:
+
+```yaml
+secrets:
+  - name: my-secret
+    provider: my-vault
+    opaque:
+      path: /v1/secret/data/myapp    # path to fetch
+      parse: data.password           # optional, extracts a key from a JSON or YAML response
+      default: fallback-value        # optional, used if the fetch fails
+      encoding: base64               # optional, base64-decodes the fetched value
+```
+
+Vault KV secrets are nested under a `data` key, so `parse` paths for Vault start with `data.`. With the shorthand and no `default`, a failed fetch fails the sync with no fallback.
+
+**`dictionary`** stores several values as a dictionary secret. Each key is fetched independently, supports the same `path`, `parse`, `default` and `encoding` options, and a failure on one key does not block the others:
+
+```yaml
+secrets:
+  - name: my-secret
+    provider: my-vault
+    dictionary:
+      PORT:
+        path: /v1/secret/data/app
+        parse: data.port
+        default: 5432
+      PASSWORD:
+        path: /v1/secret/data/app
+        parse: data.password
+      USERNAME:
+        path: /v1/secret/data/app
+        parse: data.username
+        default: "no username"
+```
+
+**`dictionaryFromProject`** syncs a whole provider project into one dictionary secret. Doppler takes a `project/config` path; GCP Secret Manager takes `true` and pulls every accessible secret from the provider's project, one key per secret:
+
+```yaml
+secrets:
+  - name: my-doppler-config
+    provider: my-doppler
+    dictionaryFromProject:
+      path: my-project/dev    # "project/config"
+  - name: my-gcp-config
+    provider: my-gcp
+    dictionaryFromProject: true
+```
+
+GCP secrets with no accessible latest version (no versions, disabled or destroyed) are skipped. A form that does not match its provider stops ESS at startup.
+
+**`dictionaryFromJson`** fetches one value holding a JSON object and flattens it into a dictionary secret. It works with any provider:
+
+```yaml
+secrets:
+  - name: json-config
+    provider: my-aws-secrets-manager
+    dictionaryFromJson: /example/app/config
+```
+
+Nested objects become dot-notation keys (`db.host`), arrays are stored as their JSON string, and `null`, numbers and booleans are stored as strings. A value that is not a JSON object is stored under a single `__raw` key, and ESS logs a warning.
+
+**`discoverAllSecrets`** (GCP Secret Manager only, must be `true`) creates a **separate** Control Plane secret for every accessible secret in the provider's project:
+
+```yaml
+secrets:
+  - name: gcp-discover        # identifier only, created secrets are named after the GCP secrets
+    provider: my-gcp
+    discoverAllSecrets: true
+```
+
+- A `cpln-type: dictionary` label on the GCP secret flattens its JSON value into a dictionary secret (same rules as `dictionaryFromJson`); `cpln-type: opaque` or no label stores an opaque secret.
+- Opaque values that are canonical base64 are marked `encoding: base64`, so workloads receive the decoded value. Label the GCP secret `cpln-encoding: disable` to store a value verbatim, for example an API key that happens to look like base64.
+- Names are normalized to valid Control Plane names (lowercased, unsupported characters such as `_` replaced by `-`, so `MY_API_KEY` becomes `my-api-key`). If two names collide, the last one wins and ESS logs a warning.
+- Each created secret carries a `syncer.cpln.io/discoveredBy` tag set to the entry's `name`.
+
+#### Path Formats
+
+| Provider | Sync type | Path format | Example |
+|---|---|---|---|
+| Doppler | `opaque` or `dictionary` key | `project/config/SECRET` | `my-app/production/DATABASE_URL` |
+| Doppler | `dictionaryFromProject` | `project/config` | `my-app/production` |
+| Infisical | `opaque` or `dictionary` key | `environment/SECRET` in the provider's project | `dev/DATABASE_URL` |
+
+#### Sync Interval
+
+Intervals use `<hours>h<minutes>m<seconds>s`; every part is optional but at least one is required (`10s`, `5m`, `1h30m`). The most specific setting wins: the secret's `syncInterval`, then the provider's, then the default of `300s`.
+
+## Connecting
+
+ESS has no client endpoint of its own. Workloads consume the secrets it writes by name, exactly like any other Control Plane secret, with no dependency on ESS being reachable.
+
+| What | Address | Notes |
+|---|---|---|
+| Synced secrets | `cpln secret reveal SYNCED_SECRET_NAME -o yaml` | The `syncer.cpln.io/lastError` tag is empty after a successful sync and holds the error message after a failed one |
+| Admin API (public) | `status.canonicalEndpoint` from `cpln workload get RELEASE_NAME-ess --gvc GVC_NAME -o yaml` | Reachable only from the CIDRs in `allowedIp` |
+| Admin API (private) | `cpln port-forward RELEASE_NAME-ess 3004:3004 --gvc GVC_NAME` | Health check `GET /about` |
+| Provider credentials | `cpln secret reveal SECRET_NAME -o yaml` | Your `sync.yaml` |
+
+To confirm a sync happened, read the secret back and check its tags and data:
+
+```bash
+cpln secret reveal SYNCED_SECRET_NAME -o yaml
+```
+
+A synced secret looks like this:
+
+```yaml
+kind: secret
+name: my-app-secret
+tags:
+  syncer.cpln.io/lastError: ''      # holds the error message if the last sync failed
+  syncer.cpln.io/source: ...        # the ESS workload that manages this secret
+type: dictionary
+data:
+  PORT: '1234'
+  PASSWORD: 'no pass'               # a default used when the key was not found
+```
+
+The syncer logs each secret it schedules and any error it hits, by secret name:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-ess"} |= "SYNCED_SECRET_NAME"' --limit 50 --since 10m
+```
+
+## Operations
+
+### Updating the Sync Configuration
+
+To add a provider, add a secret or replace a credential, export the secret, edit `sync.yaml` in its `payload`, and apply it:
+
+```bash
+cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+# edit only the payload in secret.yaml
+cpln apply -f secret.yaml
+cpln secret reveal SECRET_NAME -o yaml
+```
+
+Then force a redeployment so the running syncer mounts the new file:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-ess --gvc GVC_NAME
+```
+
+Removing an entry from `sync.yaml` stops syncing it but leaves the Control Plane secret it created in place.
+
+### Upgrading From 2.0.x
+
+Version 2.1.0 removes the `essConfig` values block. The **schema is unchanged**: migrating is a verbatim lift of that block into `sync.yaml`, minus the top-level `essConfig:` wrapper. Version 2.0.x does not create a GVC, so this is an ordinary in-place upgrade of the same release.
 
 <Warning>
-**Carrying `essConfig` forward stops the upgrade.** It is rejected at render, so `cpln helm upgrade` fails and your existing syncer is left untouched and running:
+**Carrying `essConfig` forward stops the upgrade.** It is rejected at render, so `cpln helm upgrade` fails and your existing syncer keeps running untouched:
 
 ```text
 Error: execution error at (ess/templates/identity.yaml:1:4): ess: essConfig was REMOVED — it holds
@@ -139,421 +393,70 @@ values. See Prerequisites in the README.
   <Step title="Move your essConfig block into sync.yaml">
     Copy it verbatim and drop the `essConfig:` wrapper, so `providers:` and `secrets:` become top-level keys.
   </Step>
-  <Step title="Create the secret and point the chart at it">
+  <Step title="Create the secret under a new name">
     ```bash
-    cpln secret create-opaque --name my-ess-config --encoding plain -f sync.yaml
+    cat sync.yaml | cpln secret create-opaque --name SECRET_NAME --encoding plain -f -
     ```
 
-    Delete `essConfig` from your values and set `configSecretName`.
+    Do not reuse `RELEASE_NAME-ess-config`: that is the secret 2.0.x created, and the upgrade removes it.
+  </Step>
+  <Step title="Upgrade with essConfig removed">
+    Delete `essConfig` from your values file, then upgrade:
+
+    ```bash
+    cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/ess \
+      --version 2.1.0 --gvc GVC_NAME \
+      --set configSecretName=SECRET_NAME
+    ```
   </Step>
   <Step title="Rotate every credential that was in your values file">
-    They were stored in the Helm release, so treat them as exposed — reissue the Vault token, AWS keys or 1Password service-account token, then update `sync.yaml` and the secret.
+    They were stored in the Helm release, so treat them as exposed. Reissue the Vault token, AWS keys or 1Password service-account token, then update `sync.yaml` as described in [Updating the Sync Configuration](#updating-the-sync-configuration).
   </Step>
 </Steps>
 
-<Note>
-**Why the whole file, and not individual keys.** A `cpln://secret` reference is resolved only for environment variables. Inside a mounted configuration file it stays literal text, so there is no way to swap out just the token — the file itself has to be the secret.
-</Note>
-
-## Configuration
-
-The default `values.yaml` for this template:
-
-```yaml
-image: ghcr.io/controlplane-com/cpln-build/external-secret-syncer:v2.0.0
-
-resources:
-  cpu: 200m
-  memory: 256Mi
-
-port: 3004
-
-allowedIp:
-  - 1.2.3.4 # Replace with your IP
-
-essConfig:
-  providers:
-    - name: my-vault
-      vault:
-        address: https://my-vault.com:8200
-        token: <TOKEN>
-      syncInterval: 1m
-    - name: my-aws-ssm
-      awsParameterStore:
-        region: us-east-1
-        accessKeyId: <ACCESS_KEY> # alternatively configure identity to natively use AWS permissions
-        secretAccessKey: <SECRET_ACCESS_KEY> # alternatively configure identity to natively use AWS permissions
-    # - name: my-aws-secrets-manager
-    #   awsSecretsManager:
-    #     region: us-east-1
-    #     accessKeyId: <ACCESS_KEY>
-    #     secretAccessKey: <SECRET_ACCESS_KEY>
-    # - name: my-1password
-    #   onePassword:
-    #     serviceAccountToken: <TOKEN>
-    #     integrationName: my-ess <optional - defaults to syncer.cpln.io>
-    #     integrationVersion: 1.0.0 <optional - defaults to image tag>
-    # - name: my-1password-connect
-    #   onePasswordConnect:
-    #     serverURL: https://my-connect-server.example.com
-    #     token: <TOKEN>
-    # - name: my-doppler
-    #   doppler:
-    #     accessToken: <TOKEN>
-    # - name: my-gcp
-    #   gcpSecretManager:
-    #     projectId: 123456789876
-    #     credentials:
-    #       clientEmail: <EMAIL_ADDRESS>
-    #       privateKey: <PRIVATE_KEY>
-    # - name: my-infisical
-    #   infisical:
-    #     clientId: <CLIENT_ID>           # from an Infisical machine identity
-    #     clientSecret: <CLIENT_SECRET>
-    #     projectId: <PROJECT_ID>
-  secrets:
-    - name: auth
-      provider: my-vault
-      syncInterval: 20s
-      dictionary:
-        PORT:
-          path: /v1/secret/data/app
-          parse: data.port
-          default: 5432
-        PASSWORD:
-          path: /v1/secret/data/app
-          parse: data.password
-        USERNAME:
-          default: "no username"
-          path: /v1/secret/data/app
-          parse: data.username
-    - name: ssm
-      provider: my-aws
-      syncInterval: 20s
-      opaque: /example/app
-    # - name: secrets-manager
-    #   provider: my-aws-secrets-manager
-    #   dictionary:
-    #     PASSWORD:
-    #       path: /example/app
-    #       parse: password
-    # - name: doppler-secret
-    #   provider: my-doppler
-    #   opaque: /project/config/SECRET_NAME
-    # - name: doppler-project
-    #   provider: my-doppler
-    #   dictionaryFromProject:
-    #     path: project/config   # syncs all secrets from a Doppler project+config
-    # - name: gcp
-    #   provider: my-gcp
-    #   opaque: database-password
-    # - name: gcp-project
-    #   provider: my-gcp
-    #   dictionaryFromProject: true   # combines every accessible secret from the GCP project into one dictionary
-    # - name: gcp-discover
-    #   provider: my-gcp
-    #   discoverAllSecrets: true      # GCP only — creates one Control Plane secret per project secret;
-    #                                 # each secret's "cpln-type" label (opaque|dictionary) sets the type;
-    #                                 # base64 values are auto-marked "encoding: base64" unless the GCP
-    #                                 # secret is labeled "cpln-encoding: disable"
-    # - name: infisical-secret
-    #   provider: my-infisical
-    #   opaque: dev/DATABASE_URL       # format: "<environmentID>/<secret>"
-    # - name: json-config
-    #   provider: my-aws-secrets-manager
-    #   dictionaryFromJson: /example/app/config   # fetches a JSON object and flattens it into a dictionary
-```
-
-### Top-Level Fields
-
-- `image` — The ESS container image. Do not change unless upgrading.
-- `resources.cpu` / `resources.memory` — Resource limits for the workload container.
-- `port` — Port for the ESS HTTP admin API (default: `3004`). Used for health checks and manual sync triggers.
-- `allowedIp` — List of CIDRs allowed to reach the ESS admin API externally. Replace the placeholder with your IP, or use `0.0.0.0/0` to allow all.
-- `configSecretName` — Name of the opaque secret holding your `sync.yaml`, the full sync configuration. See [Prerequisites](#prerequisites).
-
-### Providers
-
-Each entry in `providers` defines a connection to an external secret store. Every provider must have a unique `name`. An optional `syncInterval` sets the default polling interval for all secrets using that provider.
-
-| Provider | Required Fields |
-|----------|----------------|
-| HashiCorp Vault | `vault.address`, `vault.token` |
-| AWS Parameter Store | `awsParameterStore.region` |
-| AWS Secrets Manager | `awsSecretsManager.region` |
-| GCP Secret Manager | `gcpSecretManager.projectId` |
-| 1Password | `onePassword.serviceAccountToken` |
-| 1Password Connect | `onePasswordConnect.serverURL`, `onePasswordConnect.token` |
-| Doppler | `doppler.accessToken` |
-| Infisical | `infisical.clientId`, `infisical.clientSecret`, `infisical.projectId` |
-
-AWS providers optionally accept `accessKeyId` and `secretAccessKey`. If omitted, ESS falls back to credentials provided through the workload's cloud access [identity](/reference/identity).
-
-GCP Secret Manager optionally accepts `credentials.clientEmail` and `credentials.privateKey`. If omitted, ESS uses Application Default Credentials.
-
-**Provider examples:**
-
-```yaml
-# HashiCorp Vault
-- name: my-vault
-  vault:
-    address: https://my-vault.com:8200
-    token: <TOKEN>
-  syncInterval: 1m
-
-# AWS Parameter Store
-- name: my-aws-ssm
-  awsParameterStore:
-    region: us-east-1
-    accessKeyId: <ACCESS_KEY>       # optional if using an IAM-linked identity
-    secretAccessKey: <SECRET_KEY>   # optional if using an IAM-linked identity
-
-# AWS Secrets Manager
-- name: my-aws-secrets-manager
-  awsSecretsManager:
-    region: us-east-1
-    accessKeyId: <ACCESS_KEY>
-    secretAccessKey: <SECRET_KEY>
-
-# GCP Secret Manager
-- name: my-gcp
-  gcpSecretManager:
-    projectId: 123456789876
-    credentials:                    # optional — omit to use Application Default Credentials
-      clientEmail: <EMAIL>
-      privateKey: <PRIVATE_KEY>
-
-# 1Password
-- name: my-1password
-  onePassword:
-    serviceAccountToken: <TOKEN>
-    integrationName: my-ess         # optional
-    integrationVersion: 1.0.0       # optional
-
-# 1Password Connect
-- name: my-1password-connect
-  onePasswordConnect:
-    serverURL: https://my-connect-server.example.com
-    token: <TOKEN>
-
-# Doppler
-- name: my-doppler
-  doppler:
-    accessToken: <TOKEN>            # use a Doppler service token (dp.st....)
-
-# Infisical
-- name: my-infisical
-  infisical:
-    clientId: example-client-id     # create an Infisical machine identity for the ESS
-    clientSecret: example-client-secret
-    projectId: example-project-id
-```
-
-
-### Secrets
-
-Each entry in `secrets` maps an external secret to a Control Plane secret. Each secret must specify a `name`, a `provider`, and exactly one sync type.
-
-#### `opaque` — Single value
-
-Creates a Control Plane `opaque` secret from a single fetched value.
-
-Shorthand (path only):
-```yaml
-- name: my-secret
-  provider: my-vault
-  opaque: /v1/secret/data/myapp
-```
-
-With options:
-```yaml
-- name: my-secret
-  provider: my-vault
-  opaque:
-    path: /v1/secret/data/myapp    # path to fetch
-    parse: data.password           # optional — extract a key from a JSON/YAML response
-    default: fallback-value        # optional — used if fetch fails
-    encoding: base64               # optional — base64-decode the fetched value before storing
-```
-
-<Note>
-Vault KV engine secrets are nested under a `data` key. When using `parse`, start with `data` to access the secret content (e.g., `data.password`).
-
-If you use the shorthand form with no `default`, a fetch failure causes the sync to fail with no fallback.
-</Note>
-
-#### `dictionary` — Multiple values
-
-Creates a Control Plane `dictionary` secret. Each key is fetched independently and supports `path`, `parse`, `default`, and `encoding`.
-
-```yaml
-- name: auth
-  provider: my-vault
-  dictionary:
-    PORT:
-      path: /v1/secret/data/app
-      parse: data.port
-      default: 5432
-    PASSWORD:
-      path: /v1/secret/data/app
-      parse: data.password
-    USERNAME:
-      path: /v1/secret/data/app
-      parse: data.username
-      default: "no username"
-```
-
-A failure on one key does not block the others.
-
-#### `dictionaryFromProject` — Sync an entire project
-
-Syncs all secrets from a provider project in one operation, stored as a Control Plane `dictionary` secret. Only valid with a Doppler or GCP Secret Manager provider. The expected shape differs per provider.
-
-**Doppler** — specify a `project/config` path:
-```yaml
-- name: my-doppler-config
-  provider: my-doppler
-  dictionaryFromProject:
-    path: my-project/dev    # format: "project/config" — exactly two segments
-```
-
-**GCP Secret Manager** — set to `true` to pull every accessible secret from the project configured on the provider. Each fetched secret's latest version becomes one key in the resulting dictionary. Secrets with no accessible latest version (no versions, disabled, or destroyed) are skipped.
-```yaml
-- name: my-gcp-config
-  provider: my-gcp
-  dictionaryFromProject: true
-```
-
-<Note>
-Doppler requires the `{ path: ... }` object form; GCP Secret Manager requires the `true` form. Mixing them — or using either with another provider — causes ESS to exit at startup.
-</Note>
-
-#### `dictionaryFromJson` — Flatten a JSON object
-
-Fetches a single value that contains a JSON object and flattens it into a Control Plane `dictionary` secret. Set it to the path of the value to fetch. Valid with any provider.
-
-```yaml
-- name: json-config
-  provider: my-aws-secrets-manager
-  dictionaryFromJson: /example/app/config   # path to a value holding a JSON object
-```
-
-Each leaf in the JSON object becomes one dictionary key:
-
-- **Nested objects** are flattened using dot notation (`{ "db": { "host": "x" } }` → key `db.host`).
-- **Arrays** are JSON-stringified into the value (`{ "tags": ["a", "b"] }` → key `tags` with value `["a","b"]`).
-- **`null`** is stored as the string `"null"`; numbers and booleans are stored as their string form.
-
-For example, the JSON object `{"db":{"host":"db.internal","port":5432},"tags":["a","b"]}` produces a dictionary with keys `db.host` (`db.internal`), `db.port` (`5432`), and `tags` (`["a","b"]`).
-
-<Note>
-If the fetched value is not a valid JSON object — a raw string, number, array, or malformed JSON — ESS stores the raw value under a single `__raw` key and logs a warning, so the secret stays usable as a dictionary type.
-</Note>
-
-#### `discoverAllSecrets` — Mirror an entire GCP project (one secret each)
-
-Discovers every accessible secret in the GCP project configured on the provider and creates a **separate** Control Plane secret for each one. This differs from `dictionaryFromProject: true`, which combines every secret into a single dictionary. GCP Secret Manager only, and must be set to `true`.
-
-```yaml
-- name: gcp-discover        # identifier only — created secrets are named after the GCP secrets
-  provider: my-gcp
-  discoverAllSecrets: true
-```
-
-The type of each created secret is controlled by a `cpln-type` **label** on the GCP secret:
-
-- `cpln-type: dictionary` — the value is parsed as JSON and flattened into a Control Plane `dictionary` secret (same flattening rules as `dictionaryFromJson`, including the `__raw` fallback for non-JSON values).
-- `cpln-type: opaque` (or no label) — stored as a Control Plane `opaque` secret.
-
-Opaque values that are canonical base64 are automatically marked `encoding: base64` on the created Control Plane secret, so the payload is decoded when workloads consume it. Surrounding whitespace (such as a trailing newline from `... | base64 | gcloud ...`) is trimmed from the stored payload. Detection can be switched off per secret with a `cpln-encoding` **label** on the GCP secret:
-
-- `cpln-encoding: disable` — the value is stored verbatim and never marked `encoding: base64`. Use this for plain values that happen to look like base64 (for example, a 16-character alphanumeric API key).
-
-Each Control Plane secret is named after its GCP secret, normalized to a valid Control Plane name (lowercased, with unsupported characters such as `_` replaced by `-` — e.g. `MY_API_KEY` → `my-api-key`). If two names normalize to the same value, the last one wins and a warning is logged. Created secrets carry a `syncer.cpln.io/discoveredBy` tag set to this entry's `name`. Secrets with no accessible latest version (no versions, disabled, or destroyed) are skipped.
-
-<Note>
-`discoverAllSecrets` is only valid with a GCP Secret Manager provider. ESS does not delete a discovered Control Plane secret when its source GCP secret is later removed.
-</Note>
-
-### Sync Interval
-
-Intervals use the format `<hours>h<minutes>m<seconds>s`. All parts are optional but at least one is required. Examples: `10s`, `5m`, `1h`, `1h30m`, `1h30m10s`.
-
-Priority (highest wins):
-1. Secret-level `syncInterval`
-2. Provider-level `syncInterval`
-3. Global default (`300s`)
-
-### Doppler Path Formats
-
-| Sync type | Path format | Example |
-|-----------|-------------|---------|
-| `opaque` or `dictionary` key | `project/config/SECRET_NAME` | `my-app/production/DATABASE_URL` |
-| `dictionaryFromProject` | `project/config` | `my-app/production` |
-
-### Infisical Path Formats
-
-The Infisical project is set on the provider (`infisical.projectId`). Secret paths are scoped to an environment within that project.
-
-| Sync type | Path format | Example |
-|-----------|-------------|---------|
-| `opaque` or `dictionary` key | `<environmentID>/<secret>` | `dev/DATABASE_URL` |
-
-## Synced Secret Output
-
-A secret created by ESS will look like:
-
-```yaml
-kind: secret
-name: hello
-description: hello
-tags:
-  syncer.cpln.io/lastError: '' # populated if ESS encounters an error
-  syncer.cpln.io/source: //gvc/<gvc name>/workload/<ess workload name>
-type: dictionary
-data:
-  PORT: '1234'
-  PASSWORD: 'no pass' # default used if the key was not found
-```
-
-The `syncer.cpln.io/lastError` tag is empty on success. If ESS encounters an error syncing a secret, the tag is populated with the error message.
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The deployment never becomes ready and cpln logs is empty">
+    **Cause:** the secret named by `configSecretName` does not exist, so the container never starts.
+
+    **Fix:** read `status.versions[].message` with `cpln workload get-deployments RELEASE_NAME-ess --gvc GVC_NAME -o yaml`, create the secret it names (see [Prerequisites](#prerequisites)), and wait for the deployment to recover or force a redeployment.
+  </Accordion>
+  <Accordion title="The syncer restarts with Error parsing sync config">
+    **Cause:** `sync.yaml` does not match the schema. Common messages are `Secrets must only reference one secret type`, `Provider must have exactly one provider`, `Secrets must have a valid provider` and `Provider names must be unique`.
+
+    **Fix:** correct the file against [Sync Configuration Secret](#sync-configuration-secret), re-apply the secret and force a redeployment.
+  </Accordion>
+  <Accordion title="A synced secret shows an error in syncer.cpln.io/lastError">
+    **Cause:** ESS could not fetch the value from the provider, for example a wrong path, an expired token or missing read access. On Doppler, `parse` on a value that is not JSON or YAML also fails.
+
+    **Fix:** read the message from the tag with `cpln secret reveal SYNCED_SECRET_NAME -o yaml`, fix the path or credential in `sync.yaml`, and apply it. The tag clears on the next successful sync.
+  </Accordion>
+  <Accordion title="Sync fails with Secret is managed by another ESS">
+    **Cause:** the target secret's `syncer.cpln.io/source` tag names a different ESS workload, for example a release installed earlier under another name.
+
+    **Fix:** sync into a different secret name, or delete the existing secret so this ESS can create it.
+  </Accordion>
+  <Accordion title="The admin API endpoint refuses connections">
+    **Cause:** `allowedIp` still holds the `1.2.3.4` placeholder, or your address is not in it.
+
+    **Fix:** set `allowedIp` to your CIDR and upgrade, or reach the API privately with `cpln port-forward RELEASE_NAME-ess 3004:3004 --gvc GVC_NAME`.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Conflict protection** — If a Control Plane secret already exists and is managed by a different ESS instance, the sync for that secret will fail. Two ESS instances cannot manage the same secret.
-- **Secret type changes** — Changing a secret from `opaque` to `dictionary` (or vice versa) causes ESS to delete the existing secret and recreate it. There is a brief window where the secret does not exist.
-- **No automatic deletion** — ESS only creates and updates secrets; it never deletes them. Removing a secret from `sync.yaml`, or deleting a source secret upstream, leaves the existing Control Plane secret in place — delete unwanted secrets manually. ESS-managed secrets carry the `syncer.cpln.io/source` tag (and discovered secrets additionally carry `syncer.cpln.io/discoveredBy`) to help identify them.
-- **Doppler `parse`** — The `parse` field only works when the Doppler secret's value is JSON or YAML. Using `parse` on a plain string secret throws an error.
-- **Hot reload** — ESS watches its config file and automatically restarts when changes are detected (every ~5 seconds). No workload restart is needed after updating the config secret.
+- The policy grants `manage` on every secret in the org, so treat the ESS workload as security-sensitive and keep `allowedIp` narrow.
+- Create the `sync.yaml` secret before installing, and force a redeployment after every change to it.
+- Two ESS instances cannot manage the same secret; give each release its own target secret names.
+- ESS never deletes secrets. Removing an entry from `sync.yaml`, or deleting the source upstream, leaves the Control Plane secret in place; delete it yourself.
+- Changing a secret between `opaque` and `dictionary` makes ESS delete and recreate it, so it briefly does not exist.
+- Version 2.1.0 removed `essConfig`; follow [Upgrading From 2.0.x](#upgrading-from-2-0-x) before upgrading an older release.
 
 ## External References
 
-<CardGroup cols={2}>
-    <Card title="AWS Parameter Store" icon="aws" href="https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html">
-    AWS Systems Manager Parameter Store documentation
-    </Card>
-    <Card title="AWS Secrets Manager" icon="aws" href="https://aws.amazon.com/secrets-manager/">
-    AWS Secrets Manager documentation
-    </Card>
-    <Card title="HashiCorp Vault" icon="vault" href="https://www.hashicorp.com/en/products/vault">
-    HashiCorp Vault secret management
-    </Card>
-    <Card title="GCP Secret Manager" icon="google" href="https://cloud.google.com/security/products/secret-manager">
-    Google Cloud Secret Manager documentation
-    </Card>
-    <Card title="1Password" icon="key" href="https://1password.com/">
-    1Password secret management
-    </Card>
-    <Card title="Doppler" icon="shield-check" href="https://www.doppler.com/">
-    Doppler secrets platform
-    </Card>
-    <Card title="Infisical" icon="lock" href="https://infisical.com/">
-    Infisical secret management platform
-    </Card>
-    <Card title="ESS Image Source" icon="github" href="https://github.com/controlplane-com/external-secret-syncer">
-    Source code for the External Secret Syncer image
-    </Card>
-    <Card title="ESS Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/ess">
-    View the source files, default values, and chart definition
-    </Card>
-</CardGroup>
+- [External Secret Syncer source](https://github.com/controlplane-com/external-secret-syncer)
+- [ESS template source](https://github.com/controlplane-com/templates/tree/main/ess)
+- [Control Plane secrets reference](https://docs.controlplane.com/reference/secret)
+- [HashiCorp Vault KV secrets engine](https://developer.hashicorp.com/vault/docs/secrets/kv)
+- [GCP Secret Manager documentation](https://cloud.google.com/secret-manager/docs)
