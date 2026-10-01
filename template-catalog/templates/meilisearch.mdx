@@ -1,51 +1,70 @@
 ---
 title: Meilisearch
 icon: /template-catalog/templates/icons/meilisearch.png
-description: Deploy Meilisearch on Control Plane using the Template Catalog. An open-source instant, typo-tolerant REST search engine with persistent index storage, master-key authentication, scheduled snapshots, and platform volume backups. Covers the prerequisite key secret, access modes, and upgrades.
+description: Deploy Meilisearch on Control Plane using the Template Catalog. A single-replica, typo-tolerant REST search engine with persistent index storage, platform volume backups and optional Prometheus metrics. Needs an existing GVC and a master-key secret you create before installing.
 keywords: ['meilisearch', 'full text search', 'typo tolerance', 'instant search', 'faceted search', 'site search', 'search api', 'algolia alternative', 'typesense alternative', 'elasticsearch alternative', 'opensearch alternative', 'search as you type', 'search engine template']
 ---
 
 ## Overview
 
-Meilisearch is an open-source (MIT) search engine for instant, typo-tolerant, faceted search — a self-hosted alternative to Algolia, driven entirely by a REST API. This template deploys a single Meilisearch 1.52 server with persistent index storage, mandatory master-key authentication, an indexing memory budget derived from the container's own memory limit, optional scheduled snapshots, and scheduled platform volume backups.
+Meilisearch is an open-source (MIT) search engine for instant, typo-tolerant, faceted search — a self-hosted alternative to Algolia, driven entirely by a REST API on a single port. This template deploys one Meilisearch server with persistent index storage, mandatory master-key authentication, an indexing memory budget derived from the container's own memory limit, optional scheduled Meilisearch snapshots, and scheduled platform volume backups.
 
-The image is the Community build, compiled without any Enterprise code. Everything it contains is available here; replication and sharding are not part of it (see [Important Notes](#important-notes)).
+The image is the Community build, compiled without any Enterprise code. Replication and sharding are not part of it, so the template runs exactly one replica (see [Scaling and Availability](#scaling-and-availability)).
 
-### Architecture
-
-- **Meilisearch server** — A single-replica `stateful` workload (`{release}-meilisearch`) serving the REST API on port `7700`. There is no second port: the API, `/metrics`, and the search preview all live behind `7700`.
-- **Persistent data** — One volume set mounted at `/meili_data` holding the LMDB index (`data.ms`), Meilisearch's own `.snapshot` files, and dumps. All three paths are set explicitly to absolute locations on the volume, so nothing durable ever lands on the container's ephemeral layer.
-- **Authentication** — Always on. The master key comes from an opaque secret you create yourself and reference by name; Meilisearch derives its four built-in API keys from it.
+<Note>
+**This template deploys into an existing GVC.** It does not create one. Every resource lands in the GVC you pass at install time, so `cpln workload exec`, `cpln logs` and uninstalling all work against that GVC. Install into a GVC with a single location: a workload runs in every location its GVC has, and each location would get its own independent, diverging index behind one endpoint.
+</Note>
 
 ### What Gets Created
 
-- **Stateful Meilisearch Workload** — A single replica serving the REST API on `7700`, with `/health` used for both probes.
-- **Volume Set** — Persistent `ext4` storage at `/meili_data` with scheduled snapshots and a final snapshot on delete.
-- **Identity** — An identity bound to the workload, used to read the master-key secret.
-- **Policy** — `reveal` on exactly that one secret and nothing else.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-meilisearch` | Meilisearch server (stateful, 1 replica), REST API on port `7700` | — |
+| Volume Set | `RELEASE_NAME-meilisearch-data` | `ext4` volume mounted at `/meili_data` holding the index (`data.ms`), Meilisearch snapshots and dumps; scheduled platform snapshots and a final snapshot on delete | — |
+| Identity | `RELEASE_NAME-meilisearch-identity` | Workload identity used to read the master-key secret | — |
+| Policy | `RELEASE_NAME-meilisearch-policy` | `reveal` on exactly the one secret named in `auth.secretName` | — |
 
-The template creates no secrets of its own, and needs no database, cache, or object store.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+The template creates no secrets of its own and needs no database, cache or object store. The master-key secret is yours, created before installing and left untouched on uninstall.
 
 ## Prerequisites
 
-**Create the master-key secret before installing.** This is required — Meilisearch refuses every route except `GET /health` without a master key, and a workload referencing a secret that does not exist waits indefinitely with no obvious error. It is an **opaque** secret with `encoding: plain` whose entire payload is the key:
+<Steps>
+  <Step title="Create the master-key secret">
+    Meilisearch refuses every route except `GET /health` without a master key, and the key must be **at least 16 bytes** while `server.env` is `production`. Create an **opaque** secret whose entire payload is the key:
 
-```bash
-printf '%s' "$(openssl rand -base64 32)" | \
-  cpln secret create-opaque --name my-meilisearch-master-key --encoding plain -f -
-```
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name SECRET_NAME --encoding plain -f -
+    ```
 
-Then set `auth.secretName` to the name you used. Installing with an empty `auth.secretName` fails at render time.
+    Set `auth.secretName` to this name.
+  </Step>
+</Steps>
 
 <Warning>
-The key must be **at least 16 bytes** while `server.env` is `production`. A shorter one makes the server refuse to launch with `The master key must be at least 16 bytes in a production environment.` Rotating the key later regenerates every API key derived from it, breaking every deployed client — treat it as write-once, or plan to redistribute all keys.
+**The secret must exist before you install.** A workload that references a secret that does not exist wedges silently: it never becomes ready, `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-meilisearch --gvc GVC_NAME -o yaml
+```
+
+Once the secret exists the deployment recovers on its own after several minutes, or immediately with `cpln workload force-redeployment RELEASE_NAME-meilisearch --gvc GVC_NAME`.
+</Warning>
+
+<Warning>
+**Treat the master key as write-once.** Meilisearch derives all four of its built-in API keys from it, so rotating it changes every key and breaks every deployed client until you redistribute them. If you must rotate, update the secret, then run `cpln workload force-redeployment RELEASE_NAME-meilisearch --gvc GVC_NAME` — a changed secret is only picked up when the replica restarts.
 </Warning>
 
 Nothing else is required: no cloud account, no bucket, no external database. Backups use platform volume snapshots.
+
+## Installation
+
+Install with the secret name from the prerequisite step; every other value has a working default.
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/meilisearch \
+  --version 1.0.0 --gvc GVC_NAME \
+  --set auth.secretName=SECRET_NAME
+```
 
 Install the template using your preferred method:
 
@@ -73,15 +92,17 @@ Install the template using your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Image
 
 ```yaml
-# ─── Image ────────────────────────────────────────────────────────────────────
 image: getmeili/meilisearch:v1.52.0
+```
 
-# ─── Resources ────────────────────────────────────────────────────────────────
-# Searches are served from a memory-mapped index, so steady-state RAM is modest;
-# indexing is the hungry phase. Upstream sizing guide: RAM ≈ ⅓ of on-disk index.
+Pin a concrete tag. Raising it on a populated volume requires the procedure in [Upgrading Meilisearch](#upgrading-meilisearch).
+
+### Resources
+
+```yaml
 resources:
   minCpu: 250m
   maxCpu: 1000m
@@ -90,44 +111,80 @@ resources:
 
 tuning:
   indexingMemoryPercent: 50 # MEILI_MAX_INDEXING_MEMORY = this percent of maxMemory (20–80)
+```
 
-# ─── Storage ──────────────────────────────────────────────────────────────────
+Searches are served from a memory-mapped index, so steady-state RAM is modest — indexing is the hungry phase. The indexing budget is **derived, not absolute**: `MEILI_MAX_INDEXING_MEMORY` is set to `tuning.indexingMemoryPercent` of `resources.maxMemory` (at the defaults, `1024MiB`), and there is no absolute override, so it can never exceed the container's own limit. Raise `maxMemory` to index faster and hold a larger index; raise `indexingMemoryPercent` (accepted range 20–80, enforced at render time) only if the instance indexes far more often than it searches.
+
+<Note>
+The platform rejects a `maxCpu`-to-`minCpu` ratio greater than 4:1 on a stateful workload. The defaults sit exactly at 4:1, so raising `maxCpu` means raising `minCpu` too.
+</Note>
+
+### Storage
+
+```yaml
 volumeset:
   capacity: 20 # GiB (platform minimum 10) — index, snapshots and dumps share it
+```
 
-# ─── Master key (REQUIRED — create the secret BEFORE installing) ──────────────
-# The workload will NOT start until this opaque secret exists. Create it with:
-#   printf '%s' "$(openssl rand -base64 32)" | \
-#     cpln secret create-opaque --name my-meilisearch-master-key --encoding plain -f -
-# Must be at least 16 bytes while server.env is production.
-# Changing it later regenerates every Meilisearch API key derived from it.
+The single `ext4` volume at `/meili_data` holds `data.ms` (the index), `snapshots/` and `dumps/`. The chart rejects a capacity below 10 at render time.
+
+### Master Key
+
+```yaml
 auth:
   secretName: my-meilisearch-master-key # name of your pre-created opaque secret
+```
 
-# ─── Server ───────────────────────────────────────────────────────────────────
+The name of the opaque secret from [Prerequisites](#prerequisites). Its whole payload is the master key; the chart grants the workload `reveal` on exactly that secret and nothing else.
+
+### Server
+
+```yaml
 server:
   env: production            # production | development — development also serves the search-preview UI at /
   logLevel: INFO             # ERROR | WARN | INFO | DEBUG | TRACE
   maxPayloadSize: "100 MB"   # largest accepted request body; a bigger import is rejected with HTTP 413
   telemetry: false           # true = send anonymous usage data upstream
   upgradeDb: false           # true for ONE deploy when moving to a newer image tag, then set back to false
+```
 
-# ─── Metrics (experimental upstream) ──────────────────────────────────────────
+<Note>
+With `server.env: production`, `GET /` returns **HTTP 200** with `{"status":"Meilisearch is running"}` and no HTML. That is a healthy instance — the browser search-preview UI is only served with `server.env: development`. The master key protects every route either way.
+</Note>
+
+### Metrics
+
+```yaml
 metrics:
   enabled: false # true = Prometheus /metrics on port 7700 (needs an API key with the metrics.get action)
+```
 
-# ─── Meilisearch snapshots (app-consistent files on the volumeset) ────────────
+These are index-level metrics (documents indexed, searches per index, database size) that the platform's built-in workload metrics cannot see. The route requires an API key carrying the `metrics.get` action.
+
+### Snapshots
+
+```yaml
 snapshots:
   enabled: false         # scheduled .snapshot files in /meili_data/snapshots — only the newest is kept
   intervalSeconds: 86400 # seconds between snapshots
+```
 
-# ─── Backup (platform volume snapshots — no cloud account needed) ─────────────
+Meilisearch's own application-level `.snapshot` files, written onto the same volume. These are distinct from the platform volume snapshots under `backup` — see [Backing Up](#backing-up) for how the two relate.
+
+### Backup
+
+```yaml
 backup:
   enabled: true
   schedule: "0 3 * * *" # cron in UTC — daily 03:00 (hourly is the platform max)
   retention: 7d         # how long each snapshot is kept (e.g. 7d, 720h, 30d)
+```
 
-# ─── Access ───────────────────────────────────────────────────────────────────
+Platform volume snapshots of the whole `/meili_data` volume. No cloud account or bucket is needed. `backup.enabled: false` disables the schedule only; the final snapshot on delete is always taken and kept for `backup.retention`. Changing any `backup` value updates the volume set without restarting the workload.
+
+### Access
+
+```yaml
 publicAccess:
   enabled: false # true = REST API over HTTPS on the auto *.cpln.app endpoint
 internalAccess:
@@ -137,110 +194,47 @@ internalAccess:
   #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
-### Image and resources
-
-- `image` — The Meilisearch server image. Pin a concrete tag; changing it on a populated volume requires the upgrade procedure below.
-- `resources.minCpu` / `resources.maxCpu` / `resources.minMemory` / `resources.maxMemory` — CPU reservation and limit, memory reservation and limit for the Meilisearch container.
-- `tuning.indexingMemoryPercent` — Percentage of `resources.maxMemory` given to the indexing arena. Accepted range is 20–80; anything else is rejected at render time.
-
-Searches are served from a memory-mapped index, so steady-state RAM is modest — indexing is the hungry phase. Upstream's rough guide is RAM ≈ ⅓ of the on-disk index size.
-
-The indexing budget is **derived, not absolute**: `MEILI_MAX_INDEXING_MEMORY` is set to `indexingMemoryPercent` of `resources.maxMemory`. At the defaults that is `1024MiB`; with `maxMemory: 8Gi` it becomes `4096MiB`. There is deliberately no absolute override, so the budget can never drift from the container's own limit. Left to itself, Meilisearch budgets two thirds of the RAM it detects — in a container that is routinely the node's, not your limit — and OOM-kills itself part-way through an indexing task.
-
-Raise `maxMemory` to index faster and to hold a larger index; raise `indexingMemoryPercent` only if the instance indexes far more often than it searches.
+| `internalAccess.type` | Who can reach port `7700` inside the platform |
+|---|---|
+| `none` | No workload |
+| `same-gvc` | Every workload in the same GVC (default) |
+| `same-org` | Every workload in the same org |
+| `workload-list` | Only the workload links in `internalAccess.workloads` |
 
 <Note>
-The API rejects a `maxCpu`-to-`minCpu` ratio greater than 4:1. The defaults sit exactly at 4:1, so raising `maxCpu` means raising `minCpu` too.
-</Note>
-
-### Storage
-
-- `volumeset.capacity` — Initial volume size in GiB. The platform minimum is 10, and the chart rejects anything smaller at render time.
-
-The single `ext4` volume at `/meili_data` holds `data.ms` (the LMDB index), `snapshots/`, and `dumps/`. Upstream advises against network-mounted storage for the memory-mapped index, so this is a block device rather than shared storage.
-
-### Master key
-
-- `auth.secretName` — Name of your prerequisite opaque secret. Its whole payload is the master key. The chart creates a policy granting the workload `reveal` on exactly that secret.
-
-### Server
-
-- `server.env` — `production` (default) or `development`. Only `development` serves the browser search-preview UI at `/`; the master key protects every route either way.
-- `server.logLevel` — One of `ERROR`, `WARN`, `INFO` (default), `DEBUG`, `TRACE`.
-- `server.maxPayloadSize` — Largest accepted request body. A larger import is rejected with **HTTP 413** and `The provided payload reached the size limit.`
-- `server.telemetry` — When `false` (default), no anonymous usage data is sent upstream.
-- `server.upgradeDb` — Set to `true` for exactly one deploy when moving to a newer image tag, then back to `false`. See [Upgrading Meilisearch](#upgrading-meilisearch).
-
-<Note>
-With `server.env: production`, `GET /` returns **HTTP 200** with `{"status":"Meilisearch is running"}` and no HTML. That is a healthy instance, not a broken one — the search-preview UI is suppressed in production mode by design. Set `server.env: development` if you want the playground at `/`.
-</Note>
-
-### Metrics
-
-- `metrics.enabled` — When `true`, Meilisearch exposes Prometheus metrics at `/metrics` on port `7700`. The route requires an API key with the `metrics.get` action; unauthenticated requests get `401`.
-
-These are index-level metrics (documents indexed, searches per index, database size) that the platform's built-in workload metrics cannot see. With `metrics.enabled: false` (the default), `GET /metrics` returns **HTTP 400** with `{"code":"feature_not_enabled"}` — not a `404`.
-
-### Snapshots and backup
-
-Two different things are called "snapshots" here, and they do different jobs:
-
-| Block | What it is | Default |
-|---|---|---|
-| `backup` | **Platform** volume snapshots — crash-consistent whole-disk copies. No cloud account or bucket needed. | On |
-| `snapshots` | **Meilisearch's own** `.snapshot` files written onto the same volume. Only the newest is kept. Required by upstream's restore procedure. | Off |
-
-- `backup.enabled` — When `true` (default), the volume set takes snapshots on `backup.schedule`.
-- `backup.schedule` — Cron expression in UTC. Hourly is the platform maximum frequency.
-- `backup.retention` — How long each snapshot is kept (for example `7d`, `720h`, `30d`).
-- `snapshots.enabled` — When `true`, Meilisearch writes a scheduled `.snapshot` file into `/meili_data/snapshots`, rewriting it each interval.
-- `snapshots.intervalSeconds` — Seconds between those snapshots.
-
-The volume set also takes a final snapshot when it is deleted, retained for `backup.retention`. That final snapshot happens regardless of `backup.enabled` — setting it to `false` disables *scheduled* snapshots only. Changing any `backup` value updates the volume set without restarting the workload.
-
-You can also trigger a Meilisearch snapshot on demand with `POST /snapshots`, whether or not the scheduled ones are enabled.
-
-### Access
-
-- `publicAccess.enabled` — When `true`, the REST API is served over HTTPS on the automatically assigned `*.cpln.app` canonical endpoint. When `false` (default), no external inbound traffic is allowed.
-- `internalAccess.type` — Internal firewall scope of the workload:
-
-| Type | Description |
-|------|-------------|
-| `none` | No internal access — in-GVC traffic is refused. |
-| `same-gvc` | Allow access from all workloads in the same GVC (default). |
-| `same-org` | Allow access from all workloads in the same organization. |
-| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
-
-- `internalAccess.workloads` — Workload links (`//gvc/GVC_NAME/workload/WORKLOAD_NAME`), used only with `workload-list`.
-
-<Note>
-Firewall changes take **45–150 seconds** to propagate. After toggling `publicAccess` or `internalAccess`, requests may keep returning the old behavior (or `503`) for more than a minute before settling — re-test rather than concluding the knob does not work.
+Firewall changes take a few minutes to propagate. After toggling `publicAccess` or `internalAccess`, requests may keep returning the old behavior (or `503`) for a while — re-test before concluding the knob does not work.
 </Note>
 
 ## Connecting
 
-| Target | Address | Credentials |
+| What | Address | Notes |
 |---|---|---|
-| Internal REST (same GVC) | `http://{release}-meilisearch.{gvc}.cpln.local:7700` | `Authorization: Bearer <key>` |
-| Public REST *(if enabled)* | `https://<canonical>.cpln.app` | `Authorization: Bearer <key>` |
-| Health | `GET /health` on `7700` | None — the one route the master key does not protect |
+| Internal REST API (same GVC) | `http://RELEASE_NAME-meilisearch.GVC_NAME.cpln.local:7700` | `Authorization: Bearer <key>` on every route except `GET /health` |
+| Public REST API (`publicAccess.enabled: true`) | `status.canonicalEndpoint` of the workload | HTTPS at the platform edge; same header |
+| Master key | `cpln secret reveal SECRET_NAME -o yaml` | Use it only to fetch the derived API keys below |
 
-The canonical hostname appears under `status.canonicalEndpoint`:
+Read the public hostname from the workload status:
 
 ```bash
-cpln workload get {release}-meilisearch --gvc {gvc} -o yaml
+cpln workload get RELEASE_NAME-meilisearch --gvc GVC_NAME -o yaml   # status.canonicalEndpoint
 ```
 
-Public traffic is HTTPS at the platform edge; same-GVC traffic is plain HTTP carried over the mesh's own mTLS. A fresh install typically reaches `ready: true` in 45–60 seconds.
-
-### Use a scoped API key, not the master key
-
-On first boot Meilisearch derives four keys from the master key. Fetch them once and hand the right one to each caller:
+Verify the server is up without exposing it, from your own machine:
 
 ```bash
-curl -H "Authorization: Bearer YOUR_MASTER_KEY" \
-  http://{release}-meilisearch.{gvc}.cpln.local:7700/keys
+cpln port-forward RELEASE_NAME-meilisearch 7700:7700 --gvc GVC_NAME
+# in a second terminal
+curl http://localhost:7700/health
+```
+
+A healthy server answers `{"status":"available"}`.
+
+### Use a Scoped API Key
+
+On first boot Meilisearch derives four API keys from the master key. Fetch them once and hand the right one to each caller; never give the master key to a browser.
+
+```bash
+curl -H "Authorization: Bearer YOUR_MASTER_KEY" http://localhost:7700/keys
 ```
 
 | Key | Use it for |
@@ -250,12 +244,12 @@ curl -H "Authorization: Bearer YOUR_MASTER_KEY" \
 | Default Read-Only Admin API Key | Dashboards and monitoring |
 | Default Chat API Key | The experimental chat route |
 
-### Index and search
+### Index and Search
 
-Indexing is asynchronous: writes return `202 Accepted` with a `taskUid` you can poll on `/tasks`.
+Indexing is asynchronous: writes return `202 Accepted` with a `taskUid` you can poll on `/tasks`. From another workload in the GVC, replace `localhost:7700` with the internal address above.
 
 ```bash
-MEILI=http://{release}-meilisearch.{gvc}.cpln.local:7700
+MEILI=http://localhost:7700
 KEY=YOUR_ADMIN_API_KEY
 
 # create an index
@@ -274,37 +268,129 @@ curl -X POST "$MEILI/indexes/movies/search" -H "Authorization: Bearer $KEY" \
   -d '{"q":"interstelar"}'
 ```
 
-The misspelled query returns the `Interstellar` document. Use the Search API key, not the admin key, for anything running in a browser.
+The misspelled query returns the `Interstellar` document.
 
-## Upgrading Meilisearch
+## Operations
 
-Meilisearch refuses to open a database written by an older version, so raising `image` on a populated volume fails by design until you ask for the migration:
+### Backing Up
+
+Two different things are called "snapshots" here, and they do different jobs:
+
+| Mechanism | What it is | Where it lives | Default |
+|---|---|---|---|
+| `backup` | Platform volume snapshots — crash-consistent copies of the whole `/meili_data` volume | Platform snapshot store, kept for `backup.retention` | On, daily |
+| `snapshots` | Meilisearch's own `.snapshot` file — an application-consistent copy of the database | `/meili_data/snapshots` on the same volume; only the newest is kept | Off |
+
+List the platform snapshots the volume set holds, or take one on demand before a risky change:
+
+```bash
+cpln volumeset snapshot get RELEASE_NAME-meilisearch-data --gvc GVC_NAME
+cpln volumeset snapshot create RELEASE_NAME-meilisearch-data --gvc GVC_NAME --snapshot-name pre-upgrade
+```
+
+Meilisearch can also write its own backups on demand, with or without the schedule enabled. Both are asynchronous tasks you can follow on `/tasks`:
+
+```bash
+# application-consistent snapshot → /meili_data/snapshots (same Meilisearch version only)
+curl -X POST http://localhost:7700/snapshots -H "Authorization: Bearer YOUR_ADMIN_API_KEY"
+# portable dump → /meili_data/dumps (the format that moves data between Meilisearch versions)
+curl -X POST http://localhost:7700/dumps -H "Authorization: Bearer YOUR_ADMIN_API_KEY"
+```
+
+A Meilisearch snapshot is version-locked and a dump is not, so a dump is the right file to keep before a version upgrade. Both files sit on the volume, so a platform snapshot of the volume captures them too.
+
+### Restoring a Backup
+
+<Warning>
+**No restore path for this template has been verified.** Meilisearch imports a `.snapshot` or `.dump` file only at launch, through the `--import-snapshot` / `--import-dump` flags, and the chart exposes no values key that sets them. The platform's volume-snapshot restore has also not been exercised against this template.
+</Warning>
+
+What the chart does make true: the index, Meilisearch snapshots and dumps all live on the `RELEASE_NAME-meilisearch-data` volume set, which the platform snapshots on `backup.schedule` and on delete. Recovering from one of those snapshots therefore means restoring the volume set rather than anything inside Meilisearch — consult the [volume set reference](/reference/volumeset) for the platform's restore procedure. Test any procedure on a disposable release before relying on it.
+
+### Upgrading Meilisearch
+
+Meilisearch refuses to open a database written by an older version, so raising `image` on a populated volume fails by design until you ask for the migration. The chart's `server.upgradeDb` sets `MEILI_UPGRADE_DB`, the upstream in-place upgrade flag.
 
 <Steps>
   <Step title="Confirm a recent backup exists">
-    The migration is not atomic. Check the volume set's snapshots before starting.
+    The migration is not atomic. List the volume set's snapshots (see [Backing Up](#backing-up)) and take a Meilisearch dump as a portable fallback.
   </Step>
   <Step title="Deploy the new image with the migration flag">
-    Set `image` to the new tag **and** `server.upgradeDb: true` in the same deploy. The database is upgraded on startup.
+    Set `image` to the new tag **and** `server.upgradeDb: true` in the same `helm upgrade`. The database is upgraded on startup.
   </Step>
   <Step title="Turn the flag back off">
-    Once the workload is ready on the new tag, set `server.upgradeDb: false` and redeploy so a migration flag is not left permanently on.
+    Once the workload is ready on the new tag, set `server.upgradeDb: false` and upgrade again so the migration flag is not left permanently on.
   </Step>
 </Steps>
 
-If you raise the image tag *without* the flag, the new container exits with `Your database version (X) is incompatible with your current engine version (Y).` and restarts in a loop. The platform keeps the old, working version serving for roughly two minutes before the deployment flips to not-ready, so a forgotten flag looks fine at first and then goes down — check the deployment status, not just the first minute after the upgrade.
+If you raise the image tag *without* the flag, the new container exits with `Your database version (X) is incompatible with your current engine version (Y).` and restarts in a loop. The previous, working version keeps serving for a while before the deployment goes not-ready, so a forgotten flag looks fine at first — check `cpln workload get-deployments RELEASE_NAME-meilisearch --gvc GVC_NAME -o yaml`, not just the first minute.
+
+### Scaling and Availability
+
+The template runs exactly one replica, and there is no `replicas` knob. Replication and sharding are Meilisearch Enterprise features that are not compiled into the Community image, so a second replica would serve a separate, empty index behind the same endpoint.
+
+Consequences to plan around:
+
+- A `helm upgrade` or restart is a real outage of the search endpoint, and it begins some time *after* the command returns. Have your application fall back to a database query while search is unavailable.
+- An abrupt replica loss recovers on its own with data intact; the volume reattaches to the rescheduled replica.
+- Scale vertically: raise `resources.maxMemory` (which also raises the indexing budget) and `volumeset.capacity`.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Deployment never becomes ready and cpln logs returns nothing">
+    **Cause:** the master-key secret named in `auth.secretName` does not exist, or did not exist when the workload was created. The container never starts, so there is no container output to collect.
+
+    **Fix:** read `status.versions[].message`, which names the missing secret:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-meilisearch --gvc GVC_NAME -o yaml
+    ```
+
+    Create the secret (see [Prerequisites](#prerequisites)) and either wait several minutes or run `cpln workload force-redeployment RELEASE_NAME-meilisearch --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Container exits with: The master key must be at least 16 bytes in a production environment">
+    **Cause:** the secret's payload is shorter than 16 bytes while `server.env` is `production`.
+
+    **Fix:** replace the secret's value with a longer key (`openssl rand -hex 32` produces 64 characters) and force a redeployment. Every derived API key changes with it.
+  </Accordion>
+  <Accordion title="Container restarts with: Your database version (X) is incompatible with your current engine version (Y)">
+    **Cause:** the image tag was raised on a populated volume without `server.upgradeDb: true`.
+
+    **Fix:** follow [Upgrading Meilisearch](#upgrading-meilisearch) — redeploy with the same new tag and `server.upgradeDb: true`, then set it back to `false`.
+  </Accordion>
+  <Accordion title="Import rejected with HTTP 413 payload_too_large">
+    **Cause:** the request body is larger than `server.maxPayloadSize` (default `100 MB`). Nothing from that request is written.
+
+    **Fix:** send the documents in smaller batches, or raise `server.maxPayloadSize` and upgrade the release.
+  </Accordion>
+  <Accordion title="GET /metrics returns HTTP 400 feature_not_enabled">
+    **Cause:** `metrics.enabled` is `false` (the default). The route exists but the experimental feature is off, so the answer is `400`, not `404`.
+
+    **Fix:** set `metrics.enabled: true`, upgrade the release, and call the route with an API key that has the `metrics.get` action. Without any key the route answers `401`.
+  </Accordion>
+  <Accordion title="GET / returns JSON instead of the search-preview UI">
+    **Cause:** `server.env` is `production`, which suppresses the browser UI by design. `{"status":"Meilisearch is running"}` is a healthy answer.
+
+    **Fix:** set `server.env: development` if you want the playground at `/`. The master key still protects every route.
+  </Accordion>
+  <Accordion title="Writes fail with HTTP 403 invalid_api_key">
+    **Cause:** the caller is using the Default Search API Key, which is search-only.
+
+    **Fix:** use the Default Admin API Key for indexing (see [Use a Scoped API Key](#use-a-scoped-api-key)). Keep the search key for anything running in a browser.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **The master-key secret must exist before you install.** If it does not, the deployment hangs waiting on a secret that will never resolve and looks broken. Verify with `cpln secret get my-meilisearch-master-key` first.
-- **Rotating the master key changes every API key.** All four built-in keys are derived from it, so a rotation silently breaks every deployed client. Treat it as write-once, or plan to redistribute all keys.
-- **Single replica, by design and by edition.** Replication and sharding are Meilisearch Enterprise features and are not compiled into the Community image this template ships, so there is no `replicas` knob and no failover. A restart or upgrade is a real outage of the search endpoint: measured at **87 seconds** (68 consecutive failed requests out of 349, at 1 request per second across a `helm upgrade`). The failures begin about **51 seconds after the upgrade command returns**, so the CLI looks finished well before the outage starts. An abrupt replica loss recovers faster — about **20 seconds**, with data intact. Have your application fall back to a database query while search is unavailable.
-- **`server.env: production` does not serve the search-preview UI**, and `GET /` returns **200** with `{"status":"Meilisearch is running"}`. That is a healthy instance. Use `server.env: development` for the browser playground.
-- **`/metrics` returns 400 `feature_not_enabled`, not 404, when metrics are disabled.** Set `metrics.enabled: true` to serve it, and call it with a key that has the `metrics.get` action.
-- **Size indexing with `resources.maxMemory`.** The indexing budget is derived from it via `tuning.indexingMemoryPercent` (default 50%), and there is no absolute override, so the two cannot drift apart.
-- **Over-size imports return HTTP 413.** A body larger than `server.maxPayloadSize` is rejected outright and nothing is written — batch large imports or raise the limit.
-- **Install into a single-location GVC.** A workload runs in every location its GVC has, and each location gets its own volume — two locations means two independent indexes diverging silently behind one endpoint.
-- **Uninstall deletes the volume set.** A final snapshot is retained for `backup.retention`, and your own master-key secret is left untouched.
+- **Create the master-key secret before installing**, and confirm it exists with `cpln secret reveal SECRET_NAME -o yaml`; without it the deployment wedges silently.
+- **Rotating the master key changes every derived API key** and requires a forced redeployment to take effect — treat it as write-once.
+- **Never hand the master key to a browser**; use the Default Search API Key for front-ends.
+- **Set `server.upgradeDb: true` for exactly one deploy when raising the image tag**, then set it back to `false`. Confirm a backup first; the migration is not atomic.
+- **Size indexing with `resources.maxMemory`** — the indexing budget is a percentage of it and has no absolute override.
+- **Batch large imports** below `server.maxPayloadSize`; an oversized body is rejected with HTTP 413 and nothing is written.
+- **Install into a single-location GVC**; each location gets its own volume and its own diverging index.
+- **Uninstall deletes the volume set.** A final snapshot is kept for `backup.retention`; your master-key secret is left untouched.
 
 ## External References
 
@@ -318,7 +404,7 @@ If you raise the image tag *without* the flag, the new container exits with `You
   <Card title="API Keys and Security" icon="key" href="https://www.meilisearch.com/docs/learn/security/basic_security">
     Master key, derived keys, and scoping access
   </Card>
-  <Card title="Snapshots and Backups" icon="camera" href="https://www.meilisearch.com/docs/resources/self_hosting/data_backup/overview">
+  <Card title="Snapshots and Dumps" icon="camera" href="https://www.meilisearch.com/docs/resources/self_hosting/data_backup/overview">
     Meilisearch's own snapshot and dump formats
   </Card>
   <Card title="Updating Meilisearch" icon="arrow-up" href="https://www.meilisearch.com/docs/resources/migration/updating">
