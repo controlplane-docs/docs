@@ -1,99 +1,199 @@
 ---
 title: CPLN Jenkins
 icon: /template-catalog/templates/icons/cpln-jenkins.png
-description: Deploy Jenkins on Control Plane using the Template Catalog. Build agents are provisioned as Control Plane workloads on demand and deleted once idle. Covers the two prerequisite secrets, the API key permissions agents need, and why the agent GVC must have a single location.
+description: Deploy a single Jenkins controller on Control Plane into an existing GVC. Build agents run as on-demand Control Plane workloads and are deleted once idle. Two secrets must exist first, the admin password and a service account API key, and the agent GVC must have one location.
+keywords: ['jenkins', 'ci', 'cd', 'continuous integration', 'build server', 'jenkins agents', 'ephemeral build agents', 'github actions alternative', 'gitlab ci alternative', 'configuration as code', 'jcasc', 'service account', 'cpln jenkins template']
 ---
-
-Jenkins CI server with the [Control Plane cloud plugin](https://github.com/controlplane-com/cpln-jenkins-plugin) built in. Jenkins provisions each build agent as its own Control Plane workload and deletes it once idle, so build capacity costs nothing between builds.
-
-The controller is configured entirely from code and boots straight to a login screen — there is no setup wizard to click through.
 
 ## Overview
 
+Jenkins is an open-source automation server for CI/CD pipelines. This template deploys a single Jenkins controller with the [Control Plane cloud plugin](https://github.com/controlplane-com/cpln-jenkins-plugin) built in: when a job is queued, Jenkins provisions a build agent as its own Control Plane workload and deletes it once idle, so build capacity costs nothing between builds.
+
+The controller is configured entirely from code and boots straight to a login screen, with no setup wizard. The admin password and the Control Plane API key Jenkins uses to create agents both come from secrets you create **before** installing; neither passes through Helm values.
+
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have. By default agents are provisioned into that same GVC, which must have exactly one location.
+</Note>
+
 ### What Gets Created
 
-- **Jenkins Controller** — a `stateful` workload serving HTTP on port 8080, pinned to a single replica.
-- **Volume Set** — an `ext4` volume mounted at `/var/jenkins_home`, holding jobs, build history and installed plugins. A final snapshot is kept for 7 days when the volume set is deleted.
-- **Cloud Configuration Secret** — created by the chart from your values and read by Jenkins at boot as Configuration as Code.
-- **Identity and Policy** — grants the controller `reveal` on exactly the secrets it mounts, and nothing else.
-- **Agent Workloads** — created and deleted by Jenkins itself at build time, not by the chart.
-
-This template does not create a GVC. You must deploy it into an existing GVC.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-jenkins` | Jenkins controller (stateful, 1 replica, HTTP port `8080`) | — |
+| Volume set | `RELEASE_NAME-jenkins-vs` | `/var/jenkins_home` — jobs, build history and installed plugins (`ext4`, final snapshot kept 7 days on delete) | — |
+| Secret | `RELEASE_NAME-jenkins-cloud` | The Control Plane cloud settings, rendered from `cloud.*` and read by Jenkins at boot as Configuration as Code | `cloud.enabled: true` (default) |
+| Identity | `RELEASE_NAME-jenkins-identity` | Controller identity | — |
+| Policy | `RELEASE_NAME-jenkins-policy` | `reveal` on exactly the secrets the controller reads: your admin password secret, plus your API key secret and `RELEASE_NAME-jenkins-cloud` when the cloud is enabled | — |
+| Workloads | names start with `cloud.agentWorkload` (`jenkins-agent`) | Build agents, created and deleted **by Jenkins** at build time — not by the chart | `cloud.enabled: true` (default) |
 
 ## Prerequisites
 
-**Two `opaque` secrets must exist before you install.**
-
-<Warning>
-A missing prerequisite secret leaves the workload waiting on something that does not exist, and produces **zero log lines** — the container never starts, so there is nothing to log. See [Diagnosing a stuck install](#diagnosing-a-stuck-install).
-</Warning>
+**Two `opaque` secrets must exist before you install.** Secrets are org-level, so no GVC flag is involved, and their names are org-wide — give each Jenkins release its own.
 
 <Steps>
   <Step title="Create the admin password secret">
-    Anyone holding this password controls your CI, so use a strong one.
+    Anyone holding this password controls your CI, so use a strong one:
 
     ```bash
-    printf '%s' 'YOUR-STRONG-PASSWORD' | cpln secret create-opaque \
-      --name my-jenkins-admin-password --encoding plain -f -
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name ADMIN_PASSWORD_SECRET_NAME --encoding plain -f -
     ```
 
-    Set `admin.passwordSecretName` to the name you used.
+    Read it back to sign in:
+
+    ```bash
+    cpln secret reveal ADMIN_PASSWORD_SECRET_NAME -o yaml
+    ```
+
+    Set `admin.passwordSecretName` to this name.
   </Step>
-
-  <Step title="Create a Control Plane API key secret">
-    Jenkins uses this key to create and delete agent workloads.
-
-    ```bash
-    cpln serviceaccount add-key my-service-account --description jenkins
-    ```
-
-    Copy the `key` value from the output — it is shown once — then:
+  <Step title="Create a service account and key">
+    Jenkins calls the Control Plane API to create, list and delete agent workloads, and it authenticates with a [service account](/guides/create-service-account) key. Create a service account and add a key to it:
 
     ```bash
-    printf '%s' 'THE-KEY-VALUE' | cpln secret create-opaque \
-      --name my-jenkins-cpln-api-key --encoding plain -f -
+    cpln serviceaccount create --name SERVICE_ACCOUNT_NAME --description jenkins-agents
+    cpln serviceaccount add-key SERVICE_ACCOUNT_NAME --description jenkins
     ```
 
-    Set `cloud.apiKeySecretName` to the name you used.
+    Copy the `key` value from the output — it is shown only once. These two commands have been checked against the CLI help only, not run against a live install.
   </Step>
-
   <Step title="Grant the service account permissions">
-    The key needs `view`, `create` and `delete` on workloads in the agent GVC, plus `view` on GVCs, identities and volume sets.
+    Create a [policy](/guides/policy) binding the service account to exactly these permissions:
 
-    A key with **no policy bindings authenticates successfully but provisions nothing** — this is the most common reason agents never appear.
+    | Target kind | Permissions | Scope |
+    |---|---|---|
+    | Workload | `view`, `create`, `delete` | Workloads in the agent GVC |
+    | GVC | `view` | The agent GVC |
+    | Identity | `view` | The agent GVC |
+    | Volume set | `view` | The agent GVC |
+
+    A key with **no policy bindings authenticates successfully but provisions nothing** — this is the most common reason agents never appear (see [Troubleshooting](#troubleshooting)).
+  </Step>
+  <Step title="Store the key in a secret">
+    Paste the key value from the previous step in place of `THE-KEY-VALUE`:
+
+    ```bash
+    printf '%s' 'THE-KEY-VALUE' | cpln secret create-opaque --name API_KEY_SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `cloud.apiKeySecretName` to this name. With `cloud.enabled: false` the API key secret is not needed.
   </Step>
 </Steps>
 
 <Warning>
-**The agent GVC must have exactly one location.** The plugin only accepts single-location GVCs, because each agent is a single replica and cannot be placed across locations.
+**The agent GVC must have exactly one location.** The plugin rejects multi-location GVCs. With `cloud.gvc` left empty, the agent GVC is the GVC you install Jenkins into, so check it before installing:
+
+```bash
+cpln gvc get GVC_NAME -o yaml
+```
+
+`spec.staticPlacement.locationLinks` must list a single location.
 </Warning>
 
-Secret names are organization-wide, so give each Jenkins release its own secret names.
+<Warning>
+**A missing prerequisite secret wedges the deployment silently.** `cpln helm install` still succeeds, the resources are created, and the controller never starts. `cpln logs` returns nothing at all, because the container never ran. The only place the reason appears is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-jenkins --gvc GVC_NAME -o yaml
+```
+
+Note this is `get-deployments` — plain `cpln workload get` has no `versions` key. Create the missing secret and the deployment recovers on its own, or force a redeployment to skip the wait:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-jenkins --gvc GVC_NAME
+```
+</Warning>
+
+## Installation
+
+Once both secrets exist and the service account has its permissions, install from the marketplace registry with the two secret names:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/cpln-jenkins \
+  --version 1.0.0 --gvc GVC_NAME \
+  --set admin.passwordSecretName=ADMIN_PASSWORD_SECRET_NAME \
+  --set cloud.apiKeySecretName=API_KEY_SECRET_NAME
+```
+
+Or follow the instructions for your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
 
 ## Configuration
 
+### Image
+
 ```yaml
 image: ghcr.io/controlplane-com/cpln-jenkins:2.0.1
+```
 
+Jenkins LTS with the Control Plane cloud plugin baked in and Configuration as Code enabled, built from [cpln-jenkins-plugin](https://github.com/controlplane-com/cpln-jenkins-plugin).
+
+### Admin Login
+
+```yaml
 admin:
-  username: admin                                 # login name (not sensitive)
-  passwordSecretName: my-jenkins-admin-password   # opaque secret; must EXIST BEFORE INSTALL
+  username: admin
+  # REQUIRED prerequisite `opaque` secret holding the password, created BEFORE
+  # install. The deployment wedges silently until it exists.
+  passwordSecretName: my-jenkins-admin-password
+```
 
+`admin.username` is the login name and stays an ordinary value. The password is applied on **every** boot, not only the first: change the secret and force a redeployment to change the login (see [Rotating the Admin Password](#rotating-the-admin-password)).
+
+### Control Plane Cloud
+
+These values pre-configure the **Control Plane cloud inside Jenkins** — the settings you would otherwise fill in by hand under **Manage Jenkins → Clouds**. The chart renders them into a Configuration as Code file the controller reads at boot, so a fresh install already knows how to provision agents.
+
+```yaml
 cloud:
-  enabled: true
-  apiKeySecretName: my-jenkins-cpln-api-key  # opaque secret; must EXIST BEFORE INSTALL
-  gvc: ""                    # agent GVC; empty = the GVC Jenkins runs in. ONE location only
-  agentWorkload: jenkins-agent  # name prefix for provisioned agent workloads
+  enabled: true                # false = no cloud is configured; builds have nowhere to run
+  # REQUIRED prerequisite `opaque` secret holding a Control Plane API key, with
+  # create/delete/view on workloads in the target GVC. See the README.
+  apiKeySecretName: my-jenkins-cpln-api-key
+  # GVC the agents run in. Empty = the GVC Jenkins itself runs in. It MUST have
+  # exactly ONE location — the plugin rejects multi-location GVCs.
+  gvc: ""
+  agentWorkload: jenkins-agent   # name prefix for provisioned agent workloads
   agentImage: jenkins/inbound-agent:latest
-  labels: cpln               # space-separated; jobs target these
-  allowJobsWithoutLabels: true  # false = only jobs requesting a label above
-  useUniqueAgents: true      # one dedicated agent per queued job
-  executors: 1               # concurrent builds per agent
-  cpu: 300                   # millicores per agent (minimum 50)
-  memory: 512                # MiB per agent (minimum 128)
-  retentionMins: 5           # delete an idle agent after this long
-  provisioningCooldownSecs: 60  # gap between provisions; prevents over-scaling
+  labels: cpln                   # space-separated; jobs target these
+  allowJobsWithoutLabels: true   # false = only jobs requesting a label above
+  useUniqueAgents: true          # one dedicated agent per queued job
+  executors: 1                   # concurrent builds per agent
+  cpu: 300                       # millicores per agent (minimum 50)
+  memory: 512                    # MiB per agent (minimum 128)
+  retentionMins: 5               # delete an idle agent after this long
+  provisioningCooldownSecs: 60   # gap between provisions; prevents over-scaling
+```
 
+The chart refuses to render with `cloud.cpu` below 50, `cloud.memory` below 128 or `cloud.retentionMins` below 1. The organization and the controller address agents connect back to are derived from where the controller runs, so you never supply them.
+
+<Warning>
+The cloud file is re-applied on **every** boot, so editing these settings in the Jenkins UI does not survive a restart. Change them in values and upgrade instead (see [Changing Cloud Settings](#changing-cloud-settings)).
+</Warning>
+
+### Controller Resources and Storage
+
+```yaml
 resources:
   minCpu: 500m
   maxCpu: 1000m
@@ -101,70 +201,65 @@ resources:
   maxMemory: 2Gi
 
 volumeset:
-  capacity: 10               # GiB (minimum 10); holds JENKINS_HOME
-
-publicAccess:
-  enabled: false             # true publishes the Jenkins login to the internet
-
-internalAccess:
-  type: same-gvc             # none | same-gvc | same-org | workload-list
-  workloads: []              # used with workload-list
+  capacity: 10                   # GiB (minimum 10); holds JENKINS_HOME
 ```
 
-### Admin Login
-
-- `admin.username` — The login name. Not sensitive, so it stays a value.
-- `admin.passwordSecretName` — Name of the `opaque` secret holding the password. It never passes through Helm values, so it does not land in the release.
-
-<Note>
-The password is applied on **every** boot, not only the first. Rotating the secret and redeploying does change the login — unlike templates that seed an admin account once and ignore the value afterwards.
-</Note>
-
-### The Control Plane Cloud
-
-These values pre-configure the **Control Plane cloud inside Jenkins** — the same settings you would otherwise fill in by hand under **Manage Jenkins → Clouds**. The chart renders them into a Configuration as Code file the controller reads at boot, so a fresh install already knows how to provision agents.
-
-<Warning>
-Because that file is applied on **every** boot, editing these settings in the Jenkins UI does not survive a restart. Change them in values and upgrade instead.
-</Warning>
-
-- `cloud.gvc` — The GVC agents are provisioned into. Empty means the GVC Jenkins itself runs in.
-- `cloud.labels` — Space-separated labels jobs use to target Control Plane agents.
-- `cloud.useUniqueAgents` — On by default: one dedicated agent per queued job, so jobs do not wait behind each other.
-- `cloud.retentionMins` — How long an idle agent survives before Jenkins deletes both the Jenkins node and the Control Plane workload.
-- `cloud.cpu` / `cloud.memory` — Per-agent resources. The chart refuses to render below 50 millicores or 128 MiB, because the agent JVM fails to start or is OOM-killed below those floors.
-
-The organization and the controller URL are derived at runtime from the platform's own values, so they cannot drift from where the workload actually runs.
+These size the controller only; each agent is sized by `cloud.cpu` and `cloud.memory`.
 
 ### Access
 
-`publicAccess` defaults to **off**, because the controller serves a login form and a CI server holds credentials for everything it deploys. A private controller is still reachable:
+```yaml
+publicAccess:
+  enabled: false                 # true publishes the Jenkins login to the internet
+
+internalAccess:
+  type: same-gvc                 # none | same-gvc | same-org | workload-list
+  workloads: []                  # used with workload-list
+```
+
+| `internalAccess.type` | Description |
+|---|---|
+| `none` | No internal access. |
+| `same-gvc` | Allow access from all workloads in the same GVC (default). |
+| `same-org` | Allow access from all workloads in the same org. |
+| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads`. |
+
+`publicAccess` defaults to off, because the controller serves a login form and a CI server holds credentials for everything it deploys. A private controller is still reachable through a port-forward — see [Connecting](#connecting). A change to either access setting can take a few minutes to take effect.
+
+## Connecting
+
+The controller is private by default. Open a tunnel to it from your machine:
 
 ```bash
 cpln port-forward RELEASE_NAME-jenkins 8080:8080 --gvc GVC_NAME
 ```
 
-Then open `http://localhost:8080`.
+Then open `http://localhost:8080`. To publish the UI instead, set `publicAccess.enabled: true` and read the public address from `status.canonicalEndpoint`:
 
-<Note>
-Access changes take up to a couple of minutes to propagate after toggling `publicAccess` or `internalAccess`. A measured toggle moved through `403` then `503` before reaching `200` over about 140 seconds.
-</Note>
+```bash
+cpln workload get RELEASE_NAME-jenkins --gvc GVC_NAME -o yaml
+```
 
-## Connecting
+| What | Address | Notes |
+|---|---|---|
+| Jenkins UI (private, default) | `http://localhost:8080` | Through the port-forward above |
+| Jenkins UI (public) | `https://CANONICAL_ENDPOINT` | Only with `publicAccess.enabled: true`; `status.canonicalEndpoint` of `RELEASE_NAME-jenkins` |
+| Internal (same GVC) | `http://RELEASE_NAME-jenkins.GVC_NAME.cpln.local:8080` | Subject to `internalAccess`; always use the fully qualified name |
+| Login | `admin.username` and the payload of your admin password secret | `cpln secret reveal ADMIN_PASSWORD_SECRET_NAME -o yaml` |
 
-| What | Where |
-|---|---|
-| Public UI | `https://<canonical-endpoint>` — only when `publicAccess.enabled` is true. Read it from `status.canonicalEndpoint` in `cpln workload get RELEASE_NAME-jenkins -o yaml` |
-| Internal UI | `http://RELEASE_NAME-jenkins.GVC_NAME.cpln.local:8080`, subject to `internalAccess.type` |
-| Admin login | `admin.username` plus the payload of your `admin.passwordSecretName` secret |
+Verify the controller is serving before you sign in — with the port-forward open:
 
-<Warning>
-Use the fully-qualified `.cpln.local` name for internal access. The short workload name does not resolve reliably from every workload type.
-</Warning>
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/login
+```
 
-## Running Builds on Control Plane Agents
+### First Run
 
-Give a job the label from `cloud.labels`:
+There is no setup wizard. Open the UI and sign in with `admin.username` (default `admin`) and the password in your admin password secret. The Control Plane cloud is already configured under **Manage Jenkins → Clouds**.
+
+### Running Builds on Control Plane Agents
+
+A job runs on a Control Plane agent when it requests one of the labels in `cloud.labels` (default `cpln`):
 
 ```groovy
 pipeline {
@@ -177,36 +272,124 @@ pipeline {
 }
 ```
 
-An agent workload appears in the GVC within about 30 seconds, runs the build, and is deleted once `cloud.retentionMins` elapses. With `allowJobsWithoutLabels: true` (the default), unlabelled jobs also run on Control Plane agents.
+When the job is queued, Jenkins creates an agent workload in the agent GVC whose name starts with `cloud.agentWorkload` (default `jenkins-agent`), runs the build on it, and deletes it once it has been idle for `cloud.retentionMins`. Each agent runs `cloud.agentImage` with `cloud.cpu` millicores and `cloud.memory` MiB.
 
-To route work away from Control Plane instead, set `allowJobsWithoutLabels: false` so only jobs explicitly requesting one of `cloud.labels` are picked up.
+- `cloud.useUniqueAgents: true` (default) gives every queued job its own agent; `cloud.executors` sets how many builds one agent runs at once.
+- `cloud.allowJobsWithoutLabels: true` (default) also sends jobs with **no** label to Control Plane agents. Set it to `false` so only jobs requesting one of `cloud.labels` are picked up.
 
-## Diagnosing a Stuck Install
+## Operations
 
-A missing prerequisite secret produces **no log output at all**. The container never starts, so `cpln logs` returns zero lines and the deployment simply looks slow.
+### Backing Up
+
+Jobs, build history and installed plugins all live on the volume set `RELEASE_NAME-jenkins-vs`. Take a snapshot at any time:
 
 ```bash
-cpln workload get-deployments RELEASE_NAME-jenkins --gvc GVC_NAME -o yaml
+cpln volumeset snapshot create RELEASE_NAME-jenkins-vs --gvc GVC_NAME --snapshot-name SNAPSHOT_NAME
+cpln volumeset snapshot get RELEASE_NAME-jenkins-vs --gvc GVC_NAME
 ```
 
-Read `status.versions[].message` — it names the missing secret.
+When the volume set is deleted — including by uninstalling the release — a final snapshot is kept for 7 days. Your two prerequisite secrets are not part of the release and are never deleted by it.
 
-<Warning>
-This is `get-deployments`, not `cpln workload get`. Plain `get` has no `versions` field and shows you nothing.
-</Warning>
+### Restoring a Backup
 
-Creating the secret repairs the deployment on its own in roughly 5.5 to 10.5 minutes, or force a redeployment to skip the wait.
+The CLI restores a snapshot into the volume set with the command below. This path has been checked against the CLI help only and has **not** been verified against a Jenkins install, so take a fresh snapshot first and expect to restart the controller afterwards:
 
-If Jenkins starts but no agents ever appear, the API key is the usual cause. The controller log shows `Failed to list workloads: 403` when the key lacks workload permissions — the Jenkins UI only shows an idle cloud, so the log is the place to look.
+```bash
+cpln volumeset snapshot restore RELEASE_NAME-jenkins-vs --gvc GVC_NAME \
+  --snapshot-name SNAPSHOT_NAME --location LOCATION --volume-index 0
+cpln workload force-redeployment RELEASE_NAME-jenkins --gvc GVC_NAME
+```
+
+`LOCATION` is the single location of your GVC.
+
+### Rotating the Admin Password
+
+The password is re-applied at every boot, so a new secret value becomes the login after the next restart. Replace the secret's value with the file below, then force a redeployment — a running controller keeps the old password until it restarts:
+
+```yaml
+kind: secret
+name: ADMIN_PASSWORD_SECRET_NAME
+type: opaque
+data:
+  encoding: plain
+  payload: NEW-VALUE
+```
+
+Save it as `rotate.yaml`, then:
+
+```bash
+cpln apply -f rotate.yaml
+cpln secret reveal ADMIN_PASSWORD_SECRET_NAME -o yaml
+cpln workload force-redeployment RELEASE_NAME-jenkins --gvc GVC_NAME
+```
+
+Rotate the API key the same way against `API_KEY_SECRET_NAME`, with a new key from `cpln serviceaccount add-key` as the payload, then force a redeployment.
+
+### Changing Cloud Settings
+
+Change `cloud.*` values with an upgrade; settings edited in the Jenkins UI are overwritten at the next boot:
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/cpln-jenkins \
+  --version 1.0.0 --gvc GVC_NAME \
+  --set cloud.labels=cpln
+```
+
+Repeat every `--set` you passed at install, including both secret names.
+
+### Scaling and Availability
+
+The controller is a single replica pinned to one volume set; it is not clustered, and there is no replicas knob. Build capacity scales through agents instead: each queued job gets its own agent workload, with `cloud.provisioningCooldownSecs` between provisions. A controller restart interrupts the UI and running builds; jobs, history and plugins survive on the volume set.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The controller never starts and cpln logs shows nothing">
+    **Cause:** A prerequisite secret is missing, so the container never ran.
+
+    **Fix:** Read `status.versions[].message`, which names the missing secret, then create it:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-jenkins --gvc GVC_NAME -o yaml
+    ```
+
+    The deployment recovers on its own once the secret exists, or force a redeployment to skip the wait.
+  </Accordion>
+  <Accordion title="Jenkins is up but no agents ever appear">
+    **Cause:** The API key lacks permissions. The controller log shows `Failed to list workloads: 403`, while the Jenkins UI only shows an idle cloud.
+
+    **Fix:** Confirm the error in the controller log, then grant the service account the permissions listed in [Prerequisites](#prerequisites):
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-jenkins"} |= "Failed to list workloads"' --limit 50 --since 10m
+    ```
+  </Accordion>
+  <Accordion title="Agents are never provisioned into a multi-location GVC">
+    **Cause:** The agent GVC has more than one location. The plugin only accepts single-location GVCs.
+
+    **Fix:** Point `cloud.gvc` at a GVC with exactly one location and upgrade.
+  </Accordion>
+  <Accordion title="Cloud settings changed in the UI revert after a restart">
+    **Cause:** Configuration as Code re-applies `cloud.*` at every boot.
+
+    **Fix:** Change the values and upgrade — see [Changing Cloud Settings](#changing-cloud-settings).
+  </Accordion>
+  <Accordion title="Install fails with a cloud.cpu or cloud.memory minimum error">
+    **Cause:** The chart refuses agent sizes below 50 millicores or 128 MiB, and a `cloud.retentionMins` below 1, because the agent JVM fails to start or is OOM-killed below those floors.
+
+    **Fix:** Raise `cloud.cpu`, `cloud.memory` or `cloud.retentionMins` and install again.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
 - **Create both secrets before installing** — a missing one wedges the deployment silently.
-- **The agent GVC must have exactly one location.** Multi-location GVCs are rejected by the plugin.
-- **An API key with no policy bindings authenticates but provisions nothing.** It needs workload `view`, `create` and `delete` in the agent GVC.
-- **`publicAccess.enabled: true` puts a Jenkins login on the internet.** Set a strong admin password first, or reach the UI through a port-forward tunnel instead.
-- **Editing cloud settings in the Jenkins UI does not survive a restart** — Configuration as Code re-applies them at every boot.
-- **Jobs, build history and installed plugins live on the volume set** and survive redeployment. Uninstalling the release deletes the volume set.
+- **The agent GVC must have exactly one location** — by default that is the GVC Jenkins is installed into.
+- **The API key needs policy bindings** — workload `view`/`create`/`delete` in the agent GVC, plus `view` on GVCs, identities and volume sets.
+- **`publicAccess.enabled: true` puts a Jenkins login on the internet** — use a strong admin password, or stay private and use the port-forward.
+- **Edit cloud settings in values, not in the Jenkins UI** — UI edits are lost at the next restart.
+- **A rotated secret needs a forced redeployment** — the running controller keeps the old value until it restarts.
+- **Uninstalling deletes the volume set** — jobs and build history then survive only in the 7-day final snapshot.
 
 ## External References
 
@@ -214,3 +397,4 @@ If Jenkins starts but no agents ever appear, the API key is the usual cause. The
 - [Jenkins documentation](https://www.jenkins.io/doc/)
 - [Jenkins Configuration as Code](https://www.jenkins.io/projects/jcasc/)
 - [Jenkins pipeline syntax](https://www.jenkins.io/doc/book/pipeline/syntax/)
+- [CPLN Jenkins template source](https://github.com/controlplane-com/templates/tree/main/cpln-jenkins)
