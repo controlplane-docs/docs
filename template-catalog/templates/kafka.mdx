@@ -1,65 +1,105 @@
 ---
 title: Kafka
 icon: /template-catalog/templates/icons/kafka.png
-description: Deploy Apache Kafka on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and KRaft mode clustering with optional UI, REST proxy, and connectors.
-keywords: ['event streaming', 'message broker', 'pubsub', 'topic', 'partition', 'rabbitmq alternative', 'kinesis alternative', 'pulsar alternative', 'redpanda alternative', 'kafbat ui', 'kafka connect']
+description: Deploy an Apache Kafka cluster in KRaft mode on Control Plane using the Template Catalog. Three brokers by default (1, 3, 4 or 5), persistent log volumes with daily snapshots, SASL listeners, optional Kafbat UI, REST Proxy, Kafka Connect and a public listener. Deploys into an existing GVC.
+keywords: ['event streaming', 'message broker', 'pubsub', 'topic', 'partition', 'rabbitmq alternative', 'kinesis alternative', 'pulsar alternative', 'redpanda alternative', 'kafbat ui', 'kafka connect', 'rest proxy', 'rack awareness', 'mirrormaker']
 ---
 
 ## Overview
 
-Apache Kafka is a distributed event streaming platform designed for high-throughput, fault-tolerant publish-subscribe messaging. This template deploys a Kafka cluster in **KRaft mode** (no ZooKeeper required), using built-in Raft consensus for distributed coordination. Optional components include a Kafbat UI for cluster management, a REST Proxy for HTTP-based access, Kafka Connect for sink and source connectors, and Prometheus exporters for metrics.
+Apache Kafka is a distributed event streaming platform for high-throughput, fault-tolerant publish-subscribe messaging. This template deploys a Kafka cluster in **KRaft mode** (no ZooKeeper): every broker is also a KRaft controller, the client listener authenticates with SASL/PLAIN, Kafka ACLs are enforced, and each broker keeps its logs on persistent volumes with daily snapshots. A health sidecar and two Prometheus exporters run beside every broker. Kafbat UI (a web console), a Confluent REST Proxy and a Kafka CLI client workload are on by default; Kafka Connect workers and a public listener for clients outside the GVC are opt-in.
+
+<Note>
+This template deploys into an **existing** [GVC](/reference/gvc) — the one you pass with `--gvc`. It does not create, provision or manage a GVC, and uninstalling the release never deletes one.
+</Note>
 
 ### What Gets Created
 
-- **Kafka Cluster Workload** — A stateful Kafka broker cluster with configurable replicas (minimum 3). Each replica runs as a combined controller and broker. Optional sidecar containers for Kafka Exporter and JMX Exporter can be co-located on the same workload.
-- **Volume Set** — Persistent storage for Kafka log directories with autoscaling, snapshot retention, and optional AWS KMS encryption.
-- **Secrets** — Three opaque secrets: the controller configuration (KRaft quorum and SASL settings), the cluster initialization script (startup logic, listener setup, and log directory initialization), and the Kafka credentials (KRaft cluster ID, inter-broker password, controller password, and listener admin credentials). A JMX exporter configuration secret is also created when JMX exporter is enabled.
-- **Identity & Policy** — An identity bound to the cluster workload with `reveal` access to the Kafka secrets.
-- **Kafbat UI Workload** (optional) — A web-based Kafka management interface with its own identity, policy, and optional domain routing. Enabled when `kafbat_ui.enabled: true`.
-- **Kafka REST Proxy Workload** (optional) — An HTTP API gateway for producing and consuming Kafka messages without a native client. Enabled when `kafka_rest_proxy.enabled: true`.
-- **Kafka Connect Workload** (optional) — A worker cluster for running sink and source connectors. Configured via the `kafka_connectors` section (commented out by default).
-- **Kafka Client Workload** (optional) — A lightweight client workload for testing and debugging cluster connectivity from within the GVC. Enabled when `kafka_client` is uncommented in the values file.
-- **Domain** (optional) — Public listener routing for external Kafka access. Created when the public listener is configured, using either direct replica routing or multi-port routing.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-cluster` | Kafka brokers (stateful, `kafka.replicas` replicas, each a KRaft controller and broker). Containers: `kafka`, `kafka-orchestrator` (readiness and metrics), `kafka-exporter`, `jmx-exporter` | Set `kafka_orchestrator`, `kafka_exporter` or `jmx_exporter` to `null` to drop that sidecar |
+| Volume Set | `RELEASE_NAME-logs-0`, `RELEASE_NAME-logs-1` | One per path in `kafka.logDirs`; ext4 SSD, autoscaling, daily snapshots | `kafka.volumes.logs.externalVolumeSets` mounts existing volume sets instead |
+| Secret | `RELEASE_NAME-controller-configuration` | Broker `server.properties` (listeners, SASL, ACL, replication defaults) | — |
+| Secret | `RELEASE_NAME-init` | Broker startup script | — |
+| Secret | `RELEASE_NAME-secrets` | KRaft cluster ID, controller, inter-broker and listener admin passwords | — |
+| Secret | `RELEASE_NAME-jmx-exporter-conf` | JMX exporter rules | with `jmx_exporter` |
+| Identity and Policy | `RELEASE_NAME` | `reveal` on the broker secrets | — |
+| Workload | `RELEASE_NAME-kafbat-ui` | Kafbat UI web console (standard), with an identity and policy of the same name reading your configuration secret | `kafbat_ui.enabled: true` (default) |
+| Workload | `RELEASE_NAME-rest-proxy` | Confluent REST Proxy (standard) on port 8082, with identity `RELEASE_NAME-rest-proxy-identity`, policy `RELEASE_NAME-rest-proxy-policy` and secrets `RELEASE_NAME-rest-properties`, `RELEASE_NAME-rest-jaas-conf` (plus `RELEASE_NAME-rest-password-properties` when BASIC-auth users are set) | `kafka_rest_proxy.enabled: true` (default) |
+| Workload | `RELEASE_NAME-client` | Kafka CLI tools container for testing from inside the GVC | `kafka_client` block (default on; set to `null` to omit) |
+| Workload | `RELEASE_NAME-connect-` followed by the connector `name` | Kafka Connect worker (stateful) with its own volume set, identity, policy and secrets of the same name | `kafka_connectors` list |
+| Domain | the hostname you configure | TLS entry point for the public listener, Kafbat UI or REST Proxy | `kafka.listeners.<listener>.directReplicaRouting.publicAddress`, `kafbat_ui.domain`, `kafka_rest_proxy.domain` |
 
 ## Prerequisites
 
-Prerequisites are only required if you plan to use the public listener or Kafbat UI. Skip the relevant section if those features are not needed.
+<Steps>
+  <Step title="Create the Kafbat UI configuration secret">
+    Kafbat UI is on by default and reads its whole configuration from an **opaque** secret mounted as a file. The secret must exist **before** you install. Replace `ADMIN_PASSWORD` with the value you will pass as `kafka.listeners.client.sasl.admin.password`, and `UI_PASSWORD` with the login you want for the console. The full file format is in the [Kafbat configuration reference](https://ui.docs.kafbat.io/configuration/configuration-file).
 
-### Public Listener (External Access)
+    ```bash
+    cat > kafbat-config.yaml <<'EOF'
+    kafka:
+      clusters:
+        - name: kafka
+          bootstrapServers: RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092
+          properties:
+            security.protocol: SASL_PLAINTEXT
+            sasl.mechanism: PLAIN
+            sasl.jaas.config: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"ADMIN_PASSWORD\";"
+    auth:
+      type: LOGIN_FORM
+    spring:
+      security:
+        user:
+          name: admin
+          password: UI_PASSWORD
+    EOF
+    cpln secret create-opaque --name kafka-kafbat-ui-config --encoding plain -f kafbat-config.yaml
+    ```
 
-To expose Kafka brokers to clients outside the GVC, you need:
+    `kafka-kafbat-ui-config` is the default value of `kafbat_ui.configuration_secret`; if you pick another name, set that value to match. If you do not want the console, install with `--set kafbat_ui.enabled=false` instead and skip this step.
 
-1. A registered domain (e.g., `kafka.example.com`).
-2. A **Dedicated Load Balancer** enabled on the GVC. This is required for external Kafka access and reduces cross-zone traffic costs when `kafka.multiZone` is enabled.
-3. DNS configured as described in the [Configure Domain](https://docs.controlplane.com/guides/configure-domain) guide.
+    <Warning>
+    If the secret is missing at install time the install still succeeds, `cpln logs` returns nothing for `RELEASE_NAME-kafbat-ui`, and the workload never becomes ready. The only place the missing secret is named is `status.versions[].message`:
 
-### Kafbat UI
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-kafbat-ui --gvc GVC_NAME -o yaml
+    ```
 
-Kafbat UI requires a pre-created Control Plane secret containing its YAML configuration before the template is installed. The secret name must match the value of `kafbat_ui.configuration_secret` (default: `kafka-kafbat-ui-config`).
+    Create the secret and the deployment recovers on its own after a few minutes, or force it with `cpln workload force-redeployment RELEASE_NAME-kafbat-ui --gvc GVC_NAME`.
+    </Warning>
+  </Step>
+  <Step title="Choose the cluster credentials">
+    The KRaft cluster ID and the SASL passwords are template values, set at install time. Generate a cluster ID with the Kafka tooling (the same image the template runs):
 
-Create the secret with a `config.yaml` key containing your Kafbat UI configuration. A minimal example connecting to the Kafka cluster with SASL authentication:
+    ```bash
+    docker run --rm apache/kafka:3.9.1 /opt/kafka/bin/kafka-storage.sh random-uuid
+    ```
 
-```yaml
-kafka:
-  clusters:
-    - name: local
-      bootstrapServers: RELEASE_NAME-cluster:9092
-      properties:
-        security.protocol: SASL_PLAINTEXT
-        sasl.mechanism: PLAIN
-        sasl.jaas.config: >-
-          org.apache.kafka.common.security.plain.PlainLoginModule required
-          username="admin"
-          password="your-admin-password";
-```
+    Pick strong values for `kafka.secrets.inter_broker_password`, `kafka.secrets.controller_password`, `kafka.listeners.client.sasl.admin.password` and `kafka.listeners.client.sasl.passwords`. The `your-…` defaults in `values.yaml` are placeholders that work as literal passwords, so never leave them in place. The cluster ID is written into the log volumes at first start and cannot be changed afterwards without a new cluster.
+  </Step>
+  <Step title="Public listener (optional)">
+    Exposing brokers to clients outside the GVC needs a domain you control and a **dedicated load balancer** enabled on the GVC. Follow the [Configure Domain](/guides/configure-domain) guide first, then see [Public Listener](#public-listener) below.
+  </Step>
+</Steps>
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+Install into an existing GVC, supplying the credentials from the prerequisites:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/kafka \
+  --version 4.2.0 --gvc GVC_NAME \
+  --set kafka.secrets.kraft_cluster_id=KRAFT_CLUSTER_ID \
+  --set kafka.secrets.inter_broker_password=INTER_BROKER_PASSWORD \
+  --set kafka.secrets.controller_password=CONTROLLER_PASSWORD \
+  --set kafka.listeners.client.sasl.admin.password=ADMIN_PASSWORD \
+  --set kafka.listeners.client.sasl.passwords=USER_PASSWORD
+```
+
+<Note>
+The REST Proxy ships pointing at a bootstrap address and admin password that only match a release named `kafka-dev` with the default password. Either put `kafka_rest_proxy.properties.bootstrap.servers`, `kafka_rest_proxy.jaas_conf` and `kafka_rest_proxy.password_properties` in a values file (`-f values.yaml`) as shown under [Kafka REST Proxy](#kafka-rest-proxy), or add `--set kafka_rest_proxy.enabled=false`.
+</Note>
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -85,25 +125,42 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+Each block below shows the shipped defaults for one area of `values.yaml`. Only the keys you change need to go in your values file.
+
+### Kafka Cluster
 
 ```yaml
 kafka:
-  name: cluster
-  image: apache/kafka:3.9.1
+  name: cluster # workload is RELEASE_NAME-cluster
+  image: apache/kafka:3.9.1 # Apache images only; Bitnami images are rejected at render time
   suspend: false
   deletionProtection: false
-  replicas: 3 # must not be 2
+  replicas: 3 # 1, 3, 4 or 5 — must not be 2 and cannot exceed 5
   minReadySeconds: 0
   debug: false
-  multiZone: false # If true: It's recommended to enable multi-zone on the Dedicated Load Balancer setting on GVC to reduce the cross-zone traffic
-  logDirs: /opt/kafka/logs-0,/opt/kafka/logs-1
-  env: [] # If you need to set environment variables, add them here
+  multiZone: false # true spreads brokers across availability zones; enable multi-zone on the GVC's dedicated load balancer too
+  rackAwareness:
+    enabled: false # AWS-only: brokers advertise their zone as broker.rack so consumers that set client.rack read from a same-zone replica
+  logDirs: /opt/kafka/logs-0,/opt/kafka/logs-1 # one volume set per path
+  env: [] # extra environment variables for the kafka container
+  terminationGracePeriodSeconds: 600 # time allowed for a clean broker shutdown; raise for very large brokers
+  cpu: 1000m
+  memory: 2000Mi # the JVM heap defaults to 60% of this
+  minCpu: 250m
+  minMemory: 2000Mi
+  # overrideHeapOpts: "-Xmx1024m -Xms1024m" # replace the derived heap settings
+```
+
+### Storage
+
+```yaml
+kafka:
   volumes:
     logs:
       initialCapacity: 10 # In GB
       performanceClass: general-purpose-ssd # general-purpose-ssd / high-throughput-ssd (Min 1000GB)
       fileSystemType: ext4 # ext4 / xfs
+      externalVolumeSets: [] # mount existing volume sets instead of creating them: one entry per logDirs path, in order; "" keeps that one chart-managed
       snapshots:
         createFinalSnapshot: true
         retentionDuration: 7d
@@ -112,56 +169,124 @@ kafka:
         maxCapacity: 1000 # In GB
         minFreePercentage: 20
         scalingFactor: 1.2
-    # customEncryption:
-    #   enabled: false
-    #   region: aws-us-east-2 # Replace with the appropriate region
-    #   keyId: arn:aws:kms:us-east-2:1234567890:key/d411f35a-1d31-4515-9934-4f193e042d80 # Replace with your AWS KMS key ARN
-  cpu: 1000m
-  memory: 2000Mi
-  minCpu: 250m
-  minMemory: 2000Mi
-  # overrideHeapOpts: "-Xmx1024m -Xms1024m"
+      # customEncryption: # encrypt the broker volumes with your own AWS KMS key; only possible when the volume sets are first created
+      #   enabled: true
+      #   region: aws-us-east-2
+      #   keyId: arn:aws:kms:us-east-2:1234567890:key/d411f35a-1d31-4515-9934-4f193e042d80
+```
+
+<Note>
+With `customEncryption` enabled, finish the setup after installing: open each `RELEASE_NAME-logs-N` volume set in the console, go to its spec and follow the **AWS Custom Encryption Instructions** shown there. Existing volumes cannot be re-encrypted.
+</Note>
+
+### Firewall
+
+```yaml
+kafka:
   firewall:
-    internal_inboundAllowType: "same-gvc" # Options: same-org / same-gvc (Recommended)
-    # external_inboundAllowCIDR: 0.0.0.0/0
-    # inboundAllowWorkload:
+    internal_inboundAllowType: "same-gvc" # same-gvc (recommended) / same-org
+    # external_inboundAllowCIDR: 0.0.0.0/0 # comma-separated list; leave commented to keep the brokers off the internet
+    # inboundAllowWorkload: # additional workloads allowed in, with same-gvc or workload-list
     #   - //gvc/main-kafka/workload/main-kafka-kafbat-ui
     #   - //gvc/client-gvc/workload/client
-    # external_outboundAllowCIDR: "111.222.333.444/16,111.222.444.333/32"
+    # external_outboundAllowCIDR: "111.222.333.444/16,111.222.444.333/32" # comma-separated list
+```
+
+### Listeners
+
+Every entry under `kafka.listeners` becomes a broker listener. The chart ships one, `client`; a second entry is how you add external access. Ports `9091`, `9093` and `9094` are reserved for the controller and inter-broker listeners.
+
+#### Client Listener
+
+```yaml
+kafka:
   listeners:
     client:
-      protocol: SASL_PLAINTEXT
+      protocol: SASL_PLAINTEXT # PLAINTEXT or SASL_PLAINTEXT
       name: CLIENT
-      containerPort: 9092
+      containerPort: 9092 # ignored when the listener has a publicAddress (ports 3000-3004 are used instead)
       sasl:
         admin:
-          username: admin
-          password: "your-admin-password"
-        users: "user"
-        passwords: "your-user-password"
-    # public:
-    #   protocol: SASL_PLAINTEXT
-    #   name: PUBLIC
-    #   directReplicaRouting:
-    #     enabled: true
-    #     containerPort: 9095
-    #     publicAddress: kafka.example.com # Dedicated Load Balancer must be enabled on the GVC
-    #   sasl:
-    #     users: "public-user"
-    #     passwords: "your-public-user-password"
-  acl:
-    superUsers: "User:admin"
-    allowEveryoneIfNoAclFound: false
-  secrets:
-    kraft_cluster_id: your-kraft-cluster-id # Example: bkdDtS1Rsf536si7BGM0JY
-    inter_broker_password: your-inter-broker-password
-    controller_password: your-controller-password
-  extra_configurations:
-    default.replication.factor: 3
-    auto.create.topics.enable: true
-    log.retention.hours: 168
+          username: admin # also an ACL super user; the sidecars and exporters authenticate as this user
+          password: "your-admin-password" # change before installing
+        users: "user" # comma-separated list of additional users
+        passwords: "your-user-password" # comma-separated, one per user, same order
+```
 
-kafka_exporter:
+#### Public Listener
+
+Add a second listener to reach the brokers from outside the GVC. TLS is terminated at the load balancer, so external clients connect with `security.protocol=SASL_SSL`. Only one listener may carry a public address.
+
+**Direct replica routing (recommended).** One domain with a DNS01 certificate challenge; each broker is advertised at `<replica>-<location>.<publicAddress>:<containerPort>` (for release `kafka` in `aws-us-east-1`: `kafka-cluster-0-aws-us-east-1.kafka.example.com:9095`, `kafka-cluster-1-aws-us-east-1.kafka.example.com:9095`, …). Create a CNAME for each broker hostname plus the `_acme-challenge` record as the [domain reference](/reference/domain) describes.
+
+```yaml
+# goes under kafka.listeners, beside the shipped client listener
+public:
+  protocol: SASL_PLAINTEXT # external clients use SASL_SSL
+  name: PUBLIC
+  directReplicaRouting:
+    enabled: true
+    containerPort: 9095 # not 9091, 9093 or 9094
+    publicAddress: kafka.example.com # a domain you own; the GVC needs a dedicated load balancer
+  sasl:
+    users: "public-user"
+    passwords: "your-public-user-password"
+```
+
+**Multi-port routing (legacy).** One port per broker starting at 3000 on a single hostname (`kafka.example.com:3000`, `:3001`, `:3002`). Do not set `containerPort` here. Not recommended for multi-zone clusters, because traffic is not routed zone-aware.
+
+```yaml
+# goes under kafka.listeners, beside the shipped client listener
+public:
+  protocol: SASL_PLAINTEXT
+  name: PUBLIC
+  publicAddress: kafka.example.com # ports 3000, 3001, … are created automatically, one per broker
+  sasl:
+    users: "public-user"
+    passwords: "your-public-user-password"
+```
+
+### ACL and Cluster Secrets
+
+```yaml
+kafka:
+  acl:
+    superUsers: "User:admin" # semicolon-separated, e.g. User:admin;User:connectors
+    allowEveryoneIfNoAclFound: false # true allows any operation on a resource that has no ACL
+  secrets:
+    kraft_cluster_id: your-kraft-cluster-id # kafka-storage.sh random-uuid, e.g. bkdDtS1Rsf536si7BGM0JY; fixed for the life of the cluster
+    inter_broker_password: your-inter-broker-password # change before installing
+    controller_password: your-controller-password # change before installing
+```
+
+### Extra Configurations
+
+Keys under `kafka.extra_configurations` are appended to `server.properties` and override the chart's defaults. The chart derives `default.replication.factor` as the smaller of 3 and `kafka.replicas`, and `min.insync.replicas` as one less than that; set them here only to override.
+
+```yaml
+kafka:
+  extra_configurations:
+    auto.create.topics.enable: true
+    log.retention.hours: 168 # 7 days
+```
+
+### Health Sidecar and Exporters
+
+All three run as sidecar containers on `RELEASE_NAME-cluster`. The health sidecar gates broker readiness on real cluster health (broker registration, controller election, under-replicated partitions, log directories); the exporters publish Prometheus metrics that the platform scrapes automatically.
+
+```yaml
+kafka_orchestrator: # readiness and metrics sidecar; set the whole block to null to remove it
+  image: ghcr.io/controlplane-com/kafka-orchestrator:v0.1.0
+  cpu: 100m
+  memory: 128Mi
+  minCpu: 50m
+  minMemory: 64Mi
+  listener: client # the kafka.listeners entry whose port and SASL admin user the health checks use
+  logLevel: info # debug / info / warn / error
+  checkTimeout: 10s # per-check timeout
+  env: [] # e.g. BROKER_ID / BOOTSTRAP_SERVERS overrides for non-standard setups
+
+kafka_exporter: # consumer-group lag and topic metrics; set to null to remove it
   name: exporter
   image: danielqsj/kafka-exporter:v1.9.0
   debug: false
@@ -169,12 +294,12 @@ kafka_exporter:
   memory: 128Mi
   listener: client
   env: []
-  dropMetrics: []
+  dropMetrics: [] # regex list, e.g. ["kafka_consumergroup.*", "^kafka_topic_partition_current_offset"]
 
-jmx_exporter:
+jmx_exporter: # broker JVM and request metrics over JMX; set to null to remove it
   name: jmx-exporter
   image: ghcr.io/controlplane-com/bitnami/jmx-exporter
-  kafkaJmxPort: 5557
+  kafkaJmxPort: 5557 # must match the port in config.jmxUrl
   exporterPort: 5556
   debug: false
   cpu: 250m
@@ -183,11 +308,16 @@ jmx_exporter:
   minMemory: 125Mi
   listener: client
   dropMetrics: []
+  # config: the JMX exporter rules file (jmxUrl, whitelistObjectNames, rules) — keep the chart defaults
+```
 
+### Kafbat UI
+
+```yaml
 kafbat_ui:
   enabled: true
   deletionProtection: false
-  name: kafbat-ui
+  name: kafbat-ui # workload is RELEASE_NAME-kafbat-ui
   image: ghcr.io/kafbat/kafka-ui
   cpu: 300m
   memory: 1000Mi
@@ -195,41 +325,50 @@ kafbat_ui:
   minMemory: 400Mi
   replicas: 1
   timeoutSeconds: 30
-  configuration_secret: kafka-kafbat-ui-config # Pre-create this secret before installing
-  # domain: kafbat-ui.example.com
+  configuration_secret: kafka-kafbat-ui-config # opaque secret you create before installing (see Prerequisites)
+  # domain: kafbat-ui.example.com # custom domain for the console; create its DNS records first
   firewall:
-    external_inboundAllowCIDR: "0.0.0.0/0"
+    # internal_inboundAllowType: "same-gvc" # same-org / same-gvc
+    external_inboundAllowCIDR: "0.0.0.0/0" # the console is reachable from the internet by default
     external_outboundAllowCIDR: "0.0.0.0/0"
+```
 
+### Kafka REST Proxy
+
+The proxy connects to the brokers as the `KafkaClient` principal in `jaas_conf`, and authenticates HTTP callers with BASIC auth against the users in `password_properties`. Both must be set for your release: `bootstrap.servers` must name your cluster workload and the `KafkaClient` password must equal `kafka.listeners.client.sasl.admin.password`. Without `password_properties` the BASIC realm has no users and every request is refused.
+
+```yaml
 kafka_rest_proxy:
   enabled: true
   deletionProtection: false
-  name: rest-proxy
+  name: rest-proxy # workload is RELEASE_NAME-rest-proxy
   image: confluentinc/cp-kafka-rest:latest
   cpu: 500m
   memory: 1000Mi
   capacityAI:
     enabled: true
-    minCpu: 125m
-    minMemory: 200Mi
+    minCpu: 125m # only applied when capacityAI is enabled
+    minMemory: 200Mi # only applied when capacityAI is enabled
   replicas: 1
   timeoutSeconds: 15
-  # domain: kafka-rest.example.com
+  # domain: kafka-rest.example.com # custom domain for the proxy
   firewall:
-    external_inboundAllowCIDR: 0.0.0.0/0
+    # internal_inboundAllowType: "same-gvc" # same-org / same-gvc
+    external_inboundAllowCIDR: 0.0.0.0/0 # the proxy is reachable from the internet by default
     external_outboundAllowCIDR: "0.0.0.0/0"
   properties:
-    bootstrap.servers: SASL_PLAINTEXT://kafka-dev-cluster:9092
+    bootstrap.servers: SASL_PLAINTEXT://kafka-dev-cluster:9092 # set to SASL_PLAINTEXT://RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092
     resource.extension: ALL
     api.v3.enable: true
     api.v2.enable: true
     client.sasl.mechanism: PLAIN
     api.compatibility.mode: BOTH
-    listeners: http://0.0.0.0:8082
     authentication.realm: KafkaRest
     authentication.method: BASIC
     authentication.roles: user
     client.security.protocol: SASL_PLAINTEXT
+    # listeners and log4j.opts: keep the chart defaults; the proxy serves on port 8082
+  # KafkaClient: the broker credentials (the client listener's admin user). KafkaRest: the HTTP BASIC-auth realm.
   jaas_conf:
     KafkaClient {
     org.apache.kafka.common.security.plain.PlainLoginModule required
@@ -241,231 +380,237 @@ kafka_rest_proxy:
       debug="true"
       file="/etc/kafka-rest/password.properties";
     };
-  password_properties:
-    user: your-user-password,user
+  # password_properties: # HTTP BASIC-auth users, one per line as name: password,role (role must match authentication.roles)
+  #   user: your-user-password,user
+```
 
-kafka_client:
-  name: client
+### Kafka Connect
+
+`kafka_connectors` is a list; each entry deploys a Kafka Connect worker cluster named `RELEASE_NAME-connect-` plus the entry's `name`, with a volume set for plugins and a downloader sidecar that fetches `jar`, `zip` or `tgz` artifacts into `plugins_folder` at startup. Connectors listed under `plugins` are created or updated through the Connect REST API when the worker starts; an entry with `enabled: false` is removed. The shipped `values.yaml` carries complete, commented examples for MirrorMaker 2, a Camel S3 sink, a ClickHouse sink and a Snowflake sink.
+
+```yaml
+kafka_connectors:
+  - name: cluster
+    image: apache/kafka:3.9.1 # Apache images only
+    # tags: # extra tags for the worker workload only
+    #   cpln/largeDisk: 'true'
+    multiZone: true
+    cpu: 400m
+    memory: 1500Mi
+    minCpu: 100m
+    minMemory: 375Mi
+    plugins_folder: /opt/kafka/plugins
+    timeoutSeconds: 15
+    replicas: 1
+    verbose: false # true traces the init scripts
+    extraVolumes: []
+    volumes: # the plugins volume set; all keys optional
+      initialCapacity: 10 # In GB
+      performanceClass: general-purpose-ssd
+      fileSystemType: ext4
+      snapshots:
+        createFinalSnapshot: true
+        retentionDuration: 7d
+    env:
+      - name: KAFKA_HEAP_OPTS
+        value: '-Xms900m -Xmx900m' # 50%-75% of memory
+    firewall:
+      internal_inboundAllowType: "same-gvc"
+      external_outboundAllowCIDR: "0.0.0.0/0" # the downloader needs outbound access to fetch artifacts
+    listener: client # the kafka.listeners entry the worker connects through
+    connector_properties: # written to connect-distributed.properties; the chart fills bootstrap.servers from the listener
+      group.id: "connect-cluster"
+      security.protocol: "SASL_PLAINTEXT"
+      sasl.mechanism: "PLAIN"
+      sasl.jaas.config: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"your-admin-password\";"
+      offset.storage.topic: "connect-offsets"
+      offset.storage.replication.factor: "3"
+      config.storage.topic: "connect-configs"
+      config.storage.replication.factor: "3"
+      status.storage.topic: "connect-status"
+      status.storage.replication.factor: "3"
+      plugin.path: "/opt/kafka/plugins"
+      key.converter: "org.apache.kafka.connect.storage.StringConverter"
+      value.converter: "org.apache.kafka.connect.converters.ByteArrayConverter"
+    plugins:
+      - name: "camel-s3-sink"
+        enabled: true
+        artifacts:
+          - type: tgz # jar / zip / tgz
+            url: https://repo.maven.apache.org/maven2/org/apache/camel/kafkaconnector/camel-aws-s3-sink-kafka-connector/4.8.5/camel-aws-s3-sink-kafka-connector-4.8.5-package.tar.gz
+        config:
+          "connector.class": "org.apache.camel.kafkaconnector.awss3sink.CamelAwss3sinkSinkConnector"
+          "tasks.max": "1"
+          "topics": "your-topic"
+```
+
+### Kafka Client
+
+```yaml
+kafka_client: # Kafka CLI tools for testing from inside the GVC; set the whole block to null to omit the workload
+  name: client # workload is RELEASE_NAME-client
   image: apache/kafka:3.9.1
   cpu: 500m
   memory: 1000Mi
   firewall:
+    # internal_inboundAllowType: "same-gvc" # same-org / same-gvc
+    # external_inboundAllowCIDR: 0.0.0.0/0
     external_outboundAllowCIDR: "0.0.0.0/0"
-
-# kafka_connectors:  # Uncomment and configure to deploy Kafka Connect workers
-#   - name: cluster
-#     image: apache/kafka:3.9.1
-#     replicas: 1
-#     ...  # See template source for full connector configuration and plugin examples
 ```
 
-### Kafka Cluster
+## Connecting
 
-- `kafka.name` — Suffix used to form the workload name (`{release}-{kafka.name}`).
-- `kafka.replicas` — Number of broker replicas. Must be 3 or more and **must not be 2**. Maximum 5 replicas act as combined controller+broker; replicas beyond 5 are broker-only.
-- `kafka.multiZone` — When `true`, distributes replicas across availability zones. Enable the **Dedicated Load Balancer** on the GVC to reduce cross-zone traffic costs.
-- `kafka.resources` — CPU and memory bounds for each Kafka broker (`cpu`, `memory`, `minCpu`, `minMemory`).
-- `kafka.overrideHeapOpts` — Override the default JVM heap settings. If unset, the heap is derived from the configured memory.
-- `kafka.logDirs` — Comma-separated paths for Kafka log directories. Each path maps to a separate volume.
+| What | Address | Notes |
+|---|---|---|
+| Kafka bootstrap server (inside the GVC) | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092` | `security.protocol=SASL_PLAINTEXT`, `sasl.mechanism=PLAIN`, credentials from `kafka.listeners.client.sasl` |
+| Kafka public listener | `<replica>-<location>.<publicAddress>:<containerPort>` per broker (direct replica routing) or `<publicAddress>:3000`, `:3001`, … (multi-port) | `security.protocol=SASL_SSL`; users from the public listener's `sasl.users` |
+| Kafbat UI | `status.canonicalEndpoint` of `RELEASE_NAME-kafbat-ui`, or `kafbat_ui.domain` | Login from `spring.security.user` in your configuration secret |
+| REST Proxy | `status.canonicalEndpoint` of `RELEASE_NAME-rest-proxy`, `kafka_rest_proxy.domain`, or `RELEASE_NAME-rest-proxy.GVC_NAME.cpln.local:8082` inside the GVC | HTTP BASIC auth with a user from `kafka_rest_proxy.password_properties` |
+| Kafka Connect REST API | `RELEASE_NAME-connect-<name>.GVC_NAME.cpln.local:8083` inside the GVC | Standard Connect REST API |
+| Stored credentials | `cpln secret reveal RELEASE_NAME-secrets -o yaml` | KRaft cluster ID and the admin, controller and inter-broker passwords |
 
-### Storage
-
-- `kafka.volumes.logs.initialCapacity` — Initial volume size in GB per replica (minimum 10).
-- `kafka.volumes.logs.performanceClass` — Storage class: `general-purpose-ssd` or `high-throughput-ssd` (minimum 1000 GB for high-throughput).
-- `kafka.volumes.logs.fileSystemType` — Filesystem type: `ext4` or `xfs`.
-- `kafka.volumes.logs.snapshots` — Snapshot configuration: `createFinalSnapshot` (taken on workload deletion), `retentionDuration` (e.g., `7d`), and optional `schedule` (cron, UTC).
-- `kafka.volumes.logs.autoscaling` — Automatically expand the volume as it fills:
-  - `maxCapacity` — Maximum volume size in GB.
-  - `minFreePercentage` — Trigger scale-up when free space drops below this percentage.
-  - `scalingFactor` — Multiply current capacity by this factor when scaling up.
-
-#### Custom Encryption (AWS KMS)
-
-To encrypt Kafka data volumes with a customer-managed key, uncomment `kafka.volumes.customEncryption`:
-
-- `region` — AWS region where the KMS key is located (e.g., `aws-us-east-2`).
-- `keyId` — The full ARN of the AWS KMS key.
-
-<Note>
-Custom encryption can only be applied when the volume is first created. Existing volumes cannot be re-encrypted after creation.
-</Note>
-
-### Firewall
-
-- `kafka.firewall.internal_inboundAllowType` — Controls which workloads can reach the Kafka cluster internally (`same-gvc` recommended, or `same-org`).
-- `kafka.firewall.external_inboundAllowCIDR` — CIDR ranges allowed to reach Kafka from the internet. Commented out by default.
-- `kafka.firewall.inboundAllowWorkload` — Explicit workload links allowed to connect (use with `same-gvc` or `workload-list`).
-
-### Listeners
-
-#### Client Listener (Internal)
-
-The client listener is the primary access point for producers and consumers within the GVC.
-
-- `kafka.listeners.client.protocol` — Security protocol: `PLAINTEXT` or `SASL_PLAINTEXT`.
-- `kafka.listeners.client.containerPort` — Port for client connections (default `9092`). Automatically overridden to the range `3000–3004` when the public listener with direct replica routing is enabled.
-- `kafka.listeners.client.sasl.admin` — Admin username and password. The admin user is also added as an ACL superuser. **Change the default password before deploying to production.**
-- `kafka.listeners.client.sasl.users` / `.passwords` — Comma-separated lists of additional usernames and their passwords for client connections.
-
-#### Public Listener (Optional, External Access)
-
-Uncomment `kafka.listeners.public` to expose Kafka brokers to clients outside the GVC. Two routing approaches are supported:
-
-**Direct Replica Routing (Recommended)**
-
-Generates a subdomain per replica, enabling zone-aware routing and minimizing cross-zone traffic. Requires a dedicated load balancer on the GVC.
-
-```yaml
-public:
-  protocol: SASL_PLAINTEXT
-  name: PUBLIC
-  directReplicaRouting:
-    enabled: true
-    containerPort: 9095
-    publicAddress: kafka.example.com
-  sasl:
-    users: "public-user"
-    passwords: "your-public-user-password"
-```
-
-Each broker becomes reachable at a replica-specific subdomain, for example:
-```text
-kafka-0-aws-us-east-1.kafka.example.com:9095
-kafka-1-aws-us-east-1.kafka.example.com:9095
-```
-
-**Multi-Port Routing**
-
-Assigns one port per replica starting at 3000. Does not require per-replica subdomains but is **not recommended for multi-zone deployments** due to potential cross-zone routing charges.
-
-<Note>
-For external access, Kafka clients should use `SASL_SSL` as the security protocol since TLS is enforced at the load balancer level.
-</Note>
-
-### ACL
-
-- `kafka.acl.superUsers` — Semicolon-separated list of Kafka superusers (e.g., `User:admin;User:connectors`). Superusers bypass ACL checks.
-- `kafka.acl.allowEveryoneIfNoAclFound` — When `true`, allows all operations on topics or groups that have no ACL defined. Set to `false` for strict access control.
-
-### Secrets
-
-These values are stored as a Control Plane secret and injected into the cluster at startup. **Change all three before deploying to production.**
-
-- `kafka.secrets.kraft_cluster_id` — A unique identifier for the KRaft cluster. Generate with `kafka-storage.sh random-uuid` or any base64-encoded random string.
-- `kafka.secrets.inter_broker_password` — Password used for inter-broker communication (SASL).
-- `kafka.secrets.controller_password` — Password used for controller-to-broker communication (SASL).
-
-### Extra Configurations
-
-- `kafka.extra_configurations.default.replication.factor` — Default replication factor for new topics. Cannot exceed the number of replicas.
-- `kafka.extra_configurations.auto.create.topics.enable` — When `true`, topics are automatically created when first produced to or consumed from.
-- `kafka.extra_configurations.log.retention.hours` — How long Kafka retains log segments before deletion (default `168` hours = 7 days).
-
-### Exporters
-
-Both exporters run as sidecar containers on the Kafka cluster workload.
-
-**Kafka Exporter** (`kafka_exporter`) — Exposes consumer group lag and topic metrics in Prometheus format.
-- `kafka_exporter.cpu` / `kafka_exporter.memory` — Resources for the exporter sidecar.
-- `kafka_exporter.listener` — Listener name to connect to (default: `client`).
-- `kafka_exporter.dropMetrics` — List of metric name patterns to exclude (e.g., `["kafka_consumergroup.*"]`).
-
-**JMX Exporter** (`jmx_exporter`) — Exposes Kafka JMX metrics in Prometheus format.
-- `jmx_exporter.kafkaJmxPort` — JMX port on the Kafka broker (default `5557`).
-- `jmx_exporter.exporterPort` — Port where the exporter serves metrics (default `5556`).
-- `jmx_exporter.cpu` / `jmx_exporter.memory` — Resources for the JMX exporter sidecar.
-
-### Kafbat UI (Optional)
-
-Kafbat UI is a web-based interface for browsing topics, viewing consumer groups, and managing the cluster.
-
-- `kafbat_ui.enabled` — Enable or disable the Kafbat UI workload (default: `true`).
-- `kafbat_ui.configuration_secret` — Name of the pre-created Control Plane secret containing the Kafbat configuration YAML (see [Prerequisites](#prerequisites)).
-- `kafbat_ui.domain` — Optional custom domain for the Kafbat UI. Requires DNS configuration pointing to the GVC's load balancer.
-- `kafbat_ui.replicas` — Number of Kafbat UI replicas (default: `1`).
-- `kafbat_ui.resources` — CPU and memory for the UI workload.
-- `kafbat_ui.firewall` — Firewall rules for the UI workload. By default, external access is open to `0.0.0.0/0`.
-
-### Kafka REST Proxy (Optional)
-
-The REST Proxy provides an HTTP API for producing, consuming, and managing Kafka resources without a native client.
-
-- `kafka_rest_proxy.enabled` — Enable or disable the REST Proxy workload (default: `true`).
-- `kafka_rest_proxy.domain` — Optional custom domain for the REST Proxy.
-- `kafka_rest_proxy.properties.bootstrap.servers` — Kafka cluster bootstrap address (update to match your release name and cluster name).
-- `kafka_rest_proxy.jaas_conf` — JAAS configuration for the Kafka client and REST Proxy HTTP authentication.
-- `kafka_rest_proxy.password_properties` — Users and passwords for REST Proxy BASIC authentication.
-
-<Note>
-Update `kafka_rest_proxy.properties.bootstrap.servers` to match your release name and cluster workload name before deploying (e.g., `SASL_PLAINTEXT://my-release-cluster:9092`).
-</Note>
-
-### Kafka Connect (Optional)
-
-Kafka Connect workers for running sink and source connectors are configured via the `kafka_connectors` list (commented out by default). Each entry defines a Connect worker with connector plugins and their configurations.
-
-Supported plugin artifact types: `jar`, `zip`, `tgz`. Plugins are downloaded and extracted into the `plugins_folder` on startup.
-
-See the [template source](https://github.com/controlplane-com/templates/tree/main/kafka) for full connector configuration examples including MirrorMaker 2, Camel S3 Sink, ClickHouse Sink, and Snowflake Sink.
-
-### Kafka Client (Optional)
-
-The Kafka client workload provides a persistent container running in the GVC that you can connect to via the Control Plane UI or CLI for testing and debugging.
-
-To enable it, uncomment the `kafka_client` section in your values file. Once deployed, connect via the workload terminal and use the Kafka CLI tools:
+Read a canonical endpoint from the workload:
 
 ```bash
-# Create a client properties file for SASL authentication
-cat > /tmp/client.properties <<EOF
+cpln workload get RELEASE_NAME-kafbat-ui --gvc GVC_NAME -o yaml   # status.canonicalEndpoint
+```
+
+Verify the cluster from the bundled client workload. Open a shell on it, write a client properties file with the admin credentials, then list topics, produce and consume:
+
+```bash
+cpln workload connect RELEASE_NAME-client --gvc GVC_NAME
+```
+
+```bash
+cat > /tmp/client.properties <<'EOF'
 security.protocol=SASL_PLAINTEXT
 sasl.mechanism=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
-  username="admin" \
-  password="your-admin-password";
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="ADMIN_PASSWORD";
 EOF
 
-# Produce a message
-kafka-console-producer.sh \
-  --bootstrap-server RELEASE_NAME-cluster:9092 \
-  --producer.config /tmp/client.properties \
-  --topic test-topic
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092 \
+  --command-config /tmp/client.properties --list
 
-# Consume messages
-kafka-console-consumer.sh \
-  --bootstrap-server RELEASE_NAME-cluster:9092 \
-  --consumer.config /tmp/client.properties \
-  --topic test-topic \
-  --from-beginning
+/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092 \
+  --producer.config /tmp/client.properties --topic test-topic
+
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092 \
+  --consumer.config /tmp/client.properties --topic test-topic --from-beginning
 ```
 
-### Connecting to Kafka
+With a `PLAINTEXT` client listener, drop the `--command-config`, `--producer.config` and `--consumer.config` flags. Topics are created on first use because `auto.create.topics.enable` is `true`.
 
-**Internal (same GVC)**
+To check the REST Proxy from a workload in the same GVC, list the clusters it sees (the v3 API) with one of the BASIC-auth users you configured:
 
-Connect using the cluster workload name as the bootstrap server:
-
-```text
-RELEASE_NAME-cluster:9092
+```bash
+curl -u user:USER_PASSWORD http://RELEASE_NAME-rest-proxy.GVC_NAME.cpln.local:8082/v3/clusters
 ```
 
-To target a specific replica:
+## Operations
 
-```text
-RELEASE_NAME-cluster-0.RELEASE_NAME-cluster:9092
-RELEASE_NAME-cluster-1.RELEASE_NAME-cluster:9092
+### Backing Up
+
+Kafka's first line of defence is replication: with the default three brokers, every topic is replicated three times and a write is acknowledged only once two replicas have it. On top of that, each broker volume set takes a snapshot daily at 00:00 UTC, keeps it for seven days and takes a final snapshot when the volume set is deleted (`kafka.volumes.logs.snapshots`). Take an extra snapshot before risky changes, once per log-directory volume set:
+
+```bash
+cpln volumeset snapshot create RELEASE_NAME-logs-0 --gvc GVC_NAME --snapshot-name pre-upgrade
+cpln volumeset snapshot create RELEASE_NAME-logs-1 --gvc GVC_NAME --snapshot-name pre-upgrade
+cpln volumeset snapshot get RELEASE_NAME-logs-0 --gvc GVC_NAME
 ```
 
-**External (public listener)**
+### Restoring a Backup
 
-When the public listener is configured with direct replica routing, each broker is reachable at a replica-specific subdomain:
+Restoring a volume snapshot onto a running broker has **not been verified** for this template; a broker whose log directories are replaced underneath it, or whose KRaft metadata no longer matches its peers, is not something this page can promise will rejoin cleanly. Treat snapshots as a last resort and rely on replication for broker loss. What the chart does support is **mounting volume sets that were restored or renamed outside the chart**: list them, in `kafka.logDirs` order, and the chart stops creating its own and mounts yours instead, leaving their data and settings untouched. Use `""` for any entry the chart should keep managing.
 
-```text
-kafka-0-aws-us-east-1.kafka.example.com:9095
-kafka-1-aws-us-east-1.kafka.example.com:9095
-kafka-2-aws-us-east-1.kafka.example.com:9095
+```yaml
+kafka:
+  logDirs: /opt/kafka/logs-0,/opt/kafka/logs-1
+  volumes:
+    logs:
+      externalVolumeSets:
+        - kafka-logs-0-fresh
+        - kafka-logs-1-fresh
 ```
 
-Use `SASL_SSL` as the security protocol for external clients since TLS is enforced at the load balancer.
+The list must have exactly one entry per `kafka.logDirs` path, or rendering fails with an error naming both counts.
+
+### Upgrading from 2.x
+
+Since 3.0.0 the chart only supports Apache Kafka images. A values file that still sets a Bitnami image fails to render with `Error: This chart does not support Bitnami images, please use Apache Kafka images instead.` Set `kafka.image` to an `apache/kafka` tag. Moving the data of a 2.x Bitnami-based release onto 3.x or later has not been verified; plan for a new release and re-mirror topics (the `kafka_connectors` MirrorMaker 2 example in `values.yaml` is one way).
+
+### Upgrading from 3.x
+
+- **4.0.0** added the `kafka-orchestrator` readiness sidecar (set `kafka_orchestrator: null` to opt out), raised the graceful shutdown window to `kafka.terminationGracePeriodSeconds: 600`, and started deriving `default.replication.factor` and `min.insync.replicas` from `kafka.replicas`. A `default.replication.factor` you carried over in `kafka.extra_configurations` still wins; remove it unless you need a non-default value.
+- **4.0.2** commented out the sample REST Proxy user. If you relied on the default `user` BASIC-auth account, set `kafka_rest_proxy.password_properties` explicitly.
+- **4.1.0** added `kafka.rackAwareness`, `kafka.volumes.logs.externalVolumeSets` and per-connector `tags`; all off by default, nothing to change.
+- **4.2.0** stops the brokers writing a duplicate `server.log` to the container filesystem on `apache/kafka:3.x` images by setting `KAFKA_LOG4J_ROOT_LOGLEVEL=INFO`; the broker log is in `cpln logs`. The upgrade restarts the brokers.
+
+### Scaling and Availability
+
+- `kafka.replicas` accepts 1, 3, 4 or 5. Rendering fails with `Invalid value for kafka.replicas. It must be less than or equal to 5 and not equal to 2.` otherwise. Every broker is also a KRaft controller, so never shrink a running cluster below the number of controllers it was formed with — the quorum is lost and the cluster stops.
+- A single-broker cluster replicates nothing; use it for development only.
+- `kafka.multiZone: true` spreads the brokers across availability zones. On AWS, add `kafka.rackAwareness.enabled: true` and set `client.rack` on consumers to their zone ID (workloads on AWS locations receive it in the `AWS_ZONE_ID` environment variable) so they fetch from a same-zone replica; producers and replication are unaffected.
+- Broker volumes grow automatically up to `kafka.volumes.logs.autoscaling.maxCapacity` when free space drops below `minFreePercentage`.
+- Kafbat UI, the REST Proxy and each Kafka Connect worker scale with their own `replicas` value.
+
+### Troubleshooting
+
+Broker output is in `cpln logs`; filter server-side:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cluster"} |= "ERROR"' --limit 50 --since 10m
+```
+
+<AccordionGroup>
+  <Accordion title="Kafbat UI never becomes ready and cpln logs shows nothing">
+    **Cause:** the configuration secret named in `kafbat_ui.configuration_secret` did not exist when the workload was created. The container never starts, so there is no log output.
+
+    **Fix:** read `status.versions[].message` from `cpln workload get-deployments RELEASE_NAME-kafbat-ui --gvc GVC_NAME -o yaml` to see which secret is missing, create it as shown in [Prerequisites](#prerequisites), then wait a few minutes or run `cpln workload force-redeployment RELEASE_NAME-kafbat-ui --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Install fails with Invalid value for kafka.replicas">
+    **Cause:** `kafka.replicas` is 2 or more than 5. Two controllers cannot form a quorum, and the chart caps the cluster at five.
+
+    **Fix:** set `kafka.replicas` to 1, 3, 4 or 5.
+  </Accordion>
+  <Accordion title="Install fails with This chart does not support Bitnami images">
+    **Cause:** `kafka.image`, `kafka_client.image` or a connector `image` references a Bitnami image, which the chart stopped supporting in 3.0.0.
+
+    **Fix:** use an `apache/kafka` tag such as `apache/kafka:3.9.1`.
+  </Accordion>
+  <Accordion title="Install fails with containerPort cannot be 9091, 9093, or 9094 for listener">
+    **Cause:** a listener's `containerPort` (or `directReplicaRouting.containerPort`) uses one of the ports reserved for the controller and inter-broker listeners.
+
+    **Fix:** pick another port, for example `9092` for the client listener and `9095` for a public one.
+  </Accordion>
+  <Accordion title="Install fails with kafka.volumes.logs.externalVolumeSets has N entries but kafka.logDirs defines M log dirs">
+    **Cause:** `externalVolumeSets` is set but its length does not match the number of comma-separated paths in `kafka.logDirs`. The chart refuses a partial list so it never mounts an empty new volume set beside imported ones.
+
+    **Fix:** provide exactly one entry per log directory, in the same order, using `""` for any directory the chart should keep managing.
+  </Accordion>
+  <Accordion title="REST Proxy requests fail and its log mentions kafka-dev-cluster">
+    **Cause:** `kafka_rest_proxy.properties.bootstrap.servers` still has the shipped default `SASL_PLAINTEXT://kafka-dev-cluster:9092`, which only resolves for a release named `kafka-dev`, or the `KafkaClient` password in `kafka_rest_proxy.jaas_conf` does not match `kafka.listeners.client.sasl.admin.password`.
+
+    **Fix:** set `bootstrap.servers` to `SASL_PLAINTEXT://RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092`, align the `KafkaClient` password, add at least one user under `kafka_rest_proxy.password_properties`, and upgrade the release.
+  </Accordion>
+  <Accordion title="A changed Kafbat UI configuration is not picked up">
+    **Cause:** the configuration secret is read when the container starts; updating the secret does not restart the workload.
+
+    **Fix:** run `cpln workload force-redeployment RELEASE_NAME-kafbat-ui --gvc GVC_NAME` after changing the secret.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- Replace every `your-…` placeholder (`kafka.secrets.*`, `kafka.listeners.client.sasl.*`) before installing; they are accepted as literal passwords. They are plain template values and therefore land in the Helm release.
+- `kafka.secrets.kraft_cluster_id` is fixed once the brokers have started; changing it later means a new cluster.
+- `kafka.replicas` must be 1, 3, 4 or 5. Never shrink a running cluster below its controller count.
+- Kafbat UI and the REST Proxy are open to the internet by default (`external_inboundAllowCIDR: 0.0.0.0/0`); set a strong console login and BASIC-auth users, or narrow the CIDR.
+- The REST Proxy defaults only work for a release named `kafka-dev`: set `kafka_rest_proxy.properties.bootstrap.servers`, `kafka_rest_proxy.jaas_conf` and `kafka_rest_proxy.password_properties` for your release, or disable it.
+- `ghcr.io/kafbat/kafka-ui`, `confluentinc/cp-kafka-rest:latest` and the JMX exporter image are not pinned, so a redeploy may pick up a newer build; pin a tag in your values if that matters.
+- Uninstalling deletes the volume sets and every topic's data; a final snapshot is kept for `retentionDuration` because `createFinalSnapshot` is `true`.
+- Only set `KAFKA_LOG4J_ROOT_LOGLEVEL` in `kafka.env` on `apache/kafka:3.x` images; on a 4.x image it removes every output from the root logger, including `cpln logs`.
+- `kafka_ui` (Provectus Kafka UI) is deprecated and off by default; use `kafbat_ui`.
+- Changing broker values restarts the brokers; schedule upgrades accordingly.
 
 ## External References
 
@@ -476,8 +621,11 @@ Use `SASL_SSL` as the security protocol for external clients since TLS is enforc
     <Card title="KRaft Mode" icon="server" href="https://kafka.apache.org/documentation/#kraft">
     Kafka KRaft consensus mode without ZooKeeper
     </Card>
-    <Card title="Kafbat UI" icon="chart-bar" href="https://ui.docs.kafbat.io/">
-    Kafbat UI documentation
+    <Card title="Kafbat UI Configuration" icon="chart-bar" href="https://ui.docs.kafbat.io/configuration/configuration-file">
+    Configuration file reference for the Kafbat UI secret
+    </Card>
+    <Card title="Confluent REST Proxy API" icon="code" href="https://docs.confluent.io/platform/current/kafka-rest/api.html">
+    REST Proxy v2 and v3 API reference
     </Card>
     <Card title="Kafka Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/kafka">
     View the source files, default values, and chart definition
