@@ -1,226 +1,118 @@
 ---
 title: MongoDB Cluster
 icon: /template-catalog/templates/icons/mongodb.png
-description: Deploy a highly available MongoDB replica set on Control Plane using Percona Server for MongoDB. Covers the prerequisite credential and keyfile secrets, sizing a replica set within MongoDB's 7-voter limit, single and multi-location topologies, HAProxy write routing, failover, logical backup and restore, and migrating from template version 1.x.
-keywords: ['mongodb', 'percona', 'replica set', 'nosql', 'document database', 'haproxy', 'mongodump', 'mongorestore', 'multi-location', 'mongo cluster', 'keyfile', 'failover', 'database template', 'voting members', 'quorum']
+description: Deploy a highly available MongoDB replica set (Percona Server for MongoDB 8.0) on Control Plane, in one location or stretched across several, with HAProxy routing to the primary and optional mongodump backups. Two prerequisite secrets and a GVC that already has your locations must exist first.
+keywords: ['nosql', 'document database', 'mongorestore', 'multi-location', 'multi-region', 'keyfile', 'failover', 'voting members', 'quorum', 'rs.status', 'authSource', 'mongosh', 'atlas alternative', 'database template']
 ---
-
-<Warning>
-**Template version 2.0.0 is a breaking change, and two of the changes fix defaults that could never fully work.**
-
-- **The template no longer creates a GVC.** It deploys into the GVC you install into. The `gvc.name` and `gvc.locations` values are gone; locations moved to a top-level `locations` list.
-- **Never upgrade a 1.x release onto 2.0.0 in place.** A 1.x release owns the GVC it created, and Helm deletes what a chart stops declaring — the upgrade destroys that GVC and **every workload, volume set and identity inside it**, including your data. Migrate to a new release instead: [Migrating from 1.x](#migrating-from-1-x).
-- **The 1.x default was nine members, and MongoDB allows at most seven voters.** The 8th and 9th members joined nothing: they ran a healthy-looking `mongod`, reported `ready: true`, and were never in the replica set. The default is now one location with three members, and a roster above seven is refused at render. See [Locations and Sizing](#locations-and-sizing).
-- **`backup.mode: physical` was removed**, and a values file that still sets it fails at render. Its restore could never run. See [Backing Up](#backing-up).
-</Warning>
 
 ## Overview
 
-MongoDB Cluster deploys a highly available MongoDB replica set using Percona Server for MongoDB 8.0 into an existing GVC. The cluster provides automatic leader election, self-healing replica membership, and failover across one or more locations. An optional HAProxy workload provides a stable write endpoint that always routes to the current primary.
+MongoDB is a document-oriented NoSQL database. This template deploys a MongoDB replica set built on Percona Server for MongoDB 8.0 (`percona/percona-server-mongodb:8.0`): a configurable number of members per location, keyfile authentication between members, automatic replica set formation at boot, and automatic primary election when a member is lost. An HAProxy workload (on by default) gives clients one stable address that always routes to the current primary, and an optional cron job writes `mongodump` archives to AWS S3 or GCS.
 
 Neither the database credentials nor the replica set keyfile are template values. Both come from secrets you create before installing, so no credential passes through Helm or lands in the release.
 
-<Warning>
-**Template version 1.1.0 was also a breaking security change.** `mongodb.username`, `mongodb.password`, `mongodb.database` and `mongodb.replicaSetKey` were removed, and an install that still sets any of them fails at render instead of silently falling back to a published default. If you are coming from 1.0.0, read [Coming From 1.0.0](#coming-from-1-0-0) as well — its password and keyfile are published values.
-</Warning>
-
-### Architecture
-
-- **MongoDB Replica Set** — Multi-member cluster with keyfile authentication and automatic replica set initialization. Every member this template creates votes; only the primary accepts writes.
-- **HAProxy** *(optional, enabled by default)* — Leader-routing proxy that health-checks every member and routes traffic to the current primary. Provides a stable connection endpoint that survives failover.
-- **Backup** *(optional)* — Logical backup via `mongodump`, restored with `mongorestore` through a port-forward tunnel.
+<Note>
+This template does not create a GVC. It deploys into an existing [GVC](/reference/gvc) that you already have, and every location you list in `locations` must already be on that GVC. Locations on the GVC that you do **not** list start nothing: no members, no proxy replicas and no volumes are created there.
+</Note>
 
 ### What Gets Created
 
-- **Stateful MongoDB Workload** — (`RELEASE_NAME-mongo`): a MongoDB container per member per configured location, serving TCP on port `27017` with per-replica DNS for peer discovery.
-- **Volume Set** — (`RELEASE_NAME-mongo-vs`): one persistent ext4 volume per member, mounted at `/data/db`, with optional capacity autoscaling. A final snapshot is taken on deletion and retained for 7 days.
-- **Identity & Two Policies** — (`RELEASE_NAME-mongo-identity`, `RELEASE_NAME-mongo-policy`, `RELEASE_NAME-mongo-gvc-policy`): an identity bound to the workloads, a policy granting it `reveal` on exactly the two secrets you created plus the chart's own startup scripts, and a policy granting `view` on the one GVC you install into so each member can confirm at boot that the GVC really has every location you listed. When backups are enabled, the identity also carries the cloud account binding the backup job uses to reach your bucket.
-- **Startup Secrets** — (`RELEASE_NAME-mongo-startup`, and `RELEASE_NAME-mongo-proxy-startup` when the proxy is enabled): the chart's own boot scripts. They hold no credentials.
-- **HAProxy Workload** *(optional, enabled by default)* — (`RELEASE_NAME-mongo-proxy`): a standard workload routing traffic to the current primary.
-- **Cron Backup Workload** *(optional)* — (`RELEASE_NAME-mongo-backup`): a scheduled `mongodump` that writes compressed archives to AWS S3 or GCS, running in one location only.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-mongo` | Replica set members (stateful, `replicas` per listed location, port `27017`) | — |
+| Workload | `RELEASE_NAME-mongo-proxy` | HAProxy routing clients to the current primary (standard, 2 replicas per location, port `27017`) | `proxy.enabled: true` (default) |
+| Workload | `RELEASE_NAME-mongo-backup` | Cron job running `mongodump` in one location | `backup.enabled: true` |
+| Volume set | `RELEASE_NAME-mongo-vs` | One volume per member mounted at `/data/db`; a final snapshot is kept 7 days on deletion | — |
+| Identity | `RELEASE_NAME-mongo-identity` | Identity the workloads run as; carries the Cloud Account binding when backups are on | — |
+| Policy | `RELEASE_NAME-mongo-policy` | Grants the identity `reveal` on your two prerequisite secrets and the startup-script secrets | — |
+| Policy | `RELEASE_NAME-mongo-gvc-policy` | Grants the identity `view` on the install GVC so members can check its locations at boot | — |
+| Secret | `RELEASE_NAME-mongo-startup` | MongoDB startup script; holds no credentials | — |
+| Secret | `RELEASE_NAME-mongo-proxy-startup` | HAProxy startup script | `proxy.enabled: true` (default) |
 
-The template creates **no credential secret of its own**. The database password and the replica set keyfile live only in the prerequisite secrets described below.
-
-<Note>
-**This template does not create a GVC.** Every resource lands in the GVC you install into, so `cpln workload exec`, `cpln logs` and uninstalling all work against that GVC, and uninstalling can never delete it. Nothing runs in a GVC location you did not list in `locations`.
-</Note>
-
-## Migrating from 1.x
-
-Template versions through 1.1.1 created their own GVC, so that GVC is part of the 1.x release's manifest. Version 2.0.0 does not declare it — and Helm deletes what a chart stops declaring.
-
-<Warning>
-**An in-place upgrade from 1.x to 2.0.0 destroys the cluster.** Measured on a sibling template with the guard removed: the upgrade **deleted the GVC and every workload, volume set and identity inside it in 6 seconds, and reported that the release had been upgraded successfully.** Reading the GVC back afterwards returned `404`. The volume sets hold your data.
-
-The chart ships a render-time refusal so this cannot happen by accident: any leftover `gvc` key in your values aborts the upgrade before a single API call is made, leaving your cluster untouched and running.
-
-```text
-Error: execution error at (mongodb-cluster/templates/identity.yaml:1:4): mongodb-cluster 2.0.0: the
-`gvc` values key was REMOVED. This chart no longer creates a GVC -- it deploys into the GVC you
-install into, and `gvc.locations` moved to the top-level `locations`. DO NOT `helm upgrade` a 1.x
-release onto 2.0.0: the upgrade drops `kind: gvc` from the manifest and Helm deletes what a chart no
-longer declares, which DESTROYS that GVC and every workload, volumeset and identity inside it.
-```
-
-**The guard cannot cover one case: an upgrade run with no values at all.** A 1.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires and the deletion proceeds. Do not run an upgrade of a 1.x release against the 2.0.0 chart under any circumstances — migrate to a new release instead.
-</Warning>
-
-<Steps>
-  <Step title="Choose the GVC for the new release">
-    Create or pick a GVC and make sure it has exactly the locations you intend to list in `locations`. See [Prerequisites](#prerequisites).
-  </Step>
-  <Step title="Create the prerequisite secrets and install 2.0.0 as a NEW release">
-    Use a **different release name**: secret names are org-wide, so a same-named release collides with the 1.x one even in another GVC. The new cluster is bootstrapped from the credentials secret on a fresh data directory, so this is the moment to choose a new password — and if you are coming from 1.0.0, you must, because its defaults are published.
-
-    Re-check your roster while you are here: 1.x defaulted to **nine** members and only seven of them were ever in the replica set. See [Locations and Sizing](#locations-and-sizing).
-  </Step>
-  <Step title="Move the data across">
-    Dump from the old cluster and restore into the new one, tunnelling to each with `cpln port-forward`. The procedure is the same as [Restoring a Backup](#restoring-a-backup), with `mongodump` against the old proxy in place of downloading an archive.
-  </Step>
-  <Step title="Point your applications at the new release, then uninstall the old one">
-    Uninstall it **against the GVC you installed it into**, not the one it created: that is where Helm tracks the release, and uninstalling from there takes the created GVC with it.
-  </Step>
-</Steps>
-
-Values that moved or were removed in 2.0.0. Each one is named at render time rather than ignored, so an old values file produces an error instead of a silent misconfiguration:
-
-| 1.x | 2.0.0 |
-|---|---|
-| `gvc.name` | Gone. The chart deploys into the GVC you install into |
-| `gvc.locations` | `locations`, at the top level |
-| Backup location derived from `backup.aws.region` | `backup.location`, explicit and validated against `locations` |
-| `backup.mode: physical` and the whole `backup.physical` block | Gone. Its restore could never run — see [Backing Up](#backing-up) |
-| `locations[].replicas: 0` | Not allowed. Remove the location instead |
-| A total above 7 members, or exactly 2 | Not allowed. See the sizing table |
-
-### Coming From 1.0.0
-
-Template version 1.0.0 took the database credentials as plain Helm values and shipped a working default password, and it shipped a **working replica set keyfile** as a default too. Both were published in the public template repository, which means every 1.0.0 install that kept the defaults shares one publicly known password and one publicly known keyfile. The keyfile is what replica set members authenticate to each other with, so anyone holding it can join a member to your cluster.
-
-| | 1.0.0 | 1.1.0 and later |
-|---|---|---|
-| Database credentials | `mongodb.username`, `mongodb.password`, `mongodb.database` values | `mongodb.credentialsSecretName` — a dictionary secret you create |
-| Replica set keyfile | `mongodb.replicaSetKey` value, with a working default | `mongodb.keyfileSecretName` — an opaque secret you create |
-| Where the secrets live | Rendered into the release by the chart | Created by you, referenced by name, never in the release |
-
-The two are deliberately **separate** secrets: granting an application `reveal` on the database credentials must not also hand it the key that lets a member join your replica set.
-
-<Warning>
-**Treat a 1.0.0 cluster's password and keyfile as compromised, not merely outdated.** An unchanged default password (`mypassword`) and the default `replicaSetKey` are publicly known, and neither changes by itself when you move off 1.0.0.
-
-The migration to 2.0.0 fixes both for free, because it is a **new cluster**: it is bootstrapped from your new credentials secret on a fresh data directory, and its members authenticate with the new keyfile you generate. So do not carry the 1.0.0 values across — [generate both](#prerequisites) and use the new ones for the new release.
-</Warning>
-
-While the old 1.0.0 cluster is still running and you need its credentials to dump from it, read them back out of the secrets that version created:
-
-```bash
-cpln secret reveal RELEASE_NAME-mongo-config -o yaml
-```
-
-The credential keys are `username`, `password` and `database`. Failing that, they are in the values file you installed 1.0.0 with.
-
-<Note>
-**A keyfile cannot be rotated in place on a running cluster**, which is why the 1.0.0 key is only fixed by moving to a new release. Members that disagree on the key cannot authenticate to each other, so an in-place rotation means bringing the whole replica set down and back up together. If you must stay on 1.x for now, restrict who can reach the cluster with [Firewall](#firewall) and rotate the database password, which you can do online:
-
-```js
-db.getSiblingDB("admin").changeUserPassword("admin", "NEW-STRONG-PASSWORD")
-```
-</Note>
+The template creates no credential secret of its own. The password and the keyfile live only in the secrets you create.
 
 ## Prerequisites
 
-**Two secrets must exist before you install.** Neither value passes through Helm values, so neither lands in the release. Secrets are org-level, so no GVC flag is involved.
+**Two secrets and a GVC with your locations must exist before you install.** Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
   <Step title="Create the database credentials secret">
-    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. MongoDB is bootstrapped with this user, and this is the credential your applications put in their connection strings:
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. The cluster is bootstrapped with this user (created in the `admin` database with the `root` role), and it is the credential your applications put in their connection strings. The `database` entry is for your own connection strings; MongoDB creates the database on first write.
 
     ```bash
-    cpln secret create-dictionary --name my-mongodb-credentials \
+    cpln secret create-dictionary --name CREDENTIALS_SECRET_NAME \
       --entry username=admin \
       --entry password='YOUR-STRONG-PASSWORD' \
       --entry database=mydatabase
     ```
 
-    Set `mongodb.credentialsSecretName` to the name you used.
+    Set `mongodb.credentialsSecretName` to this name.
   </Step>
   <Step title="Create the replica set keyfile secret">
-    An [opaque secret](/guides/create-secret/opaque) with encoding `plain` holding the key that replica set members authenticate to each other with. **Generate it — do not invent a passphrase:**
+    An [opaque secret](/guides/create-secret/opaque) with encoding `plain` holding the key that members authenticate to each other with. Generate it — never invent a passphrase:
 
     ```bash
-    openssl rand -base64 756 | cpln secret create-opaque --name my-mongodb-keyfile --encoding plain -f -
+    openssl rand -base64 756 | cpln secret create-opaque --name KEYFILE_SECRET_NAME --encoding plain -f -
     ```
 
-    Set `mongodb.keyfileSecretName` to the name you used.
+    Set `mongodb.keyfileSecretName` to this name. The two secrets stay separate so that an application granted `reveal` on the credentials cannot also read the key that lets a member join your replica set.
+  </Step>
+  <Step title="Check that the GVC has every location you will list">
+    The GVC may have more locations than you list — nothing runs in those — but every entry in `locations` must be present. The locations are under `spec.staticPlacement.locationLinks`:
+
+    ```bash
+    cpln gvc get GVC_NAME -o yaml
+    ```
   </Step>
   <Step title="Read either secret back later">
+    A bare `cpln secret reveal` prints only a summary table; pass `-o yaml` for the values:
+
     ```bash
-    cpln secret reveal my-mongodb-credentials -o yaml
+    cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml
     ```
   </Step>
 </Steps>
 
 <Warning>
-**The keyfile must be valid base64, or the cluster will not start.** MongoDB accepts **6–1024 characters from the base64 alphabet only** — `A-Z`, `a-z`, `0-9`, `+`, `/` and `=`. A hand-written passphrase such as `change-me-mongodb-key` **will not boot**, because hyphens are outside that alphabet. `openssl rand -base64 756` produces 1008 characters, which is the largest generator that still fits under the 1024 limit.
-
-The container checks the key at boot and fails with an explicit message naming your secret, before MongoDB is ever started:
+**The keyfile must be valid base64, or the cluster will not start.** MongoDB accepts 6–1024 characters from the base64 alphabet only (`A-Z`, `a-z`, `0-9`, `+`, `/`, `=`). A hand-written passphrase with hyphens or punctuation will not boot. The container checks the key before starting MongoDB and fails with a message naming your secret, visible in `cpln logs`:
 
 ```text
-FATAL: the keyfile in secret 'my-mongodb-keyfile' contains characters outside the base64 alphabet
+FATAL: the keyfile in secret 'KEYFILE_SECRET_NAME' contains characters outside the base64 alphabet
 (A-Z a-z 0-9 + / =). A passphrase with hyphens or punctuation will NOT work. Regenerate it with:
 openssl rand -base64 756
 ```
 
-A key that is too short gets its own message: `the keyfile in secret 'my-mongodb-keyfile' is 3 characters; mongod requires 6-1024`. Both appear in `cpln logs` only — the workload status shows just `Error: exitCode: 1`.
+The keyfile cannot be changed after the cluster is initialized.
 </Warning>
 
 <Warning>
-**Create both secrets before installing.** The template refuses to render when either name is blank, but a name pointing at a secret that does not exist installs "successfully" and then wedges: `cpln helm install` reports every resource created, the workload never becomes ready, and **`cpln logs` shows nothing at all** because no container ever starts. The only diagnostic is `status.versions[].message`:
+**Create both secrets before installing, or the deployment wedges silently.** The template refuses to render when either name is blank, but a name that points at a secret which does not exist installs successfully and then never starts. No container runs, so `cpln logs` returns **zero lines**. The one place the reason appears is `status.versions[].message`:
 
 ```bash
-cpln workload get-deployments RELEASE_NAME-mongo --gvc GVC_NAME -o json
+cpln workload get-deployments RELEASE_NAME-mongo --gvc GVC_NAME -o yaml
 ```
 
-It names the missing secret: `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Creating the secret does recover the workload on its own — measured at about **6 minutes**, so a user who waits only five will wrongly conclude the install is broken.
+```text
+The secret CREDENTIALS_SECRET_NAME no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key. Once the secret exists the deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-mongo --gvc GVC_NAME` to skip the wait.
 </Warning>
 
-### A GVC Containing Every Location You List
-
-**A GVC must already exist, and it must contain every location you list in `locations`.** The requirement is one-directional — the GVC may have *more* locations than you list, and nothing MongoDB-related runs in those. Check what a GVC has before installing:
-
-```bash
-cpln gvc get GVC_NAME -o json
-```
-
-The locations are under `spec.staticPlacement.locationLinks`. To add a missing one:
-
-```bash
-cpln gvc add-location GVC_NAME --location aws-us-east-2
-```
-
-Every workload in a GVC runs in every location that GVC has, so add locations to a shared GVC deliberately.
-
-<Warning>
-**A location the GVC does not have is not caught at install time.** The platform stores the placement without validating it, so the install succeeds — and the members there simply never start, leaving you with a **smaller replica set than the quorum you sized for** while HAProxy still carries backends for the members that do not exist.
-
-Each member reads the GVC at boot and reports it. A member with an **empty** data directory refuses to start; one that already holds data warns and keeps serving, so the check can never take a live cluster down:
-
-```bash
-cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-mongo"} |= "GVC location check"' --limit 100 --since 15m
-```
-</Warning>
-
-<Note>
-GVC locations you did **not** list run nothing, and no volume is provisioned there. Their deployment reads `This workload location is deactivated because maxScale is set to 0.` That is the mechanism that keeps a shared GVC safe — it is what a healthy install looks like, not a fault.
-</Note>
-
-### Other Prerequisites
-
-- For backups: an AWS or GCP [cloud account](/guides/create-cloud-account) and a storage bucket — see [AWS S3](#aws-s3) or [GCS](#gcs).
+Backups need a bucket and a Control Plane Cloud Account before they can be enabled — see [Backing Up](#backing-up). Nothing else is required.
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+Create the [prerequisite secrets](#prerequisites), then install with their names and the location your GVC has. The default `locations` entry is `aws-us-east-1` with three members; a `--set` on a list entry replaces the whole entry, so pass both fields. For more than one location, use a values file instead.
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/mongodb-cluster \
+  --version 2.0.0 --gvc GVC_NAME \
+  --set mongodb.credentialsSecretName=CREDENTIALS_SECRET_NAME \
+  --set mongodb.keyfileSecretName=KEYFILE_SECRET_NAME \
+  --set 'locations[0].name=LOCATION_NAME' --set 'locations[0].replicas=3'
+```
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -246,42 +138,59 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+Each block below is the shipped default for that part of `values.yaml`.
+
+### Locations
 
 ```yaml
-# ─── Locations ────────────────────────────────────────────────────────────────
-# This chart deploys into the GVC you install into — it does NOT create one.
-# Every location listed here MUST already exist in that GVC. A location the GVC
-# lacks contributes HAProxy backends and seed hosts for members that never start,
-# so you silently get a smaller replica set than you configured. The members check
-# this against the live GVC at boot and say so (see Important Notes in the README).
-#
+# Every location listed MUST already exist in the GVC you install into.
 # One entry per location; `replicas` = mongod members in that location.
-#
-# The default is ONE location with THREE members: the smallest shape that both
-# installs on any single-location GVC and survives losing a member. Set it to
-# YOUR GVC's locations before installing. MongoDB allows at most 7 VOTING members
-# and every member here votes, so the chart refuses a total above 7 (1.x defaulted
-# to 9, where the 8th and 9th silently never joined). See the quorum table in the
-# README.
 locations:
   - name: aws-us-east-1
     replicas: 3
 
-image: percona/percona-server-mongodb:8.0
-
 # Spread each location's members across availability zones. Confirm your
 # locations support multi-zone before enabling.
 multiZone: false
+```
+
+The default is one location with three members — the smallest shape that installs on any single-location GVC and survives losing a member. Set it to your GVC's locations before installing. Listing the same location twice, or giving one `replicas: 0`, is refused at render; to stop running somewhere, remove the entry.
+
+Every member this template creates is a **voting** member, so the total across all locations decides what the replica set survives:
+
+| Total members | Majority | Survives | Notes |
+|---|---|---|---|
+| 1 | 1 | nothing | Valid and writable — a single member is always its own primary |
+| 2 | 2 | nothing | **Refused by this template.** Losing either member leaves no primary, so it is strictly worse than 1 |
+| 3 | 2 | 1 member | The usual choice |
+| 5 | 3 | 2 members | |
+| 7 | 4 | 3 members | **The maximum.** MongoDB allows at most 7 voting members |
+
+A total above 7 is refused at render: MongoDB rejects the 8th voting member, and every member past it would run a `mongod` that reports ready while never being in the replica set.
+
+<Warning>
+**At most 6 members in one location on a default org quota.** A 7-member roster in a single location passes render and is then rejected at install with `One or more containers exceed the autoscaling.maxScale of 6 (quota: replicas-per-replica-direct-workload)`. Reach 7 by splitting across locations (4 + 3 is proven), or request a quota increase.
+</Warning>
+
+Spreading members across locations buys survival of a whole location, at the cost of cross-region replication traffic, which is billed. Size it against the same table: 3 locations × 1 member survives losing one location; 2 locations × 2 members survives losing neither, because 2 of 4 is not a majority.
+
+<Warning>
+**Never reorder `locations` after installing — only append.** The first entry is the bootstrap location: `replica-0` there is the member that initializes the replica set. Moving a different location into first position points that logic at a member with an empty data directory.
+</Warning>
+
+### Image and Resources
+
+```yaml
+image: percona/percona-server-mongodb:8.0
 
 resources:
   cpu: 1
   memory: 2Gi
+```
 
-# ─── Credentials (prerequisite secrets) ───────────────────────────────────────
-# BOTH SECRETS MUST EXIST BEFORE YOU INSTALL — the deployment wedges waiting on a
-# secret that does not exist. Neither value passes through Helm values, so neither
-# lands in the release. See Prerequisites in the README for the exact commands.
+### Credentials
+
+```yaml
 mongodb:
   # `dictionary` secret holding exactly three keys: `username`, `password`,
   # `database`. This is the credential you put in your applications' connection
@@ -296,7 +205,13 @@ mongodb:
   # `openssl rand -base64 756`; do NOT invent a passphrase, hyphens alone break it.
   # It CANNOT be changed after the cluster is initialized.
   keyfileSecretName: my-mongodb-keyfile
+```
 
+Both secrets must exist before you install — see [Prerequisites](#prerequisites). The workloads read them through `cpln://secret/...` references, so the values appear in neither the Helm release nor the stored workload spec.
+
+### Storage
+
+```yaml
 volumeset:
   capacity: 10 # initial capacity in GiB per member (minimum is 10)
   autoscaling:
@@ -304,15 +219,31 @@ volumeset:
     maxCapacity: 100
     minFreePercentage: 10
     scalingFactor: 1.2
+```
 
-# ─── Access ───────────────────────────────────────────────────────────────────
+There is no snapshot schedule: a final snapshot is taken when the volume set is deleted and kept for 7 days. Use [backups](#backing-up) for point-in-time copies.
+
+### Access
+
+```yaml
 # There is no public endpoint: MongoDB is reachable on the internal network only.
 firewall:
   internalAllowType: same-gvc # options: same-gvc, same-org, workload-list
   workloads: [] # only used with workload-list; this release's own workloads are added automatically
   # - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
-# ─── HAProxy ──────────────────────────────────────────────────────────────────
+| Type | Who can connect on port `27017` |
+|---|---|
+| `same-gvc` | Every workload in the same GVC (default) |
+| `same-org` | Every workload in the org |
+| `workload-list` | Only the workloads listed under `workloads`, plus this release's own workloads |
+
+The list also governs replication between the members, HAProxy's health checks and the backup job, so the template always adds its own workloads to it — list only your clients. A change to `firewall` can take several minutes to take effect; re-test rather than trusting the first response.
+
+### HAProxy
+
+```yaml
 # Only the primary accepts writes. The proxy gives clients one stable address and
 # routes to whichever member is primary right now.
 proxy:
@@ -323,7 +254,13 @@ proxy:
     memory: 128Mi
   minReplicas: 2 # per configured location
   maxReplicas: 2
+```
 
+The proxy health-checks every member and forwards to the one that is currently primary, so applications keep one connection string across failovers. Backups do not use it: the backup job connects to `replica-0` in `backup.location` directly, so `proxy.enabled: false` does not affect them.
+
+### Backups
+
+```yaml
 backup:
   enabled: false
   # `logical` is the only supported mode. Physical (Percona Backup for MongoDB)
@@ -360,211 +297,54 @@ backup:
     prefix: mongodb-cluster/backups
 ```
 
-### Locations and Sizing
+`backup.location` is validated against `locations` at render time, and `backup.mode: physical` fails at render even while `backup.enabled` is `false`. The bucket and Cloud Account must exist first — see [Backing Up](#backing-up) for the per-provider steps and the IAM policy.
 
-Each entry in `locations` pairs a location with the number of `mongod` members to run there. Every location listed must already exist in the GVC you install into; extra GVC locations are ignored. Listing the same location twice, or giving one `replicas: 0`, is refused at render — to stop running somewhere, remove the entry.
+## Connecting
 
-```yaml
-locations:
-  - name: aws-us-east-1
-    replicas: 3
-```
+| What | Address | Notes |
+|---|---|---|
+| Through the proxy (reads and writes) | `RELEASE_NAME-mongo-proxy.GVC_NAME.cpln.local:27017` | One stable address that follows the primary. Always use the fully qualified name. |
+| A specific member | `replica-N.RELEASE_NAME-mongo.LOCATION_NAME.GVC_NAME.cpln.local:27017` | `N` is the member index within that location, starting at 0. |
+| From your own machine | `cpln port-forward RELEASE_NAME-mongo-proxy 27017:27017 --gvc GVC_NAME`, then `127.0.0.1:27017` | There is no public endpoint. |
+| Credentials | `cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml` | The `username`, `password` and `database` entries of your prerequisite secret. |
 
-The default is one location with three members: the smallest shape that both installs on any single-location GVC and survives losing a member. **Set it to your GVC's locations before installing.**
-
-Every member this template creates is a **voting** member, so the total across all locations decides what the replica set survives:
-
-| Total members | Majority | Survives | Notes |
-|---|---|---|---|
-| 1 | 1 | nothing | Valid and writable — a single member is always its own primary |
-| 2 | 2 | nothing | **Refused by this template.** Losing either member leaves no primary, so it is strictly worse than 1 |
-| 3 | 2 | 1 member | The usual choice |
-| 5 | 3 | 2 members | |
-| 7 | 4 | 3 members | **The maximum.** MongoDB allows at most 7 voting members |
-
-<Warning>
-**A total above 7 is refused at render, because 1.x shipped a default that could not work.** The 1.x default was three locations × 3 replicas — nine members. MongoDB rejects the 8th voting member, and the startup script swallowed that error, so members 8 and 9 ran a `mongod` that passed its health check and reported `ready: true` while **never being in the replica set at all**. If you are carrying a 1.x roster forward, re-size it against the table above.
-</Warning>
-
-<Warning>
-**Seven members do not fit in a single location on a default org quota.** A `replicaDirect` workload is capped at 6 replicas per location by the `replicas-per-replica-direct-workload` quota, and the install is rejected at apply:
-
-```text
-One or more containers exceed the autoscaling.maxScale of 6
-(quota: replicas-per-replica-direct-workload). Request quota increase
-```
-
-Reach 7 by splitting across locations — 4 + 3 is proven — or request a quota increase. Six in one location is fine.
-</Warning>
-
-Spreading members across **locations** buys survival of a whole location, at the cost of cross-region replication traffic, which is billed. Size it against the same table: 3 locations × 1 member survives losing one location, while 2 locations × 2 members survives losing neither, because 2 of 4 is not a majority.
-
-<Warning>
-**Never reorder `locations` after installing — only append.** The first entry is the bootstrap location: `replica-0` there is the member that initializes the replica set. Moving a different location into first position points that logic at a member with an empty data directory, which can initialize a second, independent replica set.
-</Warning>
-
-Adding a location to an existing cluster needs no manual step: new members discover the primary through the seed list and register themselves into the replica set. Add it to the GVC first.
-
-### Multi-Zone
-
-Set `multiZone: true` to spread replicas across availability zones within each location, protecting against zone-level failures. Verify your selected location(s) support multi-zone before enabling.
-
-### MongoDB Settings
-
-- `mongodb.credentialsSecretName` — Name of the dictionary secret holding `username`, `password` and `database`. The cluster is bootstrapped with this user on first start, and this is the credential your applications use. Must exist before install — see [Prerequisites](#prerequisites).
-- `mongodb.keyfileSecretName` — Name of the opaque secret holding the replica set keyfile. Must exist before install, and its contents must be generated with `openssl rand -base64 756`.
-- `resources.cpu` / `resources.memory` — Resource limits applied to each MongoDB replica.
-- `image` — MongoDB image. Defaults to `percona/percona-server-mongodb:8.0`.
-
-Neither credential is a Helm value, so neither appears in the release. The two secrets stay separate so that an application granted `reveal` on the database credentials cannot also read the key that lets a member join the replica set.
-
-<Warning>
-**The keyfile cannot be changed after the cluster is initialized.** It authenticates replica set members to each other; replacing it requires every member to restart with the new key at the same time, which means planned downtime.
-</Warning>
-
-<Note>
-The `database` entry of the credentials secret is for your own connection strings — the cluster is bootstrapped with the admin user, and MongoDB creates a database the first time you write to it.
-</Note>
-
-### HAProxy Proxy
-
-HAProxy is enabled by default and strongly recommended. In a MongoDB replica set, only the primary accepts writes — HAProxy provides a stable endpoint that routes all write traffic to the current primary automatically, surviving failover without any client-side changes.
-
-- `proxy.enabled` — Enable or disable the proxy workload.
-- `proxy.minReplicas` / `proxy.maxReplicas` — Number of HAProxy instances **per configured location**. Defaults to 2 for availability.
-- `proxy.resources` — CPU and memory limits for the proxy workload.
-- `proxy.image` — The HAProxy image. Defaults to `haproxy:2.9`.
-
-<Note>
-**Backups do not use the proxy.** The backup job connects to `replica-0` in `backup.location` directly, so disabling the proxy does not affect it. The proxy matters for clients that cannot track the primary themselves.
-</Note>
-
-<Note>
-HAProxy's backends are generated from each location's own `replicas`. In 1.x every location got the *largest* location's count, so an asymmetric roster such as 3 + 1 produced backends for members that never existed.
-</Note>
-
-### Storage
-
-- `volumeset.capacity` — Initial volume size in GiB. Minimum is 10.
-- `volumeset.autoscaling.enabled` — Set to `true` to automatically expand volumes as data grows.
-- `volumeset.autoscaling.maxCapacity` — Maximum volume size in GiB.
-- `volumeset.autoscaling.minFreePercentage` — Percentage of free space that triggers a scale-up.
-- `volumeset.autoscaling.scalingFactor` — Multiplier applied to the current capacity when scaling up.
-
-The volumes are ext4 on general-purpose SSD. There is no snapshot *schedule*: a final snapshot is taken when a volume is deleted and kept for 7 days. Use [backups](#backing-up) for point-in-time copies.
-
-### Firewall
-
-- `firewall.internalAllowType` — Controls which workloads can reach MongoDB:
-  - `same-gvc` — All workloads in the same GVC (default).
-  - `same-org` — All workloads in the org.
-  - `workload-list` — Only the workloads listed in `firewall.workloads`, **plus this release's own workloads**, which the template adds for you.
-- `firewall.workloads` — List of your own client workload paths, used only with `workload-list`.
-
-<Note>
-This list is not only about client traffic: it also governs replication between the members themselves, HAProxy's health checks and the backup job's connection. A list naming only your applications would cut the replica set off from itself, so the template always merges its own workloads in — list only your clients.
-</Note>
-
-<Note>
-A firewall change takes roughly **30 seconds to 10 minutes** to propagate. After changing `firewall.internalAllowType`, keep re-testing rather than concluding the knob is broken.
-</Note>
-
-## Connecting to MongoDB
-
-Connect using the appropriate endpoint depending on your setup:
-
-| Setup | Address | Port |
-|-------|---------|------|
-| Via HAProxy (writes + reads) | `RELEASE_NAME-mongo-proxy.GVC_NAME.cpln.local` | `27017` |
-| Direct per-member (read-only or internal) | `replica-N.RELEASE_NAME-mongo.LOCATION.GVC_NAME.cpln.local` | `27017` |
-| From your own machine | `cpln port-forward RELEASE_NAME-mongo-proxy 27017:27017 --gvc GVC_NAME`, then `localhost:27017` | `27017` |
-
-The username, password and database name are the three entries of your credentials secret. Read them back with:
-
-```bash
-cpln secret reveal my-mongodb-credentials -o yaml
-```
-
-Example connection string via the proxy:
+The user lives in the `admin` database, so connection strings must carry `authSource=admin`:
 
 ```text
 mongodb://USERNAME:PASSWORD@RELEASE_NAME-mongo-proxy.GVC_NAME.cpln.local:27017/DATABASE?authSource=admin
 ```
 
-To offload reads from the primary, add `readPreference=secondaryPreferred` to your connection string and connect directly to a replica:
+To offload reads, connect to the members directly and add `readPreference=secondaryPreferred`; secondary reads can lag the primary slightly.
 
-```text
-mongodb://USERNAME:PASSWORD@replica-0.RELEASE_NAME-mongo.LOCATION.GVC_NAME.cpln.local:27017/DATABASE?authSource=admin&readPreference=secondaryPreferred
+Verify the replica set from inside a member. The credentials are already in its environment, so nothing is typed on the command line:
+
+```bash
+cpln workload exec RELEASE_NAME-mongo --gvc GVC_NAME --location LOCATION_NAME \
+  --replica RELEASE_NAME-mongo-0 --container mongodb -- \
+  sh -c 'mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "rs.status().members.forEach(m => print(m.name, m.stateStr))"'
 ```
 
-<Note>
-Secondary reads may be slightly stale due to replication lag. Use `readPreference=primary` (the default) when read-your-own-writes consistency is required.
-</Note>
+Every member should be listed, one `PRIMARY` and the rest `SECONDARY`. To use `mongosh` from your own machine, forward the proxy port and connect to `127.0.0.1`; `db.hello().primary` shows which member the proxy is routing to:
 
-Configure `maxPoolSize` in your MongoDB driver to prevent connection exhaustion. A per-app-replica pool of 10–50 connections is a reasonable starting point for most workloads.
-
-The cluster has no public endpoint — it is reachable only from inside the org, subject to [Firewall](#firewall).
-
-### Failover Behavior
-
-When the primary goes away, the remaining members elect a new one and the proxy re-routes to it. Clients connected through the proxy keep the same connection string and need no change.
-
-Measured on a three-member cluster with the primary killed abruptly — a forced `shutdown` with no step-down, so MongoDB's own election-timeout path ran rather than a coordinated handover — write availability was restored in **7 seconds or less** through the unchanged proxy connection string. Data written before the failover survived, writes after it landed on the new primary, and the killed member rejoined by itself as a secondary about **44 seconds** later, restarting in place on its own volume.
-
-<Warning>
-**Do not lose a member while an upgrade is rolling.** A `helm upgrade` that changes the MongoDB tier restarts it one member at a time, which took about **4 minutes** for three members. Losing another member during that window can leave a three-member cluster with one live member and no quorum. Wait for the rollout to finish before performing any other maintenance.
-</Warning>
-
-## Backing Up
-
-When `backup.enabled` is `true`, a cron workload runs `mongodump` on the configured schedule and uploads a compressed BSON archive to AWS S3 or GCS. Set `backup.provider` and fill in the matching provider block.
-
-```yaml
-backup:
-  enabled: true
-  mode: logical          # the only supported mode
-  schedule: "0 2 * * *"  # daily at 2am UTC
-  location: aws-us-east-1
-  provider: aws
+```bash
+cpln port-forward RELEASE_NAME-mongo-proxy 27017:27017 --gvc GVC_NAME
 ```
 
-`backup.location` names the **one** location the job runs in, and it must be one of your `locations` — the template refuses to render otherwise. That check matters: the platform accepts a placement naming a location that is not there, stores it, and the job then never runs anywhere, with nothing to observe.
-
-The job connects to `replica-0` in that location **directly, not through the proxy**, so `proxy.enabled: false` does not affect it.
-
-<Warning>
-**`backup.mode: physical` was removed in 2.0.0, and a values file that still sets it fails at render** — including when `backup.enabled` is `false`, so an old values file gets the signal immediately rather than on the day someone turns backups on.
-
-Its restore could never work. Percona Backup for MongoDB's physical restore has to execute `mongod` itself, and the `pbm-agent` image does not contain that binary:
-
-```text
-check mongod binary: run: exec: "mongod": executable file not found in $PATH
+```bash
+mongosh "mongodb://USERNAME:PASSWORD@127.0.0.1:27017/?authSource=admin" --eval "db.hello().primary"
 ```
 
-Worse, it failed **silently**: `pbm status` reported nothing running while the agent kept heartbeating into the bucket, and the failed restore did not appear in `pbm list --restore` at all. So the mode wrote real-looking snapshots that could never be restored, and gave no sign of it. `backup.mode: logical` is the supported path, and its restore is [verified end to end](#restoring-a-backup).
-</Warning>
+## Operations
 
-Keep `backup.schedule` quoted in your values file. Any valid cron expression works, including one beginning with `*`.
+### Backing Up
 
-### AWS S3
-
-Complete the following in your AWS account before installing:
+When `backup.enabled` is `true`, the `RELEASE_NAME-mongo-backup` cron workload runs `mongodump` on `backup.schedule` in `backup.location` only, authenticating with the username and password from your credentials secret. Each run writes one gzip-compressed archive of **every database in the cluster** to `PREFIX/mongo-YYYY-MM-DDTHH-MM-SSZ.archive.gz` in your bucket. Backups do not delete older archives; manage retention with a bucket lifecycle rule.
 
 <Steps>
-  <Step title="Create a bucket">
-    Create an S3 bucket and set `backup.aws.bucket` and `backup.aws.region` to match.
-  </Step>
-  <Step title="Set up a Cloud Account">
-    If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
-  </Step>
-  <Step title="Create an IAM policy">
-    Create an IAM policy with the following JSON (replace `YOUR_BUCKET_NAME`) and set `backup.aws.policyName` to its name:
-
-    <Warning>
-    **Version 1.1.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
-
-    **Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
-    </Warning>
+  <Step title="AWS S3">
+    1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+    2. If you do not have a Control Plane Cloud Account for AWS, follow the [Create a Cloud Account](/guides/create-cloud-account) guide. Set `backup.aws.cloudAccountName` to its name.
+    3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`, and set `backup.aws.policyName` to its name. The template attaches this policy to the identity and nothing else, so the bucket in it is the only storage the job can reach:
 
     ```json
     {
@@ -592,118 +372,246 @@ Complete the following in your AWS account before installing:
         ]
     }
     ```
+
+    4. Set `backup.location` to one of your `locations`, `backup.aws.prefix` to the folder path for the archives, then `backup.enabled: true` and `backup.provider: aws`.
+  </Step>
+  <Step title="GCS">
+    1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+    2. If you do not have a Control Plane Cloud Account for GCP, follow the [Create a Cloud Account](/guides/create-cloud-account) guide. Set `backup.gcp.cloudAccountName` to its name.
+    3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account. The template additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket in `backup.gcp.bucket`.
+    4. Set `backup.location` to one of your `locations`, `backup.gcp.prefix` to the folder path for the archives, then `backup.enabled: true` and `backup.provider: gcp`.
   </Step>
 </Steps>
 
-### GCS
+Check a run with the container logs of the cron workload; a successful run ends with `[INFO] Backup completed: mongo-....archive.gz`:
 
-Complete the following in your GCP account before installing:
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-mongo-backup"}' --limit 50 --since 24h
+```
 
-<Steps>
-  <Step title="Create a bucket">
-    Create a GCS bucket and set `backup.gcp.bucket` to its name.
-  </Step>
-  <Step title="Set up a Cloud Account">
-    If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
-  </Step>
-</Steps>
+If you enable backups while `firewall.internalAllowType: workload-list` is in force, the first scheduled run can fail with `server selection error: context deadline exceeded` because the firewall change has not taken effect yet; the next run succeeds.
 
-<Warning>
-You must add the `Storage Admin` role to the GCP service account created for the Cloud Account.
-</Warning>
+### Restoring a Backup
 
-## Restoring a Backup
-
-The cluster has no public endpoint, so the restore runs through a `cpln port-forward` tunnel. You need the [MongoDB Database Tools](https://www.mongodb.com/docs/database-tools/) and your cloud CLI on the machine you run it from.
+The archive is a `mongodump --archive --gzip` file, so it is restored with `mongorestore --gzip --archive`. The cluster has no public endpoint, so the restore runs through a `cpln port-forward` tunnel from a machine that has the [MongoDB Database Tools](https://www.mongodb.com/docs/database-tools/) and your cloud CLI installed. This procedure was followed verbatim against this chart version: archive downloaded, data dropped, restored, and the restored documents read back from a secondary.
 
 <Steps>
-  <Step title="Find and download the archive">
-    List what is in the bucket with `aws s3 ls s3://BUCKET_NAME/PREFIX/` (or `gcloud storage ls gs://BUCKET_NAME/PREFIX/`), then download the one you want:
+  <Step title="Download the archive">
+    List what is in the bucket with `aws s3 ls s3://BUCKET_NAME/PREFIX/` (for GCS, `gcloud storage ls gs://BUCKET_NAME/PREFIX/`), then download the one you want:
 
     ```bash
-    aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.gz ./backup.gz
+    aws s3 cp s3://BUCKET_NAME/PREFIX/mongo-TIMESTAMP.archive.gz ./backup.gz
     ```
   </Step>
   <Step title="Open a tunnel to the proxy">
-    The proxy routes to whichever member is primary right now. Point at `RELEASE_NAME-mongo` instead if you disabled the proxy. Leave this running.
+    The proxy routes the tunnel to whichever member is primary right now, which is where a restore must write. Leave this running. If you disabled the proxy, forward to `RELEASE_NAME-mongo` instead.
 
     ```bash
     cpln port-forward RELEASE_NAME-mongo-proxy 27017:27017 --gvc GVC_NAME
     ```
   </Step>
   <Step title="Restore through the tunnel">
-    In another terminal:
+    By default `mongorestore` adds the archive's documents to the existing collections and keeps any document whose `_id` already exists. Add `--drop` to replace each collection with the backup's contents, or `--nsInclude` to restore a single database or collection; see the [mongorestore reference](https://www.mongodb.com/docs/database-tools/mongorestore/) for both. In another terminal:
 
     ```bash
-    mongorestore --uri="mongodb://USERNAME:PASSWORD@localhost:27017/?authSource=admin" \
+    mongorestore --uri="mongodb://USERNAME:PASSWORD@127.0.0.1:27017/?authSource=admin" \
       --gzip --archive=./backup.gz
     ```
 
-    Restored data replicates out to the secondaries like any other write.
+    Restored data replicates to the secondaries like any other write.
+  </Step>
+  <Step title="Verify">
+    Through the same tunnel, list the databases and spot-check a collection count:
+
+    ```bash
+    mongosh "mongodb://USERNAME:PASSWORD@127.0.0.1:27017/?authSource=admin" --eval "db.adminCommand({ listDatabases: 1 })"
+    ```
   </Step>
 </Steps>
 
-<Note>
-**Template versions before 2.0.0 documented a restore that could not be followed.** They told you to run `mongorestore` from "a client with network access to the cluster" against a `*.cpln.local` address — an internal DNS name no external machine can resolve. The tunnel above is the working procedure, and it has been run verbatim end to end: archive downloaded, data destroyed, restored, and confirmed replicated to the secondaries.
-</Note>
+### Rotating the Password
 
-<Note>
-**Physical (PBM) restores are gone**, along with `backup.mode: physical` itself — see [Backing Up](#backing-up) for why. There is no PBM restore procedure to follow, because there never was a working one.
-</Note>
+The password in the secret creates the root user on first boot; afterwards the members and the backup job present it when they authenticate. Rotate inside MongoDB first, then bring the secret and the running replicas in line:
 
-## Scaling
+<Steps>
+  <Step title="Change it inside MongoDB">
+    Through a [port-forward tunnel to the proxy](#connecting), which reaches the primary:
 
-### Scaling Up
+    ```bash
+    mongosh "mongodb://USERNAME:PASSWORD@127.0.0.1:27017/?authSource=admin" \
+      --eval 'db.getSiblingDB("admin").changeUserPassword("USERNAME", "NEW-STRONG-PASSWORD")'
+    ```
+  </Step>
+  <Step title="Update the secret">
+    Re-apply your [dictionary secret](/guides/create-secret/dictionary) with the new `password` entry, keeping `username` and `database` unchanged:
 
-Increase `replicas` for a location in `locations`, or append a location that the GVC already has, and apply the template upgrade. New members connect to the primary through the seed list and self-register into the replica set automatically.
+    ```yaml
+    kind: secret
+    name: CREDENTIALS_SECRET_NAME
+    type: dictionary
+    data:
+      username: admin
+      password: NEW-STRONG-PASSWORD
+      database: mydatabase
+    ```
 
-Keep the total inside MongoDB's 7-voting-member limit, and remember that a single location holds at most 6 on a default quota — see [Locations and Sizing](#locations-and-sizing).
+    ```bash
+    cpln apply -f secret.yaml
+    ```
+  </Step>
+  <Step title="Redeploy the members">
+    A running replica keeps the environment it started with; updating the secret does not restart it, and the old value keeps working with no error until it does. Force a redeployment so every member — and the startup checks that use these credentials — picks up the new password. Members restart one at a time; wait for the rollout to finish:
 
-### Scaling Down
+    ```bash
+    cpln workload force-redeployment RELEASE_NAME-mongo --gvc GVC_NAME
+    ```
+  </Step>
+</Steps>
 
-<Warning>
-Scaling down requires manually removing departing members from the replica set configuration first. If stale members are not removed, the replica set config keeps referencing hosts that no longer exist, which distorts elections and quorum.
-</Warning>
+### Migrating from 1.x
 
-Before reducing a location's `replicas`, connect to the primary and remove each departing member:
+Template versions through 1.1.1 created their own GVC. Version 2.0.0 does not — and Helm deletes what a chart stops declaring, so **an in-place upgrade of a 1.x release onto 2.0.0 deletes the GVC the 1.x release created, with every workload, volume set and identity in it, including your data.** The chart refuses to render when your values still carry the 1.x `gvc` key, so the usual path fails safely:
 
-```js
-rs.remove("replica-N.RELEASE_NAME-mongo.LOCATION.GVC_NAME.cpln.local:27017")
+```text
+Error: execution error at (mongodb-cluster/templates/identity.yaml:1:4): mongodb-cluster 2.0.0: the
+`gvc` values key was REMOVED. This chart no longer creates a GVC -- it deploys into the GVC you
+install into, and `gvc.locations` moved to the top-level `locations`. DO NOT `helm upgrade` a 1.x
+release onto 2.0.0 ...
 ```
 
-After all departing members are removed from the config, apply the template upgrade to reduce the count.
+<Warning>
+**Do not run `cpln helm upgrade` on a 1.x release with the 2.0.0 chart under any circumstances**, including with no values at all — the guard can only see values you pass. Migrate to a new release instead.
+</Warning>
+
+<Steps>
+  <Step title="Pick an existing GVC and create the prerequisite secrets">
+    Choose a GVC that already has the locations you will list, and create both [prerequisite secrets](#prerequisites) with new values. The new cluster is bootstrapped from them on a fresh data directory, so this is the moment to choose a new password and generate a new keyfile.
+  </Step>
+  <Step title="Install 2.0.0 as a new release">
+    Use a **different release name** — secret and policy names are org-wide. Re-check your roster against the [sizing table](#locations): 1.x defaulted to nine members, and only seven of them were ever in the replica set.
+  </Step>
+  <Step title="Move the data across">
+    Dump from the old cluster and restore into the new one, tunnelling to each with `cpln port-forward` — the procedure is [Restoring a Backup](#restoring-a-backup), with `mongodump --uri="mongodb://USERNAME:PASSWORD@127.0.0.1:27017/?authSource=admin" --gzip --archive=./backup.gz` against the old proxy in place of downloading an archive.
+  </Step>
+  <Step title="Point your applications at the new release, then uninstall the old one">
+    Run `cpln helm uninstall` against the GVC you installed the 1.x release into — that is where Helm tracks it. Uninstalling the 1.x release deletes the GVC it created and everything still in it.
+  </Step>
+</Steps>
+
+Values that moved or were removed in 2.0.0. Each is named at render time rather than ignored:
+
+| 1.x | 2.0.0 |
+|---|---|
+| `gvc.name` | Gone. The chart deploys into the GVC you install into |
+| `gvc.locations` | `locations`, at the top level |
+| Backup location derived from `backup.aws.region` | `backup.location`, explicit and validated against `locations` |
+| `backup.mode: physical` and the `backup.physical` block | Gone. Its restore could never run — see [Backing Up](#backing-up) |
+| `locations[].replicas: 0` | Not allowed. Remove the location instead |
+| A total above 7 members, or exactly 2 | Not allowed. See the sizing table |
+
+**Coming from 1.0.0 specifically.** That version took the credentials as plain values with a working default password, and shipped a working replica set keyfile as the `mongodb.replicaSetKey` default. Both were published in the public template repository, so treat an unchanged 1.0.0 password and keyfile as compromised, not merely outdated — do not carry either across. Version 1.1.0 replaced them with the two prerequisite secrets. While the old cluster is still running and you need its credentials to dump from it, read them from the secret 1.0.0 created (keys `username`, `password`, `database`), or from the values file you installed with:
+
+```bash
+cpln secret reveal RELEASE_NAME-mongo-config -o yaml
+```
+
+### Scaling and Availability
+
+**What the cluster survives.** Only the primary accepts writes; when it is lost, the remaining members elect a new primary and the proxy re-routes to it, so clients using the proxy address keep the same connection string. With three members in one location the set survives losing one member; spread across three locations with one member each it survives losing a whole location. A member that comes back rejoins as a secondary on its own volume. Members are voting members, so size against the [table under Locations](#locations).
+
+**Upgrades roll the MongoDB tier one member at a time**, stepping a primary down before it stops. Do not perform other maintenance, and avoid losing a member, while a rollout is in progress: a three-member set with one member restarting and another lost has no majority.
+
+**Scaling up.** Increase `replicas` for a location, or append a location the GVC already has, and upgrade the release. New members find the primary through the other members and register themselves into the replica set; no manual step is needed. Stay within 7 members in total and 6 per location.
+
+**Scaling down.** Remove departing members from the replica set configuration **before** reducing `replicas`; otherwise the configuration keeps referencing hosts that no longer exist, which distorts elections and quorum. Through a [tunnel to the proxy](#connecting), for each departing member (highest index first):
+
+```javascript
+rs.remove("replica-N.RELEASE_NAME-mongo.LOCATION_NAME.GVC_NAME.cpln.local:27017")
+```
+
+Then upgrade the release with the lower count. To stop running in a location entirely, remove its entry from `locations`.
+
+**Storage.** Each member's data lives on its own volume, survives restarts and upgrades, and grows automatically when `volumeset.autoscaling.enabled` is `true`. `cpln helm uninstall` deletes the volume set; a final snapshot is retained for 7 days.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The workload never becomes ready and cpln logs is empty">
+    **Symptom:** `cpln helm install` reported success, `RELEASE_NAME-mongo` never reaches ready, and `cpln logs` returns no lines. `cpln workload get-deployments RELEASE_NAME-mongo --gvc GVC_NAME -o yaml` shows under `status.versions[].message`:
+
+    ```text
+    The secret CREDENTIALS_SECRET_NAME no longer exists. Workload updates are paused until the
+    secret is added or the reference to the secret removed.
+    ```
+
+    **Cause:** `mongodb.credentialsSecretName` or `mongodb.keyfileSecretName` names a secret that does not exist in this org.
+
+    **Fix:** Create the secret as shown in [Prerequisites](#prerequisites), then run `cpln workload force-redeployment RELEASE_NAME-mongo --gvc GVC_NAME` or wait several minutes for the deployment to recover on its own.
+  </Accordion>
+  <Accordion title="FATAL: the keyfile in secret ... contains characters outside the base64 alphabet">
+    **Symptom:** The member container exits with code 1 before MongoDB starts, and `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-mongo"}' --limit 50 --since 10m` shows `FATAL: the keyfile in secret '...' contains characters outside the base64 alphabet` or `... is N characters; mongod requires 6-1024`.
+
+    **Cause:** The keyfile secret holds a hand-written passphrase or a truncated value. MongoDB accepts only 6–1024 characters from `A-Z a-z 0-9 + / =`.
+
+    **Fix:** On a cluster that has never started, recreate the secret with `openssl rand -base64 756 | cpln secret create-opaque --name KEYFILE_SECRET_NAME --encoding plain -f -` (delete the old one first) and force a redeployment. The keyfile cannot be changed once the cluster is initialized.
+  </Accordion>
+  <Accordion title="FATAL: refusing to bootstrap a replica set smaller than it was configured to be">
+    **Symptom:** Member logs show `locations declared in values are not in GVC 'GVC_NAME': ...` followed by either `FATAL: refusing to bootstrap a replica set smaller than it was configured to be` (fresh members, which exit) or `This member holds data and keeps running rather than taking a live cluster down` (members that already hold data, which keep serving).
+
+    **Cause:** `locations` names a location the GVC does not have. The platform accepts the placement without error, so the members there never start and the replica set would be smaller than the quorum you sized.
+
+    **Fix:** Add the missing location to the GVC, or remove it from `locations` and upgrade the release. Check the GVC's locations with `cpln gvc get GVC_NAME -o yaml` under `spec.staticPlacement.locationLinks`.
+  </Accordion>
+  <Accordion title="This workload location is deactivated because maxScale is set to 0">
+    **Symptom:** `cpln workload get-deployments RELEASE_NAME-mongo --gvc GVC_NAME -o yaml` shows a location with `This workload location is deactivated because maxScale is set to 0.` and no replicas.
+
+    **Cause:** The GVC has a location that is not in `locations`. This is intended: nothing runs there and no volume is provisioned.
+
+    **Fix:** None needed. To run members there, add the location to `locations` and upgrade the release.
+  </Accordion>
+  <Accordion title="Install rejected with exceed the autoscaling.maxScale of 6 (quota: replicas-per-replica-direct-workload)">
+    **Symptom:** `cpln helm install` creates the proxy and then fails on `RELEASE_NAME-mongo` with `One or more containers exceed the autoscaling.maxScale of 6 (quota: replicas-per-replica-direct-workload). Request quota increase`.
+
+    **Cause:** A single location lists 7 members. The chart allows 7 in total, but a default org quota caps this workload at 6 replicas per location.
+
+    **Fix:** Split the roster across locations (for example 4 + 3), or request a quota increase. Uninstall the failed release before reinstalling.
+  </Accordion>
+  <Accordion title="Render fails with the gvc values key was REMOVED or backup.mode physical was REMOVED">
+    **Symptom:** `cpln helm install` or `cpln helm upgrade` exits with a `mongodb-cluster 2.0.0:` render error naming the `gvc` key or `backup.mode 'physical'`, and nothing is changed.
+
+    **Cause:** Your values file is from a 1.x release. The `gvc` block and physical backups were removed in 2.0.0, and an in-place upgrade from 1.x is refused deliberately.
+
+    **Fix:** Follow [Migrating from 1.x](#migrating-from-1-x). For a 2.0.0 values file, remove the `gvc` block and set `backup.mode: logical`.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Both prerequisite secrets must exist before you install.** A missing one wedges the deployment with no log output at all; the only diagnostic is `status.versions[].message` from `cpln workload get-deployments`. See [Prerequisites](#prerequisites).
-- **Generate the keyfile, never invent one.** It must be 6-1024 characters from the base64 alphabet (`A-Z a-z 0-9 + / =`) — a `change-me-...` style placeholder will not boot. Use `openssl rand -base64 756`.
-- **The keyfile cannot be changed after the cluster is initialized.** Replacing it requires restarting every member with the new key at the same time.
-- **Never upgrade a 1.x release onto 2.0.0 in place** — it deletes the GVC the 1.x chart created and everything in it. Migrate to a new release: [Migrating from 1.x](#migrating-from-1-x).
-- **The GVC must contain every location you list**, and may contain more. A missing location is not caught at install: the members there never start, leaving a smaller replica set than you sized. Each member checks the GVC at boot — fatal on an empty data directory, a warning on one that already holds data.
-- **At most 7 members in total, and at most 6 in one location.** MongoDB allows 7 voting members and the template refuses more; a single location is capped at 6 by a default org quota, so a 7-member set has to be split across locations.
-- **Never reorder `locations` after install**, only append. The first entry is the bootstrap location that initializes the replica set.
-- **Sizing**: 3 members is the usual minimum. A 2-member set is refused, because a majority of 2 is 2 and losing either leaves no primary — strictly worse than a single member.
-- **Rotating either secret does not restart anything.** A `cpln://` reference resolves when a replica starts and is never re-resolved while it lives, so the old value keeps working with no error until you run `cpln workload force-redeployment`.
-- **An upgrade that changes the MongoDB tier rolls it** — about 4 minutes for three members. Avoid other maintenance during that window.
-- **`backup.mode: physical` was removed in 2.0.0** and now fails at render. Use `logical`, whose restore is verified end to end.
-- **Read from secondaries**: To offload reads from the primary, use `readPreference=secondaryPreferred` in your connection string. Secondary reads may be slightly stale due to replication lag.
-- **Connection pooling**: Configure `maxPoolSize` in your MongoDB driver to prevent connection exhaustion. A per-app-replica pool of 10-50 is a reasonable starting point.
-- **Data lives on the volume set and survives redeployment, but uninstalling deletes it.**
+- **Create both prerequisite secrets before installing.** A missing secret wedges the deployment with no log output; the only diagnostic is `status.versions[].message` from `cpln workload get-deployments`.
+- **Generate the keyfile with `openssl rand -base64 756`**, never a passphrase, and never change it after the cluster is initialized.
+- **Never `helm upgrade` a 1.x release onto 2.0.0.** It deletes the GVC the 1.x chart created and everything in it. Migrate to a new release.
+- **The GVC must already have every location you list**, and may have more; unlisted locations run nothing. Never reorder `locations` after install — only append.
+- **At most 7 members in total and 6 in one location.** A 2-member set is refused; 3 is the usual minimum.
+- **Connection strings need `authSource=admin`**, and clients should use the proxy address so failover needs no client change.
+- **Rotating a secret does not restart anything.** The old value keeps working with no error until you run `cpln workload force-redeployment`.
+- **Remove members with `rs.remove` before scaling down**, and let a rollout finish before any other maintenance.
+- **Backups are full-cluster dumps** with no retention policy of their own; use a bucket lifecycle rule. Restore runs through `cpln port-forward`.
+- **Uninstalling deletes the volume set.** A final snapshot is retained for 7 days.
 
 ## External References
 
 <CardGroup cols={2}>
   <Card title="Percona Server for MongoDB" href="https://docs.percona.com/percona-server-for-mongodb/" icon="database">
-    Official documentation for Percona Server for MongoDB
+    Official documentation for the database image this template runs
   </Card>
-  <Card title="MongoDB Database Tools" href="https://www.mongodb.com/docs/database-tools/" icon="box-archive">
-    mongodump and mongorestore, used for backup and restore
-  </Card>
-  <Card title="MongoDB Replica Set" href="https://www.mongodb.com/docs/manual/replication/" icon="circle-nodes">
-    MongoDB replica set concepts and administration
+  <Card title="MongoDB Replication" href="https://www.mongodb.com/docs/manual/replication/" icon="circle-nodes">
+    Replica set concepts, elections and failover
   </Card>
   <Card title="Replica Set Members" href="https://www.mongodb.com/docs/manual/core/replica-set-members/" icon="users">
     Member roles and the 7-voting-member limit
+  </Card>
+  <Card title="mongorestore Reference" href="https://www.mongodb.com/docs/database-tools/mongorestore/" icon="box-archive">
+    Options for restoring archives, including --drop and --nsInclude
   </Card>
   <Card title="MongoDB Connection String" href="https://www.mongodb.com/docs/manual/reference/connection-string/" icon="link">
     Connection string URI format and options
