@@ -1,45 +1,90 @@
 ---
 title: Trino
 icon: /template-catalog/templates/icons/trino.png
-description: Deploy Trino on Control Plane using the Template Catalog. A distributed SQL query engine that joins PostgreSQL, MySQL, ClickHouse, MongoDB and more in one query, with a coordinator plus a scalable worker tier. Covers catalogs, credential secrets, authentication, and access.
-keywords: ['distributed sql', 'federated query', 'cross database join', 'presto', 'athena alternative', 'starburst alternative', 'query engine', 'jdbc driver', 'sql over multiple databases', 'connector', 'tpch', 'data virtualization', 'trino template']
+description: Trino distributed SQL query engine — one coordinator plus a scalable stateless worker tier that joins PostgreSQL, MySQL, ClickHouse, MongoDB and Iceberg in one query, deployed into an existing single-location GVC. Nothing is required for a default install; catalog and login secrets come first.
+keywords: ['distributed sql', 'federated query', 'cross database join', 'presto', 'athena alternative', 'starburst alternative', 'query engine', 'jdbc driver', 'sql over multiple databases', 'connector', 'iceberg', 'tpch', 'data virtualization', 'trino template']
 ---
 
 ## Overview
 
-Trino is a distributed SQL query engine that queries data where it lives. This template deploys a Trino cluster — one coordinator plus a scalable worker tier — that connects to PostgreSQL, MySQL, ClickHouse, MongoDB and 40+ other sources through **catalogs**, and joins across them in a single query without copying any data. Databases you already run on Control Plane are reachable over internal DNS, so a query can span several of them at once.
+Trino is a distributed SQL query engine that queries data where it lives. This template deploys a Trino cluster — one coordinator plus a scalable worker tier — that connects to PostgreSQL, MySQL, ClickHouse, MongoDB and many other sources through **catalogs**, and joins across them in a single query without copying any data. Databases you already run on Control Plane are reachable over internal DNS, and Iceberg tables in object storage are reachable through the [Polaris](/template-catalog/templates/polaris) template.
 
-Trino stores nothing itself: it plans and executes queries against your existing systems, so there are no volumes and a restart costs only the queries in flight.
+Trino stores nothing itself, so the template has no volume set: a restart costs only the queries in flight, and uninstalling never touches the databases it queries.
 
-### Architecture
-
-- **Coordinator** — Parses and plans queries, serves the Web UI and the JDBC/REST endpoint on port `8080`, and tracks the workers. Always exactly one replica.
-- **Workers** — Stateless execution tier on port `8080`, `workers.replicas` replicas. Setting `workers.replicas: 0` collapses the cluster to a single node where the coordinator executes queries itself.
-- **Catalogs** — One properties file per data source, mounted on every node. The image already ships the `tpch`, `tpcds`, `memory` and `jmx` catalogs, so a default install is queryable immediately.
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have — it does not create or manage a GVC. Every workload runs in each location of that GVC, so install Trino into a single-location GVC: coordinator and worker traffic happens on every query.
+</Note>
 
 ### What Gets Created
 
-- **Standard Coordinator Workload** — A single replica serving clients, the Web UI and worker discovery on port `8080`.
-- **Standard Worker Workload** — `workers.replicas` interchangeable execution replicas on port `8080`. Not created when `workers.replicas: 0`.
-- **Config Secrets** — The rendered `config.properties` (one per tier), `jvm.config` and `node.properties`, mounted into `/etc/trino`.
-- **Catalog Secrets** *(optional)* — One per `catalogs[]` entry, mounted as `/etc/trino/catalog/<name>.properties` on every node.
-- **Password-authenticator Secret** *(optional)* — Created on the coordinator when `auth.enabled`.
-- **Identity & Policy** — One identity shared by both workloads, with a policy granting `reveal` on exactly the config, catalog and authentication secrets in use — including the credential secrets you created yourself.
-- **No Volume Sets** — Trino owns no data.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-trino` | Coordinator — plans queries, serves the Web UI and the JDBC/REST endpoint, tracks the workers (standard, always 1 replica, HTTP port `8080`) | — |
+| Workload | `RELEASE_NAME-trino-worker` | Stateless query-execution tier (standard, `workers.replicas` replicas, port `8080`) | Not created when `workers.replicas: 0` |
+| Secret | `RELEASE_NAME-trino-coordinator-config`, `RELEASE_NAME-trino-jvm`, `RELEASE_NAME-trino-node` | Rendered `config.properties`, `jvm.config` and `node.properties`, mounted into `/etc/trino` | — |
+| Secret | `RELEASE_NAME-trino-worker-config` | Worker `config.properties` | Not created when `workers.replicas: 0` |
+| Secret | `RELEASE_NAME-trino-catalog-NAME` | One per `catalogs[]` entry, mounted as `/etc/trino/catalog/NAME.properties` on every node (underscores in the name become hyphens in the secret name) | `catalogs[]` entries |
+| Secret | `RELEASE_NAME-trino-password-authenticator` | Password-file authenticator settings, coordinator only | `auth.enabled: true` |
+| Identity / Policy | `RELEASE_NAME-trino-identity`, `RELEASE_NAME-trino-policy` | One identity shared by both workloads; `reveal` on exactly the config and catalog secrets plus the credential and login secrets you created | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+The chart never creates, modifies or deletes the secrets you create yourself — they are referenced by name only.
 
 ## Prerequisites
 
-- **None for a default install.** The built-in `tpch`, `tpcds`, `memory` and `jmx` catalogs make the cluster queryable the moment it is ready.
-- **To query your own data sources:** one Control Plane secret per credential, created **before** installing — see [Connecting Data Sources](#connecting-data-sources). Credentials are never passed through values.
-- **To enable authentication** (required for public access): two [opaque secrets](/guides/create-secret/opaque) created before installing — see [Authentication](#authentication).
+None for a default install. The image ships the `tpch`, `tpcds`, `memory` and `jmx` catalogs, so the cluster is queryable the moment it is ready.
+
+Two features need secrets that must exist **before** you install or upgrade with them on. Secrets are org-level, so no `--gvc` flag is involved.
+
+<Steps>
+  <Step title="Catalog credentials (to query your own data sources)">
+    One secret per credential a catalog needs. Use an [opaque secret](/guides/create-secret/opaque) for a single value, or a [dictionary secret](/guides/create-secret/dictionary) when one secret holds several values:
+
+    ```bash
+    # one value — referenced without secretKey
+    printf '%s' 'YOUR-DATABASE-PASSWORD' | cpln secret create-opaque --name PG_CREDENTIALS_SECRET_NAME --encoding plain -f -
+
+    # several values — referenced with secretKey
+    cpln secret create-dictionary --name MYSQL_CREDENTIALS_SECRET_NAME \
+      --entry password='YOUR-DATABASE-PASSWORD'
+    ```
+
+    The sibling database templates already read their credentials from a dictionary secret with a `password` key, so you can reference that same secret instead of creating a new one. Set `catalogs[].secrets[].secretName` (and `secretKey` for a dictionary) to this name — see [Catalogs](#catalogs).
+  </Step>
+  <Step title="Login secrets (to enable authentication and public access)">
+    Two opaque secrets: a bcrypt password file with one user per line, and a random string every node shares once authentication is on:
+
+    ```bash
+    # password file — bcrypt, cost 8 or more, one user per line
+    htpasswd -B -C 10 -n alice | cpln secret create-opaque --name PASSWORD_FILE_SECRET_NAME --encoding plain -f -
+
+    # internal shared secret
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name SHARED_SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `auth.passwordFileSecretName` and `auth.sharedSecretName` to these names — see [Authentication](#authentication).
+  </Step>
+</Steps>
+
+<Warning>
+**A missing secret wedges the install rather than failing it.** `cpln helm install` reports success, but a workload that references a secret that does not exist never starts — so `cpln logs` returns **zero lines**. The only place the missing secret is named is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-trino --gvc GVC_NAME -o yaml
+```
+
+Check `RELEASE_NAME-trino-worker` the same way. It is `get-deployments` — plain `cpln workload get` has no `versions` key. Create the missing secret and the deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-trino --gvc GVC_NAME` (and the same for the worker workload) to skip the wait.
+</Warning>
 
 ## Installation
 
-Install the template using your preferred method:
+A default install needs no values — it runs unauthenticated, reachable only from inside the GVC, with the built-in demo catalogs:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/trino \
+  --version 1.0.0 --gvc GVC_NAME
+```
+
+Add your own catalogs and authentication with a values file (`--values`) — see [Configuration](#configuration).
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -65,24 +110,30 @@ Install the template using your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Image
 
 ```yaml
 image: trinodb/trino:483
+```
 
-# ─── Coordinator ──────────────────────────────────────────────────────────────
-# One coordinator per cluster (Trino's design): plans queries, serves the Web UI,
-# the JDBC/REST endpoint, and worker discovery.
+One image runs both tiers. The chart is shipped and tested on Trino 483.
+
+### Coordinator
+
+```yaml
 coordinator:
   resources:
     minCpu: 500m
     maxCpu: 1000m
     minMemory: 2Gi
     maxMemory: 4Gi # JVM heap is a percentage OF THIS — see jvm.maxRAMPercentage
+```
 
-# ─── Workers ──────────────────────────────────────────────────────────────────
-# Stateless query-execution tier. Raise replicas for more query capacity and to
-# keep capacity through a rolling restart.
+There is exactly one coordinator per cluster — open-source Trino supports no more.
+
+### Workers
+
+```yaml
 workers:
   replicas: 1 # 0 = single-node mode (the coordinator executes queries itself)
   resources:
@@ -90,33 +141,76 @@ workers:
     maxCpu: 2000m
     minMemory: 2Gi
     maxMemory: 4Gi # JVM heap is a percentage OF THIS — see jvm.maxRAMPercentage
+```
 
-# ─── JVM ──────────────────────────────────────────────────────────────────────
-# Heap = this percentage of each tier's maxMemory. Trino derives per-node query
-# memory (30% of heap) and headroom (30% of heap) from it, so maxMemory is the
-# only number you normally change. Allowed range 40–80.
+Raise `workers.replicas` for more query capacity and to keep capacity through a rolling restart. For both tiers the chart refuses to render unless `maxMemory` is whole GiB and at least `2Gi`, `minMemory` does not exceed `maxMemory`, and `maxCpu:minCpu` is at most 4:1; the error names the value to fix. Worker resources are only checked when `workers.replicas` is above `0`.
+
+### JVM
+
+```yaml
 jvm:
   maxRAMPercentage: 70
+```
 
-# ─── Catalogs (data sources) ──────────────────────────────────────────────────
-# One entry per data source. `properties` is a Trino connector properties file —
-# copy it from the connector's documentation page. Never put a password here:
-# create a Control Plane secret first and reference it as ${ENV:NAME} plus a
-# `secrets` entry below. The image already ships the tpch, tpcds, memory and jmx
-# catalogs, so a default install is queryable with no catalogs configured.
-catalogs: [] # worked examples: see "Connecting Data Sources" below
+The heap is this percentage of each tier's `maxMemory` (allowed range 40–80). Trino derives its per-node query memory (30% of heap) and headroom (30% of heap) from it, so `maxMemory` is normally the only number you change. Capacity AI is off on both workloads, because the JVM sizes its heap once from the container limit at startup.
 
-# ─── Authentication ───────────────────────────────────────────────────────────
-# Off by default: Trino is then unauthenticated and reachable only inside the
-# GVC. REQUIRED before publicAccess can be enabled. Both secrets must exist
-# BEFORE install. Note: the SERVER refuses password auth over plain HTTP, so
-# auth requires publicAccess — the chart enforces it.
+### Catalogs
+
+```yaml
+catalogs: []
+# catalogs:
+#   - name: pg # queried as pg.<schema>.<table>
+#     properties: |
+#       connector.name=postgresql
+#       connection-url=jdbc:postgresql://my-postgres.my-gvc.cpln.local:5432/postgres
+#       connection-user=postgres
+#       connection-password=${ENV:PG_PASSWORD}
+#     secrets:
+#       - env: PG_PASSWORD
+#         secretName: my-postgres-credentials # must exist BEFORE install
+#         secretKey: password # omit for an opaque secret (uses its payload)
+#   - name: mysql
+#     properties: |
+#       connector.name=mysql
+#       connection-url=jdbc:mysql://my-mysql.my-gvc.cpln.local:3306
+#       connection-user=root
+#       connection-password=${ENV:MYSQL_PASSWORD}
+#     secrets:
+#       - env: MYSQL_PASSWORD
+#         secretName: my-mysql-credentials
+#         secretKey: password
+```
+
+Each entry renders one secret and mounts one file at `/etc/trino/catalog/NAME.properties` on the coordinator and every worker. Credentials never go into `properties`: the file holds only a `${ENV:NAME}` placeholder, and the `secrets` list injects the value from a secret you created as that environment variable.
+
+| Field | Description |
+|---|---|
+| `name` | Catalog name, queried as `name.schema.table`. Lowercase letters, digits and underscores, starting with a letter; unique; `system` is reserved. |
+| `properties` | The connector properties file, copied from the connector's documentation page. Must contain a `connector.name=` line. |
+| `secrets[].env` | `UPPER_SNAKE_CASE` environment variable name, referenced from `properties` as `${ENV:NAME}`. Must be unique across all catalogs. |
+| `secrets[].secretName` | The secret holding the credential. It must exist **before** install. |
+| `secrets[].secretKey` | Key within a dictionary secret. Omit it for an opaque secret, whose payload is used. |
+
+The chart rejects any entry that breaks these rules at render, before anything is installed. Worked entries for the sibling templates are in [Connecting Data Sources](#connecting-data-sources).
+
+### Authentication
+
+```yaml
 auth:
   enabled: false
   passwordFileSecretName: "" # opaque secret, payload = bcrypt password file (e.g. my-trino-passwords)
   sharedSecretName: "" # opaque secret, payload = random string shared by all nodes (e.g. my-trino-shared-secret)
+```
 
-# ─── Access ───────────────────────────────────────────────────────────────────
+`auth.enabled` turns on password-file login on the coordinator and the shared secret the nodes use to authenticate to each other. Both secret names are required when it is on — create them first, as shown in [Prerequisites](#prerequisites).
+
+<Warning>
+**Authentication and public access must be enabled together — the chart refuses either one alone.** Trino refuses password logins over plain HTTP, so an internal-only cluster with authentication on could not be queried by anyone; and an unauthenticated Trino on the internet would expose every connected data source. With both on, clients sign in over the public HTTPS endpoint. Without authentication, the internal firewall is the boundary.
+</Warning>
+
+### Access
+
+```yaml
 publicAccess:
   enabled: false # true = Web UI + JDBC on the automatic *.cpln.app HTTPS endpoint; requires auth.enabled
 
@@ -125,209 +219,205 @@ internalAccess: # who may reach the coordinator from inside Control Plane
   workloads: [] # used with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
-### Coordinator and Workers
-
-- `image` — The Trino container image. The chart is shipped and tested on Trino 483.
-- `coordinator.resources` — CPU and memory for the single coordinator replica.
-- `workers.replicas` — Number of worker replicas. Raise it for more query throughput and to keep capacity available through a rolling restart; `0` collapses the cluster to a single node where the coordinator both plans and executes.
-- `workers.resources` — CPU and memory per worker replica.
-
-`maxMemory` must be a whole number of GiB and at least `2Gi`, `minMemory` may not exceed `maxMemory`, and `maxCpu:minCpu` may not exceed 4:1 (a Control Plane limit) — the chart refuses to render otherwise, with a message naming the value to fix.
-
-### JVM and Memory
-
-`jvm.maxRAMPercentage` (default `70`, allowed range 40–80) sets the JVM heap as a percentage of each tier's `maxMemory`. Trino derives its per-node query memory and headroom from that heap, so `maxMemory` is normally the only number you change. Capacity AI is disabled on both workloads: the JVM sizes its heap from the container limit at startup, so shrinking the container afterwards would be an out-of-memory kill with no diagnostic.
-
-### Catalogs
-
-Each `catalogs[]` entry renders one secret and mounts one file at `/etc/trino/catalog/<name>.properties` on every node:
-
-| Field | Description |
+| `internalAccess.type` | Who may reach the coordinator |
 |---|---|
-| `name` | Catalog name, queried as `<name>.<schema>.<table>`. Lowercase letters, digits and underscores; `system` is reserved. |
-| `properties` | The connector properties file, copied from the connector's documentation page. Must contain a `connector.name=` line. |
-| `secrets[].env` | `UPPER_SNAKE_CASE` environment variable name, referenced from `properties` as `${ENV:NAME}`. Must be unique across all catalogs. |
-| `secrets[].secretName` | Name of the Control Plane secret holding the credential. It must exist **before** install. |
-| `secrets[].secretKey` | Key within a [dictionary secret](/guides/create-secret/dictionary). Omit it for an [opaque secret](/guides/create-secret/opaque) (its payload is used). |
+| `same-gvc` | Every workload in the same GVC (default). |
+| `same-org` | Every workload in the same org. |
+| `workload-list` | Only the workloads listed in `internalAccess.workloads`. The chart adds the coordinator and its own worker workload automatically, so list only your clients. |
 
-Object-storage catalogs (Hive, Iceberg, Delta Lake) need an external metastore, which this template does not bundle. For Iceberg, deploy the [Polaris](/template-catalog/templates/polaris) template as the REST catalog and point a `catalogs[]` entry at it — that pairing is tested end to end, including writing Iceberg tables to [SeaweedFS](/template-catalog/templates/seaweedfs).
+`none` is rejected at render: the coordinator reaches itself through this same path, so it would fail every query. The worker tier always keeps its own firewall — only the coordinator and sibling workers may reach a worker, whatever you set here. Allow several minutes after changing an access setting before concluding it did not apply.
 
-### Authentication
+## Connecting
 
-`auth.enabled` turns on Trino's file-based password authentication on the coordinator and the shared secret that nodes use to authenticate to each other. It requires `publicAccess.enabled`, and both secret names are required when it is on.
+| What | Address | Notes |
+|---|---|---|
+| Web UI / JDBC / REST (public) | `status.canonicalEndpoint` of `RELEASE_NAME-trino` | `cpln workload get RELEASE_NAME-trino --gvc GVC_NAME -o yaml`; reachable while `publicAccess.enabled` is `true`. The Web UI is at `/ui/` |
+| JDBC / clients (internal) | `jdbc:trino://RELEASE_NAME-trino.GVC_NAME.cpln.local:8080/tpch/tiny` | Plain HTTP, reachable per `internalAccess.type`; usable only while `auth.enabled` is `false` |
+| REST API | `POST /v1/statement` on either address | The protocol the Trino CLI and drivers use |
+| Credentials | A user from your password file | `cpln secret reveal PASSWORD_FILE_SECRET_NAME -o yaml` shows only the bcrypt hash — keep the plain passwords elsewhere. No credentials while `auth.enabled` is `false` |
+| Built-in catalogs | `tpch`, `tpcds`, `memory`, `jmx`, `system` | Queryable on a default install |
 
-Create both [opaque secrets](/guides/create-secret/opaque) before installing:
+Verify the cluster from inside the coordinator — the image ships the Trino CLI:
 
 ```bash
-# password file — bcrypt, cost >= 8, one user per line
-htpasswd -B -C 10 -n alice | cpln secret create-opaque \
-  --name my-trino-passwords --encoding plain -f -
-
-# internal shared secret — a random string used by every node
-printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque \
-  --name my-trino-shared-secret --encoding plain -f -
+cpln workload exec RELEASE_NAME-trino --gvc GVC_NAME --container trino -- trino --execute "SELECT count(*) FROM tpch.tiny.nation"
 ```
 
-<Warning>
-`auth.enabled` requires `publicAccess.enabled`, and the chart enforces both directions. Trino's **server** refuses password authentication over plain HTTP, so an internal-only cluster with authentication on cannot be queried by anyone — in-GVC clients get `401 Password not allowed for insecure authentication`. Either enable public access (TLS terminates at the Control Plane edge) or leave authentication off and let the internal firewall be the boundary. Public access without authentication is rejected too: an unauthenticated Trino on the internet is a read primitive over every connected data source.
-</Warning>
+On a default internal-only install, open the Web UI through a tunnel and browse to `http://localhost:8080/ui/`; with no authentication configured, Trino asks only for a user name:
 
-### Access
+```bash
+cpln port-forward RELEASE_NAME-trino 8080:8080 --gvc GVC_NAME
+```
 
-- `publicAccess.enabled` — Serve the Web UI and the JDBC/REST endpoint on the automatic `*.cpln.app` HTTPS endpoint. Requires `auth.enabled`. When off, external requests are blocked at the edge even though the workload still has a canonical endpoint.
-- `internalAccess.type` — Which workloads inside Control Plane may reach the coordinator:
+The tunnel to this template has not been exercised in a test install. Once authentication is on, use the public endpoint instead: Trino refuses password logins over the plain-HTTP tunnel and the internal address alike.
 
-| Type | Description |
-|---|---|
-| `same-gvc` | Allow access from all workloads in the same GVC (default). |
-| `same-org` | Allow access from all workloads in the same organization. |
-| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads`. The chart automatically adds the coordinator itself and its worker workload, so you only list your clients. |
+### Connecting Data Sources
 
-<Warning>
-`none` is rejected by the chart. The coordinator addresses itself by service DNS, so its own task and status calls travel through this internal firewall — with `none` every query fails with `403 RBAC: access denied`, even at `workers.replicas: 0`.
-</Warning>
+Point a catalog at any database Trino can reach. A sibling template in the same GVC is reachable at its fully qualified internal name, `WORKLOAD_NAME.GVC_NAME.cpln.local`:
 
-The worker tier keeps its own least-privilege firewall regardless of this setting: only the coordinator and sibling workers may reach it.
-
-## Connecting Data Sources
-
-Point a catalog at any database Trino can reach. Templates deployed in the same GVC are reachable at `{workload-name}.{gvc}.cpln.local`. Credentials always come from a secret you create first and are referenced with Trino's `${ENV:NAME}` substitution, so no password is written into values or into any rendered file — the mounted catalog file contains only the placeholder.
-
-<Steps>
-  <Step title="Create the credential secret">
-    Use an [opaque secret](/guides/create-secret/opaque) for a single credential, or a [dictionary secret](/guides/create-secret/dictionary) when one secret holds several values:
-
-    ```bash
-    # one credential — referenced without secretKey
-    printf '%s' 'the-password' | cpln secret create-opaque \
-      --name my-postgres-credentials --encoding plain -f -
-
-    # several values — referenced with secretKey
-    cpln secret create-dictionary --name my-mysql-credentials --entry password=the-password
-    ```
-  </Step>
-  <Step title="Add the catalog to your values">
-    Reference the secret by name and inject it as an environment variable:
-
-    ```yaml
-    catalogs:
-      - name: pg # queried as pg.<schema>.<table>
-        properties: |
-          connector.name=postgresql
-          connection-url=jdbc:postgresql://my-postgres.my-gvc.cpln.local:5432/postgres
-          connection-user=postgres
-          connection-password=${ENV:PG_PASSWORD}
-        secrets:
-          - env: PG_PASSWORD
-            secretName: my-postgres-credentials # must exist BEFORE install
-            secretKey: password # omit for an opaque secret (uses its payload)
-    ```
-  </Step>
-  <Step title="Query it">
-    The catalog appears in `SHOW CATALOGS` once the cluster restarts with the new values.
-  </Step>
-</Steps>
-
-### Catalog Examples
-
-Worked entries for the sibling database templates:
+| Template | Workload to point at | Port | Credential in its secret |
+|---|---|---|---|
+| [postgres](/template-catalog/templates/postgres) | its release name followed by `-postgres` | `5432` | `password` key |
+| [mysql](/template-catalog/templates/mysql) | its release name followed by `-mysql` | `3306` | `password` key |
+| [mariadb](/template-catalog/templates/mariadb) | its release name followed by `-maria` | `3306` | `password` key |
+| [clickhouse](/template-catalog/templates/clickhouse) | its release name followed by `-clickhouse-server` | `8123` (HTTP interface) | `password` key |
+| [mongodb](/template-catalog/templates/mongodb) | its release name followed by `-mongo` | `27017` | the whole connection URL, in a secret of its own |
 
 ```yaml
 catalogs:
-  # postgres / postgres-highly-available / timescaledb / cockroach / postgis
+  # postgres / postgres-highly-available / timescaledb / postgis
   - name: pg
     properties: |
       connector.name=postgresql
-      connection-url=jdbc:postgresql://my-postgres.my-gvc.cpln.local:5432/postgres
+      connection-url=jdbc:postgresql://WORKLOAD_NAME.GVC_NAME.cpln.local:5432/postgres
       connection-user=postgres
       connection-password=${ENV:PG_PASSWORD}
     secrets:
       - env: PG_PASSWORD
-        secretName: my-postgres-credentials
+        secretName: PG_CREDENTIALS_SECRET_NAME
+        secretKey: password # omit for an opaque secret
 
   # mysql / mariadb / tidb — no database name in the URL
   - name: mysql
     properties: |
       connector.name=mysql
-      connection-url=jdbc:mysql://my-mysql.my-gvc.cpln.local:3306
+      connection-url=jdbc:mysql://WORKLOAD_NAME.GVC_NAME.cpln.local:3306
       connection-user=root
       connection-password=${ENV:MYSQL_PASSWORD}
     secrets:
       - env: MYSQL_PASSWORD
-        secretName: my-mysql-credentials
+        secretName: MYSQL_CREDENTIALS_SECRET_NAME
         secretKey: password
 
   # clickhouse — HTTP interface on 8123
   - name: clickhouse
     properties: |
       connector.name=clickhouse
-      connection-url=jdbc:clickhouse://my-clickhouse.my-gvc.cpln.local:8123/
+      connection-url=jdbc:clickhouse://WORKLOAD_NAME.GVC_NAME.cpln.local:8123/
       connection-user=default
       connection-password=${ENV:CLICKHOUSE_PASSWORD}
     secrets:
       - env: CLICKHOUSE_PASSWORD
-        secretName: my-clickhouse-credentials
+        secretName: CLICKHOUSE_CREDENTIALS_SECRET_NAME
+        secretKey: password
 
-  # mongodb — credentials live inside the URL, so the whole URL is the secret
+  # mongodb — credentials live inside the URL, so the whole URL is the secret (opaque)
   - name: mongo
     properties: |
       connector.name=mongodb
       mongodb.connection-url=${ENV:MONGO_URL}
     secrets:
       - env: MONGO_URL
-        secretName: my-mongo-url
+        secretName: MONGO_URL_SECRET_NAME
 ```
 
-The matching templates are [postgres](/template-catalog/templates/postgres), [postgres-highly-available](/template-catalog/templates/postgres-highly-available), [mysql](/template-catalog/templates/mysql), [mariadb](/template-catalog/templates/mariadb), [clickhouse](/template-catalog/templates/clickhouse) and [mongodb](/template-catalog/templates/mongodb).
-
-### Querying Across Catalogs
-
-With several catalogs configured, one statement spans all of them — including the built-in `tpch` data — and Trino performs the join itself:
+Use the user name your database template was installed with in `connection-user`. With several catalogs configured, one statement spans all of them — including the built-in `tpch` data — and Trino performs the join itself:
 
 ```sql
-SELECT c.name AS customer, c.tier, n.name AS nation, count(*) AS orders, sum(o.amount) AS total
+SELECT c.name, count(*) AS orders
 FROM pg.public.orders o
-JOIN mysql.demo.customers c ON o.customer_id = c.customer_id
-JOIN tpch.tiny.nation n ON o.nation_key = n.nationkey
-GROUP BY c.name, c.tier, n.name
-ORDER BY total DESC;
+JOIN mysql.shop.customers c ON c.id = o.customer_id
+GROUP BY c.name;
 ```
 
-Trino reads from each source at query time; nothing is copied and nothing is written back.
+**Iceberg tables in object storage** need a REST catalog, which this template does not bundle. Deploy the [Polaris](/template-catalog/templates/polaris) template against your bucket and add the `iceberg` catalog entry its page gives — Trino then creates, writes and queries Iceberg tables there. Hive and Delta Lake catalogs are not offered.
 
-## Connecting
+## Operations
 
-| What | Value |
-|---|---|
-| Web UI / JDBC (public) | `https://<canonical>.cpln.app` — `status.canonicalEndpoint` of `{release}-trino`. Available when `publicAccess.enabled`. |
-| JDBC / clients (internal) | `jdbc:trino://{release}-trino.{gvc}.cpln.local:8080/<catalog>/<schema>` |
-| REST API | `POST /v1/statement` on the same host |
-| CLI inside the cluster | `cpln workload exec {release}-trino --container trino -- trino --execute "SELECT 1"` |
-| Credentials | A user from your password file when `auth.enabled`; none when it is off |
-| Built-in catalogs | `tpch`, `tpcds`, `memory`, `jmx`, `system` |
+### Adding or Changing a Catalog
 
-With authentication on, the Web UI login form is served at `/ui/legacy/login.html` on the public endpoint.
+Add the entry to your values and upgrade the release; create any secret it references first. Adding or removing a catalog changes both workloads, so they restart and the new catalog appears in `SHOW CATALOGS`:
 
-## Availability
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/trino \
+  --version 1.0.0 --gvc GVC_NAME \
+  --values values.yaml
+```
 
-Trino has no fault-tolerant execution in this template: a query running on a node that goes away fails and must be retried. Measured on a 3-worker cluster:
+Editing the `properties` of an existing catalog changes only the content of its catalog secret, which a running replica does not re-read. After the upgrade, force a redeployment of both workloads:
 
-| Event | Impact |
-|---|---|
-| Worker-tier rolling restart (`replicas: 3`) | 3 of 80 queries failed, all inside the ~3 minute rollout window; every query after convergence succeeded. |
-| Worker replica lost | 0 of 90 queries failed. The replacement replica joined after ~40 s and the dead node was evicted from `system.runtime.nodes` after ~115 s. |
-| Coordinator restart | ~6 seconds of `503` responses and one in-flight query lost (`Query is gone (server restarted?)`). |
+```bash
+cpln workload force-redeployment RELEASE_NAME-trino --gvc GVC_NAME
+cpln workload force-redeployment RELEASE_NAME-trino-worker --gvc GVC_NAME
+```
 
-The coordinator is the single point of failure — open-source Trino has no coordinator failover, and this template does not claim otherwise. Workers are interchangeable, so `workers.replicas` is the knob for both capacity and restart tolerance. At the default `workers.replicas: 1` a rolling restart empties the execution tier entirely, so every query in flight fails for the duration.
+### Rotating a Catalog Credential
+
+Change the value by applying the whole secret — `cpln secret update` does not change values. For a dictionary secret:
+
+```bash
+cat > rotate.yaml <<'EOF'
+kind: secret
+name: SECRET_NAME
+type: dictionary
+data:
+  password: NEW-PASSWORD
+EOF
+cpln apply -f rotate.yaml
+cpln secret reveal SECRET_NAME -o yaml
+```
+
+Keep every key the secret already has — the applied secret replaces its data. For an opaque secret use `type: opaque` with `data.encoding: plain` and `data.payload: NEW-VALUE`. A running replica keeps the old value until it restarts, so force a redeployment of `RELEASE_NAME-trino` and `RELEASE_NAME-trino-worker` as shown above. The same applies to the two login secrets.
+
+### Scaling and Availability
+
+- **Workers** are interchangeable: raise `workers.replicas` for capacity, and keep it at `2` or more if queries must keep running through a rolling restart. At the default of `1`, a worker restart empties the execution tier for its duration.
+- **The coordinator** is a single point of failure — open-source Trino has one coordinator and no failover. Restarting it briefly interrupts all querying.
+- **Queries are not retried.** A query running on a node that restarts or is replaced fails and must be resubmitted by the client.
+- **Single node** — `workers.replicas: 0` removes the worker workload and the coordinator executes queries itself. Suitable for small or development installs.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Deployment never becomes ready and the logs are empty">
+    **Cause:** A catalog or login secret the workload references does not exist, so the container never starts.
+
+    **Fix:** Read `status.versions[].message` with `cpln workload get-deployments RELEASE_NAME-trino --gvc GVC_NAME -o yaml` (and for `RELEASE_NAME-trino-worker`) — it names the missing secret. Create it; the deployment recovers on its own after several minutes, or force a redeployment.
+  </Accordion>
+  <Accordion title="Install fails with auth.enabled requires publicAccess.enabled">
+    **Cause:** The chart only renders authentication and public access together. The mirror message, `publicAccess.enabled requires auth.enabled`, means the opposite half is missing.
+
+    **Fix:** Set both `auth.enabled` and `publicAccess.enabled` to `true` with both login secret names, or leave both off.
+  </Accordion>
+  <Accordion title="Clients get 401 Password not allowed for insecure authentication">
+    **Cause:** Authentication is on and the client connected over plain HTTP — the internal address or a port-forward tunnel. Trino accepts password logins only over HTTPS.
+
+    **Fix:** Connect through the public canonical endpoint over HTTPS. For the JDBC driver that means port `443` with `SSL=true`.
+  </Accordion>
+  <Accordion title="An internal client gets 403 RBAC access denied">
+    **Cause:** The client is outside the scope `internalAccess.type` allows — for example not listed under `workload-list`, or in another GVC under `same-gvc`.
+
+    **Fix:** Add the client's workload link to `internalAccess.workloads`, or widen `internalAccess.type`, and upgrade. Allow several minutes for the change to apply.
+  </Accordion>
+  <Accordion title="A catalog password does not work">
+    **Cause:** `secrets[].secretKey` does not match a key in the dictionary secret, a dictionary secret is referenced without `secretKey`, or the secret was rotated without a redeployment.
+
+    **Fix:** Compare the key names with `cpln secret reveal SECRET_NAME -o yaml`, correct the catalog entry, and force a redeployment of both workloads.
+  </Accordion>
+  <Accordion title="Coordinator restarts after adding a catalog">
+    **Cause:** Trino refuses to start on a catalog property it does not recognise, reporting `Configuration property 'NAME' was not used`.
+
+    **Fix:** Find the property in the coordinator logs, then correct the `properties` block against the connector's documentation page:
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-trino"} |= "ERROR"' --limit 50 --since 10m
+    ```
+  </Accordion>
+  <Accordion title="Queries fail with out-of-memory errors">
+    **Cause:** Each query gets 30% of a node's heap, and the heap is `jvm.maxRAMPercentage` of `maxMemory`.
+
+    **Fix:** Raise `maxMemory` on the tier doing the work first, then add workers. Raising `jvm.maxRAMPercentage` above about 75 makes it worse — the JVM needs the remainder outside the heap.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Every catalog credential secret must exist before installing** — a missing secret leaves the deployment waiting and the cluster never becomes ready.
-- **Rotating a secret's payload does not take effect until the workloads are redeployed.** Control Plane resolves secret-backed environment variables at deployment time, so run a Helm upgrade after changing a credential.
-- **`auth.enabled` requires `publicAccess.enabled`, and public access requires authentication** — the chart rejects either one on its own at render time.
-- **`internalAccess.type: none` is rejected** — the coordinator must be able to reach itself over the internal path.
-- **Trino is read-oriented here** — it queries the databases you connect; the template never installs or modifies them, and uninstalling removes only the cluster. Your own credential secrets are left in place.
-- **Keep the GVC single-location** — coordinator-to-worker traffic is per-query and latency-sensitive.
+- Authentication and public access are enabled together or not at all; with authentication on, every client signs in over the public HTTPS endpoint.
+- Never put a password in a catalog's `properties` — reference it as `${ENV:NAME}` from a secret you created before installing.
+- A rotated secret or an edited catalog takes effect only after a forced redeployment of both workloads.
+- The coordinator is a single point of failure and in-flight queries are not retried; keep `workers.replicas` at `2` or more for restart tolerance.
+- The built-in `jmx` catalog exposes JVM internals to anyone who can run a query.
+- Uninstalling removes only the cluster — the databases it queried and the secrets you created are left in place.
 
 ## External References
 
@@ -338,9 +428,6 @@ The coordinator is the single point of failure — open-source Trino has no coor
     <Card title="Connectors" icon="plug" href="https://trino.io/docs/current/connector.html">
     Every available connector and its properties
     </Card>
-    <Card title="SQL Reference" icon="database" href="https://trino.io/docs/current/sql.html">
-    Trino SQL statement and syntax reference
-    </Card>
     <Card title="JDBC Driver" icon="code" href="https://trino.io/docs/current/client/jdbc.html">
     Connect BI tools and applications over JDBC
     </Card>
@@ -349,8 +436,5 @@ The coordinator is the single point of failure — open-source Trino has no coor
     </Card>
     <Card title="Secrets in Properties Files" icon="key" href="https://trino.io/docs/current/security/secrets.html">
     The `${ENV:NAME}` substitution used by catalog credentials
-    </Card>
-    <Card title="Trino Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/trino">
-    View the source files, default values, and chart definition
     </Card>
 </CardGroup>
