@@ -1,30 +1,48 @@
 ---
 title: 'Elasticsearch'
 icon: /template-catalog/templates/icons/elasticsearch.png
-description: 'Deploy an Elasticsearch 8.17 cluster on Control Plane using the Template Catalog. Covers Kibana, cluster and resource settings, scaling, and SLM snapshot backups to AWS S3 or GCS, with restore scenarios.'
-keywords: ['lucene', 'full-text search', 'indices', 'shards', 'master election', 'snapshot lifecycle management', 'disaster recovery', 'search engine', 'analytics', 'elastic', 'stateful workload', 'volume set']
+description: 'Deploy an Elasticsearch 8.17 cluster with optional Kibana on Control Plane. A three-node stateful cluster by default (replica count must be odd), no authentication, with optional SLM snapshot backups to AWS S3 or GCS. Deploys into an existing GVC; a default install has no prerequisites.'
+keywords: ['lucene', 'full-text search', 'indices', 'shards', 'master election', 'snapshot lifecycle management', 'disaster recovery', 'search engine', 'analytics', 'elastic stack', 'stateful workload', 'volume set', 'opensearch alternative', 'quartz cron']
 ---
 
 ## Overview
 
-Elasticsearch is a distributed search and analytics engine built on Apache Lucene. This template deploys a production-ready Elasticsearch 8.17.0 cluster with automatic master election, optional Kibana for visualization and management, and automated snapshot backups to AWS S3 or GCS via Elasticsearch's built-in Snapshot Lifecycle Management (SLM).
+Elasticsearch is a distributed search and analytics engine built on Apache Lucene. This template deploys an Elasticsearch 8.17.0 cluster whose nodes discover each other and elect a master automatically, an optional Kibana workload for querying data and managing indices, and optional incremental snapshot backups to AWS S3 or GCS driven by Elasticsearch's built-in Snapshot Lifecycle Management (SLM).
+
+The cluster runs with X-Pack security disabled: there is no username, password or TLS anywhere in the template, and the only access control is the `internal_access` setting on each workload.
 
 <Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
+**This template deploys into an existing [GVC](/reference/gvc) that you already have.** It does not create or manage a GVC. Every resource lands in the GVC you name at install time, so `cpln workload exec`, `cpln logs` and `cpln helm uninstall` all run against that GVC, and uninstalling the release never deletes it.
 </Note>
 
 ### What Gets Created
 
-- **Stateful Elasticsearch Workload** — A multi-node Elasticsearch cluster. Each replica gets its own persistent volume so index data and shards survive restarts.
-- **Volume Set** — One persistent volume per replica for Elasticsearch data.
-- **Standard Kibana Workload** *(optional, enabled by default)* — The Elasticsearch web UI for querying data, managing indices, and monitoring cluster health.
-- **Standard Backup Setup Workload** *(optional)* — A one-time job that waits for the cluster to be healthy, registers the snapshot repository with Elasticsearch, and creates the SLM policy. Runs once and can be removed after initial setup.
-- **Identity & Policy** — An identity bound to the workloads with `reveal` access to the configuration secrets, and cloud storage access when backup is enabled.
-- **Secrets** — Configuration secrets for Elasticsearch and Kibana credentials and cluster settings.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-elasticsearch` | Elasticsearch nodes (stateful, `replicas` replicas, HTTP on 9200, transport on 9300) | — |
+| Workload | `RELEASE_NAME-kibana` | Kibana web UI (standard, 1 replica, port 5601) | `kibana.enabled: true` (default) |
+| Workload | `RELEASE_NAME-backup-setup` | Setup job that registers the snapshot repository and the SLM policy | `backup.enabled: true` |
+| Volume Set | `RELEASE_NAME-elasticsearch-vs` | One ext4 data volume per node, with 7-day volume snapshots and a final snapshot on deletion | — |
+| Secret | `RELEASE_NAME-elasticsearch-startup` | Node startup script that writes `elasticsearch.yml` | — |
+| Identity | `RELEASE_NAME-elasticsearch-identity` | Bound to every workload; carries the cloud account binding when backups are enabled | — |
+| Policy | `RELEASE_NAME-elasticsearch-policy` | Grants the identity `reveal` on the startup secret | — |
 
 ## Prerequisites
 
-This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
+None for a default install.
+
+Backups are optional and need a bucket and a Control Plane [cloud account](/guides/create-cloud-account) (plus an IAM policy on AWS) before they can be enabled. The per-provider steps are under [Backing Up](#backing-up).
+
+## Installation
+
+A default install needs no `--set` values:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/elasticsearch \
+  --version 1.0.1 --gvc GVC_NAME
+```
+
+To install with a different method, follow the instructions for your preferred tool:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -50,40 +68,75 @@ This template has no external prerequisites unless backup is enabled. To install
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Cluster
 
 ```yaml
 image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
 
-replicas: 3 # Must be odd for master quorum (3, 5, 7, ...)
+replicas: 3 # Must be odd for master quorum
 
 clusterName: my-elasticsearch-cluster
 
-# JVM heap size per node — set to ~50% of maxMemory, hard cap at 30g
+# JVM heap size for each node - set to ~50% of maxMemory, hard cap at 30g
 jvmHeap: 3g
+```
 
+Elasticsearch requires an odd number of master-eligible nodes to hold a quorum; the template refuses to render an even `replicas` value. Three nodes survive the loss of one. `jvmHeap` is not derived from `resources` — if you raise `resources.maxMemory`, decide separately whether to raise the heap, and keep it at roughly half the memory limit so the rest is available to the filesystem cache.
+
+### Resources
+
+```yaml
 resources:
   minCpu: 1
   minMemory: 2Gi
   maxCpu: 2
   maxMemory: 6Gi
+```
 
+### Volume Set
+
+```yaml
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
   autoscaling:
-    enabled: false
-    maxCapacity: 100
-    minFreePercentage: 10
-    scalingFactor: 1.2
+    enabled: false # Set to true to enable autoscaling
+    maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
+    minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
+    scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
+```
 
+Each node gets its own volume of `volumeset.capacity` GiB. With autoscaling enabled, a volume grows by `scalingFactor` whenever its free space drops below `minFreePercentage`, up to `maxCapacity`.
+
+### Multi-Zone
+
+```yaml
 multiZone:
-  enabled: false # Set to true to schedule replicas across availability zones
+  enabled: false # Set to true to schedule replicas across availability zones for higher durability
+```
 
+When enabled, replicas are spread across availability zones within each location, so losing one zone leaves the remaining nodes holding quorum. Confirm the location you deploy to supports multiple availability zones before enabling it.
+
+### Internal Access
+
+```yaml
 internal_access:
   type: same-gvc # options: same-gvc, same-org, workload-list
-  workloads:
+  workloads: # Note: can only be used if type is same-gvc or workload-list
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
+| Type | Who can reach Elasticsearch |
+|---|---|
+| `same-gvc` | Every workload in the same GVC (default) |
+| `same-org` | Every workload in the org |
+| `workload-list` | Only the workloads listed under `workloads` |
+
+Because the cluster has no authentication, this is the only thing standing between a workload and full admin access to every index. With `workload-list`, remember to list the template's own consumers: `//gvc/GVC_NAME/workload/RELEASE_NAME-kibana` when Kibana is enabled, and `//gvc/GVC_NAME/workload/RELEASE_NAME-backup-setup` when backups are enabled — both reach Elasticsearch over this port.
+
+### Kibana
+
+```yaml
 kibana:
   enabled: true
   image: docker.elastic.co/kibana/kibana:8.17.0
@@ -92,112 +145,91 @@ kibana:
     memory: 2Gi
   internal_access:
     type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads:
+    workloads: # Note: can only be used if type is same-gvc or workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
+Kibana connects to `RELEASE_NAME-elasticsearch.GVC_NAME.cpln.local:9200` and has its own `kibana.internal_access` block with the same three options as Elasticsearch.
+
+### Backup
+
+```yaml
 backup:
   enabled: false
-  remove_setup_workload: false # Set to true after setup completes to reduce resource usage
+  remove_setup_workload: false # Set to true after backup setup is no longer needed to reduce resource usage
 
-  provider: aws # options: aws or gcp
+  # Cloud provider: aws or gcp
+  provider: aws
 
   # Snapshot schedule in Quartz cron format (6 fields: seconds minutes hours day-of-month month day-of-week)
+  # e.g. "0 0 2 * * ?" = daily at 2am UTC. Note: ES SLM requires Quartz format, not standard 5-field cron.
   schedule: "0 0 2 * * ?"
 
+  # Snapshot retention
   retention:
     maxAge: 30d   # Delete snapshots older than this
     maxCount: 30  # Keep at most this many snapshots
 
+  # AWS S3 Configuration
   aws:
-    bucket: my-s3-bucket
-    region: us-east-1
-    prefix: elasticsearch-snapshots
-    cloudAccountName: my-cloud-account
-    policyName: my-backup-policy
+    bucket: my-s3-bucket               # S3 bucket name (required if provider=aws)
+    region: us-east-1                  # S3 bucket region (required if provider=aws)
+    prefix: elasticsearch-snapshots    # Path prefix in bucket
+    cloudAccountName: my-cloud-account # Control Plane Cloud Account name (required)
+    policyName: my-backup-policy       # AWS IAM custom policy name (required)
 
+  # GCP GCS Configuration
   gcp:
-    bucket: my-gcs-bucket
-    prefix: elasticsearch-snapshots
-    cloudAccountName: my-cloud-account
+    bucket: my-gcs-bucket              # GCS bucket name (required if provider=gcp)
+    prefix: elasticsearch-snapshots    # Path prefix in bucket
+    cloudAccountName: my-cloud-account # Control Plane Cloud Account name (required)
 ```
 
-### Cluster Settings
+The bucket, cloud account and (on AWS) IAM policy must exist before you enable backups — see [Backing Up](#backing-up) for the per-provider steps and what the setup job does.
 
-- `replicas` — Number of Elasticsearch nodes. **Must be an odd number** (3, 5, 7) to maintain a valid master election quorum.
-- `clusterName` — The Elasticsearch cluster name. Used internally by nodes to discover each other.
-- `jvmHeap` — JVM heap size per node. Set to approximately 50% of `maxMemory`. Hard cap at `30g`.
+## Connecting
 
-<Note>
-A minimum of 3 replicas is required for master quorum. With 3 nodes, the cluster can survive the loss of 1 node. Always use an odd number — an even number of nodes does not improve fault tolerance and can cause split-brain scenarios.
-</Note>
+Both workloads are reachable only from inside the GVC by default; external inbound traffic is closed and there is no public endpoint. Use `cpln port-forward` to reach either from your machine.
 
-### Resources and Storage
+| What | Address | Notes |
+|---|---|---|
+| Elasticsearch REST API (same GVC) | `http://RELEASE_NAME-elasticsearch.GVC_NAME.cpln.local:9200` | Plain HTTP, no credentials |
+| Elasticsearch transport | `RELEASE_NAME-elasticsearch.GVC_NAME.cpln.local:9300` | Node-to-node traffic only |
+| Kibana (same GVC) | `http://RELEASE_NAME-kibana.GVC_NAME.cpln.local:5601` | When `kibana.enabled: true` |
+| Public endpoint | None | Reach the UI and API with `cpln port-forward` |
+| Credentials | None | X-Pack security is disabled; `internal_access` is the only access control |
 
-- `resources.minCpu` / `resources.minMemory` — Guaranteed minimum CPU and memory per node.
-- `resources.maxCpu` / `resources.maxMemory` — Maximum CPU and memory per node.
-- `volumeset.capacity` — Initial volume size in GiB per node (minimum 10).
-- `volumeset.autoscaling.enabled` — Automatically expand volumes as data grows.
-- `volumeset.autoscaling.maxCapacity` — Maximum volume size in GiB.
-- `volumeset.autoscaling.minFreePercentage` — Triggers a scale-up when free space falls below this percentage.
-- `volumeset.autoscaling.scalingFactor` — Multiplier applied to current capacity on each scale-up.
+Always use the fully qualified hostname; the bare workload name is not reliably resolvable.
 
-### Multi-Zone
+Check cluster health from inside an Elasticsearch container:
 
-When `multiZone.enabled: true`, Control Plane spreads Elasticsearch replicas across availability zones within the location. This improves durability — if a zone goes down, remaining nodes in other zones maintain quorum.
-
-Verify your selected location supports multiple availability zones before enabling.
-
-### Internal Access
-
-Controls which workloads can reach Elasticsearch and Kibana. Both have independent `internal_access` settings.
-
-| Type | Description |
-|------|-------------|
-| `same-gvc` | Allow access from all workloads in the same GVC (recommended) |
-| `same-org` | Allow access from all workloads in the org |
-| `workload-list` | Allow access only from specific workloads listed in `workloads` |
-
-### Kibana
-
-Kibana is enabled by default and provides a web UI for exploring data, managing indices, building dashboards, and monitoring cluster health.
-
-- `kibana.enabled` — Deploy the Kibana workload.
-- `kibana.resources.cpu` / `kibana.resources.memory` — CPU and memory for the Kibana container.
-- `kibana.internal_access` — Controls which workloads can reach Kibana (same options as `internal_access`).
-
-### Connecting
-
-Both Elasticsearch and Kibana are accessible internally from within the same GVC. External access is blocked by default — use `cpln port-forward` to reach them from your local machine.
-
-| Service | Internal hostname | Port |
-|---------|-----------------|------|
-| Elasticsearch | `{release-name}-elasticsearch.{gvc-name}.cpln.local` | `9200` |
-| Kibana | `{release-name}-kibana.{gvc-name}.cpln.local` | `5601` |
-
-**Port-forward to Kibana:**
 ```bash
-cpln port-forward RELEASE_NAME-kibana 5601 --gvc GVC_NAME
-# Then open http://localhost:5601 in your browser
+cpln workload exec RELEASE_NAME-elasticsearch --gvc GVC_NAME --container elasticsearch -- curl -s 'http://localhost:9200/_cluster/health?pretty'
 ```
 
-**Port-forward to Elasticsearch:**
+Open Kibana or the REST API in a browser or local client:
+
 ```bash
-cpln port-forward RELEASE_NAME-elasticsearch 9200 --gvc GVC_NAME
+cpln port-forward RELEASE_NAME-kibana 5601:5601 --gvc GVC_NAME
+# then open http://localhost:5601
+
+cpln port-forward RELEASE_NAME-elasticsearch 9200:9200 --gvc GVC_NAME
+# then curl http://localhost:9200
 ```
 
-### Scaling
+## Operations
 
-**Scaling up** — Increase `replicas` to the next odd number and run `cpln helm upgrade`. New nodes join the cluster automatically and Elasticsearch begins rebalancing shards.
+### Backing Up
 
-<Warning>
-**Scale down is destructive.** Elasticsearch does not automatically move shards off nodes that are about to be removed. Always take a manual snapshot before scaling down, and verify shard allocation with `GET /_cat/shards?v` before removing nodes to ensure no primary shards are stranded on the nodes being removed.
-</Warning>
+Backups are **incremental Elasticsearch snapshots** written straight to S3 or GCS by the `repository-s3` and `repository-gcs` modules bundled in the official image — no separate backup image runs. Snapshot Lifecycle Management (SLM) takes them on `backup.schedule` and prunes them by `backup.retention`.
 
-## Backup
+When `backup.enabled: true`, the template adds the `RELEASE_NAME-backup-setup` workload. It waits for the cluster to answer `/_cluster/health`, registers the snapshot repository as `backup-repo`, verifies the repository can reach the bucket, and creates an SLM policy named `automated-snapshots` that snapshots every index except Elasticsearch's internal and history indices with `include_global_state: false`. The job is idempotent, so it is safe for it to run more than once. Watch it finish:
 
-Elasticsearch backups are **incremental snapshots** stored directly in S3 or GCS via the built-in repository-s3 and repository-gcs plugins — no separate backup image is required. The Snapshot Lifecycle Management (SLM) feature handles scheduling and retention automatically.
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-backup-setup"}' --limit 50 --since 10m
+```
 
-When backup is enabled, a one-time **Backup Setup Workload** runs at install time. It waits for the cluster to be healthy, then calls the Elasticsearch API to register the snapshot repository and create the SLM policy. Once it completes successfully, it can be removed to save resources:
+Once the logs show `Backup Configuration Complete!`, remove the job to free its resources:
 
 ```yaml
 backup:
@@ -206,20 +238,24 @@ backup:
 ```
 
 <Note>
-The backup schedule uses **Quartz cron format** with 6 fields (seconds, minutes, hours, day-of-month, month, day-of-week) — not the standard 5-field cron format. For example, `"0 0 2 * * ?"` runs daily at 2am UTC.
+`backup.schedule` uses **Quartz cron format** with 6 fields (seconds, minutes, hours, day-of-month, month, day-of-week), not the 5-field cron most schedulers use. `"0 0 2 * * ?"` runs daily at 02:00 UTC; the `?` is required in day-of-week when day-of-month is set.
 </Note>
 
-### AWS S3 Prerequisites
-
-1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
-3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
-
 <Warning>
-**Version 1.0.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
-
-**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
+Enabling backups on a cluster that is already running can take several minutes to settle. The setup job fails and restarts until every Elasticsearch node can reach the bucket, logging `ERROR: Failed to register repository` in the meantime. Keep watching its logs rather than reading the first error as a misconfiguration.
 </Warning>
+
+#### AWS S3
+
+<Steps>
+  <Step title="Create the bucket">
+    Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+  </Step>
+  <Step title="Create or pick a cloud account">
+    If you do not have one, [create a cloud account](/guides/create-cloud-account) for your AWS account. Set `backup.aws.cloudAccountName` to its name.
+  </Step>
+  <Step title="Create a bucket-scoped IAM policy">
+    Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`. Both resource ARNs are required: `s3:ListBucket` and `s3:GetBucketLocation` authorize against the bucket itself, the rest against its objects.
 
 ```json
 {
@@ -248,44 +284,55 @@ The backup schedule uses **Quartz cron format** with 6 fields (seconds, minutes,
 }
 ```
 
-4. Set `backup.aws.policyName` to the name of the policy created in step 3.
+    Set `backup.aws.policyName` to the policy's name. The template attaches it, together with the platform's `cpln-connector` policy, to the release identity.
+  </Step>
+</Steps>
 
-### GCS Prerequisites
+#### GCS
 
-1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
-3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
+<Steps>
+  <Step title="Create the bucket">
+    Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+  </Step>
+  <Step title="Create or pick a cloud account">
+    If you do not have one, [create a cloud account](/guides/create-cloud-account) for your GCP project. Set `backup.gcp.cloudAccountName` to its name.
+  </Step>
+  <Step title="Grant storage access">
+    Add the **Storage Admin** role to the GCP service account associated with the cloud account. The template additionally binds `roles/storage.objectAdmin` on the bucket to the release identity.
+  </Step>
+</Steps>
 
-### Manual Snapshots
+#### Manual Snapshots
 
-Exec into any Elasticsearch container to trigger a snapshot immediately or inspect status:
+With a port-forward to Elasticsearch open (`cpln port-forward RELEASE_NAME-elasticsearch 9200:9200 --gvc GVC_NAME`), you can trigger a snapshot or inspect the repository directly:
 
 ```bash
-# Trigger a snapshot now via SLM
+# Take a snapshot now using the SLM policy
 curl -X PUT 'http://localhost:9200/_slm/policy/automated-snapshots/_execute'
 
-# List all snapshots in the repository
+# List every snapshot in the repository
 curl 'http://localhost:9200/_snapshot/backup-repo/_all?pretty'
 
-# Check a snapshot currently in progress
+# Show snapshots currently in progress
 curl 'http://localhost:9200/_snapshot/backup-repo/_current?pretty'
 
-# View the SLM policy and last execution result
+# Show the SLM policy and its last run
 curl 'http://localhost:9200/_slm/policy/automated-snapshots?pretty'
 ```
 
-## Restoring a Snapshot
+### Restoring a Backup
 
-Exec into any Elasticsearch node in the cluster to run restore commands. The snapshot repository (`backup-repo`) is already registered.
+<Note>
+The commands below follow the upstream Elasticsearch snapshot and restore API and use the repository name this template registers (`backup-repo`). They have **not** been exercised end to end against this template. Rehearse a restore on a non-production release before you depend on it.
+</Note>
 
-**List available snapshots:**
+All restores run through the REST API. Open a port-forward first (`cpln port-forward RELEASE_NAME-elasticsearch 9200:9200 --gvc GVC_NAME`), then list what is available:
+
 ```bash
 curl 'http://localhost:9200/_snapshot/backup-repo/_all?pretty'
 ```
 
-### Scenario 1 — Disaster Recovery (Fresh Cluster)
-
-Deploy a new cluster from this template with backup enabled and pointing at the same bucket. Once the Backup Setup Workload completes (re-registering the same repository), restore all indices:
+**Disaster recovery into a fresh cluster.** Install a new release with `backup.enabled: true` and the same bucket, prefix and provider as the lost cluster. The setup job registers the same repository, so the old snapshots become visible. Then restore everything except Elasticsearch's internal indices:
 
 ```bash
 curl -X POST 'http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore' \
@@ -297,15 +344,11 @@ curl -X POST 'http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore
   }'
 ```
 
-### Scenario 2 — Restore to Existing Cluster
-
-When the target indices already exist, close them before restoring or the restore will be rejected:
+**Restoring an index that still exists.** Elasticsearch refuses to restore over an open index with the same name. Close it first, then restore:
 
 ```bash
-# Close the index first
 curl -X POST 'http://localhost:9200/MY_INDEX/_close'
 
-# Restore from snapshot
 curl -X POST 'http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -315,7 +358,7 @@ curl -X POST 'http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore
   }'
 ```
 
-### Scenario 3 — Restore Specific Indices
+**Restoring specific indices** takes a comma-separated list with wildcards:
 
 ```bash
 curl -X POST 'http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore' \
@@ -327,36 +370,108 @@ curl -X POST 'http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore
   }'
 ```
 
-**Monitor restore progress:**
-```bash
-# View active recovery operations
-curl 'http://localhost:9200/_cat/recovery?v&active_only=true'
+Monitor the restore until the cluster returns to green:
 
-# Check overall cluster health
+```bash
+curl 'http://localhost:9200/_cat/recovery?v&active_only=true'
 curl 'http://localhost:9200/_cluster/health?pretty'
 ```
 
+### Upgrading from 1.0.0
+
+Version 1.0.1 removes the AWS managed policy `aws::ReadOnlyAccess` from the backup identity. That policy granted read access to **every bucket in your AWS account** and contained no write actions, so it never carried the backup itself — but it was silently supplying any read action your own bucket-scoped policy happened to omit. The identity now carries `cpln-connector` and your `backup.aws.policyName` policy only.
+
+Before upgrading an AWS-backed release, compare your IAM policy with the full action list under [Backing Up](#backing-up) and add anything missing. If it already matches, no action is needed. Releases without backups, and GCS-backed releases, are unaffected.
+
+### Scaling and Availability
+
+**Scaling up.** Raise `replicas` to the next odd number and run `cpln helm upgrade`. The new nodes join the cluster automatically and Elasticsearch begins rebalancing shards onto them.
+
+<Warning>
+**Scaling down is destructive.** Elasticsearch does not move shards off a node before the node is removed. Take a snapshot first, then check `GET /_cat/shards?v` to confirm no primary shard would be stranded on the nodes you are about to remove, and only then lower `replicas`.
+</Warning>
+
+Changing `replicas`, `jvmHeap`, `resources` or `image` restarts the Elasticsearch nodes. Expect the cluster to report `yellow` while shards recover after a restart; reads and writes keep working as long as a quorum of nodes is up. With `multiZone.enabled: true`, replicas are spread across availability zones so the loss of a zone does not cost the quorum.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Install or upgrade fails with 'replicas must be a positive odd number'">
+    **Symptom:** `cpln helm install` or `cpln helm upgrade` stops before creating anything with `replicas must be a positive odd number, got: 4`.
+
+    **Cause:** The template validates `replicas` at render time because Elasticsearch needs an odd number of master-eligible nodes to elect a master.
+
+    **Fix:** Set `replicas` to 1, 3, 5 or another odd number and rerun the command.
+  </Accordion>
+  <Accordion title="Backup setup job logs 'ERROR: Failed to register repository'">
+    **Symptom:** `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-backup-setup"}' --limit 50 --since 10m` shows `ERROR: Failed to register repository (HTTP 500)` followed by the Elasticsearch response body.
+
+    **Cause:** Elasticsearch could not write to the bucket. On AWS the usual reasons are a wrong `backup.aws.bucket` or `backup.aws.region`, an IAM policy missing one of the actions listed under Backing Up, or a cloud account not yet linked. On GCP it is usually a missing **Storage Admin** role. Right after enabling backups on a running cluster the same error appears for a few minutes while the nodes pick up the new configuration.
+
+    **Fix:** Read the response body printed under the error — Elasticsearch names the failing permission or bucket. Correct the IAM policy or value, and run `cpln helm upgrade` if a value changed. The job restarts on its own and succeeds once the bucket is reachable.
+  </Accordion>
+  <Accordion title="Restore is refused because an open index with the same name already exists">
+    **Symptom:** The `_restore` call returns `Cannot restore index [MY_INDEX] because an open index with same name already exists in the cluster`.
+
+    **Cause:** Elasticsearch never overwrites an open index during a restore.
+
+    **Fix:** Either close or delete the existing index before restoring, or restore under a new name:
+
+```bash
+curl -X POST 'http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "indices": "MY_INDEX",
+    "rename_pattern": "(.+)",
+    "rename_replacement": "restored-$1",
+    "include_global_state": false
+  }'
+```
+  </Accordion>
+  <Accordion title="Elasticsearch containers restart with OOMKilled">
+    **Symptom:** Nodes keep restarting, and the deployment status shows the restart reason `OOMKilled`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-elasticsearch --gvc GVC_NAME -o yaml
+```
+
+    **Cause:** `jvmHeap` is too close to `resources.maxMemory`. The JVM heap is only part of what Elasticsearch uses; the rest of the limit must stay free for off-heap memory and the filesystem cache.
+
+    **Fix:** Lower `jvmHeap` to roughly half of `resources.maxMemory`, or raise `resources.maxMemory`, and run `cpln helm upgrade`.
+  </Accordion>
+  <Accordion title="Kibana shows 'Kibana server is not ready yet'">
+    **Symptom:** Opening Kibana returns the plain-text page `Kibana server is not ready yet`.
+
+    **Cause:** Kibana cannot reach `RELEASE_NAME-elasticsearch.GVC_NAME.cpln.local:9200`. Either the cluster is still starting — nodes take a minute or two to become ready — or `internal_access.type` is `workload-list` and `//gvc/GVC_NAME/workload/RELEASE_NAME-kibana` is not in `internal_access.workloads`.
+
+    **Fix:** Wait for the Elasticsearch deployment to report ready, then reload. If it stays unready, add the Kibana workload to `internal_access.workloads` and run `cpln helm upgrade`.
+  </Accordion>
+</AccordionGroup>
+
 ## Important Notes
 
-- **Replica count must be odd** — Elasticsearch requires an odd number of master-eligible nodes for quorum. Even numbers do not improve fault tolerance and can cause split-brain.
-- **JVM heap** — Set `jvmHeap` to approximately 50% of `maxMemory`, with a hard cap of `30g`. Elasticsearch relies heavily on off-heap memory for the filesystem cache.
-- **Backup schedule format** — SLM uses Quartz cron format (6 fields), not the standard 5-field cron. The `?` wildcard is required in the day-of-week field when day-of-month is set.
-- **Scale down carefully** — Always snapshot before reducing replicas. Verify no primary shards exist on nodes being removed before running the upgrade.
+- **There is no authentication.** X-Pack security is disabled, so anything `internal_access` admits has full admin access to every index. Keep `internal_access` as narrow as your deployment allows.
+- **`replicas` must be odd** (1, 3, 5, …) or the chart refuses to render; an even count cannot hold a master quorum.
+- **`jvmHeap` does not follow `resources.maxMemory`.** Raising the memory limit does not raise the heap; setting the heap above about half the limit gets the node OOM-killed.
+- **Snapshot before scaling down.** Elasticsearch does not evacuate shards from nodes that are about to be removed.
+- **`backup.schedule` is 6-field Quartz cron**, not 5-field cron, and needs `?` in the day-of-week field when day-of-month is set.
+- **The AWS IAM policy needs both bucket ARNs** — `arn:aws:s3:::BUCKET` and `arn:aws:s3:::BUCKET/*`.
+- **Enabling backups on a running cluster takes several minutes to settle**; the setup job retries until every node can reach the bucket.
 
 ## External References
 
 <CardGroup cols={2}>
-    <Card title="Elasticsearch Documentation" icon="book" href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html">
+    <Card title="Elasticsearch Reference" icon="book" href="https://www.elastic.co/docs/reference/elasticsearch">
     Official Elasticsearch reference documentation
     </Card>
-    <Card title="Kibana Documentation" icon="book" href="https://www.elastic.co/guide/en/kibana/current/index.html">
-    Official Kibana guide
+    <Card title="Snapshot and Restore" icon="book" href="https://www.elastic.co/docs/deploy-manage/tools/snapshot-and-restore">
+    Repositories, SLM policies and how snapshots work
     </Card>
-    <Card title="Snapshot and Restore" icon="book" href="https://www.elastic.co/guide/en/elasticsearch/reference/current/snapshot-restore.html">
-    Elasticsearch snapshot and restore guide
+    <Card title="Restore a Snapshot" icon="book" href="https://www.elastic.co/docs/deploy-manage/tools/snapshot-and-restore/restore-snapshot">
+    The restore API, renaming on restore, and recovery monitoring
     </Card>
-    <Card title="Snapshot Lifecycle Management" icon="book" href="https://www.elastic.co/guide/en/elasticsearch/reference/current/snapshots-take-snapshot.html">
-    Create, monitor, and delete snapshots with SLM
+    <Card title="Quorum-based Decision Making" icon="book" href="https://www.elastic.co/docs/deploy-manage/distributed-architecture/discovery-cluster-formation/modules-discovery-quorums">
+    Why master-eligible node counts should be odd
     </Card>
     <Card title="Elasticsearch Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/elasticsearch">
     View the source files, default values, and chart definition
