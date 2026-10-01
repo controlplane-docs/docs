@@ -1,7 +1,7 @@
 ---
 title: Datadog
-description: Configure log shipping from Control Plane to Datadog for comprehensive log management, analytics, and visualization.
-keywords: ['dd', 'apm', 'log forwarding', 'log export', 'log sink', 'observability', 'opaque secret', 'api key', 'datadoghq', 'site eu', 'site us']
+description: Ship logs from Control Plane to Datadog, and send Control Plane metrics and traces to Datadog through an OpenTelemetry Collector workload that scrapes the metrics federation endpoint and receives GVC traces.
+keywords: ['dd', 'apm', 'log forwarding', 'log export', 'log sink', 'observability', 'opaque secret', 'api key', 'datadoghq', 'site eu', 'site us', 'datadog metrics', 'datadog traces', 'dd-api-key', 'otel collector', 'datadog exporter', 'prometheus federate']
 ---
 
 ## Overview
@@ -74,3 +74,181 @@ spec:
       host: http-intake.logs.us3.datadoghq.com
       credentials: //secret/OPAQUE_SECRET
 ```
+
+## Metrics and Traces
+
+Control Plane ships logs to Datadog natively. Metrics and traces take a different route: you run an [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) workload that holds your Datadog API key and forwards both signals.
+
+- **Metrics** — the collector scrapes your org's Prometheus-compatible federation endpoint at `metrics.cpln.io`.
+- **Traces** — the GVC's `OpenTelemetry` tracing provider sends spans to the collector over `cpln.local`.
+
+<Warning>
+
+`spec.tracing.provider.otel` accepts an `endpoint` only. It carries no headers or credentials, so traces cannot be sent directly to a Datadog intake, which requires an API key. The collector holds the key and adds it when forwarding.
+
+</Warning>
+
+### Create the Secrets
+
+1. Store your Datadog API key as an [Opaque Secret](/reference/secret#opaque), as described in [Credential Procurement](#step-1-credential-procurement). The examples below call it `datadog-api-key`.
+2. Follow the [Export Metrics to Prometheus](/guides/export-metrics) guide to create a service account, generate a key, and grant the service account `readMetrics` with a policy.
+3. Store that service account key as a second Opaque Secret. The examples below call it `cpln-metrics-token`.
+
+### Deploy the Collector
+
+The manifest below creates the collector configuration (as an Opaque Secret), an [identity](/reference/identity) and [policy](/reference/policy) that let the workload reveal its secrets, and the collector [workload](/reference/workload/general).
+
+- Substitute: `ORG_NAME`, `GVC_NAME`, and the Datadog `site` for your account (`datadoghq.com`, `us3.datadoghq.com`, `us5.datadoghq.com`, or `datadoghq.eu`).
+- If your account is on `datadoghq.eu`, replace `*.datadoghq.com` with `*.datadoghq.eu` in the firewall.
+- Adjust the `match[]` selector to the series you need.
+
+```yaml YAML
+kind: secret
+name: datadog-otel-config
+type: opaque
+data:
+  encoding: plain
+  payload: |
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: cpln-federate
+              scrape_interval: 1m
+              honor_labels: true
+              scheme: https
+              metrics_path: /metrics/org/ORG_NAME/api/v1/federate
+              params:
+                'match[]':
+                  - '{__name__=~".+"}'
+              authorization:
+                type: Bearer
+                credentials: ${env:CPLN_METRICS_TOKEN}
+              static_configs:
+                - targets:
+                    - metrics.cpln.io
+    processors:
+      batch: {}
+    connectors:
+      datadog/connector: {}
+    exporters:
+      datadog/exporter:
+        api:
+          site: datadoghq.com
+          key: ${env:DD_API_KEY}
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [datadog/connector, datadog/exporter]
+        metrics:
+          receivers: [prometheus, datadog/connector]
+          processors: [batch]
+          exporters: [datadog/exporter]
+---
+kind: identity
+name: datadog-otel-collector
+gvc: GVC_NAME
+---
+kind: policy
+name: datadog-otel-collector
+targetKind: secret
+targetLinks:
+  - //secret/datadog-otel-config
+  - //secret/datadog-api-key
+  - //secret/cpln-metrics-token
+bindings:
+  - permissions:
+      - reveal
+    principalLinks:
+      - //gvc/GVC_NAME/identity/datadog-otel-collector
+---
+kind: workload
+name: datadog-otel-collector
+gvc: GVC_NAME
+spec:
+  type: standard
+  identityLink: //identity/datadog-otel-collector
+  containers:
+    - name: collector
+      image: otel/opentelemetry-collector-contrib:0.157.0
+      cpu: 200m
+      memory: 256Mi
+      args:
+        - '--config=/etc/otel-collector/config.yaml'
+      env:
+        - name: DD_API_KEY
+          value: cpln://secret/datadog-api-key.payload
+        - name: CPLN_METRICS_TOKEN
+          value: cpln://secret/cpln-metrics-token.payload
+      ports:
+        - number: 4317
+          protocol: grpc
+      volumes:
+        - path: /etc/otel-collector/config.yaml
+          uri: cpln://secret/datadog-otel-config.payload
+      readinessProbe:
+        httpGet:
+          path: /
+          port: 13133
+  defaultOptions:
+    autoscaling:
+      metric: disabled
+      minScale: 1
+      maxScale: 1
+  firewallConfig:
+    external:
+      outboundAllowHostname:
+        - metrics.cpln.io
+        - '*.datadoghq.com'
+    internal:
+      inboundAllowType: same-gvc
+```
+
+Save the manifest as a file and apply it with `cpln apply --file FILE.yaml --org ORG_NAME`. See [cpln apply](/guides/cpln-apply).
+
+<Note>
+
+Every replica scrapes the federation endpoint. If the GVC has more than one location, each location runs a replica and metrics are sent to Datadog once per location. To avoid duplicates, run the `prometheus` receiver in a separate collector in a single-location GVC, and keep only the `otlp` receiver in the collector that receives traces.
+
+</Note>
+
+<Note>
+
+Egress charges apply to metrics scraped from Control Plane, and Datadog bills each federated series as a custom metric. Narrow the `match[]` selector to the series you need.
+
+</Note>
+
+### Point Tracing at the Collector
+
+Set the GVC's tracing provider to `OpenTelemetry` with the collector's internal address, as described in the [OpenTelemetry tracing provider](/reference/gvc#opentelemetry-tracing-provider) reference. Apply it with `cpln gvc patch GVC_NAME -f FILE.yaml`. Changing the tracing configuration restarts all workloads in the GVC.
+
+```yaml YAML
+kind: gvc
+name: GVC_NAME
+spec:
+  tracing:
+    provider:
+      otel:
+        endpoint: datadog-otel-collector.GVC_NAME.cpln.local:4317
+    sampling: 10
+```
+
+`sampling` is the percentage of requests that are traced.
+
+Metrics appear in Datadog's Metrics Explorer and traces in APM within a few minutes. If nothing arrives, check the collector workload's logs for exporter or scrape errors.
+
+<Tip>
+
+The [OTel Collector template](/template-catalog/templates/otel-collector) also deploys a collector you can point tracing at. Its `advanced` mode accepts a full collector configuration, including the `datadog` exporter, but it does not inject environment variables, so the API key would have to be written into the configuration itself.
+
+</Tip>
