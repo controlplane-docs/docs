@@ -1,32 +1,49 @@
 ---
 title: Ollama
 icon: /template-catalog/templates/icons/ollama.png
-description: Deploy Ollama on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and LLM serving with Open WebUI sidecar and automatic model pulling.
-keywords: ['local llm', 'self-hosted ai', 'on-prem ai', 'open source llm', 'llama', 'mistral', 'qwen', 'gemma', 'inference server', 'gpu workload', 'private ai', 'chat ui']
+description: Deploy Ollama on Control Plane using the Template Catalog. A single-replica, GPU-backed Ollama model server with Open WebUI bundled as a sidecar, a persistent volume for pulled models, and a default model pulled at first start. Deploys into an existing GVC; no prerequisite secrets.
+keywords: ['local llm', 'self-hosted ai', 'open source llm', 'llama', 'mistral', 'qwen', 'gemma', 'inference server', 'gpu workload', 'private ai', 'chat ui', 'ollama api', 'open webui', 'ollama template']
 ---
 
 ## Overview
 
-Ollama is an open-source platform for running large language models locally. This template deploys Ollama alongside Open WebUI as a sidecar interface, with a startup script that automatically pulls the configured default model on first launch. The Ollama API is accessible internally, while the Open WebUI is exposed externally.
+Ollama is an open-source server for running open-weight large language models on your own infrastructure. This template deploys a single-replica Ollama server together with an Open WebUI sidecar in the same workload: the Ollama HTTP API listens on port `11434` for other workloads in the GVC, and the chat UI on port `8080` is the surface the public endpoint serves. Pulled models and the UI's state live on one persistent volume, and a startup script pulls the model named by `defaultModel` the first time the volume is empty.
+
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create, provision, or manage a GVC. GPU-enabled locations are available across several cloud providers; a GVC with more than one location runs one replica of this workload in each.
+</Note>
 
 ### What Gets Created
 
-- **Stateful Workload** — A single-replica workload with two containers: the Ollama API server and the Open WebUI interface. The API runs on port `11434` (internal only) and the UI runs on port `8080` (externally accessible).
-- **Volume Set** — Persistent storage shared by both containers: the Ollama API stores model data at `/root/.ollama` and Open WebUI stores state at `/app/backend/data`. Supports optional autoscaling.
-- **Secret** — An opaque startup script that checks for the default model on launch and pulls it from the Ollama registry if not already present.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the startup script secret.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-ollama` | Stateful, 1 replica, two containers: `ollama` (API on `11434`, GPU-backed) and `ollama-ui` (Open WebUI on `8080`) | — |
+| Volume Set | `RELEASE_NAME-ollama-vs` | `ext4` volume mounted at `/root/.ollama` (models) and `/app/backend/data` (Open WebUI state); final snapshot on delete | — |
+| Secret | `RELEASE_NAME-ollama-secret` | Opaque startup script mounted at `/startup/entrypoint.sh`; starts the server and pulls `defaultModel` when it is not on the volume | — |
+| Identity | `RELEASE_NAME-ollama-identity` | Identity the workload runs as | — |
+| Policy | `RELEASE_NAME-ollama-policy` | `reveal` on exactly `RELEASE_NAME-ollama-secret` | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+Open WebUI reaches Ollama over the container's loopback (`http://localhost:11434`) and lists `defaultModel` as its default selection, so the two containers need no network configuration between them.
+
+## Prerequisites
+
+None for a default install. No secret, bucket, or cloud account is required; the only external dependency is outbound internet access so the startup script can pull `defaultModel` from the Ollama registry.
+
+Two org-level requirements are the usual first blockers:
+
+- **GPU enablement** — the default `workload.containers.api.gpu` requests one NVIDIA T4. GPU resources must be enabled for your org by Control Plane support before a GPU workload can schedule. To run on CPU only, pass `--set workload.containers.api.gpu=null` at install; the chart omits the GPU block when the value is empty.
+- **Quota** — the default install requests 6 CPU and 8Gi of memory for the Ollama container plus 500m and 1Gi for the UI. If your org is at the default quotas, request an increase first.
 
 ## Installation
 
-<Note>
-The default configuration requests 6 CPU and 8Gi of memory for the Ollama API container. Depending on your organization's quotas, you may need to request a limit increase. GPU access requires explicit enablement — contact Control Plane support to enable GPU resources for your organization.
-</Note>
+A default install needs no `--set` values:
 
-To install, follow the instructions for your preferred method:
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/ollama \
+  --version 1.1.2 --gvc GVC_NAME
+```
+
+The first start is slow: the server pulls `defaultModel` (several GiB) before anything is useful, so an install that looks stuck early is usually still downloading. See [Troubleshooting](#troubleshooting) for how to watch the pull.
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -52,24 +69,32 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Default Model
+
+Any model from the [Ollama library](https://ollama.com/library) can be named here. It is pulled by the startup script when it is not already on the volume, and Open WebUI selects it by default.
 
 ```yaml
-# Alternatives: llava, gemma, mistral, phi3, etc.
+# Alternatives: llava, gemmma, mistral, etc.
 defaultModel: llama3
+```
 
+### Containers
+
+Both containers run in the one workload. `api` is the Ollama server; `gpu` is rendered only when present, so clear it (`--set workload.containers.api.gpu=null`) to run on CPU alone. Large models need more CPU and memory than the defaults; size the `api` container for the models you intend to run.
+
+```yaml
 workload:
   containers:
     ui:
       name: ollama-ui
-      image: ghcr.io/open-webui/open-webui:main
+      image: ghcr.io/open-webui/open-webui:v0.11.0 # pinned: `main` is a moving branch build
       port: 8080
       resources:
         cpu: 500m
         memory: 1Gi
     api:
       name: ollama
-      image: ollama/ollama
+      image: ollama/ollama:0.32.15 # pinned: an untagged image resolves to `latest`
       port: 11434
       resources:
         cpu: 6
@@ -78,90 +103,196 @@ workload:
         nvidia:
           model: t4
           quantity: 1
-
-volumeset:
-  initialCapacity: 10
-  autoscaling:
-    enabled: false
-    maxCapacity: 100 # Maximum capacity in GiB
-    minFreePercentage: 10 # Trigger scaling when free space drops below this percentage
-    scalingFactor: 1.2 # Multiply current capacity by this factor when scaling up
-  performanceClass: general-purpose-ssd
-  snapshots:
-    retentionDuration: 7d
-
-firewall:
-  external:
-    inboundAllowCIDR:
-      - 0.0.0.0/0
-    outboundAllowCIDR:
-      - 0.0.0.0/0
-
-internal_access:
-  type: same-gvc # options: same-gvc, same-org, workload-list
-  workloads: # Note: can only be used if type is same-gvc or workload-list
-    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
-
-### Default Model
-
-- `defaultModel` — The Ollama model to download on first startup if not already present on the volume. Accepts any model name from the [Ollama model library](https://ollama.com/library) (e.g. `llama3`, `llava`, `gemma`, `mistral`, `phi3`).
-
-### Open WebUI Container
-
-- `workload.containers.ui.image` — Open WebUI container image.
-- `workload.containers.ui.port` — Port the UI listens on (default: `8080`).
-- `workload.containers.ui.resources.cpu` / `workload.containers.ui.resources.memory` — CPU and memory for the UI container.
-
-### Ollama API Container
-
-- `workload.containers.api.image` — Ollama container image.
-- `workload.containers.api.port` — Port the Ollama API listens on (default: `11434`).
-- `workload.containers.api.resources.cpu` / `workload.containers.api.resources.memory` — CPU and memory for the Ollama API container. Large models require significant resources.
-- `workload.containers.api.gpu` — Optional GPU configuration:
-  - `nvidia.model` — GPU model type (e.g. `t4`).
-  - `nvidia.quantity` — Number of GPUs to allocate.
-
-<Note>
-GPU access must be explicitly enabled for your organization by Control Plane support before it can be used in a workload.
-</Note>
 
 ### Storage
 
-- `volumeset.initialCapacity` — Initial volume size in GiB (minimum 10). Large models require more storage — plan accordingly.
-- `volumeset.autoscaling.enabled` — Automatically expand the volume as it fills. When enabled:
-  - `maxCapacity` — Maximum volume size in GiB.
-  - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
-  - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
+One volume holds both the pulled models and the Open WebUI database. Models are large: a 10 GiB volume fills quickly once a second model is pulled, so either start larger or enable autoscaling.
+
+```yaml
+volumeset:
+  initialCapacity: 10
+  autoscaling:
+    enabled: false # Set to true to enable autoscaling
+    maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
+    minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
+    scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
+  performanceClass: general-purpose-ssd
+  snapshots:
+    retentionDuration: 7d
+```
 
 ### Firewall
 
-- `firewall.external.inboundAllowCIDR` — CIDR ranges allowed to access the Open WebUI externally (default: `0.0.0.0/0`).
-- `firewall.external.outboundAllowCIDR` — CIDR ranges the workload can reach externally. Must include `0.0.0.0/0` (or the Ollama registry) for model downloads to succeed.
+Inbound is open to the internet by default so the Open WebUI is reachable at the canonical endpoint. Outbound must allow the Ollama registry (`0.0.0.0/0` in the default) or model pulls fail.
+
+```yaml
+firewall:
+  external: # Change to restrict access to the workload if needed
+    inboundAllowCIDR:
+        - 0.0.0.0/0
+    outboundAllowCIDR:
+        - 0.0.0.0/0
+```
 
 ### Internal Access
 
-- `internal_access.type` — Controls which workloads can reach the Ollama API on port `11434` internally:
+Controls which workloads can reach the Ollama API on `11434` over internal DNS. The default admits every workload in the same GVC; `workload-list` restricts it to the workloads you name.
 
-| Type | Description |
-|------|-------------|
-| `same-gvc` | Allow access from all workloads in the same GVC |
-| `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from specific workloads listed in `workloads` |
-
-### Accessing Ollama
-
-**Open WebUI** (browser interface) is available externally at:
-
-```text
-https://RELEASE_NAME-ollama.GVC_NAME.cpln.app
+```yaml
+internal_access:
+  type: same-gvc # options: same-gvc, same-org, workload-list
+  workloads:  # Note: can only be used if type is same-gvc or workload-list
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
-**Ollama API** is available internally to other workloads in the same GVC at:
+### Startup Script
 
-```text
-http://RELEASE_NAME-ollama.GVC_NAME.cpln.local:11434
+The `ollama` container runs this script instead of the image's own entrypoint. It is stored in `RELEASE_NAME-ollama-secret` and mounted at `/startup/entrypoint.sh`; override it only if you need different first-boot behaviour.
+
+```yaml
+entrypoint:
+  payload: |
+    #!/bin/bash
+    # Define the model directory
+    MODEL_DIR="/root/.ollama/models/manifests/registry.ollama.ai/library/$DEFAULT_MODELS/"
+    # Start ollama serve in the background
+    /bin/ollama serve &
+    # Check if the model directory exists
+    if [ ! -d "$MODEL_DIR" ]; then
+        echo "Model directory not found. Pulling the $DEFAULT_MODELS model..."
+        # Pull the $DEFAULT_MODELS model using the Ollama API
+        apt-get update && apt-get install curl -y
+        curl http://localhost:11434/api/pull -d '{
+            "name": "$DEFAULT_MODELS"
+        }'
+    else
+        echo "Model directory exists. No action required."
+    fi
+    # Keep the script running
+    while true; do sleep 86400; done
 ```
+
+## Connecting
+
+| What | Address | Notes |
+|---|---|---|
+| Open WebUI (browser) | `status.canonicalEndpoint` of `RELEASE_NAME-ollama` | Read it with `cpln workload get RELEASE_NAME-ollama --gvc GVC_NAME -o yaml`; reachable from the CIDRs in `firewall.external.inboundAllowCIDR` |
+| Ollama API (other workloads) | `http://RELEASE_NAME-ollama.GVC_NAME.cpln.local:11434` | Only callers admitted by `internal_access.type`; no authentication of its own |
+| Ollama API (your machine) | `cpln port-forward RELEASE_NAME-ollama 11434:11434 --gvc GVC_NAME`, then `http://localhost:11434` | Works with the external firewall closed |
+| Credentials | None for the API; the Open WebUI account you register at first run | The first account registered becomes the administrator |
+
+Verify the server is up and see which models are on the volume:
+
+```bash
+cpln workload exec RELEASE_NAME-ollama --gvc GVC_NAME --container ollama -- ollama list
+```
+
+Call the API from another workload in the GVC (the endpoints are the upstream [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md)):
+
+```bash
+# list local models
+curl http://RELEASE_NAME-ollama.GVC_NAME.cpln.local:11434/api/tags
+
+# one-shot completion
+curl http://RELEASE_NAME-ollama.GVC_NAME.cpln.local:11434/api/generate \
+  -d '{"model": "llama3", "prompt": "Why is the sky blue?", "stream": false}'
+```
+
+Other templates in this catalog that consume Ollama over that internal URL include [Open WebUI](/template-catalog/templates/open-webui) (as a standalone UI pointed at an existing Ollama workload) and [Qdrant](/template-catalog/templates/qdrant) (local embedding models for a RAG stack).
+
+### First Run
+
+Open WebUI has no preset credentials: the first account to register becomes the administrator, and the UI is public as soon as the workload is ready. Open the canonical endpoint and register your admin account immediately after install. If the endpoint must not be reachable from the internet before that happens, install with `firewall.external.inboundAllowCIDR` narrowed to your own address range and widen it afterwards. Open WebUI's own setup (users, sign-up policy, additional model pulls) is documented in the [Open WebUI documentation](https://docs.openwebui.com/).
+
+## Operations
+
+### Backing Up
+
+Backups are platform volume snapshots of `RELEASE_NAME-ollama-vs`; no cloud account or bucket is involved. The chart configures no snapshot schedule — it sets a 7-day `retentionDuration` and takes a final snapshot when the volume set is deleted. Take a snapshot by hand before an upgrade or a large model change:
+
+```bash
+cpln volumeset snapshot create RELEASE_NAME-ollama-vs --gvc GVC_NAME --snapshot-name before-upgrade
+cpln volumeset snapshot get RELEASE_NAME-ollama-vs --gvc GVC_NAME
+```
+
+The volume holds two kinds of data with very different value: pulled models, which can always be downloaded again, and Open WebUI's database (`/app/backend/data`: users, chats, uploaded documents), which cannot.
+
+### Restoring a Backup
+
+Restoring a volume-set snapshot into this template has not been verified. Treat it as an unverified path and test it on a throwaway release before relying on it.
+
+The recovery that is dependable by construction is for models: on a fresh or replaced volume the startup script pulls `defaultModel` again, and any other model is one `ollama pull` away (see [Troubleshooting](#troubleshooting)).
+
+### Upgrading from 1.1.1 or Earlier
+
+Template version 1.1.2 pins both images — `ghcr.io/open-webui/open-webui:v0.11.0` and `ollama/ollama:0.32.15`. Earlier versions used the moving `open-webui:main` branch build and an untagged `ollama/ollama` that resolved to `latest`, so an install from before 1.1.2 is not reproducible and may be running a newer or older build than the pins. Upgrading changes the running image versions and leaves the volume set, and the models and UI data on it, in place. Take a snapshot first (see [Backing Up](#backing-up)) and upgrade with your usual install method.
+
+### Scaling and Availability
+
+The workload is fixed at one replica. A GVC with several locations runs one replica per location, each with its own volume, so each location pulls its own copy of `defaultModel` and holds its own Open WebUI state; users reach the location closest to them through the canonical endpoint. Add capacity to the single replica (`workload.containers.api.resources`, a larger or additional GPU) rather than adding replicas.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The workload never becomes ready after install">
+    **Symptom:** `cpln workload get-deployments RELEASE_NAME-ollama --gvc GVC_NAME -o yaml` shows the deployment not ready, and `status.versions[].message` refers to GPU resources or a quota.
+
+    **Cause:** The default install requests one NVIDIA T4 plus 6 CPU and 8Gi of memory. GPU access must be enabled for the org by Control Plane support, and the CPU and memory must fit the org quota.
+
+    **Fix:** Request GPU enablement or a quota increase from Control Plane support. To run on CPU only in the meantime, reinstall with `--set workload.containers.api.gpu=null`; inference is much slower without a GPU.
+  </Accordion>
+  <Accordion title="The install looks stuck for a long time after the workload is ready">
+    **Symptom:** The workload reports ready but the UI lists no model, and the Ollama container's logs contain `Model directory not found. Pulling the llama3 model...` (with your `defaultModel` in place of `llama3`).
+
+    **Cause:** The first start pulls `defaultModel` from the Ollama registry. Models are several GiB, so this takes minutes.
+
+    **Fix:** Wait, and watch the pull progress:
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-ollama"} |= "Pulling"' --limit 50 --since 10m
+    ```
+
+    If the pull never starts, check that `firewall.external.outboundAllowCIDR` allows the Ollama registry; the startup script also installs `curl` from the distribution's package repositories, which needs outbound internet access.
+  </Accordion>
+  <Accordion title="The default model is not in the model list">
+    **Symptom:** `ollama list` (or `GET /api/tags`) does not include `defaultModel`, and Open WebUI's model picker is empty.
+
+    **Cause:** The startup pull did not complete — the registry was unreachable, the volume filled up, or the model name is not one the library knows.
+
+    **Fix:** Pull it by hand inside the `ollama` container, then reload the UI:
+
+    ```bash
+    cpln workload exec RELEASE_NAME-ollama --gvc GVC_NAME --container ollama -- ollama pull llama3
+    ```
+
+    Any other library model can be pulled the same way; it lands on the volume and survives restarts.
+  </Accordion>
+  <Accordion title="Pulls fail with no space left on device">
+    **Symptom:** A pull aborts with `no space left on device` in the Ollama logs, or Open WebUI starts failing to write.
+
+    **Cause:** The volume (10 GiB by default) is shared by every pulled model and the UI's data.
+
+    **Fix:** Remove models you no longer use with `ollama rm MODEL` inside the `ollama` container, and enable `volumeset.autoscaling` (or install with a larger `volumeset.initialCapacity`) so the volume grows as models accumulate.
+  </Accordion>
+  <Accordion title="Open WebUI shows no models or cannot reach Ollama">
+    **Symptom:** The UI loads but reports that Ollama is unreachable or offers no models.
+
+    **Cause:** The UI talks to the Ollama container over `http://localhost:11434`; it shows nothing while the Ollama container is still starting or has restarted.
+
+    **Fix:** Confirm both containers are ready with `cpln workload get-deployments RELEASE_NAME-ollama --gvc GVC_NAME -o yaml`, then reload the UI. If the API answers (`ollama list` above) but lists no models, follow the previous entry.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- **GPU and quota are the usual first blockers.** The default requests one NVIDIA T4, 6 CPU and 8Gi of memory; GPU access must be enabled by Control Plane support and the rest must fit your org quota.
+- **Register the admin account right after install.** The Open WebUI is public by default and the first account to register becomes the administrator — see [First Run](#first-run).
+- **Do not route public traffic to `11434`.** The Ollama API has no authentication; reach it only over internal DNS (`internal_access`) or a port-forward.
+- **Models live on the volume set, and uninstall deletes it.** A final snapshot is taken on delete, but every model is pulled again on the next install; size the volume for what you intend to run.
+- **The first start is slow.** `defaultModel` downloads before the server is useful; an install that looks stuck early is usually still pulling.
+- **Outbound internet is required.** Model pulls (and the startup script's `curl` install) need `firewall.external.outboundAllowCIDR` to allow the Ollama registry.
 
 ## External References
 
@@ -169,11 +300,14 @@ http://RELEASE_NAME-ollama.GVC_NAME.cpln.local:11434
     <Card title="Ollama Documentation" icon="book" href="https://github.com/ollama/ollama">
     Official Ollama repository and documentation
     </Card>
-    <Card title="Open WebUI" icon="browser" href="https://github.com/open-webui/open-webui">
-    Open WebUI repository and documentation
+    <Card title="Ollama API Reference" icon="code" href="https://github.com/ollama/ollama/blob/main/docs/api.md">
+    Endpoints for generate, chat, pull, and model listing
     </Card>
     <Card title="Ollama Model Library" icon="database" href="https://ollama.com/library">
     Browse available models for Ollama
+    </Card>
+    <Card title="Open WebUI Documentation" icon="browser" href="https://docs.openwebui.com/">
+    Setup, users, and model management for the bundled UI
     </Card>
     <Card title="Ollama Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/ollama">
     View the source files, default values, and chart definition
