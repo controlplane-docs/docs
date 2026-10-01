@@ -1,67 +1,88 @@
 ---
 title: Docmost
 icon: /template-catalog/templates/icons/docmost.png
-description: Deploy Docmost on Control Plane using the Template Catalog. Open-source knowledge base and wiki with real-time collaborative editing, spaces, and permissions, backed by PostgreSQL and Redis with local or S3 attachment storage.
+description: Deploy Docmost, the open-source wiki and knowledge base with real-time collaborative editing, on Control Plane. Single server with bundled PostgreSQL and Redis, optional multi-replica on S3 attachment storage. Needs an existing GVC and a pre-created APP_SECRET opaque secret.
 keywords: ['docmost', 'wiki', 'knowledge base', 'confluence alternative', 'notion alternative', 'outline alternative', 'bookstack alternative', 'collaborative editing', 'team documentation', 'spaces and permissions', 'self-hosted wiki', 'agpl']
 ---
 
 ## Overview
 
-Docmost is an open-source knowledge base and wiki — a Confluence or Notion alternative with real-time collaborative editing, spaces, and per-space permissions. This template deploys the Docmost server — UI, REST API, and collaboration websockets on port `3000` — backed by a PostgreSQL instance for documents and a bundled Redis for queues and realtime coordination, with attachments stored either on a persistent volume or in an S3 bucket.
+Docmost is an open-source knowledge base and wiki — a Confluence or Notion alternative with real-time collaborative editing, spaces, and per-space permissions. This template deploys the Docmost server (web UI, REST API, and collaboration websocket on port `3000`) backed by a bundled PostgreSQL for documents and a bundled Redis for job queues and realtime coordination, with attachments kept on a persistent volume or in an S3 bucket you own. The default is a single replica; `docmost.replicas` scales out once attachments live in S3.
 
-### Architecture
-
-- **Docmost server** — A stateful workload running the single official image, which serves the web UI, the REST API, and the Yjs collaboration websocket on port `3000`. It runs its database migrations automatically on boot and scales horizontally through `docmost.replicas`.
-- **PostgreSQL** — The [postgres](/template-catalog/templates/postgres) template as a subchart. It holds every page, user, space, and permission.
-- **Redis** — A bundled single-node Redis with AOF persistence, deployed by this chart. It carries the background job queues, the socket.io adapter, and cross-replica collaboration sync. Docmost requires it: the server does not report healthy without a reachable Redis.
-- **Attachment storage** — Either a persistent volume mounted at `/app/data/storage` (default) or an S3 bucket you own.
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have — it does not create or manage a GVC.
+</Note>
 
 ### What Gets Created
 
-- **Stateful Docmost Workload** — The Docmost server on port `3000` (`{release}-docmost`), with `docmost.replicas` replicas and configurable CPU and memory.
-- **Stateful Redis Workload** — The bundled single-node Redis (`{release}-docmost-redis`) with password authentication.
-- **Stateful PostgreSQL Workload** — One PostgreSQL instance from the subchart, with its own volume set.
-- **Volume Sets** — One for local attachments (mounted only when `storage.type` is `local`), one for the Redis AOF file, and one for the PostgreSQL data directory.
-- **Secret** — A template-created dictionary secret (`{release}-docmost-creds`) holding the PostgreSQL and Redis credentials used to assemble `DATABASE_URL` and `REDIS_URL`. Your prerequisite `APP_SECRET` secret is *not* created by the template — see [Prerequisites](#prerequisites).
-- **Identity & Policy** — An identity bound to the Docmost workload, and a policy granting it `reveal` on exactly the secrets it reads: the credentials secret, your prerequisite secret, and — when configured — the S3 key and SMTP secrets. In keyless S3 mode the identity also carries the cloud account link and your bucket-scoped IAM policy.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-docmost` | Docmost server: UI, API, and collaboration websocket on port `3000` (stateful, `docmost.replicas` replicas) | — |
+| Workload | `RELEASE_NAME-docmost-redis` | Bundled single-node Redis with AOF persistence — job queues and cross-replica realtime sync (stateful, 1 replica) | — |
+| Workload | `RELEASE_NAME-postgres` | Bundled PostgreSQL from the [postgres](/template-catalog/templates/postgres) template — every page, user, space, and permission (stateful, 1 replica) | — |
+| Workload | `RELEASE_NAME-postgres-backup` | Cron job that dumps the database to object storage on a schedule | `postgres.backup.enabled: true` |
+| Volume set | `RELEASE_NAME-docmost-storage` | Local attachment storage, mounted at `/app/data/storage` only when `storage.type` is `local` | — |
+| Volume set | `RELEASE_NAME-docmost-redis-vs` | Redis append-only file at `/data` | — |
+| Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory, with 7-day snapshots | — |
+| Secret | `RELEASE_NAME-docmost-creds` | Dictionary secret the chart creates with the PostgreSQL and Redis credentials Docmost uses to assemble `DATABASE_URL` and `REDIS_URL` | — |
+| Secret | the name in `postgres.config.credentialsSecretName` | Dictionary secret the chart creates (`username`, `password`, `database`) and hands to the bundled PostgreSQL | — |
+| Identity | `RELEASE_NAME-docmost-identity` | Bound to the Docmost and Redis workloads; carries your AWS cloud account link in keyless S3 mode | — |
+| Policy | `RELEASE_NAME-docmost-policy` | Grants that identity `reveal` on exactly the secrets it reads: the credentials secret, your `APP_SECRET` secret, and your S3-key and SMTP secrets when configured | — |
+| Identity | `RELEASE_NAME-pg-identity` | Bound to the bundled PostgreSQL (and its backup job) | — |
+| Policy | `RELEASE_NAME-pg-policy` | Grants the PostgreSQL identity `reveal` on its credentials secret only | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+Your `APP_SECRET` secret is **not** created by the template — see [Prerequisites](#prerequisites).
 
 ## Prerequisites
 
-Docmost signs its sessions, invitation links, and share links with an `APP_SECRET` that you supply through an [opaque secret](/guides/create-secret/opaque) created **before** installing. The value is never passed through Helm values.
+Docmost signs sessions, invitation links, and share links with an `APP_SECRET` that you supply through an [opaque secret](/guides/create-secret/opaque) created **before** installing. The value never passes through Helm values.
 
 <Steps>
   <Step title="Create the APP_SECRET secret">
-    The payload is a single random string of at least 32 characters:
+    The payload is a single random string of at least 32 characters. Use `printf` rather than `echo` so the payload carries no trailing newline:
 
     ```bash
-    printf '%s' "$(openssl rand -hex 32)" | \
-      cpln secret create-opaque --name my-docmost-app-secret --encoding plain -f -
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name APP_SECRET_NAME --encoding plain -f -
     ```
 
-    Use `printf` rather than `echo` so the payload carries no trailing newline.
+    Set `secrets.name` to this name. Secrets are org-level, so no GVC flag is involved.
   </Step>
-  <Step title="Point the template at it">
-    Set `secrets.name` to the secret's name (default `my-docmost-app-secret`). Secrets are org-level, so no GVC flag is involved.
-  </Step>
-  <Step title="Back the value up">
-    Store a copy somewhere safe, outside Control Plane.
+  <Step title="Back the value up outside Control Plane">
+    `APP_SECRET` is effectively write-once: rotating it logs out every user and invalidates every outstanding invitation and share link (stored documents are unaffected). Keep a copy somewhere safe.
   </Step>
 </Steps>
 
 <Warning>
-Create the secret **before** installing. Installing without it succeeds, but the deployment then pauses with `The secret my-docmost-app-secret no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` and never becomes ready. `APP_SECRET` is also write-once: rotating it logs out every user and invalidates every outstanding invitation and share link. Stored documents are unaffected.
+Create the secret **before** installing. Installing without it reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-docmost --gvc GVC_NAME -o yaml
+```
+
+The message reads `The secret APP_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Creating the secret lets the deployment recover on its own; `cpln workload force-redeployment RELEASE_NAME-docmost --gvc GVC_NAME` skips the wait.
 </Warning>
 
-Everything else works with the defaults. Two optional features need their own setup first:
+Everything else works with the defaults. Three optional features need their own setup first:
 
-- **S3 attachment storage** — an existing bucket plus either a Control Plane cloud account (AWS) or a static-key secret (S3-compatible servers). See [Attachment Storage](#attachment-storage). Required if you plan to run more than one replica.
+- **S3 attachment storage** (required for more than one replica) — an existing bucket plus either an AWS cloud account and bucket-scoped IAM policy, or a static-key secret for an S3-compatible server. See [Attachment Storage on S3](#attachment-storage-on-s3).
 - **Authenticated SMTP** — a dictionary secret holding `SMTP_USERNAME` and `SMTP_PASSWORD`. See [Email](#email).
+- **Scheduled database backups** — a bucket and cloud account for the bundled PostgreSQL. See [Backing Up](#backing-up).
 
-Once your `APP_SECRET` secret exists, install the template using your preferred method:
+## Installation
+
+Once your `APP_SECRET` secret exists, install from the marketplace registry, pointing `secrets.name` at it and replacing both bundled-component passwords:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/docmost \
+  --version 1.1.0 --gvc GVC_NAME \
+  --set secrets.name=APP_SECRET_NAME \
+  --set postgres.credentials.password='YOUR-DB-PASSWORD' \
+  --set redis.auth.password='YOUR-REDIS-PASSWORD'
+```
+
+Installing a second Docmost release in the same org? Also set `postgres.config.credentialsSecretName` to a name no other release uses — secret names are org-wide.
+
+Other ways to install and manage the template:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -84,41 +105,52 @@ Once your `APP_SECRET` secret exists, install the template using your preferred 
     Declare templates in your Pulumi programs
     </Card>
 </CardGroup>
-
-## First Run
-
-Docmost ships no default account, and the first person to reach the instance creates the workspace and its owner account.
-
-<Steps>
-  <Step title="Wait for the workload to report ready">
-    PostgreSQL and Redis come up first, then Docmost applies its schema migrations before it starts serving. A default install typically reaches ready in about a minute.
-  </Step>
-  <Step title="Open the endpoint and claim the workspace">
-    Browse to the canonical `*.cpln.app` endpoint of the `{release}-docmost` workload and complete the setup form to create the workspace and the admin account. Do this as soon as the workload is ready.
-  </Step>
-  <Step title="Configure email before inviting anyone">
-    Member invitations are delivered only by email. Configure [SMTP](#email) before you invite your team.
-  </Step>
-</Steps>
+<CardGroup cols={2}>
+  <Card title="Ghost Documentation" href="https://docs.ghost.org" icon="book">
+    Official Ghost product documentation
+  </Card>
+  <Card title="Configuration Reference" href="https://docs.ghost.org/config" icon="sliders">
+    Full reference of Ghost configuration options
+  </Card>
+  <Card title="Supported Databases" href="https://docs.ghost.org/faq/supported-databases" icon="database">
+    Why Ghost requires MySQL 8
+  </Card>
+  <Card title="Official Docker Image" href="https://hub.docker.com/_/ghost" icon="docker">
+    The library/ghost image on Docker Hub
+  </Card>
+  <Card title="Ghost Template" href="https://github.com/controlplane-com/templates/tree/main/ghost" icon="github">
+    View the source files, default values, and chart definition
+  </Card>
+</CardGroup>
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Docmost Server
 
 ```yaml
 docmost:
-  image: docmost/docmost:0.95.0
+  image: docmost/docmost:0.95.0 # pin a released tag, never latest
   replicas: 1 # >1 REQUIRES storage.type: s3; replicas coordinate via Redis
-  appUrl: "" # public base URL used in links; empty = derive from the canonical endpoint
+  appUrl: "" # public base URL used in links; empty = derive from the canonical endpoint; set WITH https:// for a custom domain
   resources:
     minCpu: 250m
     maxCpu: 1000m
     minMemory: 512Mi
     maxMemory: 2Gi # headroom for boot migrations and large imports
+```
 
+### Prerequisite Secret
+
+```yaml
 secrets:
-  name: my-docmost-app-secret # opaque secret holding APP_SECRET — MUST exist before install
+  name: my-docmost-app-secret # opaque secret (encoding plain) whose payload is APP_SECRET — MUST exist before install
+```
 
+### Attachment Storage
+
+`storage.type` decides where uploaded files, images, and avatars are kept. The default local volume works for a single replica; the bucket, cloud account, and secret setup for `s3` is under [Attachment Storage on S3](#attachment-storage-on-s3).
+
+```yaml
 storage:
   type: local # local | s3 (s3 required for replicas > 1)
   local:
@@ -127,51 +159,93 @@ storage:
   s3:
     bucket: my-docmost-bucket
     region: us-east-1
-    endpoint: "" # set for S3-compatible servers (e.g. http://my-minio:9000)
+    endpoint: "" # set for S3-compatible servers (e.g. http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000)
     forcePathStyle: false # true for most S3-compatible servers (MinIO)
     cloudAccountName: my-s3-cloud-account # keyless AWS auth; used only when auth.secretName is empty
     policyName: my-docmost-s3-policy # your pre-created bucket-scoped IAM policy
     auth:
       secretName: "" # dictionary secret with AWS_S3_ACCESS_KEY_ID + AWS_S3_SECRET_ACCESS_KEY; S3-compatible servers only
-  fileUploadSizeLimit: 50mb # max single attachment size
+  fileUploadSizeLimit: 50mb # max single attachment size — larger uploads are stored truncated, not rejected
+```
 
+### Email
+
+SMTP is off by default and a default install works without it — the first visitor still creates the workspace and signs in with a password. Member invitations, however, are delivered only by email.
+
+```yaml
 smtp:
-  enabled: false # off = member invites cannot be delivered
+  enabled: false # off = member invites cannot be delivered — enable for any multi-user workspace
   host: smtp.example.com
   port: 587
   secure: false # false = STARTTLS/plain (587); true = implicit TLS (465)
   fromAddress: no-reply@example.com
   fromName: Docmost
   auth:
-    secretName: "" # optional dictionary secret with SMTP_USERNAME + SMTP_PASSWORD
+    secretName: "" # optional dictionary secret with SMTP_USERNAME + SMTP_PASSWORD; empty = unauthenticated relay
+```
 
+For an authenticated relay, create the credentials secret before installing and set `smtp.auth.secretName` to its name. The Docmost identity is granted `reveal` on exactly that secret.
+
+```bash
+cpln secret create-dictionary --name SMTP_SECRET_NAME \
+  --entry SMTP_USERNAME=YOUR-SMTP-USERNAME \
+  --entry SMTP_PASSWORD='YOUR-SMTP-PASSWORD'
+```
+
+### Access
+
+```yaml
 publicAccess:
   enabled: true # HTTPS UI + websockets on the auto *.cpln.app endpoint; false = internal-only
-
 internalAccess:
-  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  type: same-gvc # none | same-gvc | same-org | workload-list
   workloads: [] # used only with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
-postgres: # documents, users, spaces
+| `internalAccess.type` | Who can reach Docmost over the internal network |
+|---|---|
+| `none` | No workload |
+| `same-gvc` | Every workload in the same GVC (default) |
+| `same-org` | Every workload in the same org |
+| `workload-list` | Only the workloads listed in `internalAccess.workloads` |
+
+A change to either access knob takes a couple of minutes to take effect after the upgrade reports success.
+
+### Bundled PostgreSQL
+
+The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. The chart builds the credentials secret from `postgres.credentials.*` for you — nothing to create before installing.
+
+```yaml
+postgres:
   image: postgres:18
-  credentials: # the chart writes these into the secret named below — nothing for you to create
+  credentials: # the chart writes these into the secret named below
     username: docmost
-    password: change-me-docmost-pg # change before installing
+    password: change-me-docmost-pg # change before installing — seeds the database on first boot
     database: docmost
   config:
-    credentialsSecretName: my-docmost-db-credentials # secret names are org-wide — give each release its own
+    credentialsSecretName: my-docmost-db-credentials # chart-created; secret names are org-wide, so give each release its own
   resources:
     minCpu: 250m
     maxCpu: 1000m
     minMemory: 512Mi
     maxMemory: 1Gi
   volumeset:
-    capacity: 10 # initial capacity in GiB (minimum is 10)
+    capacity: 10 # GiB (minimum 10)
+  backup:
+    enabled: false # scheduled pg_dumpall to object storage — see Backing Up
+    schedule: "0 2 * * *" # daily at 02:00 UTC
+    provider: aws # aws | gcp | minio
+```
 
-redis: # bundled single node — queues + realtime coordination (required)
+### Bundled Redis
+
+Redis is required: Docmost's readiness check pings it alongside the database, and the workload does not become ready without it.
+
+```yaml
+redis:
   image: redis:8
   auth:
-    password: change-me-docmost-redis # change before installing
+    password: change-me-docmost-redis # change before installing — wired into REDIS_URL
   resources:
     minCpu: 100m
     maxCpu: 400m
@@ -181,40 +255,64 @@ redis: # bundled single node — queues + realtime coordination (required)
     capacity: 10 # GiB (minimum 10); AOF at /data
 ```
 
-### Docmost Server
+<Note>
+Both bundled passwords seed their component on first boot and are not updated by later value edits. Uninstalling the release deletes the volume sets; reinstall to reset.
+</Note>
 
-- `image` — The official Docmost image. Pin a released tag.
-- `replicas` — Number of Docmost replicas. Anything above `1` requires `storage.type: s3`; the chart fails the render with a clear message otherwise. See [Scaling](#scaling).
-- `appUrl` — The public base URL Docmost puts in invitation and share links, including the `https://` scheme. Leave it empty to derive it from the workload's canonical endpoint; set it when you serve Docmost on a custom domain.
-- `resources` — CPU and memory bounds for the Docmost container. The memory ceiling leaves headroom for the boot migrations and large imports.
+## Connecting
 
-### Attachment Storage
+| What | Address | Notes |
+|---|---|---|
+| Public UI and API | `https://<canonical>.cpln.app` | Assigned automatically while `publicAccess.enabled` is `true`. Read it from `status.canonicalEndpoint` with `cpln workload get RELEASE_NAME-docmost --gvc GVC_NAME -o yaml`. |
+| Collaboration websocket | `wss://<canonical>.cpln.app/collab` | Used by the editor; no separate configuration. |
+| Health | `/api/health` (readiness), `/api/health/live` (liveness) | Unauthenticated, on the same host. |
+| Internal (same GVC) | `http://RELEASE_NAME-docmost.GVC_NAME.cpln.local:3000` | Reachable per `internalAccess.type`. |
+| Login | The account created on first run | Docmost ships no default account. |
+| PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | `username` / `password` / `database` from `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `postgres.config.credentialsSecretName`. |
+| Redis | `RELEASE_NAME-docmost-redis.GVC_NAME.cpln.local:6379` | Password is the `redisPassword` key of `cpln secret reveal RELEASE_NAME-docmost-creds -o yaml`. |
 
-`storage.type` decides where uploaded files, images, and avatars are kept.
+With `publicAccess.enabled: false` there is no public endpoint; reach the UI from your machine through a tunnel instead and open `http://localhost:3000`:
+
+```bash
+cpln port-forward RELEASE_NAME-docmost 3000:3000 --gvc GVC_NAME
+```
+
+### First Run
+
+Docmost ships no default account: the first person to reach the instance creates the workspace and its owner account, and that form is open to anyone who can reach the endpoint.
+
+<Steps>
+  <Step title="Wait for the Docmost workload to report ready">
+    PostgreSQL and Redis come up first, then Docmost applies its schema migrations and starts serving.
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-docmost --gvc GVC_NAME -o yaml
+    ```
+  </Step>
+  <Step title="Open the endpoint and claim the workspace">
+    Browse to the canonical endpoint (or the port-forward URL) and complete the setup form to create the workspace and the owner account. Do this as soon as the workload is ready.
+  </Step>
+  <Step title="Configure email before inviting anyone">
+    Member invitations are delivered only by email. Configure [SMTP](#email) before you invite your team.
+  </Step>
+</Steps>
+
+## Operations
+
+### Attachment Storage on S3
+
+Set `storage.type: s3` to keep attachments in a bucket you own. This is required for more than one replica, and nothing in the template moves existing attachments between the local volume and the bucket — choose the storage type before uploading content.
 
 <Tabs>
-  <Tab title="Local volume (default)">
-    Attachments are written to a persistent volume set mounted at `/app/data/storage`, and survive restarts, redeploys, and upgrades under the same release name.
-
-    ```yaml
-    storage:
-      type: local
-      local:
-        volumeset:
-          capacity: 10 # initial capacity in GiB (minimum is 10)
-    ```
-
-    Local storage works only with a single replica — each replica would get its own volume, so attachments uploaded through one replica would be missing from the others.
-  </Tab>
   <Tab title="AWS S3 (keyless)">
-    AWS S3 uses a Control Plane cloud identity: no credentials are stored, and the workload's identity vends temporary credentials at runtime. This is the only supported way to reach AWS S3 — the chart rejects static keys unless `storage.s3.endpoint` is set.
+    AWS S3 uses a Control Plane cloud account: no access keys are stored anywhere, and the Docmost identity obtains temporary credentials at runtime. This is the only supported way to reach AWS S3 — the chart rejects static keys unless `storage.s3.endpoint` is set.
 
     <Steps>
       <Step title="Create a bucket">
         Create an S3 bucket. Set `storage.s3.bucket` and `storage.s3.region` to match.
       </Step>
-      <Step title="Set up a Cloud Account">
-        If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for your AWS account. Set `storage.s3.cloudAccountName` to its name.
+      <Step title="Set up a cloud account">
+        If you do not have one, [create a cloud account](/guides/create-cloud-account) for your AWS account. Set `storage.s3.cloudAccountName` to its name.
       </Step>
       <Step title="Create a bucket-scoped IAM policy">
         Create an AWS IAM policy with the JSON below (replace `YOUR_BUCKET_NAME` with your bucket), then set `storage.s3.policyName` to the policy's name:
@@ -241,7 +339,7 @@ redis: # bundled single node — queues + realtime coordination (required)
         ```
       </Step>
       <Step title="Leave the key secret empty">
-        Keep `storage.s3.auth.secretName` empty. The template then attaches the cloud account and your policy to the Docmost identity, and no access keys exist anywhere.
+        Keep `storage.s3.auth.secretName` empty. The template then attaches the cloud account and your policy to the Docmost identity.
       </Step>
     </Steps>
   </Tab>
@@ -256,29 +354,170 @@ redis: # bundled single node — queues + realtime coordination (required)
         Set `storage.s3.endpoint` to the S3 API address including scheme and port, and `storage.s3.forcePathStyle: true` (required by most S3-compatible servers).
       </Step>
       <Step title="Create the key secret">
-        Create a dictionary secret with the server's credentials and set `storage.s3.auth.secretName` to its name:
+        Create a dictionary secret with the server's access and secret keys and set `storage.s3.auth.secretName` to its name. The Docmost identity is granted `reveal` on exactly this secret.
 
         ```bash
-        cpln secret create-dictionary --name my-docmost-s3-keys \
-          --entry AWS_S3_ACCESS_KEY_ID=YOUR_ACCESS_KEY \
-          --entry AWS_S3_SECRET_ACCESS_KEY=YOUR_SECRET_KEY
+        cpln secret create-dictionary --name S3_KEYS_SECRET_NAME \
+          --entry AWS_S3_ACCESS_KEY_ID=YOUR-ACCESS-KEY \
+          --entry AWS_S3_SECRET_ACCESS_KEY='YOUR-SECRET-KEY'
         ```
-
-        The Docmost identity is granted `reveal` on exactly this secret.
       </Step>
     </Steps>
   </Tab>
 </Tabs>
 
-`storage.fileUploadSizeLimit` caps the size of a single attachment (default `50mb`).
+### Backing Up
+
+Scheduled backups of the bundled PostgreSQL are off by default. Enabling `postgres.backup.enabled: true` adds one cron workload, `RELEASE_NAME-postgres-backup`, that runs `pg_dumpall` on the schedule and uploads a gzipped dump to your bucket under the configured prefix. Pick a `postgres.backup.provider` and complete the matching setup **before** installing or upgrading with it on.
+
+<Tabs>
+  <Tab title="AWS S3">
+    ```yaml
+    postgres:
+      backup:
+        enabled: true
+        provider: aws
+        aws:
+          bucket: my-postgres-bucket
+          region: us-east-1
+          cloudAccountName: my-s3-cloud-account
+          policyName: my-postgres-backup-policy # bucket-scoped IAM policy
+          prefix: postgres/backups
+    ```
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create an S3 bucket. Set `postgres.backup.aws.bucket` and `postgres.backup.aws.region` to match.
+      </Step>
+      <Step title="Set up a cloud account">
+        If you do not have one, [create a cloud account](/guides/create-cloud-account) for the AWS account holding the bucket. Set `postgres.backup.aws.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        Create an IAM policy with the JSON below (replace `YOUR_BUCKET_NAME`) and set `postgres.backup.aws.policyName` to its name:
+
+        ```json
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion",
+                "s3:GetBucketLocation",
+                "s3:AbortMultipartUpload",
+                "s3:ListBucketMultipartUploads",
+                "s3:ListMultipartUploadParts"
+              ],
+              "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+              ]
+            }
+          ]
+        }
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    ```yaml
+    postgres:
+      backup:
+        enabled: true
+        provider: gcp
+        gcp:
+          bucket: my-postgres-bucket
+          cloudAccountName: my-gcs-cloud-account
+          prefix: postgres/backups
+    ```
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create a GCS bucket. Set `postgres.backup.gcp.bucket` to its name.
+      </Step>
+      <Step title="Set up a cloud account">
+        [Create a cloud account](/guides/create-cloud-account) for the GCP project holding the bucket and set `postgres.backup.gcp.cloudAccountName` to its name.
+      </Step>
+      <Step title="Grant storage access">
+        Grant the cloud account's service account the **Storage Admin** (`roles/storage.admin`) role on the project. The chart additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket in `postgres.backup.gcp.bucket`.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="MinIO / S3-compatible">
+    ```yaml
+    postgres:
+      backup:
+        enabled: true
+        provider: minio
+        minio:
+          endpoint: http://my-minio-workload:9000 # S3 API address including the port
+          bucket: my-postgres-bucket
+          credentialsSecretName: my-postgres-minio-credentials # dictionary secret with accessKey + secretKey
+          prefix: postgres/backups
+    ```
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create the bucket on your server. Set `postgres.backup.minio.bucket` to its name and `postgres.backup.minio.endpoint` to the S3 API address including the port — for the [MinIO](/template-catalog/templates/minio) template in the same GVC, `http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000`.
+      </Step>
+      <Step title="Create the credentials secret">
+        Create a dictionary secret with the server's keys and set `postgres.backup.minio.credentialsSecretName` to its name. No cloud account is involved.
+
+        ```bash
+        cpln secret create-dictionary --name BACKUP_MINIO_SECRET_NAME \
+          --entry accessKey=YOUR-ACCESS-KEY \
+          --entry secretKey='YOUR-SECRET-KEY'
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
 
 <Warning>
-An upload larger than `storage.fileUploadSizeLimit` is stored truncated at the limit rather than rejected with an error — the file appears in the page but is incomplete. Raise the limit before importing large attachments.
+A zero-length backup object is a failed run, not a backup. If the dump cannot reach the database, the upload still writes a near-empty gzip under a normal timestamped filename. Check the object size before you rely on one.
 </Warning>
 
-### Scaling
+Two things the database dump does not cover: local attachments live on the `RELEASE_NAME-docmost-storage` volume set (S3 attachments are already in your bucket), and your `APP_SECRET` lives in the secret you created. The PostgreSQL volume set `RELEASE_NAME-pg-vs` also keeps 7 days of [volume set snapshots](/reference/volumeset) and takes a final snapshot when the release is uninstalled.
 
-`docmost.replicas` sets how many Docmost replicas run. Replicas coordinate through the bundled Redis, which carries both the job queues and the collaborative-editing updates, so a document edited on one replica appears live for a reader connected to another.
+### Restoring a Backup
+
+Each backup is a gzipped plain-SQL `pg_dumpall` archive. Restoring means replaying that SQL into the bundled PostgreSQL. The one transport that carries a dump into the container intact is `cpln workload exec` with `--stdin` and a `base64` wrapper on both ends — raw binary piped through exec is corrupted:
+
+```bash
+gunzip -c BACKUP_FILE.sql.gz | base64 | cpln workload exec RELEASE_NAME-postgres --gvc GVC_NAME \
+  --container postgresql --stdin --quiet -- sh -c 'base64 -d | psql -U "$POSTGRES_USER" -d postgres'
+```
+
+Two constraints make this a planned operation: the archive contains `CREATE ROLE` and `CREATE DATABASE` statements, so a straight replay collides with the database Docmost already created and migrated on first boot; and no Docmost replica may be connected while you drop and recreate that database before the replay.
+
+<Warning>
+This restore path has not been exercised against this template end to end. Rehearse it on a throwaway release before you depend on it. Restoring from a volume set snapshot is likewise unverified here.
+</Warning>
+
+### Upgrading from 1.0.0
+
+Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. Docmost absorbed that change rather than passing it on — the chart now creates the credentials secret itself — so there is **no new prerequisite**, only a rename of three keys:
+
+| Removed key (1.0.0) | Replacement (1.1.0) |
+|---|---|
+| `postgres.config.username` | `postgres.credentials.username` |
+| `postgres.config.password` | `postgres.credentials.password` |
+| `postgres.config.database` | `postgres.credentials.database` |
+
+Move the three keys, keep the same values so the running database still matches, and upgrade in place. A values file that still carries an old key fails the render with the **postgres template's** message, which tells you to create a dictionary secret yourself — ignore that advice here; this template creates it.
+
+<Note>
+The first `helm upgrade` after an install can restart the bundled PostgreSQL even when its values are unchanged, so expect a brief interruption.
+</Note>
+
+### Scaling and Availability
+
+`docmost.replicas` sets how many Docmost replicas run. Replicas coordinate through the bundled Redis, which carries both the job queues and the collaborative-editing updates, so a document edited on one replica appears live for a reader connected to another, and no sticky sessions are needed.
 
 ```yaml
 docmost:
@@ -293,91 +532,77 @@ storage:
 ```
 
 <Warning>
-`docmost.replicas` above `1` requires `storage.type: s3`. Local attachments live on per-replica volumes, so an attachment uploaded through one replica would return a `404` from another. The chart refuses to render the combination.
+`docmost.replicas` above `1` requires `storage.type: s3`. Local attachments live on per-replica volumes, so a file uploaded through one replica would return a `404` from another. The chart refuses to render the combination.
 </Warning>
 
-At two replicas, a rolling upgrade served every health check without a single failure, and killing a replica outright cost one failed request before the replacement rejoined automatically.
+The bundled PostgreSQL and Redis are single-instance by design: Docmost has no Sentinel support, so the highly-available Redis template is not used. Their data lives on persistent volume sets and survives restarts, redeploys, and upgrades under the same release name.
 
-### Access
+### Troubleshooting
 
-- `publicAccess.enabled` — Serve the UI, API, and collaboration websockets on the auto-assigned `*.cpln.app` HTTPS endpoint (default). Set to `false` for an internal-only instance: external requests are then refused at the edge, and in-GVC callers still reach it per `internalAccess`.
-- `internalAccess.type` — Controls which workloads can reach Docmost over the internal network:
+<AccordionGroup>
+  <Accordion title="Deployment never becomes ready and the logs are empty">
+    **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-docmost --gvc GVC_NAME -o yaml` shows `The secret APP_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
 
-| Type | Description |
-|------|-------------|
-| `none` | No internal access. |
-| `same-gvc` | Allow access from all workloads in the same GVC (default). |
-| `same-org` | Allow access from all workloads in the same organization. |
-| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
+    **Cause:** The `APP_SECRET` prerequisite secret named by `secrets.name` does not exist.
 
-<Note>
-Flipping `publicAccess.enabled` changes the load balancer configuration, so the public endpoint may return `503` for a minute or two after the upgrade reports success.
-</Note>
+    **Fix:** Create it (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-docmost --gvc GVC_NAME` skips the wait.
+  </Accordion>
+  <Accordion title="Second install refused as managed by a different release">
+    **Symptom:** Installing a second Docmost release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
 
-### Email
+    **Cause:** Both releases use the same `postgres.config.credentialsSecretName`. Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
 
-SMTP is **off by default**, and a default install works without it — the first visitor still creates the workspace and the admin account, and that account signs in with its password.
+    **Fix:** Set `postgres.config.credentialsSecretName` to a distinct name for the second release and install again.
+  </Accordion>
+  <Accordion title="Render fails because replicas above 1 require s3 storage">
+    **Symptom:** `docmost: docmost.replicas > 1 requires storage.type: s3 — local attachments live on per-replica volumesets and would scatter/404 across replicas`.
 
-```yaml
-smtp:
-  enabled: true
-  host: smtp.example.com
-  port: 587
-  secure: false
-  fromAddress: no-reply@example.com
-  fromName: Docmost
-  auth:
-    secretName: my-docmost-smtp # dictionary secret with SMTP_USERNAME + SMTP_PASSWORD
-```
+    **Cause:** `docmost.replicas` is above `1` while `storage.type` is `local`.
 
-For an authenticated relay, create the credentials secret before installing and reference it by name:
+    **Fix:** Complete [Attachment Storage on S3](#attachment-storage-on-s3) and set `storage.type: s3`, or keep a single replica.
+  </Accordion>
+  <Accordion title="Render fails because static keys are only for S3-compatible servers">
+    **Symptom:** `docmost: static keys (storage.s3.auth.secretName) are only for S3-compatible servers (storage.s3.endpoint set)`.
 
-```bash
-cpln secret create-dictionary --name my-docmost-smtp \
-  --entry SMTP_USERNAME=apikey --entry SMTP_PASSWORD=YOUR_PASSWORD
-```
+    **Cause:** `storage.s3.auth.secretName` is set without a `storage.s3.endpoint`. AWS S3 is keyless-only in this template.
 
-Leave `smtp.auth.secretName` empty for a relay that does not require authentication. When it is set, the Docmost identity is granted `reveal` on exactly that secret.
+    **Fix:** For AWS, clear `storage.s3.auth.secretName` and set `storage.s3.cloudAccountName` and `storage.s3.policyName`. For an S3-compatible server, set `storage.s3.endpoint` too.
+  </Accordion>
+  <Accordion title="Upgrade from 1.0.0 fails asking you to create a dictionary secret">
+    **Symptom:** The render fails with the postgres template's message about `config.credentialsSecretName` and a prerequisite dictionary secret.
 
-<Warning>
-With SMTP disabled there is no way to deliver a member invitation. The image sends no mail and writes no invitation link to the workload logs, so an invitation created in the UI never reaches its recipient. Configure `smtp.*` for any workspace with more than one member.
-</Warning>
+    **Cause:** Your values file still carries `postgres.config.username`, `postgres.config.password`, or `postgres.config.database`.
 
-### Databases
+    **Fix:** Rename them to `postgres.credentials.*` as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0). Do not create a secret yourself — this template creates it.
+  </Accordion>
+  <Accordion title="Member invitations never arrive">
+    **Symptom:** An invitation created in the UI reaches no one, and the workload logs contain no invitation link.
 
-- `postgres.credentials.username` / `password` / `database` — Credentials for the bundled PostgreSQL from the [postgres](/template-catalog/templates/postgres) subchart. **Change the password before installing** — it seeds the database on first boot and is not updated by later value edits.
-- `postgres.config.credentialsSecretName` — Name of the dictionary secret the chart creates from those three values and hands to the bundled PostgreSQL. Secret names are organization-wide, so give each release its own name; a second release left on the default is **refused at install** and creates nothing, leaving the first release untouched.
-- `postgres.resources` / `postgres.volumeset.capacity` — CPU and memory bounds and the initial data volume size in GiB (minimum 10).
-- `redis.auth.password` — Password for the bundled Redis, wired into Docmost's `REDIS_URL`. **Change it before installing.** Redis requires authentication: an unauthenticated client is refused.
-- `redis.resources` / `redis.volumeset.capacity` — CPU and memory bounds and the volume size for the Redis AOF file at `/data`.
+    **Cause:** `smtp.enabled` is `false`. The production image sends no mail and writes no fallback link to the logs.
 
-<Note>
-Redis is not optional. Docmost's health check reports the Redis connection alongside the database one, and the workload does not become ready without it. A Redis restart briefly fails readiness on the Docmost workload, which recovers on its own without restarting the application container.
-</Note>
+    **Fix:** Configure [Email](#email) with `smtp.enabled: true` (and `smtp.auth.secretName` for an authenticated relay), then re-send the invitation.
+  </Accordion>
+  <Accordion title="Uploaded attachment is incomplete">
+    **Symptom:** A large upload succeeds with no error but the stored file is cut off.
 
-## Connecting
+    **Cause:** The file exceeded `storage.fileUploadSizeLimit`. Docmost stores the upload truncated at the limit instead of rejecting it.
 
-| What | Value |
-|---|---|
-| Public UI / API | `https://<canonical>.cpln.app` — `status.canonicalEndpoint` of `{release}-docmost` (`cpln workload get {release}-docmost -o yaml`) |
-| Collaboration websocket | `wss://<canonical>.cpln.app/collab` — used by the editor, no separate configuration |
-| Health check | `https://<canonical>.cpln.app/api/health` (readiness) and `/api/health/live` (liveness) — unauthenticated |
-| Internal (same GVC) | `http://{release}-docmost.{gvc}.cpln.local:3000` |
-| Login | The admin account created on first visit |
-| PostgreSQL (internal) | `{release}-postgres.{gvc}.cpln.local:5432`, credentials from `postgres.config` |
-| Redis (internal) | `{release}-docmost-redis.{gvc}.cpln.local:6379`, password from `redis.auth.password` |
+    **Fix:** Raise `storage.fileUploadSizeLimit` (for example `200mb`) and upload the file again.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Create the `APP_SECRET` secret before installing** — `secrets.name` must point at an existing opaque secret (plain encoding) whose payload is a random string of at least 32 characters. A missing secret pauses the deployment until the secret exists, and the install looks broken until then.
-- **`APP_SECRET` is write-once** — rotating it logs out every user and invalidates outstanding invitation and share links. Stored documents are unaffected. Back the value up outside Control Plane.
-- **Claim the workspace right after install** — the first visitor to complete the setup form becomes the workspace owner.
-- **With SMTP off, member invitations cannot be delivered** — no mail is sent and no invitation link is written to the logs. Configure `smtp.*` before inviting anyone.
-- **`docmost.replicas` above `1` requires `storage.type: s3`** — local attachments are per-replica and would `404` across replicas.
-- **AWS S3 is keyless only** — use a cloud account plus a bucket-scoped IAM policy. Static keys are accepted only when `storage.s3.endpoint` points at an S3-compatible server.
+- **Create the `APP_SECRET` secret before installing** — `secrets.name` must name an existing opaque secret (plain encoding) with a random payload of at least 32 characters. A missing secret wedges the deployment silently.
+- **Treat `APP_SECRET` as write-once** — rotating it logs out every user and invalidates outstanding invitation and share links. Back the value up outside Control Plane.
+- **Claim the workspace right after install** — the first visitor to complete the setup form becomes the workspace owner, and the form is reachable by anyone who can reach the endpoint.
+- **With SMTP off, member invitations cannot be delivered** — configure `smtp.*` before inviting anyone.
+- **`docmost.replicas` above `1` requires `storage.type: s3`** — local attachments are per-replica.
+- **AWS S3 is keyless only** — a cloud account plus a bucket-scoped IAM policy; static keys are accepted only with an S3-compatible `storage.s3.endpoint`.
 - **Uploads larger than `storage.fileUploadSizeLimit` are truncated, not rejected** — raise the limit before importing large attachments.
 - **Change `postgres.credentials.password` and `redis.auth.password` before installing** — both seed their component on first boot and are not updated by later value edits.
-- **Pages survive restarts and upgrades** — documents live in the PostgreSQL volume set and local attachments in the storage volume set. Uninstalling deletes those volume sets and everything in them; your `APP_SECRET` secret is yours and survives an uninstall.
+- **Give each release its own `postgres.config.credentialsSecretName`** — secret names are org-wide, and a second release on the same name is refused at install.
+- **Uninstalling deletes the volume sets** and every page and local attachment in them; your `APP_SECRET` secret is yours and survives.
 - **Docmost is licensed under the AGPL** — this template deploys the open-source edition.
 
 ## External References
@@ -389,11 +614,8 @@ Redis is not optional. Docmost's health check reports the Redis connection along
   <Card title="Environment Variables" icon="gear" href="https://docmost.com/docs/self-hosting/environment-variables">
     Every setting the Docmost server reads from its environment
   </Card>
-  <Card title="File Storage" icon="box" href="https://docmost.com/docs/self-hosting/configuration#file-storage">
-    Local and S3 attachment storage options
-  </Card>
-  <Card title="Email Configuration" icon="envelope" href="https://docmost.com/docs/self-hosting/configuration#email">
-    SMTP settings for invitations and notifications
+  <Card title="Self-Hosting Configuration" icon="box" href="https://docmost.com/docs/self-hosting/configuration">
+    File storage and email configuration options
   </Card>
   <Card title="Docmost on GitHub" icon="github" href="https://github.com/docmost/docmost">
     Source code and release notes
