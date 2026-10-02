@@ -1,0 +1,283 @@
+---
+title: 'Usage API'
+description: 'Query the metered usage of an org (CPU, memory, egress, storage, load balancers) by GVC, workload, or location, and list the values a usage tag takes, through the metering API.'
+keywords: ['metering', 'metering.cpln.io', 'consumption', 'usage query', 'tag values', 'core-seconds', 'byte-seconds', 'egress bytes', 'cost attribution', 'chargeback', 'showback', 'readMetrics']
+---
+
+## Usage API Overview
+
+The usage API returns the raw quantities Control Plane meters for an org: CPU, memory, egress, GPUs, volume sets, observability storage, and load balancers. It is served from `https://metering.cpln.io` and has two endpoints:
+
+| Endpoint | Returns |
+| :--- | :--- |
+| `POST /org/{org}/query` | Metered usage for the org, summed and grouped by the [usage tags](#usage-tags) you choose |
+| `POST /org/{org}/tags/values/query` | The distinct values one usage tag took during a period, such as every GVC or workload that had usage |
+
+The usage API returns quantities only. To get the same data priced in your billing account's currency, use the [charges query](/reference/billing-api#query-charges) of the billing API, which takes the same query body.
+
+## Usage API Authentication and Permissions
+
+Send a Control Plane token as a Bearer token on every request:
+
+```bash
+Authorization: Bearer YOUR_TOKEN_HERE
+```
+
+Either kind of org credential works:
+
+- **User token**: log in with [`cpln login`](/cli-reference/commands/login), then run `cpln profile token <profile-name>`.
+- **Service account key**: [create a service account](/guides/create-service-account) and generate a key.
+
+The principal needs the `readMetrics` permission on the [org](/reference/org#permissions) named in the path. Members of the built-in `superusers` group have it through `manage`. Any other user or service account needs a [policy](/reference/policy) that grants `readMetrics` on the `org` target kind.
+
+<Note>
+Granting or revoking `readMetrics` can take up to 5 minutes to apply to the usage API, because authorization results are cached.
+</Note>
+
+Every request is scoped to the org in the path. A request without `readMetrics` on that org, or for a deactivated org, returns `401` with `{"code":401,"error":"Unauthorized"}`.
+
+## Usage Tags
+
+Every metered value carries a set of tags. They identify what was used and where. You filter, sum, and group usage by these tags.
+
+<Warning>
+Usage tags are set by Control Plane when it meters usage. They are **not** the `tags` you put on workloads, GVCs, or orgs, so usage cannot be grouped by your own labels such as `team=payments`. To attribute usage to a team, group by a dimension that maps to it, such as `gvc` or `workload`.
+</Warning>
+
+| Tag | Value | Present on |
+| :--- | :--- | :--- |
+| `feature` | `workloads`, `volume-sets`, `observability`, `custom-ingress`, or `mk8s` | All usage |
+| `metric` | The metric name. See [metrics and units](#usage-metrics-and-units) | All usage |
+| `org` | Org name | All usage |
+| `gvc` | GVC name | Workloads, volume sets, custom ingress |
+| `name` | The metered entity: workload name, volume set name, GVC name for custom ingress, or mk8s cluster name | All usage except observability |
+| `location` | Control Plane location, for example `aws-us-east-1` | Workloads, volume sets, custom ingress |
+| `locationType` | `control_plane_hosted`, `byok`, or `mk8s` | All usage |
+| `workload` | Workload name. On volume sets, the workload that mounts the volume | Workloads, volume sets |
+| `workloadType` | `serverless`, `standard`, `stateful`, or `cron` | Workload usage |
+| `provider` | Cloud provider of the location | `cross-zone-traffic`, `public-ip-external-traffic` |
+| `gpuResource`, `gpuModel` | GPU resource name and model | `gpu` |
+| `volumeSet`, `volumeIndex`, `driver`, `performanceClass` | Volume set name, volume index (a number), storage driver, and performance class | Volume sets |
+| `snapshotName` | Snapshot name | Volume set snapshots |
+| `customIngress` | Dedicated load balancer the usage belongs to | Custom ingress |
+| `mk8sCluster` | mk8s cluster name | `cores-under-management` |
+
+A tag that does not apply to a usage row is absent from it. When you aggregate by a tag that a row lacks, the row reports it as `""`.
+
+## Usage Metrics and Units
+
+Usage is metered every second and summed into hourly rows, so most values are a quantity multiplied by the seconds it was held. For example, two cores held for one hour is `7200` core-seconds.
+
+| `feature` | `metric` | Unit | What it measures |
+| :--- | :--- | :--- | :--- |
+| `workloads` | `cpu` | core-seconds | The larger of reserved and used CPU. Divide by `3600` for core-hours |
+| `workloads` | `memory` | byte-seconds | The larger of reserved and used memory. Divide by `2^30 × 3600` for GiB-hours |
+| `workloads` | `egress` | bytes | Traffic leaving Control Plane |
+| `workloads` | `cross-zone-traffic` | bytes | Traffic between availability zones inside the mesh |
+| `workloads` | `public-ip-external-traffic` | bytes | Traffic to public IPs in the same region, outside the mesh |
+| `workloads` | `replicas` | replica-seconds | Running replicas |
+| `workloads` | `gpu` | GPU-seconds | Reserved GPUs |
+| `volume-sets` | `volume-set-capacity-bytes` | GiB-seconds | The larger of used storage and 70% of provisioned capacity |
+| `volume-sets` | `volume_set_capacity` | GB-seconds | Provisioned capacity, an older measure of the same volumes |
+| `volume-sets` | `snapshot-capacity` | snapshot-seconds | How long each snapshot existed, independent of its size |
+| `volume-sets` | `snapshot-storage` | GiB-seconds | Snapshot storage, where the location reports it |
+| `volume-sets` | `cpu`, `memory` | core-seconds, byte-seconds | CPU and memory of shared-filesystem volume sets |
+| `observability` | `logs-storage`, `tracing-storage`, `metrics-storage` | GB-seconds | Stored logs, traces, and metrics |
+| `observability` | `metrics-samples` | samples | Metric samples ingested |
+| `custom-ingress` | `load-balancer-seconds` | seconds | How long a dedicated load balancer existed |
+| `custom-ingress` | `load-balancer-processed-bytes` | bytes | Bytes the dedicated load balancer processed |
+| `mk8s` | `cores-under-management` | core-seconds | Cores of mk8s nodes under management |
+
+<Warning>
+Filter on both `feature` and `metric`. The metric names `cpu` and `memory` also appear under `feature: volume-sets` for shared-filesystem volume sets, so `{"metric": "cpu"}` alone mixes workload CPU with volume set CPU. Likewise, `volume-set-capacity-bytes` and `volume_set_capacity` measure the same volumes in two ways, so never add them together.
+</Warning>
+
+Usage priced from the cloud provider's bill, `snapshot-storage` and `load-balancer-processed-bytes`, can be revised for up to about 48 hours after the hour it belongs to.
+
+## Query Usage
+
+`POST https://metering.cpln.io/org/{org}/query`
+
+Returns the org's usage between two times, summed over the tags you do not name and grouped by the tags you do.
+
+### Usage Query Request
+
+| Field | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `startTime` | string (RFC 3339) | Yes | Start of the range. Must be before `endTime`. |
+| `endTime` | string (RFC 3339) | Yes | End of the range, exclusive. |
+| `timeStep` | string | Yes | Resolution of the data read: `hour`, `day`, `week`, or `month`. |
+| `aggregateByTimeStep` | boolean | No | `true` returns one period per `timeStep`. `false`, the default, returns one period for the whole range. |
+| `groupBy` | string[] | No | Tags that split each period into `groups`. Every key must also appear in the `aggregateBy` of every consumption query. Defaults to `["name"]`, which also adds `name` to each `aggregateBy`. |
+| `consumptionQueries` | object[] | Yes | One or more usage selections, run independently and merged into the same periods. |
+| `consumptionQueries[].filterBy` | object | No | Tag-to-value filters, all of which must match. See [filter syntax](#usage-filter-syntax). |
+| `consumptionQueries[].aggregateBy` | string[] | No | Tags to keep. Usage is summed over every other tag, and each result's `tags` contains only these keys. |
+| `consumptionQueries[].chargeableItems` | string[] | No | Limit usage to rows priced by these [chargeable items](/reference/billing-api#list-chargeable-items), by name. Their tag keys are added to the result's `tags`. |
+
+Times are aligned outward to whole `timeStep` boundaries in UTC, so a `day` query from `2026-09-01T10:00:00Z` starts at `2026-09-01T00:00:00Z`. Weeks start on Monday. Send times in UTC (`Z`): other offsets misalign day, week, and month boundaries.
+
+#### Usage Retention
+
+Usage at `month` resolution is kept indefinitely. Usage at `hour`, `day`, and `week` resolution is kept for the 12 whole months before the current month. A `startTime` before that returns `400` with the earliest start time still available. Use a later `startTime` or `timeStep: "month"`.
+
+#### Usage Filter Syntax
+
+- **Exact match**: `{"gvc": "prod"}` matches rows whose `gvc` is exactly `prod`.
+- **Regular expression**: a value wrapped in slashes is a case-sensitive POSIX regular expression, for example `{"workload": "/^api-/"}`. A regular expression is unanchored, so `/prod/` also matches `preprod`. Use `^` and `$`, and `/^(a|b)$/` to match one of several values.
+- **Multiple keys**: `{"feature": "workloads", "metric": "cpu"}` requires both.
+- **Non-string tags**: `volumeIndex` is a number, so match it with a regular expression such as `/^0$/`.
+
+### Usage Query Response
+
+| Field | Description |
+| :--- | :--- |
+| `periods` | One entry per period. `null` when no usage matched. |
+| `periods[].startTime`, `periods[].endTime` | The period's bounds, in UTC. |
+| `periods[].totalSeconds` | Length of the period in seconds. |
+| `periods[].elapsedSeconds` | Seconds of the period that have passed. Omitted for a period that has not started. |
+| `periods[].groups[].key` | The `groupBy` tag values of the group. |
+| `periods[].groups[].consumptions[].value` | Summed usage, in the [metric's unit](#usage-metrics-and-units). |
+| `periods[].groups[].consumptions[].projectedValue` | For the period that contains the current time, `value` extrapolated linearly to the full period. |
+| `periods[].groups[].consumptions[].tags` | The `aggregateBy` tag values of this row. |
+| `consumptionCount` | Number of usage rows returned. |
+
+### Example: Usage per GVC for a Month
+
+Return September's workload usage for the org `my-org`, one group per GVC with one row per metric:
+
+```bash
+curl --request POST \
+  --url https://metering.cpln.io/org/my-org/query \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "startTime": "2026-09-01T00:00:00Z",
+    "endTime": "2026-10-01T00:00:00Z",
+    "timeStep": "month",
+    "groupBy": ["gvc"],
+    "consumptionQueries": [
+      {
+        "filterBy": { "feature": "workloads" },
+        "aggregateBy": ["gvc", "metric"]
+      }
+    ]
+  }'
+```
+
+```json
+{
+  "periods": [
+    {
+      "startTime": "2026-09-01T00:00:00Z",
+      "endTime": "2026-10-01T00:00:00Z",
+      "totalSeconds": 2592000,
+      "elapsedSeconds": 2592000,
+      "consumptionCount": 4,
+      "groups": [
+        {
+          "key": { "gvc": "prod" },
+          "consumptions": [
+            { "value": 5184000, "tags": { "gvc": "prod", "metric": "cpu" } },
+            { "value": 11132555231232000, "tags": { "gvc": "prod", "metric": "memory" } },
+            { "value": 52428800000, "tags": { "gvc": "prod", "metric": "egress" } }
+          ]
+        },
+        {
+          "key": { "gvc": "staging" },
+          "consumptions": [
+            { "value": 1296000, "tags": { "gvc": "staging", "metric": "cpu" } }
+          ]
+        }
+      ]
+    }
+  ],
+  "consumptionCount": 4
+}
+```
+
+In `prod`, `5184000` core-seconds is 2 cores for 30 days, `11132555231232000` byte-seconds is 4 GiB for 30 days, and `52428800000` bytes is about 48.8 GiB of egress.
+
+### Example: Daily CPU per Workload
+
+Return one period per day, with one group per workload whose name starts with `api-` in the GVC `prod`:
+
+```json
+{
+  "startTime": "2026-09-01T00:00:00Z",
+  "endTime": "2026-09-08T00:00:00Z",
+  "timeStep": "day",
+  "aggregateByTimeStep": true,
+  "groupBy": ["workload"],
+  "consumptionQueries": [
+    {
+      "filterBy": { "feature": "workloads", "metric": "cpu", "gvc": "prod", "workload": "/^api-/" },
+      "aggregateBy": ["workload"]
+    }
+  ]
+}
+```
+
+## List Usage Tag Values
+
+`POST https://metering.cpln.io/org/{org}/tags/values/query`
+
+Returns the distinct values one tag took in the org's usage. Use it to discover what to filter or group by, for example every GVC that had usage last month, then pass those values to [Query Usage](#query-usage).
+
+### Tag Values Request
+
+| Field | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `startTime` | string (RFC 3339) | Yes | Start of the range. Must be on an hour boundary and before `endTime`. |
+| `endTime` | string (RFC 3339) | Yes | End of the range. Must be on an hour boundary. |
+| `tag` | string | Yes | The tag to list, for example `gvc`, `workload`, `location`, or `metric`. |
+| `filterBy` | object | No | Only consider usage matching these filters. Same [syntax](#usage-filter-syntax) as Query Usage. |
+
+Tag values are read from monthly usage, so the range is widened to whole calendar months in UTC. An `endTime` on the first of a month also includes that month. Values from the current month can lag until its usage is rolled up.
+
+### Tag Values Response
+
+The response echoes the request, adds the org to `filterBy`, and lists the values in `tagValues`, sorted alphabetically. The list contains `""` when some matching usage lacks the tag. Add a `feature` filter to avoid that.
+
+```bash
+curl --request POST \
+  --url https://metering.cpln.io/org/my-org/tags/values/query \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "startTime": "2026-09-01T00:00:00Z",
+    "endTime": "2026-09-30T00:00:00Z",
+    "tag": "gvc",
+    "filterBy": { "feature": "workloads" }
+  }'
+```
+
+```json
+{
+  "startTime": "2026-09-01T00:00:00Z",
+  "endTime": "2026-09-30T00:00:00Z",
+  "tag": "gvc",
+  "filterBy": { "feature": "workloads", "org": "my-org" },
+  "tagValues": ["prod", "staging"]
+}
+```
+
+## Usage API Errors
+
+| Status | Cause |
+| :--- | :--- |
+| `400` | `timeStep` missing or not one of `hour`, `day`, `week`, `month`; `startTime` not before `endTime`; a `groupBy` key missing from an `aggregateBy`; a `startTime` older than [retention](#usage-retention); tag-values times not on an hour boundary; an empty `tag`; or a body that is not valid JSON. On Query Usage, the invalid-JSON error is plain text rather than JSON. |
+| `401` | Missing or invalid token, no `readMetrics` on the org, or a deactivated org. |
+| `500` | An invalid regular expression in `filterBy`, or an internal error. |
+
+An org with no matching usage returns `200` with `"periods": null`, or an empty `tagValues` list.
+
+## Learn More
+
+<CardGroup cols={2}>
+  <Card title="Billing API" icon="file-invoice-dollar" href="/reference/billing-api">
+    Price the same usage, read invoices, and set a spend alert.
+  </Card>
+  <Card title="Query Costs and Usage" icon="chart-column" href="/guides/query-costs-and-usage">
+    Step by step: break down a month's cost and usage per GVC and workload.
+  </Card>
+</CardGroup>

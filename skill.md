@@ -548,7 +548,7 @@ For autoscaling, predictive scaling, mount options on `shared`, and AWS KMS cust
 
 ## Boundaries — Console-only actions
 
-CLI / API / Terraform handle nearly everything (resource CRUD, image push, domain config, debugging, template install). **Console-only**: managing billing and payment methods, creating the initial billing account, viewing Grafana metrics dashboards (link from Console).
+CLI / API / Terraform handle nearly everything (resource CRUD, image push, domain config, debugging, template install). **Console-only**: adding payment methods, creating the initial billing account, viewing Grafana metrics dashboards (link from Console). Cost queries, invoices, the spend alert, and billing service account tokens are available through the [billing API](https://docs.controlplane.com/reference/billing-api) (`billing-ng.cpln.io`); per-org usage through the [usage API](https://docs.controlplane.com/reference/usage-api) (`metering.cpln.io`, needs org `readMetrics`).
 
 ## Logs and observability
 

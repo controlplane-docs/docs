@@ -1,0 +1,459 @@
+---
+title: 'Billing API'
+description: 'Query priced charges for a billing account or org, list invoices and download them as PDF, set the monthly spend alert, and mint billing service account tokens through the billing API.'
+keywords: ['billing-ng', 'billing-ng.cpln.io', 'charges query', 'cost report', 'invoice pdf', 'spend alert', 'budget alert', 'billing token', 'cpln-bsat', 'finops', 'chargeback', 'account id']
+---
+
+## Billing API Overview
+
+The billing API serves your [billing account](/concepts/billing): what its orgs cost, its invoices, its spend alert, and the tokens that automate it. It is served from `https://billing-ng.cpln.io`.
+
+| Task | Endpoint |
+| :--- | :--- |
+| [Query charges](#query-charges) for an account or an org | `POST /account/{accountId}/charges/-query`, `POST /org/{org}/charges/-query` |
+| [List charge tag values](#list-charge-tag-values) across an account | `POST /account/{accountId}/tags/values/query` |
+| [List chargeable items](#list-chargeable-items) and the tags they price | `GET /chargeable_items` |
+| [Read invoices](#invoices) and download them | `GET /account/{accountId}/charges/invoices…` |
+| [Manage the spend alert](#spend-alert) | `/account/{accountId}/alert` |
+| [Manage billing service account tokens](#billing-service-account-tokens) | `/account/{accountId}/service-account-token` |
+| [View and raise org quotas](/guides/manage-quotas) | `/org/{org}/quotas`, `/org/{org}/quota-increase-requests` |
+
+For the unpriced quantities behind these charges, use the [usage API](/reference/usage-api).
+
+## Billing API Authentication
+
+Send a token as a Bearer token on every request:
+
+```bash
+Authorization: Bearer YOUR_TOKEN_HERE
+```
+
+Three kinds of token work, depending on the endpoint:
+
+| Token | How to get it | Works on |
+| :--- | :--- | :--- |
+| **User token** | `cpln login`, then `cpln profile token <profile-name>` | Every endpoint, within the user's billing roles and org permissions |
+| **Billing service account token** (`cpln-bsat-…`) | [Created by a `billing_admin`](#billing-service-account-tokens) | Endpoints under `/account/{accountId}`, for its own account and within its roles |
+| **Org service account key** | [Create a service account](/guides/create-service-account) and generate a key | Org endpoints: `/org/{org}/charges/-query` and the quota endpoints |
+
+Endpoints under `/account/{accountId}` check the caller's [billing role](/concepts/billing) on that account:
+
+| Endpoint | Required billing role |
+| :--- | :--- |
+| Query charges, list charge tag values, read invoices | `billing_admin` or `billing_viewer` |
+| Spend alert, billing service account tokens | `billing_admin` |
+
+`POST /org/{org}/charges/-query` accepts either the `readMetrics` [permission](/reference/org#permissions) on the org, or `billing_admin` or `billing_viewer` on the account that pays for the org.
+
+A caller without the required role or permission receives `401` with `{"code":401,"error":"unauthorized"}`. Role changes, token revocations, and token expiry can take up to 5 minutes to apply, because authorization results are cached.
+
+### Find Your Account ID
+
+`{accountId}` is your billing account's UUID. List the accounts your user belongs to:
+
+```bash
+curl --request GET \
+  --url https://billing-ng.cpln.io/account \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE'
+```
+
+Each item's `id` is the account ID to use in the paths below.
+
+## Query Charges
+
+`POST https://billing-ng.cpln.io/account/{accountId}/charges/-query`
+
+`POST https://billing-ng.cpln.io/org/{org}/charges/-query`
+
+Returns usage priced with your account's rate plan. The request body is the [usage query](/reference/usage-api#usage-query-request) body, so filters, aggregation, and grouping work the same way, plus the fields below.
+
+- The **account** endpoint covers every org on the account. Pass `orgs` to narrow it.
+- The **org** endpoint covers only the org in the path, priced with the rate plan of the account that pays for it.
+
+| Field | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `startTime`, `endTime` | string (RFC 3339) | Yes | The range, in UTC. Both must be on an hour boundary. `endTime` is exclusive. |
+| `timeStep` | string | Yes | `hour`, `day`, `week`, or `month`. |
+| `aggregateByTimeStep` | boolean | No | `true` returns one period per `timeStep`; `false` returns one period for the whole range. |
+| `groupBy` | string[] | No | Tags that split each period into groups. Each key must be in every `aggregateBy`. |
+| `consumptionQueries` | object[] | Yes | Usage selections with `filterBy`, `aggregateBy`, and `chargeableItems`, as in the [usage query](/reference/usage-api#usage-query-request). |
+| `orgs` | string[] | No | Account endpoint only: names of orgs on the account to include. Defaults to every org on the account. |
+| `detailed` | boolean | No | `true` returns results per billing period with the rate plan and each pricing tier. See [detailed charges](#detailed-charges). |
+
+<Warning>
+A row is priced only when its tags include every tag its [chargeable item](#list-chargeable-items) prices on. Put `metric` and `locationType` in `aggregateBy`, plus any other tag in the item's `consumptionTags`. A row that matches no chargeable item returns `"total": 0`. The `feature` tag is always added for you.
+</Warning>
+
+Pricing tiers are applied to the rows your query selects, starting from the first of the month. A query filtered to one GVC can therefore show different unit rates than the invoice, which tiers on the whole account.
+
+### Charges Response
+
+The response wraps a [usage query response](/reference/usage-api#usage-query-response) in `results`. Each row adds:
+
+| Field | Description |
+| :--- | :--- |
+| `total` | The charge, in whole currency units (for example dollars) as a decimal number. |
+| `projectedTotal` | For the period that contains the current time, `total` extrapolated to the full period. |
+| `currency` | The rate plan's currency, for example `USD`. |
+| `ratePlans` | IDs of the rate plans that priced the row. |
+
+When no usage matches, `results.periods` is `[]`.
+
+### Example: Last Month's Charges per Org and Metric
+
+```bash
+curl --request POST \
+  --url https://billing-ng.cpln.io/account/YOUR_ACCOUNT_ID/charges/-query \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "startTime": "2026-09-01T00:00:00Z",
+    "endTime": "2026-10-01T00:00:00Z",
+    "timeStep": "month",
+    "groupBy": ["org", "metric"],
+    "consumptionQueries": [
+      {
+        "filterBy": { "feature": "workloads" },
+        "aggregateBy": ["org", "metric", "locationType"]
+      }
+    ]
+  }'
+```
+
+```json
+{
+  "results": {
+    "periods": [
+      {
+        "startTime": "2026-09-01T00:00:00Z",
+        "endTime": "2026-10-01T00:00:00Z",
+        "totalSeconds": 2592000,
+        "elapsedSeconds": 2592000,
+        "consumptionCount": 2,
+        "groups": [
+          {
+            "key": { "org": "my-org", "metric": "cpu" },
+            "consumptions": [
+              {
+                "total": 412.37,
+                "currency": "USD",
+                "ratePlans": ["8b0f2a4e-3d1c-4f7a-9a51-0c6a2f1d9e10"],
+                "value": 4948444.8,
+                "tags": { "feature": "workloads", "metric": "cpu", "org": "my-org", "locationType": "control_plane_hosted" }
+              }
+            ]
+          },
+          {
+            "key": { "org": "my-org", "metric": "memory" },
+            "consumptions": [
+              {
+                "total": 95.1,
+                "currency": "USD",
+                "ratePlans": ["8b0f2a4e-3d1c-4f7a-9a51-0c6a2f1d9e10"],
+                "value": 13950729216000,
+                "tags": { "feature": "workloads", "metric": "memory", "org": "my-org", "locationType": "control_plane_hosted" }
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "consumptionCount": 2
+  }
+}
+```
+
+`value` is the usage in the [metric's unit](/reference/usage-api#usage-metrics-and-units), and `total` is its price.
+
+### Detailed Charges
+
+With `"detailed": true`, the response is `detailedResults`: one entry for each billing period that overlaps the range. Each entry has the `accountState`, which carries the period's `ratePlan`, and its `results`. Each row also has a `details` array with one entry per pricing tier:
+
+| Field | Description |
+| :--- | :--- |
+| `amount` | Charge for this tier, in whole currency units. |
+| `units` | Usage billed in this tier. |
+| `rate` | Price per unit in this tier. |
+| `from`, `to` | Tier bounds, in usage units. `-1` means unbounded. |
+| `chargeableItemId`, `ratePlanItem` | The chargeable item and rate plan item that priced the tier. |
+
+## List Charge Tag Values
+
+`POST https://billing-ng.cpln.io/account/{accountId}/tags/values/query`
+
+Returns the distinct values a usage tag took across every org on the account. It takes the same body as the usage API's [List Usage Tag Values](/reference/usage-api#list-usage-tag-values) and returns the same response, plus `accountId`.
+
+```bash
+curl --request POST \
+  --url https://billing-ng.cpln.io/account/YOUR_ACCOUNT_ID/tags/values/query \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "startTime": "2026-09-01T00:00:00Z",
+    "endTime": "2026-09-30T00:00:00Z",
+    "tag": "gvc",
+    "filterBy": { "feature": "workloads" }
+  }'
+```
+
+```json
+{
+  "startTime": "2026-09-01T00:00:00Z",
+  "endTime": "2026-09-30T00:00:00Z",
+  "tag": "gvc",
+  "filterBy": { "feature": "workloads" },
+  "accountId": "a1b2c3d4-0000-4000-8000-000000000001",
+  "tagValues": ["staging", "prod-us", "prod-eu"]
+}
+```
+
+`tagValues` is in no particular order, so sort it yourself. It contains `""` when some matching usage lacks the tag.
+
+## List Chargeable Items
+
+`GET https://billing-ng.cpln.io/chargeable_items`
+
+Lists what Control Plane charges for. Any valid token can call it. Use it to find the tags each item prices on, which the [charges query](#query-charges) must aggregate by, and the names to pass as `chargeableItems`.
+
+```json
+[
+  {
+    "id": "0f6c1d2e-8a4b-4c3d-9e7f-1a2b3c4d5e6f",
+    "name": "memory",
+    "description": "Memory",
+    "consumptionTags": { "feature": "workloads", "metric": "memory", "locationType": "control_plane_hosted" },
+    "unit": "bytes * seconds",
+    "type": "consumption"
+  }
+]
+```
+
+| Field | Description |
+| :--- | :--- |
+| `name` | Item name, used in `chargeableItems`. |
+| `consumptionTags` | Tags a usage row must carry to be priced by this item. |
+| `unit` | Unit of the usage the item prices. |
+
+## Invoices
+
+Invoice amounts are integers in the currency's smallest unit, for example cents. This differs from charge queries, which return decimal amounts in whole units.
+
+### List Invoices
+
+`GET https://billing-ng.cpln.io/account/{accountId}/charges/invoices?start=START&end=END`
+
+Returns the invoices that overlap the range, newest first. `start` and `end` are required, in RFC 3339 on an hour boundary.
+
+```bash
+curl --request GET \
+  --url 'https://billing-ng.cpln.io/account/YOUR_ACCOUNT_ID/charges/invoices?start=2026-01-01T00:00:00Z&end=2026-10-01T00:00:00Z' \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE'
+```
+
+```json
+{
+  "invoices": [
+    {
+      "id": "6f1c2a3b-4d5e-4f60-8a9b-0c1d2e3f4a5b",
+      "accountId": "a1b2c3d4-0000-4000-8000-000000000001",
+      "number": 10422,
+      "startTime": "2026-08-01T00:00:00Z",
+      "endTime": "2026-09-01T00:00:00Z",
+      "totalCharge": 51247,
+      "status": "paid",
+      "orgNames": ["my-org"],
+      "periods": [
+        {
+          "startTime": "2026-08-01T00:00:00Z",
+          "endTime": "2026-09-01T00:00:00Z",
+          "totalCharge": 51247,
+          "status": "paid",
+          "items": [
+            {
+              "description": "my-org: CPU (vCPU-hour), Quantity: 1374.57, Rate: 0.3",
+              "quantity": 1374.57,
+              "charge": 41237,
+              "org": "my-org"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Description |
+| :--- | :--- |
+| `number` | Sequential invoice number. |
+| `totalCharge` | Invoice total in the smallest currency unit. `51247` is $512.47. |
+| `status` | `paid`, `pending-payment`, `payment-failed`, `partially-paid`, or `partially-failed`. |
+| `periods[].items[]` | Line items, one per org and chargeable item, with `quantity` and `charge` in the smallest currency unit. |
+| `credits` | Credits applied to the invoice, as line items with negative charges. Omitted when there are none. |
+
+Credits are applied by Control Plane and appear only on invoices. The billing API has no endpoint to list or add them.
+
+### Get Pending Invoices
+
+`GET https://billing-ng.cpln.io/account/{accountId}/charges/invoices/pending`
+
+Returns `{"invoices": [...]}`: charges the account has accrued but not yet been billed for, such as the current month so far. The format is the same as [List Invoices](#list-invoices).
+
+### Get or Download an Invoice
+
+`GET https://billing-ng.cpln.io/account/{accountId}/charges/invoices/{invoiceId}`
+
+Set the `Accept` header to `application/json` for the invoice object, or to `application/pdf` to download the PDF. Any other `Accept` value returns `400`.
+
+```bash
+curl --request GET \
+  --url https://billing-ng.cpln.io/account/YOUR_ACCOUNT_ID/charges/invoices/INVOICE_ID \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE' \
+  --header 'Accept: application/pdf' \
+  --output invoice.pdf
+```
+
+An unknown `invoiceId` returns `404`.
+
+### Get an Invoice's Payment Page
+
+`GET https://billing-ng.cpln.io/account/{accountId}/charges/invoices/{invoiceId}/external-url`
+
+For accounts billed by card, returns a link to each invoice period's hosted payment page:
+
+```json
+{
+  "invoicePeriods": [
+    { "id": "3e4f5a6b-7c8d-4e9f-a0b1-c2d3e4f5a6b7", "externalUrl": "https://invoice.stripe.com/i/..." }
+  ]
+}
+```
+
+## Spend Alert
+
+`/account/{accountId}/alert` manages the account's monthly [spend alert](/concepts/billing#key-behaviors). An account has at most one alert. Every endpoint requires `billing_admin`.
+
+Every 10 minutes, Control Plane compares the account's charges for the current calendar month (UTC) with `amount`. The first time they reach it, every `billing_admin` receives an email. The alert then stays quiet until the next month.
+
+| Method | Purpose | Success |
+| :--- | :--- | :--- |
+| `POST` | Create the alert. A second create returns `409`. | `201` with the alert |
+| `PUT` | Change `amount` or `enabled`. This also re-arms an alert that already fired this month. | `200` with the alert |
+| `GET` | Read the alert. Returns `404` when none exists. | `200` with the alert |
+| `DELETE` | Remove the alert. | `200` |
+
+The body wraps the alert in `alert` and rejects unknown fields:
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `amount` | number | Threshold in whole units of the account's currency, for example `500` for $500. Must be `0` or more. |
+| `enabled` | boolean | Whether the alert is active. **Defaults to `false`**, so send `true`. |
+
+```bash
+curl --request POST \
+  --url https://billing-ng.cpln.io/account/YOUR_ACCOUNT_ID/alert \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE' \
+  --header 'Content-Type: application/json' \
+  --data '{ "alert": { "amount": 500, "enabled": true } }'
+```
+
+```json
+{
+  "kind": "alert",
+  "accountUUID": "a1b2c3d4-0000-4000-8000-000000000001",
+  "amount": 500,
+  "enabled": true,
+  "created": "2026-10-02T12:00:00Z",
+  "lastModified": "2026-10-02T12:00:00Z"
+}
+```
+
+Once the alert fires, the response also includes `lastTriggered` and `alertedTimes`.
+
+## Billing Service Account Tokens
+
+A billing service account token lets automation, such as a nightly cost export, call the billing API without a person's login. It belongs to one billing account and holds one or more billing roles. It works only on the endpoints under `/account/{accountId}` for that account. It is not an org credential and does not work on `api.cpln.io`, the usage API, or the `/org/{org}` billing endpoints.
+
+Every endpoint requires `billing_admin`.
+
+### Create a Billing Service Account Token
+
+`POST https://billing-ng.cpln.io/account/{accountId}/service-account-token`
+
+| Field | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `name` | string | Yes | A name for the token. |
+| `description` | string | No | What the token is for. |
+| `roles` | string[] | Yes | One or more of `billing_admin`, `billing_viewer`, and `org_creator`. |
+| `expiresAt` | string (RFC 3339) | No | When the token stops working. Must be in the future. Omit it for a token that does not expire. |
+
+```bash
+curl --request POST \
+  --url https://billing-ng.cpln.io/account/YOUR_ACCOUNT_ID/service-account-token \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "name": "finops-export",
+    "description": "Nightly cost export",
+    "roles": ["billing_viewer"],
+    "expiresAt": "2027-10-01T00:00:00Z"
+  }'
+```
+
+The `201` response is the only time the secret is returned, in `token`:
+
+```json
+{
+  "kind": "serviceAccountToken",
+  "id": "0e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b",
+  "accountUUID": "a1b2c3d4-0000-4000-8000-000000000001",
+  "name": "finops-export",
+  "description": "Nightly cost export",
+  "roles": ["billing_viewer"],
+  "createdBy": "jane@example.com",
+  "expiresAt": "2027-10-01T00:00:00Z",
+  "created": "2026-10-02T12:00:00Z",
+  "lastModified": "2026-10-02T12:00:00Z",
+  "token": "cpln-bsat-..."
+}
+```
+
+<Warning>
+Store `token` securely as soon as you create it. It cannot be retrieved again; if it is lost, delete the token and create a new one.
+</Warning>
+
+Use it like any other token: `Authorization: Bearer cpln-bsat-...`.
+
+### List and Delete Billing Service Account Tokens
+
+- `GET /account/{accountId}/service-account-token` lists the account's tokens in `items`, without their secrets. Each includes `lastUsedAt`, which is approximate.
+- `DELETE /account/{accountId}/service-account-token/{tokenId}` revokes a token and returns `204`, or `404` if the account has no such token. A revoked token can keep working for up to 5 minutes.
+
+## Billing API Errors
+
+Errors return a JSON body of the form `{"code": 400, "error": "message"}`.
+
+| Status | Cause |
+| :--- | :--- |
+| `400` | A body that is not valid JSON, an invalid field value, or an unsupported `Accept` header on an invoice download. |
+| `401` | Missing or invalid token, or the caller lacks the required billing role or org permission. |
+| `404` | The invoice, alert, or token does not exist. |
+| `409` | The account already has a spend alert. |
+| `500` | Charge query validation failures, such as a `startTime` or `endTime` not on an hour boundary, an invalid `timeStep`, or a `groupBy` key missing from an `aggregateBy`. The message names the problem. |
+
+## Learn More
+
+<CardGroup cols={2}>
+  <Card title="Usage API" icon="chart-line" href="/reference/usage-api">
+    Usage tags, metrics, units, and the usage query syntax.
+  </Card>
+  <Card title="Query Costs and Usage" icon="chart-column" href="/guides/query-costs-and-usage">
+    Step by step: break down a month's cost and usage per GVC and workload.
+  </Card>
+  <Card title="Billing Account" icon="credit-card" href="/concepts/billing">
+    Billing roles, spend alerts, and how accounts pay for orgs.
+  </Card>
+  <Card title="Manage Quotas" icon="gauge" href="/guides/manage-quotas">
+    View org quotas and request increases through the billing API.
+  </Card>
+</CardGroup>
