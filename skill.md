@@ -22,7 +22,7 @@ Control Plane is a hybrid platform for deploying and managing containerized work
 - Console: https://console.cpln.io
 - API: https://api.cpln.io
 - AI Plugin: `controlplane-com/ai-plugin` (recommended for Claude Code, Codex, Antigravity CLI — bundles MCP Server with skills, agents, slash commands, and guardrails)
-- MCP Server: `https://mcp.cpln.io/mcp` (80+ tools for any MCP-compatible AI client; OAuth + per-org consent)
+- MCP Server: `https://mcp.cpln.io/mcp` (over 100 tools for any MCP-compatible AI client; OAuth + per-org consent)
 - Docs: https://docs.controlplane.com (page index for AI agents: https://docs.controlplane.com/llms.txt)
 - Full CLI conventions and hallucination traps: https://docs.controlplane.com/public/cli-conventions.md
 
@@ -67,7 +67,7 @@ Org (Organization) — top-level isolation boundary, globally unique name
 | **External Logging** | Ship logs to S3, CloudWatch, Coralogix, Datadog, Logz.io, Stackdriver | Compliance, long-term retention, or external log analysis |
 | **Domains** | Custom domain routing with auto-TLS, geo-routing, path-based routing | Expose workloads on your own domain with CNAME or NS delegation |
 | **AI Plugin** | Plugin for Claude Code, Codex, and Antigravity CLI — bundles the MCP Server plus skills, agents, slash commands, and guardrails | Recommended path for AI-assisted infrastructure management when your tool supports plugins |
-| **MCP Server** | 80+ tools for AI agents to manage infrastructure programmatically; OAuth + per-org consent | Any MCP-compatible AI client (Cursor, Claude Web, Claude Desktop, ChatGPT, VS Code, Antigravity, Amp, OpenCode) |
+| **MCP Server** | Over 100 tools for AI agents to manage infrastructure programmatically, including job tools that do a whole task in one call; OAuth + per-org consent | Any MCP-compatible AI client (Cursor, Claude Web, Claude Desktop, ChatGPT, VS Code, Antigravity, Amp, OpenCode) |
 
 ## Guardrails — read these first
 
@@ -77,7 +77,7 @@ Eight rules that prevent the production failures real users have hit. Skipping t
 
 Before any state-mutating `cpln` command (`create`, `delete`, `update`, `apply`, `patch`, `edit`, `add-binding`, `remove-binding`, `add-key`, `force-redeployment`, `clone`, `image build --push`, secret `create-*` variants, `add-location`, `remove-location`), the target **org**, **profile**, and (where applicable) **GVC** must be unambiguously established. If any is missing, **stop and ask. Never silently fall back to the active CLI profile.**
 
-Context is established only when: the user named it in the current request, named it earlier this conversation, called MCP `set_context` this session, or gave an explicit "use my default profile" instruction. Otherwise ask:
+Context is established only when: the user named it in the current request, named it earlier this conversation, or gave an explicit "use my default profile" instruction. Otherwise ask:
 
 > Before I run this, I want to confirm the target. Your active profile appears to be `<name>` (org: `<org>`, GVC: `<gvc>`). Should I use that, or a different org / profile / GVC?
 
@@ -282,7 +282,7 @@ Override per command: `--org`, `--gvc`, `--profile`.
 
 ### The verification rule
 
-**Never write a `cpln` command from memory.** Verify with `cpln <command> --help` or the MCP `cpln_suggest` tool. If a command is not in the resource command map below, assume it doesn't exist. Full conventions: https://docs.controlplane.com/public/cli-conventions.md
+**Never write a `cpln` command from memory.** Verify with `cpln <command> --help`. If a command is not in the resource command map below, assume it doesn't exist. Full conventions: https://docs.controlplane.com/public/cli-conventions.md
 
 ### Command structure
 
@@ -507,7 +507,7 @@ Bind principals to permissions on resources. Wrong target kind, link format, or 
 - **Principal links**: user `//user/EMAIL`, service account `//serviceaccount/NAME`, group `//group/NAME`, **identity `//gvc/GVC/identity/NAME`** (NEVER `//identity/NAME` — silent ignore).
 - Max 50 bindings per policy, 200 principal links per binding. Permissions in each binding must be sorted alphabetically and unique. Built-in policies (`origin: builtin`) cannot be modified or deleted.
 
-For full per-kind permissions table (and what `reveal`, `use`, `manage`, etc. actually grant), use `cpln policy permissions`, the MCP `mcp__cpln__get_permissions` tool, or fetch [/reference/policy](https://docs.controlplane.com/reference/policy).
+For full per-kind permissions table (and what `reveal`, `use`, `manage`, etc. actually grant), use `cpln policy permissions`, the MCP `get_permissions` tool, or fetch [/reference/policy](https://docs.controlplane.com/reference/policy).
 
 ## Identities
 
@@ -599,7 +599,7 @@ Before submitting:
 
 - [/guides/cpln-apply](https://docs.controlplane.com/guides/cpln-apply) — GitOps, multi-resource apply, the patience-windowed safety-net pattern
 - [/cli-reference/overview](https://docs.controlplane.com/cli-reference/overview) — all CLI commands and flags
-- [/ai/overview](https://docs.controlplane.com/ai/overview), [/ai/mcp](https://docs.controlplane.com/ai/mcp), [/ai/plugin](https://docs.controlplane.com/ai/plugin) — AI Tools overview (choose-your-path), MCP Server (80+ tools, OAuth + per-org consent), and full AI plugin (skills + agents + commands + guardrails)
+- [/ai/overview](https://docs.controlplane.com/ai/overview), [/ai/mcp](https://docs.controlplane.com/ai/mcp), [/ai/plugin](https://docs.controlplane.com/ai/plugin): AI Tools overview (choose-your-path), MCP Server (over 100 tools, OAuth + per-org consent), and full AI plugin (skills + agents + commands + guardrails)
 - [/template-catalog/overview](https://docs.controlplane.com/template-catalog/overview) — 30+ production-ready templates
 - [/mk8s/overview](https://docs.controlplane.com/mk8s/overview), [/byok/overview](https://docs.controlplane.com/byok/overview), [/core/kubernetes-operator](https://docs.controlplane.com/core/kubernetes-operator)
 - Terraform: [registry.terraform.io/providers/controlplane-com/cpln](https://registry.terraform.io/providers/controlplane-com/cpln/latest/docs)
