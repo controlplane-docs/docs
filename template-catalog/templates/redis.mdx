@@ -1,37 +1,81 @@
 ---
 title: Redis
 icon: /template-catalog/templates/icons/redis.png
-description: Deploy Redis or Valkey on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and master-replica clustering with Sentinel automatic failover.
-keywords: ['kv store', 'in-memory db', 'cache', 'redis-cli', 'valkey sentinel', 'redis alternative', 'memcached alternative', 'pubsub', 'persistence aof', 'rdb snapshot', 'leader election', 'session store']
+description: Master-replica Redis or Valkey with Sentinel automatic failover, deployed into an existing GVC. Three data nodes and three Sentinels by default, with optional persistence, metrics, public TCP access and scheduled S3 or GCS backups. No prerequisites for a default install.
+keywords: ['kv store', 'in-memory db', 'cache', 'redis-cli', 'session store', 'pubsub', 'leader election', 'aof', 'rdb snapshot', 'memcached alternative', 'elasticache alternative', 'bullmq', 'sidekiq', 'celery broker']
 ---
 
 ## Overview
 
-Redis is a high-performance in-memory data store. This template deploys a Redis master-replica cluster with Redis Sentinel for automatic failover and leader election. Both tiers run Redis 8 by default; `redis:7.4` remains a supported value if you need to pin the previous line.
-
-Setting a single `engine` knob runs both tiers on [Valkey](#redis-or-valkey-engine), the BSD-licensed fork of Redis, instead. Leaving it alone changes nothing.
+Redis is a high-performance in-memory data store used as a cache, session store, message broker and queue backend. This template deploys a master-replica Redis cluster fronted by Redis Sentinel, which elects a new master automatically when the current one fails and gives clients a stable address to discover it. One `engine` knob runs both tiers on [Valkey](https://valkey.io/), the BSD-licensed fork of Redis, instead; leaving it alone changes nothing.
 
 <Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create, provision or manage a GVC.
 </Note>
 
 ### What Gets Created
 
-- **Stateful Redis Workload** — (`RELEASE_NAME-redis`): a master-replica cluster running Redis, or Valkey when `engine: valkey`. Replica 0 starts as the primary; all others replicate from it.
-- **Stateful Sentinel Workload** — (`RELEASE_NAME-sentinel`): monitors the cluster and orchestrates automatic failover when the primary becomes unavailable. Always runs the same engine as the Redis tier.
-- **Secret** — An opaque secret containing the Redis server configuration (`redis.conf`), mounted into each Redis container.
-- **Secret** — An opaque secret containing the Sentinel configuration (`sentinel.conf`), mounted into each Sentinel container.
-- **Secret** *(optional)* — A dictionary secret holding the Redis auth password, created when `redis.auth.password.enabled` is true.
-- **Secret** *(optional)* — A dictionary secret holding the Sentinel auth password, created when `sentinel.auth.password.enabled` is true.
-- **Identity & Policy** — Separate identities and policies for the Redis and Sentinel workloads, each with `reveal` access to their respective secrets, and cloud storage access when backup is enabled.
-- **Volume Set** *(optional)* — Persistent storage for Redis data, created when `redis.persistence.enabled` is true.
-- **Volume Set** *(optional)* — Persistent storage for Sentinel state, created when `sentinel.persistence.enabled` is true.
-- **Domain** *(optional)* — External domain resources for Redis and/or Sentinel when `publicAccess.enabled` is true.
-- **Backup Cron Workload** *(optional)* — A scheduled backup job that writes Redis snapshots to AWS S3 or GCS.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-redis` | Redis or Valkey data nodes (stateful, 3 replicas, port `6379`); replica 0 boots as the first master, the others replicate from it | — |
+| Workload | `RELEASE_NAME-sentinel` | Sentinel quorum (stateful, 3 replicas, port `26379`); monitors the master and promotes a replica when it fails | — |
+| Workload | `RELEASE_NAME-redis-backup` | Cron job that uploads an RDB snapshot to S3 or GCS | `backup.enabled: true` |
+| Secret | `RELEASE_NAME-redis-config` | `redis.conf`, file-mounted into each Redis container | — |
+| Secret | `RELEASE_NAME-sentinel-config` | `sentinel.conf`, file-mounted into each Sentinel container | — |
+| Secret | `RELEASE_NAME-redis-auth-password` | Redis password | `redis.auth.password.enabled: true` |
+| Secret | `RELEASE_NAME-sentinel-auth-password` | Sentinel password | `sentinel.auth.password.enabled: true` |
+| Secret | `RELEASE_NAME-redis-backup-config` | Bucket and region for the backup job | `backup.enabled: true` |
+| Identity | `RELEASE_NAME-redis-identity` | Redis workload identity; carries the cloud account binding when backup is enabled | — |
+| Identity | `RELEASE_NAME-sentinel-identity` | Sentinel workload identity | — |
+| Policy | `RELEASE_NAME-redis-policy` | `reveal` on the Redis config and password secrets | — |
+| Policy | `RELEASE_NAME-sentinel-policy` | `reveal` on the Sentinel config and password secrets | — |
+| Policy | `RELEASE_NAME-redis-backup-policy` | `reveal` on the backup config secret | `backup.enabled: true` |
+| Volume set | `RELEASE_NAME-redis-vs` | Redis data directory (`/data`) | `redis.persistence.enabled: true` |
+| Volume set | `RELEASE_NAME-sentinel-vs` | Sentinel state (`/etc/sentinel`), so the elected master survives a restart | `sentinel.persistence.enabled: true` |
+| Domain | the `redis.publicAccess.address` value | Public TCP entry point for Redis, one port per replica | `redis.publicAccess.enabled: true` |
+| Domain | the `sentinel.publicAccess.address` value | Public TCP entry point for Sentinel, one port per replica | `sentinel.publicAccess.enabled: true` |
+
+## Prerequisites
+
+None for a default install. Three optional features need something to exist first:
+
+<Steps>
+  <Step title="Optional: bring your own password secret">
+    By default authentication is off, and `redis.auth.password` creates the password secret for you. To supply the password from a secret you manage instead, create a dictionary secret whose key matches `passwordKey` (default `password`) before installing. Use a separate secret for the Sentinel tier if you enable `sentinel.auth.fromSecret`.
+
+    ```bash
+    cpln secret create-dictionary --name SECRET_NAME \
+      --entry password='YOUR-STRONG-PASSWORD'
+    ```
+
+    Set `redis.auth.fromSecret.name` (and `sentinel.auth.fromSecret.name`) to this name and `fromSecret.enabled` to `true`. See [Authentication](#authentication).
+
+    <Warning>
+    If the secret does not exist when the workload starts, the deployment wedges silently: `cpln logs` returns nothing and the workload never becomes ready. The missing secret is named only in `status.versions[].message`:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-redis --gvc GVC_NAME -o yaml
+    ```
+
+    Create the secret and the deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-redis --gvc GVC_NAME` to skip the wait.
+    </Warning>
+  </Step>
+  <Step title="Optional: public TCP access">
+    Public access needs a domain you control, the Dedicated Load Balancer enabled on your GVC, and DNS records created **before** the first deploy. See [Public Access and Firewall](#public-access-and-firewall).
+  </Step>
+  <Step title="Optional: scheduled backups">
+    Backups need an S3 or GCS bucket, a Control Plane cloud account and (on AWS) a bucket-scoped IAM policy. See [Backing Up](#backing-up).
+  </Step>
+</Steps>
 
 ## Installation
 
-This template has no external prerequisites unless backup or public access is enabled. To install, follow the instructions for your preferred method:
+A default install needs no values:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/redis \
+  --version 3.7.0 --gvc GVC_NAME
+```
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -57,47 +101,130 @@ This template has no external prerequisites unless backup or public access is en
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Engine
 
 ```yaml
-engine: redis                     # redis | valkey
+engine: redis                     # redis | valkey — chosen at INSTALL time; an existing data directory cannot move between engines
 # Used for BOTH tiers when engine is valkey; redis.image / sentinel.image are
-# then ignored. Only the Debian-based tags are supported.
+# then ignored. Only the Debian-based tags are supported (the -alpine tags have
+# no bash and this chart's probes require it).
 valkeyImage: valkey/valkey:8.1.9
+```
 
+`engine: valkey` moves the Redis *and* Sentinel workloads onto `valkeyImage` together; a Redis-Sentinel / Valkey-server hybrid cannot be produced. Nothing else changes: the Valkey image ships `redis-server`, `redis-cli` and `redis-sentinel` compatibility symlinks, so every command and config directive on this page applies to both engines. Valkey reports `redis_version:7.2.4` in `INFO` for client compatibility and carries its real version in `server_name` and `valkey_version`; check that before switching if your client library gates features on `redis_version`.
+
+<Warning>
+**The engine cannot be switched on a running deployment.** Valkey does not read the data format Redis 8 writes: with persistence enabled the replaced replica crash-loops with `Can't handle RDB format version 15`, and with persistence disabled it silently starts empty. Migrate between engines with dump/restore or replication, never by changing `engine`. Setting `engine` back recovers the release.
+</Warning>
+
+### Redis
+
+#### Image and Resources
+
+```yaml
 redis:
-  image: redis:8
+  image: redis:8                  # redis:7.4 remains a supported value; the upgrade from 7.4 to 8 is one-way
   resources:
     maxCpu: 200m
     maxMemory: 256Mi
     minCpu: 80m
     minMemory: 128Mi
-  replicas: 3
+  replicas: 3                     # one master plus (replicas - 1) read replicas
   timeoutSeconds: 15
-  multiZone: false
-  replicaDirect: false
-  auth:
-    fromSecret:
-      enabled: false
-      name: example-redis-auth-password
-      passwordKey: password
-    password:
-      enabled: false
-      value: change-me-redis-password
+  multiZone: false                # spread replicas across availability zones within the location
+  replicaDirect: false # https://docs.controlplane.com/reference/workload/general#internal-endpoint-formatting
   serverCommand: redis-server  # correct for both engines — the Valkey image ships a redis-server symlink
   # extraArgs: "--maxclients 20000 --maxmemory 200mb --maxmemory-policy allkeys-lru"
-  publicAccess:
-    enabled: false
-    address: redis-test.example-cpln.com
-  firewall:
-    internal_inboundAllowType: same-gvc # Options: same-org / same-gvc / workload-list
-    # external_inboundAllowCIDR: 0.0.0.0/0
-    # inboundAllowWorkload:
-    #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
-    # external_outboundAllowCIDR: 0.0.0.0/0
   env: []
   tags: {}
   requestRetryPolicy: {}
+  dataDir: /data
+```
+
+#### Authentication
+
+Authentication is off by default. Enable exactly one method per tier; the chart refuses to render with both enabled. The Sentinel tier takes the same two options under `sentinel.auth`.
+
+```yaml
+redis:
+  auth:
+    fromSecret:
+      enabled: false              # set true to read the password from a secret you created (see Prerequisites)
+      name: example-redis-auth-password
+      passwordKey: password
+    password:
+      enabled: false              # set true to have the chart create the password secret from `value`
+      value: change-me-redis-password
+```
+
+<Warning>
+**Do not change the password on a running cluster.** Changing `redis.auth.password.value` (or the contents of the referenced secret) stalls the rolling update: the first restarted node cannot replicate from the not-yet-restarted master, logging `Unable to AUTH to MASTER: -WRONGPASS invalid username-password pair or user is disabled.`, and its readiness probe never passes. Re-apply the previous password to recover. To change the password, uninstall and reinstall, or accept a planned outage.
+</Warning>
+
+#### Public Access and Firewall
+
+```yaml
+redis:
+  publicAccess:
+    enabled: false                # true creates a domain resource routing one public TCP port per replica
+    address: redis-test.example-cpln.com
+  firewall:
+    internal_inboundAllowType: "same-gvc" # Options: same-org / same-gvc(Recommended) / workload-list
+    # external_inboundAllowCIDR: 0.0.0.0/0 # Provide a comma-separated list — REQUIRED when publicAccess is enabled
+    # # You can specify additional workloads with either same-gvc or workload-list:
+    # inboundAllowWorkload:
+    #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+    # external_outboundAllowCIDR: "0.0.0.0/0" # Provide a comma-separated list
+```
+
+Public access exposes Redis and Sentinel over the internet through a Control Plane [domain](/reference/domain) with per-replica TCP port routing. Before enabling it:
+
+1. **Enable the Dedicated Load Balancer on your GVC** — required for arbitrary TCP port routing. It is under the GVC's settings in the console.
+2. **Create the DNS records before deploying** — ownership is verified when the domain resource is first created, and the deploy fails with `Unable to apply domain` if they are missing. Disable any proxying: TCP must pass straight through.
+
+| Type | Name | Value |
+|---|---|---|
+| TXT | `_cpln-SUBDOMAIN` | your Control Plane org name or org ID |
+| CNAME | `SUBDOMAIN` | `GVC_ALIAS.cpln.app` (the alias is shown in the GVC's settings) |
+
+3. **Set `external_inboundAllowCIDR`** on each tier you expose. Without it the workload's external firewall stays closed and the domain routes nowhere.
+
+```yaml
+redis:
+  publicAccess:
+    enabled: true
+    address: redis.example.com
+  firewall:
+    internal_inboundAllowType: "same-gvc"
+    external_inboundAllowCIDR: "0.0.0.0/0"   # or a comma-separated list of the CIDRs allowed in
+
+sentinel:
+  publicAccess:
+    enabled: true
+    address: redis-sentinel.example.com
+  firewall:
+    internal_inboundAllowType: "same-gvc"
+    external_inboundAllowCIDR: "0.0.0.0/0"
+```
+
+Ports are assigned one per replica: Redis replica *N* on `6380 + N`, Sentinel replica *N* on `26380 + N`.
+
+Firewall changes take a few minutes to take effect; re-check before concluding a rule is not working.
+
+#### Replication and Probes
+
+```yaml
+redis:
+  # Replication tuning. See secret-redis-config.yaml for how these are rendered.
+  # backlogSize: sized for (peak write throughput × tolerable disconnect window).
+  #   1mb (Redis default) escalates any brief disconnect to a full RDB resync. 1gb
+  #   covers ~5 minutes of disconnect at ~3MB/s of writes.
+  # timeout (seconds): bound on full-resync transfer + RDB load + heartbeat.
+  #   60s (Redis default) is too low for multi-GB datasets — master/slave drop the
+  #   link mid-sync. 300s covers ~30GB at typical 1Gbps + load throughput.
+  # slaveOutputBufferLimit: "<hard> <soft> <seconds>". Default
+  #   "256mb 64mb 60" can't sustain a full resync of a multi-GB dataset at high
+  #   write rate — master kills the replica mid-stream. Bump for production loads.
   replication:
     backlogSize: 1gb
     timeout: 300
@@ -105,16 +232,24 @@ redis:
   probes:
     readiness:
       failureThreshold: 10
-      initialDelaySeconds: 10
-      periodSeconds: 5
+      initialDelaySeconds: 10  # extend if AOF load takes longer than this
+      periodSeconds: 5         # also controls startup window: budget = initialDelay + 30×period
       timeoutSeconds: 4
     liveness:
       failureThreshold: 5
       initialDelaySeconds: 30
       periodSeconds: 10
       timeoutSeconds: 5
+```
+
+The readiness probe holds a replica out of rotation until it has finished syncing from the master; the liveness probe only checks that the process is up, so a replica mid-resync is never killed. The startup window is `initialDelaySeconds + 30 × periodSeconds` (160 seconds by default). With persistence enabled and a large dataset, a replica must load its AOF before it can sync, so raise `periodSeconds` to widen the window — for example `initialDelaySeconds: 35` and `periodSeconds: 20` gives 635 seconds.
+
+#### Metrics Exporter
+
+```yaml
+redis:
   exporter:
-    enabled: false  # adds a redis_exporter sidecar that exposes metrics at :9121/metrics
+    enabled: false    # adds a redis_exporter sidecar that exposes metrics at :9121/metrics
     image: oliver006/redis_exporter:v1.67.0-alpine
     resources:
       maxCpu: 50m
@@ -122,26 +257,45 @@ redis:
       minCpu: 25m
       minMemory: 32Mi
     dropMetrics: []  # e.g., ["redis_command_.*", "redis_keyspace_.*"]
-  dataDir: /data
+```
+
+When enabled, Control Plane scrapes `:9121/metrics` on each Redis replica and the metrics appear in the console. `dropMetrics` takes regular expressions matched against metric names, for filtering high-cardinality series such as `redis_commands_latencies_usec_bucket` before they are stored. The exporter authenticates with the Redis password automatically when auth is enabled.
+
+#### Persistence
+
+```yaml
+redis:
   persistence:
+    # Set at INSTALL time. Enabling this on an already-running release stalls
+    # the rollout indefinitely (volumes stay unbound) — see the README.
     enabled: false
     volumes:
       data:
-        initialCapacity: 10 # In GiB
-        performanceClass: general-purpose-ssd # general-purpose-ssd / high-throughput-ssd (Min 1000 GiB)
+        initialCapacity: 10 # In GB
+        performanceClass: general-purpose-ssd # general-purpose-ssd / high-throughput-ssd (Min 1000GB)
         fileSystemType: ext4 # ext4 / xfs
         snapshots:
           retentionDuration: 7d
-          schedule: "0 0 * * *" # UTC
+          schedule: 0 0 * * * # UTC
         autoscaling:
-          maxCapacity: 100 # In GiB
+          maxCapacity: 100 # In GB
           minFreePercentage: 20
           scalingFactor: 1.2
         # customEncryption:
         #   enabled: true
-        #   region: aws-us-east-1
-        #   keyId: arn:aws:kms:us-east-1:1234567890:key/YOUR_KEY_ID
+        #   region: aws-us-east-1 # Replace with the appropriate region
+        #   keyId: arn:aws:kms:us-east-1:1234567890:key/d411f35a-1d31-4515-9934-4f193e042d80 # Replace with your AWS KMS key ARN
+```
 
+With persistence enabled each Redis replica keeps its data in `redis.dataDir` on a [volume set](/reference/volumeset) with both AOF and RDB persistence on, so data survives restarts and redeployments. Lifecycle hooks remove orphaned temporary RDB and AOF-rewrite files on every container start and stop. Without persistence the data lives in memory and on the container's ephemeral filesystem only.
+
+<Warning>
+**Enable persistence at install time, not on a running release.** Turning `redis.persistence.enabled` or `sentinel.persistence.enabled` on for a deployment that is already running stalls the rollout indefinitely: every replica sits on `Replica N will be restarted shortly`, the volume set's volumes stay `unbound`, and a forced redeployment does not clear it. Uninstall and reinstall with persistence enabled instead. A fresh install with persistence comes up normally, and upgrading a release that already owns its volume rolls fine.
+</Warning>
+
+### Sentinel
+
+```yaml
 sentinel:
   image: redis:8
   resources:
@@ -149,12 +303,12 @@ sentinel:
     maxMemory: 256Mi
     minCpu: 80m
     minMemory: 128Mi
-  replicas: 3
+  replicas: 3                     # keep it odd; quorum is a majority
   timeoutSeconds: 10
   multiZone: false
-  replicaDirect: false
-  quorumAutoCalculation: true # Quorum = (replicas / 2) + 1
-  quorumOverride: null        # Only used if quorumAutoCalculation is false
+  replicaDirect: false # https://docs.controlplane.com/reference/workload/general#internal-endpoint-formatting
+  quorumAutoCalculation: true  # Set to false if you want to override quorum. Quorum is (replicas/2)+1
+  quorumOverride: null  # Only used if quorumAutoCalculation is false
   auth:
     fromSecret:
       enabled: false
@@ -167,33 +321,36 @@ sentinel:
     enabled: false
     address: redis-sentinel-test.example-cpln.com
   firewall:
-    internal_inboundAllowType: same-gvc # Options: same-org / same-gvc
-    # external_inboundAllowCIDR: 0.0.0.0/0
-    # inboundAllowWorkload:
-    #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
-    # external_outboundAllowCIDR: 0.0.0.0/0
+    internal_inboundAllowType: "same-gvc" # Options: same-org / same-gvc(Recommended)
   env: []
   tags: {}
   requestRetryPolicy: {}
+  # Sentinel persistence preserves the post-failover master across restarts via
+  # CONFIG REWRITE. Replicas query sentinel at startup, so persisted state lets
+  # them rejoin the real master rather than redis-0. Recommended ON in prod.
   persistence:
+    # Set at INSTALL time. Enabling this on an already-running release stalls
+    # the rollout indefinitely (volumes stay unbound) — see the README.
     enabled: false
     volumes:
       data:
-        initialCapacity: 10 # In GiB
-        performanceClass: general-purpose-ssd
-        fileSystemType: ext4
+        initialCapacity: 10 # In GB
+        performanceClass: general-purpose-ssd # general-purpose-ssd / high-throughput-ssd (Min 1000GB)
+        fileSystemType: ext4 # ext4 / xfs
         snapshots:
           retentionDuration: 7d
-          schedule: "0 0 * * *"
+          schedule: 0 0 * * * # UTC
         autoscaling:
-          maxCapacity: 50 # In GiB
+          maxCapacity: 50 # In GB
           minFreePercentage: 20
           scalingFactor: 1.2
-        # customEncryption:
-        #   enabled: true
-        #   region: aws-us-east-1
-        #   keyId: arn:aws:kms:us-east-1:1234567890:key/YOUR_KEY_ID
+```
 
+Sentinel monitors the master under the name `mymaster`, marks it down after 5 seconds without a response, and promotes a replica once a quorum of Sentinels agrees. Enable `sentinel.persistence` in production: without it, a Sentinel that restarts forgets which replica was promoted and answers from its static config (replica 0) until it re-learns the cluster.
+
+### Backup
+
+```yaml
 backup:
   enabled: false
   image: ghcr.io/controlplane-com/backup-images/redis-backup:1.0.0
@@ -210,16 +367,22 @@ backup:
     region: us-east-1
     cloudAccountName: my-backup-cloudaccount
     policyName: my-backup-policy
-    prefix: redis/backups
+    prefix: redis/backups # folder name where your backups will be stored
 
   gcp:
     bucket: my-backup-bucket
     cloudAccountName: my-backup-cloudaccount
-    prefix: redis/backups
+    prefix: redis/backups # folder name where your backups will be stored
+```
 
+The bucket, cloud account and IAM policy must exist before you enable backups — see [Backing Up](#backing-up) for the per-provider setup steps.
+
+### Grafana Dashboard
+
+```yaml
 grafana:
   dashboard:
-    enabled: false          # K8s clusters only — set to true to provision via Grafana Operator
+    enabled: false          # K8s clusters only - set to true to provision the dashboard via the Grafana Operator
   folder: Redis             # Grafana folder the dashboard is placed in
   datasource: metrics       # name of the Prometheus datasource in your Grafana instance
   instanceSelector:
@@ -227,385 +390,54 @@ grafana:
       dashboards: grafana   # must match the label on your Grafana CR
 ```
 
-### Redis or Valkey Engine
+Kubernetes only: this emits a `GrafanaDashboard` custom resource for clusters running the [Grafana Operator](https://grafana.github.io/grafana-operator/). On Control Plane's managed platform there is no operator to reconcile it, so leave it disabled there. The Redis-specific panels need `redis.exporter.enabled: true`.
 
-One knob selects the server both tiers run. `engine: redis` is the default and changes nothing: with `engine` left alone, every resource this template creates is identical to the previous version apart from the chart-version tags.
+## Connecting
 
-```yaml
-engine: valkey                    # redis | valkey
-valkeyImage: valkey/valkey:8.1.9  # used for BOTH tiers when engine is valkey
-```
+| What | Address | Notes |
+|---|---|---|
+| Redis, inside the GVC | `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` | Resolves to any data node, so a plain connection may land on a read replica |
+| Sentinel, inside the GVC | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Master name `mymaster`; Sentinel-aware clients use this and always reach the current master |
+| Redis, public | the `redis.publicAccess.address` value, port `6380 + N` for replica *N* | Only with `redis.publicAccess.enabled: true` |
+| Sentinel, public | the `sentinel.publicAccess.address` value, port `26380 + N` for replica *N* | Only with `sentinel.publicAccess.enabled: true` |
+| Password, chart-created | `cpln secret reveal RELEASE_NAME-redis-auth-password -o yaml` | With `redis.auth.password.enabled: true`; the Sentinel password is in `RELEASE_NAME-sentinel-auth-password` |
+| Password, your own secret | `cpln secret reveal SECRET_NAME -o yaml` | With `redis.auth.fromSecret.enabled: true` |
 
-[Valkey](https://valkey.io/) is the BSD-3-Clause fork of Redis 7.2, stewarded by the Linux Foundation. There is no paid edition, so nothing — replication, Sentinel, failover, persistence, backups — is feature-gated.
+Point your client library at the Sentinel address with master name `mymaster` rather than at a specific Redis replica: the master moves during failovers and rolling upgrades, and writes sent to a replica are refused with `READONLY You can't write against a read only replica.`
 
-- **Both tiers move together.** `engine: valkey` puts the Redis *and* Sentinel workloads on `valkeyImage`; `redis.image` and `sentinel.image` are then ignored. A Redis-Sentinel / Valkey-server hybrid cannot be produced with this knob.
-- **Nothing else in the chart changes.** The Valkey image ships `redis-server`, `redis-cli` and `redis-sentinel` compatibility symlinks, so every command, config directive and health probe described on this page is identical on both engines. `redis.serverCommand` stays `redis-server`.
-- **Only the Debian-based Valkey tags work.** The `-alpine` tags have no bash, and this chart's readiness and liveness probes are bash scripts.
-- **Do not set `dual-channel-replication-enabled yes` through `redis.extraArgs` on Valkey.** A [known upstream defect](https://github.com/valkey-io/valkey/issues/2338) makes Sentinel see duplicate replicas. It defaults to `no` and the chart never sets it.
-
-To confirm which server a running deployment is on:
+To verify the cluster, ask any data node to respond and ask Sentinel which node is the master (add `-a PASSWORD` when auth is enabled):
 
 ```bash
-cpln workload exec RELEASE_NAME-redis --gvc GVC_NAME \
-  --replica RELEASE_NAME-redis-0 --container redis -- redis-cli INFO server
+cpln workload exec RELEASE_NAME-redis --gvc GVC_NAME --container redis -- redis-cli ping
+
+cpln workload exec RELEASE_NAME-sentinel --gvc GVC_NAME --container sentinel -- \
+  redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
 ```
 
-Valkey answers with `server_name:valkey` and a `valkey_version` line; Redis has neither.
+The second command prints the current master's announced hostname and port. To confirm which engine a deployment is running, run `redis-cli INFO server` the same way: Valkey answers with `server_name:valkey` and a `valkey_version` line, Redis has neither.
 
-#### Version Reporting
-
-Valkey reports `redis_version:7.2.4` in `INFO` for client compatibility, and carries the real version in `server_name` and `valkey_version`. The default Redis image reports `redis_version:8.10.1`, so to a client library a Valkey install *looks like* a version downgrade. That matters only if your client gates features on `redis_version` — check it before switching.
-
-The marketplace card shows the Redis version for either engine: a chart's `appVersion` is a constant and cannot follow a values knob.
-
-<Warning>
-**The engine is an install-time choice and cannot be switched on a running deployment.** With persistence enabled, pointing an existing Redis data directory at Valkey crash-loops the replaced replica — `Can't handle RDB format version 15`, container exits 1 — because `redis:8` writes a data format Valkey does not read. With persistence disabled the node silently starts empty instead. Migrate between engines with dump/restore or replication, never by changing `engine`.
-
-The rollout replaces replicas one at a time and halts on the unhealthy one, so the remaining nodes keep serving; changing `engine` back recovers the release.
-</Warning>
-
-### Redis Version
-
-Both the data nodes and Sentinel run `redis:8` by default. Redis 8 is the current stable line and adds AGPLv3 as a license option alongside the existing RSALv2/SSPLv1 terms. To stay on the previous line, pin both images:
-
-```yaml
-redis:
-  image: redis:7.4
-sentinel:
-  image: redis:7.4
-```
-
-These image knobs apply to the Redis engine only. Under `engine: valkey`, both tiers use `valkeyImage` and `redis.image` / `sentinel.image` are ignored.
-
-<Warning>
-**Upgrading an existing Redis 7.4 deployment to Redis 8 is one-way.** Redis 8 loads a 7.4 data file directly, so upgrading with persistence enabled keeps your data — but once a node has written its data file under Redis 8, a 7.4 image can no longer load it. Snapshot the volume set before upgrading if you want a rollback path.
-</Warning>
-
-The upgrade rolls the pods one at a time, which replaces the master and triggers a Sentinel failover. Clients must discover the master through Sentinel rather than pinning replica 0 — writing to the old replica 0 after the roll returns `READONLY You can't write against a read only replica.`
-
-### Authentication
-
-Authentication is disabled by default. Both the Redis workload and the Sentinel workload support independent auth configuration. Only one method can be enabled at a time per workload.
-
-**Option 1 — Inline password** (creates a secret automatically):
-
-```yaml
-redis:
-  auth:
-    password:
-      enabled: true
-      value: change-me-redis-password
-```
-
-**Option 2 — Reference an existing secret**:
-
-```yaml
-redis:
-  auth:
-    fromSecret:
-      enabled: true
-      name: my-redis-secret   # Name of an existing Control Plane secret
-      passwordKey: password   # Key within the secret containing the password
-```
-
-Sentinel can be configured with a separate password for Sentinel-to-Sentinel communication using the same options under `sentinel.auth`.
-
-<Warning>
-**Do not rotate the Redis password on a running cluster.** Changing `redis.auth.password.value` (or the referenced secret) stalls the rolling update: the first restarted node cannot replicate from the not-yet-restarted master, logging `Unable to AUTH to MASTER: -WRONGPASS invalid username-password pair or user is disabled.` — its readiness probe never passes, so the roll never advances. Re-apply the previous password to recover. To change the password, uninstall and reinstall, or accept a planned outage.
-</Warning>
-
-### Redis Cluster
-
-- `redis.replicas` — Number of Redis replicas. Defaults to `3`. Replica 0 is always the initial primary.
-- `redis.resources.maxCpu` / `redis.resources.maxMemory` — Maximum CPU and memory per replica.
-- `redis.resources.minCpu` / `redis.resources.minMemory` — Minimum CPU and memory guaranteed per replica.
-- `redis.multiZone` — Spread replicas across availability zones within the location.
-- `redis.extraArgs` — Additional Redis server arguments (e.g. `--maxmemory 200mb --maxmemory-policy allkeys-lru`).
-
-### Sentinel
-
-Sentinel monitors the Redis cluster and automatically promotes a replica when the primary fails.
-
-- `sentinel.replicas` — Number of Sentinel replicas. A minimum of 3 is required for a majority quorum.
-- `sentinel.quorumAutoCalculation` — When `true`, the quorum is calculated automatically as `(replicas / 2) + 1`. Set to `false` to use `sentinel.quorumOverride`.
-- `sentinel.quorumOverride` — Manual quorum value, used only when `quorumAutoCalculation` is `false`.
-- `sentinel.resources.maxCpu` / `sentinel.resources.maxMemory` — Maximum CPU and memory per Sentinel replica.
-- `sentinel.resources.minCpu` / `sentinel.resources.minMemory` — Minimum CPU and memory guaranteed per Sentinel replica.
-- `sentinel.multiZone` — Spread Sentinel replicas across availability zones.
-
-Sentinel marks a master down after 5 seconds without a response. In testing on Redis 8, a full failover — detection, election, promotion of a replica, and clients seeing the new master — completed 6.7–8.4 seconds after the master stopped responding, and the old master rejoined as a replica once it recovered. Valkey 8.1.9 measured in the same band: 8.7 seconds end to end, costing a Sentinel-aware client about 6 seconds of writes.
-
-### Replication Tuning
-
-The `redis.replication` block controls low-level replication behavior. The defaults are sized for production workloads and typically do not need adjustment.
-
-- `replication.backlogSize` — Replication backlog size. The default `1gb` covers ~5 minutes of disconnect at ~3 MB/s of writes. The Redis default of `1mb` will trigger a full RDB resync on any brief disconnect.
-- `replication.timeout` — Timeout in seconds for full-resync transfers. The default `300s` covers datasets up to ~30 GB. The Redis default of `60s` is too low for large datasets.
-- `replication.slaveOutputBufferLimit` — Format: `<hard> <soft> <seconds>`. The default `"2gb 512mb 300"` sustains full resyncs of large datasets at high write rates. The Redis default `"256mb 64mb 60"` can cause the master to kill a replica mid-stream.
-
-### Health Checks
-
-Probe settings for the Redis workload are configurable under `redis.probes`. This is most useful when persistence is enabled and large datasets require additional time to load before the replica is ready.
-
-The startup probe window is derived from the readiness probe settings:
-
-```text
-startup window = initialDelaySeconds + (30 × periodSeconds)
-```
-
-The default (`10 + 30×5 = 160s`) is sufficient for small datasets. If AOF load takes longer, increase `periodSeconds`:
-
-```yaml
-redis:
-  probes:
-    readiness:
-      initialDelaySeconds: 35   # clears the AOF load window
-      periodSeconds: 20          # startup window = 35 + (30×20) = 635s
-```
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `readiness.initialDelaySeconds` | `10` | Seconds to wait before first readiness check |
-| `readiness.periodSeconds` | `5` | How often to run the readiness check; also controls the startup window |
-| `readiness.failureThreshold` | `10` | Number of failures before the replica is marked not ready |
-| `readiness.timeoutSeconds` | `4` | Timeout per probe attempt |
-| `liveness.initialDelaySeconds` | `30` | Seconds before the first liveness check |
-| `liveness.periodSeconds` | `10` | How often to run the liveness check |
-| `liveness.failureThreshold` | `5` | Number of failures before the container is restarted |
-| `liveness.timeoutSeconds` | `5` | Timeout per probe attempt |
-
-### Metrics
-
-A `redis_exporter` sidecar can be enabled to expose Prometheus metrics. When enabled, Control Plane scrapes `:9121/metrics` automatically every 30 seconds and makes the metrics available in the console. The default exporter image is verified against Redis 8 and Valkey 8.1.9, including against a password-protected server.
-
-- `redis.exporter.enabled` — Set to `true` to add the exporter sidecar to each Redis replica.
-- `redis.exporter.image` — Exporter image (default: `oliver006/redis_exporter:v1.67.0-alpine`).
-- `redis.exporter.resources` — CPU and memory limits/requests for the sidecar container.
-- `redis.exporter.dropMetrics` — List of regex patterns matched against metric names. Use to filter high-cardinality series before they are stored.
-
-```yaml
-redis:
-  exporter:
-    enabled: true
-    dropMetrics:
-      - "redis_commands_latencies_usec_bucket"
-      - "redis_latency_percentiles_usec"
-```
-
-### Grafana Dashboard
-
-A pre-built Grafana dashboard can be provisioned automatically via the [Grafana Operator](https://grafana.github.io/grafana-operator/). This is opt-in and intended for Kubernetes clusters running the Grafana Operator — on Control Plane's managed platform where no operator is present, leave this disabled.
-
-<Note>
-Enabling the dashboard requires `redis.exporter.enabled: true` for the Redis-specific panels. CPU and memory panels are always available.
-</Note>
-
-**Included panels:**
-
-| Panel | Requires exporter |
-|-------|------------------|
-| CPU Usage | No |
-| Memory Usage | No |
-| Connected Clients | Yes |
-| Redis Memory | Yes |
-| Commands/sec | Yes |
-| Cache Hit Rate | Yes |
-
-The dashboard includes template variables for datasource, GVC, workload, and replica so you can filter by deployment without editing the dashboard.
-
-**Prerequisites:**
-
-1. The [Grafana Operator](https://grafana.github.io/grafana-operator/) must be installed in your cluster with a Kubernetes secret containing your Grafana service account token:
-
-    ```bash
-    kubectl create secret generic grafana-admin-credentials \
-      --from-literal=GF_SECURITY_ADMIN_USER=admin \
-      --from-literal=GF_SECURITY_ADMIN_PASSWORD=<grafana-api-token> \
-      -n grafana-operator
-    ```
-
-2. A `Grafana` CR with a label matching `grafana.instanceSelector.matchLabels`:
-
-    ```yaml
-    apiVersion: grafana.integreatly.org/v1beta1
-    kind: Grafana
-    metadata:
-      name: grafana
-      labels:
-        dashboards: grafana
-    spec:
-      external:
-        url: https://your-org.grafana.cpln.io
-        adminPassword:
-          name: grafana-admin-credentials
-          key: GF_SECURITY_ADMIN_PASSWORD
-    ```
-
-**Configuration:**
-
-- `grafana.dashboard.enabled` — Set to `true` to provision the `GrafanaDashboard` CRD.
-- `grafana.folder` — Grafana folder the dashboard appears in (default: `Redis`).
-- `grafana.datasource` — Name of the Prometheus datasource configured in your Grafana instance (default: `metrics`).
-- `grafana.instanceSelector.matchLabels` — Label selector that must match the label on your `Grafana` CR.
-
-### Storage
-
-Persistence is disabled by default. When enabled, a Volume Set is created to store data across restarts.
-
-<Warning>
-**Enable persistence at install time, not on a running release.** Turning `redis.persistence.enabled` or `sentinel.persistence.enabled` on for a deployment that is already running stalls the rollout indefinitely: every replica sits on `Replica N will be restarted shortly`, the Volume Set's volumes stay `unbound`, and the data directory never leaves the container overlay. A forced redeployment does not clear it — this was measured at 27 minutes with no progress. Uninstall and reinstall with persistence enabled instead. A fresh install with persistence comes up normally, and upgrading a release that already owns its volume rolls fine. This is independent of `engine`.
-</Warning>
-
-**Redis persistence:**
-
-- `redis.persistence.enabled` — Enable persistent storage for Redis data.
-- `redis.persistence.volumes.data.initialCapacity` — Initial volume size in GiB. Minimum 1000 GiB for `high-throughput-ssd`.
-- `redis.persistence.volumes.data.performanceClass` — `general-purpose-ssd` or `high-throughput-ssd`.
-- `redis.persistence.volumes.data.fileSystemType` — `ext4` or `xfs`.
-- `redis.persistence.volumes.data.snapshots.retentionDuration` — How long to retain volume snapshots.
-- `redis.persistence.volumes.data.snapshots.schedule` — Cron expression for snapshot frequency.
-- `redis.persistence.volumes.data.autoscaling.maxCapacity` — Maximum volume size in GiB.
-- `redis.persistence.volumes.data.autoscaling.minFreePercentage` — Trigger scaling when free space drops below this percentage.
-- `redis.persistence.volumes.data.autoscaling.scalingFactor` — Multiply current capacity by this factor when scaling up.
-
-**Sentinel persistence** uses the same options under `sentinel.persistence`.
-
-### Firewall
-
-Both Redis and Sentinel firewall settings are configured independently.
-
-- `redis.firewall.internal_inboundAllowType` / `sentinel.firewall.internal_inboundAllowType`:
-
-| Value | Description |
-|-------|-------------|
-| `same-gvc` | Allow access from all workloads in the same GVC (recommended) |
-| `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from specific workloads |
-
-- `redis.firewall.inboundAllowWorkload` — List of specific workload links when using `workload-list`.
-- `redis.firewall.external_inboundAllowCIDR` — Comma-separated CIDR ranges for external inbound access.
-- `redis.firewall.external_outboundAllowCIDR` — Comma-separated CIDR ranges for external outbound access.
-
-### Public Access
-
-Redis and Sentinel can be exposed over the internet via TCP using Control Plane's domain resource with per-replica port routing.
-
-#### Prerequisites
-
-1. **Enable Dedicated Load Balancer on your GVC** — This is required for arbitrary TCP port routing. Navigate to your GVC settings in the Control Plane console and enable the Dedicated Load Balancer option.
-
-2. **Add DNS records before deploying** — Control Plane verifies domain ownership when the domain resource is first created. If the records are not in place, the deploy will fail with an `Unable to apply domain` error. Add the following records in your DNS provider for each address you configure, and **disable any proxy** (TCP must pass through directly):
-
-| Type | Name | Value |
-|------|------|-------|
-| TXT | `_cpln-<subdomain>` | Your Control Plane org name or org ID |
-| CNAME | `<subdomain>` | `<gvc-alias>.cpln.app` |
-
-Your GVC alias is visible under GVC settings in the Control Plane console.
-
-#### Configuration
-
-Enable public access for Redis and/or Sentinel, set the subdomain address, and open the external firewall:
-
-```yaml
-redis:
-  publicAccess:
-    enabled: true
-    address: redis.your-domain.com
-  firewall:
-    internal_inboundAllowType: same-gvc
-    external_inboundAllowCIDR: "0.0.0.0/0"  # or restrict to specific CIDRs
-
-sentinel:
-  publicAccess:
-    enabled: true
-    address: redis-sentinel.your-domain.com
-  firewall:
-    internal_inboundAllowType: same-gvc
-    external_inboundAllowCIDR: "0.0.0.0/0"
-```
-
-<Note>
-`external_inboundAllowCIDR` must be set when public access is enabled — without it, inbound traffic from the internet will be blocked even though the domain is configured.
-</Note>
-
-#### Port Mapping
-
-Each replica is assigned its own external port. Port numbers increment per replica starting at:
-- **Redis**: `6380`, `6381`, `6382`, ... (replica 0, 1, 2, ...)
-- **Sentinel**: `26380`, `26381`, `26382`, ... (replica 0, 1, 2, ...)
-
-#### Connecting Externally
+With public access enabled, connect from outside with the standard client, one port per replica:
 
 ```bash
-# Redis replica 0 (append -a <password> if auth is enabled)
-redis-cli -h redis.your-domain.com -p 6380 ping
-
-# Redis replica 1
-redis-cli -h redis.your-domain.com -p 6381 ping
-
-# Sentinel replica 0
-redis-cli -h redis-sentinel.your-domain.com -p 26380 ping
+redis-cli -h redis.example.com -p 6380 ping            # Redis replica 0
+redis-cli -h redis-sentinel.example.com -p 26380 ping  # Sentinel replica 0
 ```
 
-After deploying, verify the domain is resolving correctly:
+## Operations
 
-```bash
-dig redis.your-domain.com CNAME   # should return <gvc-alias>.cpln.app
-dig <gvc-alias>.cpln.app          # should return an IP address
-```
+### Backing Up
 
-### Connecting to Redis
-
-Connect to Redis internally from within the same GVC:
-
-```text
-RELEASE_NAME-redis.GVC_NAME.cpln.local:6379
-```
-
-For Sentinel-aware clients, connect through Sentinel to always reach the current primary:
-
-```text
-RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379
-```
-
-The Sentinel master name is `mymaster`.
-
-### Ports
-
-| Workload | Port | Description |
-|----------|------|-------------|
-| Redis | `6379` | Internal Redis data port |
-| Sentinel | `26379` | Internal Sentinel discovery port |
-| Redis (public) | `6380`, `6381`, ... | One port per replica when public access is enabled |
-| Sentinel (public) | `26380`, `26381`, ... | One port per replica when public access is enabled |
-
-## Backup
-
-Backup is disabled by default. When enabled, a cron workload runs on the configured schedule and uploads a Redis snapshot to AWS S3 or GCS. The backup image is verified against both Redis 7.4 and Redis 8.
-
-- `backup.enabled` — Enable scheduled backups.
-- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC). Step expressions such as `*/5 * * * *` are supported.
-- `backup.provider` — `aws` or `gcp`.
-- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+Backups are off by default. When `backup.enabled` is `true`, a cron workload runs on `backup.schedule`, takes an RDB snapshot of the cluster and uploads it to your bucket as `PREFIX/redis-YYYY-MM-DDTHH-MM-SSZ.rdb.gz`. The job authenticates to the bucket through the Redis identity's cloud account binding — no static keys. Step schedules such as `*/30 * * * *` are supported.
 
 <Note>
-Switching `backup.provider` between `aws` and `gcp` on an existing release leaves the previous provider's cloud binding on the workload identity — the rendered manifest is correct, but identity updates are merged rather than replaced. Inspect the identity (`cpln identity get RELEASE_NAME-redis-identity --gvc GVC_NAME`) after a provider switch and remove the stale binding, or reinstall the release, if least privilege matters to you.
+Switching `backup.provider` between `aws` and `gcp` on an existing release leaves the previous provider's cloud binding on `RELEASE_NAME-redis-identity`: the rendered manifest is correct, but identity updates are merged rather than replaced. If least privilege matters to you, inspect the identity in the console after a provider switch and remove the stale binding, or reinstall the release.
 </Note>
 
-### AWS S3
-
-Before enabling backup with `provider: aws`, complete the following in your AWS account:
+#### AWS S3
 
 1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
-3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
-
-<Warning>
-**Version 3.5.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
-
-**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
-</Warning>
+2. [Create a cloud account](/guides/create-cloud-account) for your AWS account if you do not have one. Set `backup.aws.cloudAccountName` to its name.
+3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`, and set `backup.aws.policyName` to its name:
 
 ```json
 {
@@ -634,39 +466,120 @@ Before enabling backup with `provider: aws`, complete the following in your AWS 
 }
 ```
 
-4. Set `backup.aws.policyName` to the name of the policy created in step 3.
-5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+4. Set `backup.aws.prefix` to the folder path where backups will be stored, then set `backup.enabled: true` and `backup.provider: aws`.
 
-### GCS
-
-Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+#### GCS
 
 1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
-3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
-4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+2. [Create a cloud account](/guides/create-cloud-account) for your GCP project if you do not have one. Set `backup.gcp.cloudAccountName` to its name.
+3. Grant the **Storage Admin** role to the GCP service account associated with the cloud account.
+4. Set `backup.gcp.prefix` to the folder path where backups will be stored, then set `backup.enabled: true` and `backup.provider: gcp`.
 
-## Restoring a Backup
+### Restoring a Backup
 
-Download the `.rdb` backup file from your bucket and restore it into a running Redis instance. For GCS, replace `aws s3 cp s3://...` with `gsutil cp gs://...`.
+<Warning>
+**There is no verified procedure for restoring one of these snapshots into a running release of this template.** Two things that look like they should work do not:
 
-```sh
-aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.rdb /tmp/dump.rdb
-redis-cli \
-  -h RELEASE_NAME-redis.GVC_NAME.cpln.local \
-  -p 6379 \
-  --rdb /tmp/dump.rdb
-```
+- Copying the file into the data directory as `dump.rdb` and restarting does nothing. The chart runs with `appendonly yes`, and when both AOF and RDB persistence are enabled Redis rebuilds the dataset from the AOF at startup and ignores `dump.rdb`.
+- `redis-cli --rdb FILE` *downloads* an RDB from a server; it does not load one. Running it against the cluster overwrites your downloaded backup with the live dataset.
+</Warning>
+
+What the backup is: a standard, gzipped RDB file, and RDB files are portable. The upstream-documented way to read one is to start a standalone Redis or Valkey server with AOF disabled and the decompressed file in place as its `dump.rdb` (or, on Redis 8.10 and later, with the startup-only `preload-file rdb:/path/to/file.rdb` setting described under [Restoring a backup in the Redis persistence documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/#restoring-a-backup)), for example on a local machine with Docker. From there you can inspect the data or replay it into your cluster with your own tooling. Loading the file into this template's cluster in place has not been tested; if you need that path, test it against a throwaway release before relying on it.
+
+If you enabled `redis.persistence`, the volume set also takes its own scheduled snapshots on `redis.persistence.volumes.data.snapshots.schedule`; those are managed through the volume set, independently of the bucket backups.
+
+### Upgrading from an Earlier Version
+
+- **From 3.5.1 or earlier — resource keys were renamed.** Blocks that expose both a reservation and a limit now name the limit `maxCpu` / `maxMemory` instead of `cpu` / `memory`: `redis.resources`, `sentinel.resources` and `redis.exporter.resources`. Rename them in your values before upgrading; an upgrade that still carries the old names is refused at render with `redis.resources.cpu was RENAMED to redis.resources.maxCpu`. `backup.resources`, which exposes only a limit, keeps bare `cpu` / `memory`.
+- **From 3.5.0 or earlier with AWS backups — permissions narrowed.** Version 3.5.1 removed the AWS managed policy `ReadOnlyAccess` from the backup identity. It granted read access to every bucket in your account and had been silently supplying any read action your own policy omitted. Update your IAM policy to the full action list under [Backing Up](#backing-up) before upgrading; if it already matches, nothing changes.
+- **From 3.4.x — Redis 7.4 to Redis 8 is one-way.** Version 3.5.0 moved the default image to `redis:8`. Redis 8 reads 7.4 data directly, so an upgrade with persistence enabled keeps your data, but once a node has written under Redis 8 a 7.4 image can no longer load it. Snapshot the volume set first if you want a rollback path, or pin `redis.image` and `sentinel.image` to `redis:7.4`.
+
+A rolling upgrade replaces replicas one at a time. The master is replaced along the way, which triggers a Sentinel failover; clients that discover the master through Sentinel follow it, clients pinned to replica 0 start receiving `READONLY` errors.
+
+### Scaling and Availability
+
+- The default shape is already highly available: three data nodes (one master, two replicas) and three Sentinels with a quorum of two. Change `redis.replicas` and `sentinel.replicas` to resize either tier; keep the Sentinel count odd. A `1` + `1` shape is a valid development size with no failover.
+- When the master stops responding, Sentinel marks it down after 5 seconds, elects a replica and repoints the remaining replicas at it. The old master rejoins as a replica when it comes back. Writes pause for the duration of the failover; reads from replicas continue.
+- Write capacity is that of a single node: replicas take reads only. For more memory or throughput, raise `redis.resources` and `redis.persistence.volumes.data` rather than adding replicas.
+- Enable `sentinel.persistence` so the elected master survives Sentinel restarts, and `redis.persistence` so data survives Redis restarts. Both are install-time choices.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Rollout stalls on `Replica N will be restarted shortly` after enabling persistence">
+    **Symptom:** after a `cpln helm upgrade` that turned `redis.persistence.enabled` or `sentinel.persistence.enabled` on, every replica reports `Replica N will be restarted shortly` indefinitely and the volume set's volumes stay `unbound`.
+
+    **Cause:** a volume set cannot be attached to a release that is already running.
+
+    **Fix:** uninstall the release and reinstall it with persistence enabled from the start. Data in a release without persistence lives in memory only, so take a backup first if it matters.
+  </Accordion>
+  <Accordion title="`Unable to AUTH to MASTER: -WRONGPASS invalid username-password pair or user is disabled.`">
+    **Symptom:** after changing the Redis password, the rollout stops at the first restarted node, which logs this line and never becomes ready.
+
+    **Cause:** the restarted node uses the new password; the master it must replicate from still runs with the old one.
+
+    **Fix:** run `cpln helm upgrade` again with the previous password to recover. To change the password, uninstall and reinstall, or accept a planned outage.
+  </Accordion>
+  <Accordion title="`READONLY You can't write against a read only replica.`">
+    **Symptom:** writes that used to succeed are refused after a failover or a rolling upgrade.
+
+    **Cause:** the client is connected to a fixed Redis replica that is no longer the master.
+
+    **Fix:** configure the client for Sentinel at `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` with master name `mymaster`, so it follows the master.
+  </Accordion>
+  <Accordion title="`Can't handle RDB format version 15` after changing `engine`">
+    **Symptom:** the first replaced replica exits with `# Can't handle RDB format version 15` / `# Error reading the RDB base file appendonly.aof.1.base.rdb, AOF loading aborted` and crash-loops.
+
+    **Cause:** `engine` was changed to `valkey` on a release whose data directory was written by Redis 8, which Valkey cannot read.
+
+    **Fix:** set `engine` back to `redis` and upgrade; the rollout halts on the unhealthy replica, so the remaining nodes keep serving throughout. Migrate between engines with dump/restore or replication.
+  </Accordion>
+  <Accordion title="Deployment never becomes ready after enabling `auth.fromSecret`">
+    **Symptom:** the workload never reaches ready and `cpln logs` returns nothing at all.
+
+    **Cause:** the secret named in `redis.auth.fromSecret.name` or `sentinel.auth.fromSecret.name` does not exist, so the container never starts.
+
+    **Fix:** read the missing secret's name from `status.versions[].message`:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-redis --gvc GVC_NAME -o yaml
+    ```
+
+    Create it as shown under [Prerequisites](#prerequisites). The deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-redis --gvc GVC_NAME` to skip the wait.
+  </Accordion>
+  <Accordion title="`Unable to apply domain` when installing with public access">
+    **Symptom:** the install fails while creating the domain resource for `redis.publicAccess.address` or `sentinel.publicAccess.address`.
+
+    **Cause:** domain ownership is verified when the resource is first created, and the TXT or CNAME record is missing.
+
+    **Fix:** create the records listed under [Public Access and Firewall](#public-access-and-firewall) with proxying disabled, wait for DNS to propagate, then install again.
+  </Accordion>
+  <Accordion title="Render fails with `redis.resources.cpu was RENAMED to redis.resources.maxCpu`">
+    **Symptom:** `cpln helm install` or `cpln helm upgrade` refuses to render and prints this message (or the `memory`, `sentinel` or `exporter` variant).
+
+    **Cause:** your values file still uses the pre-3.6.0 key names.
+
+    **Fix:** rename `cpu` to `maxCpu` and `memory` to `maxMemory` under `redis.resources`, `sentinel.resources` and `redis.exporter.resources`.
+  </Accordion>
+  <Accordion title="Clients can still connect after tightening the firewall">
+    **Symptom:** after changing `internal_inboundAllowType` or `inboundAllowWorkload`, previously allowed clients keep connecting.
+
+    **Cause:** firewall changes take a few minutes to propagate.
+
+    **Fix:** wait and re-test before concluding the rule is not applied.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **The engine is an install-time choice.** Switching `engine` on a running release does not migrate anything — Valkey cannot read a data file written by Redis 8. Migrate with dump/restore or replication.
-- **Persistence is an install-time choice too.** Enabling it on a running release stalls the rollout indefinitely. Enable it on the initial install, or uninstall and reinstall.
-- **The Redis 7.4 to 8 upgrade is one-way.** Data written under Redis 8 cannot be loaded by a 7.4 image. Snapshot the volume set first if you need a rollback path.
-- **Never rotate the Redis password in place.** It deadlocks the rolling update. Re-apply the previous password to recover; uninstall and reinstall to change it.
-- **Always discover the master through Sentinel.** The master moves during failovers and rolling upgrades, so a client pinned to replica 0 will hit `READONLY` errors after either.
-- **Enable `sentinel.persistence` in production.** Persisted Sentinel state lets replicas rejoin the real master after a restart instead of assuming replica 0 is still the master.
-- **Firewall changes can take up to about five minutes to propagate.** After tightening `internal_inboundAllowType` or the allowed workload list, previously-allowed clients may keep connecting for several minutes before the new rule takes effect — 305 seconds was the longest measured. Re-check before concluding a rule does not work.
+- **Choose `engine` at install time.** Switching it on a running release does not migrate anything; Valkey cannot read data written by Redis 8.
+- **Choose persistence at install time.** Enabling `redis.persistence` or `sentinel.persistence` on a running release stalls the rollout indefinitely; uninstall and reinstall instead.
+- **Never change the password in place.** It deadlocks the rolling update; re-apply the previous password to recover and reinstall to change it.
+- **Always discover the master through Sentinel** (`mymaster` at `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379`). A client pinned to replica 0 gets `READONLY` errors after any failover or upgrade.
+- **Enable `sentinel.persistence` in production** so the elected master survives Sentinel restarts.
+- **The Redis 7.4 to 8 upgrade is one-way.** Snapshot the volume set before upgrading if you need a rollback path.
+- **Public access needs the DNS records in place before the first deploy and `external_inboundAllowCIDR` uncommented**, or the domain is rejected or routes nowhere.
+- **Bucket backups have no verified in-place restore.** Treat them as portable RDB files; see [Restoring a Backup](#restoring-a-backup).
 
 ## External References
 
@@ -674,14 +587,14 @@ redis-cli \
     <Card title="Redis Documentation" icon="book" href="https://redis.io/docs/">
     Official Redis documentation
     </Card>
-    <Card title="Redis Sentinel Documentation" icon="book" href="https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/">
-    Redis Sentinel setup and client configuration
+    <Card title="Redis Sentinel" icon="book" href="https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/">
+    Sentinel setup and client configuration
+    </Card>
+    <Card title="Redis Persistence" icon="book" href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">
+    RDB, AOF, backups and how RDB files load
     </Card>
     <Card title="Valkey Documentation" icon="book" href="https://valkey.io/topics/">
-    Official Valkey documentation
-    </Card>
-    <Card title="Redis and Valkey Migration" icon="book" href="https://valkey.io/topics/migration/">
-    Moving data between Redis and Valkey
+    Official Valkey documentation, including Redis to Valkey migration
     </Card>
     <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/redis-backup">
     Source code for the Redis backup container image
