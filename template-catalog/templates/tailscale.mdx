@@ -1,77 +1,91 @@
 ---
 title: Tailscale
 icon: /template-catalog/templates/icons/tailscale.png
-description: Deploy Tailscale on Control Plane using the Template Catalog. Covers configuration, scaling, and mesh VPN gateway setup for routing Tailscale clients to GVC workloads.
-keywords: ['wireguard', 'vpn', 'zero trust network', 'tailnet', 'private network', 'p2p vpn', 'access vpn', 'subnet router', 'magic dns', 'cpln.local access']
+description: Tailscale subnet router for Control Plane. A single gateway in one location joins your tailnet and advertises the GVC's internal routes and cpln.local DNS, so tailnet devices reach private workloads. Needs an existing GVC and a Tailscale auth key stored in a secret.
+keywords: ['tailscale', 'wireguard', 'vpn', 'zero trust network', 'tailnet', 'private network', 'subnet router', 'split dns', 'magic dns', 'cpln.local access', 'bastion alternative', 'openvpn alternative', 'private database access']
 ---
 
 ## Overview
 
-Tailscale is a mesh VPN built on WireGuard. This template deploys a Tailscale gateway workload on Control Plane that joins your Tailscale network and advertises internal Control Plane routes, allowing any connected Tailscale client to reach your GVC workloads via their `cpln.local` internal endpoints.
+Tailscale is a mesh VPN built on WireGuard. This template runs a Tailscale subnet router inside your GVC: it joins your tailnet, advertises Control Plane's internal network routes plus the internal DNS server of one location, and lets any device on your tailnet reach GVC workloads by their `cpln.local` addresses without giving those workloads a public endpoint.
 
-The gateway runs in a single configured location. Other locations are suspended so only one Tailscale node is active at a time.
+The gateway runs in exactly one location, set by `location`. The auth key is **not** a template value; the gateway reads it from a secret you create before installing, so the key never passes through Helm or lands in the release.
 
-The auth key is **not** a template value. Tailscale reads it from an opaque secret you create before installing, so the key never passes through Helm or lands in the release.
-
-<Warning>
-**Template version 1.3.0 is a breaking change.** `AuthKey` was removed, and an install or upgrade that still sets it now fails at render. Two defaults also changed: the image tag is pinned, and `TS_HOSTNAME` no longer defaults to a leftover test name. If you are running 1.2.x, read [Upgrading From 1.2.x](#upgrading-from-1-2-x) before you touch the release.
-</Warning>
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have, and the location named by `location` must already be one of that GVC's locations. Every other location on the GVC runs nothing for this workload.
+</Note>
 
 ### What Gets Created
 
-- **Standard Workload** — The Tailscale gateway (`RELEASE_NAME-tailscale`), active in the configured location only. Advertises Control Plane's internal network CIDRs and the location's internal DNS server to Tailscale.
-- **Secret** — A dictionary secret storing the Tailscale auth key, injected into the container at startup.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the auth key secret.
-- **Serverless Workload** *(optional)* — An httpbin test workload (`RELEASE_NAME-httpbin`) accessible only from the Tailscale workload, useful for verifying connectivity.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-tailscale` | Tailscale subnet router (standard, 1 replica, active only in `location`) | — |
+| Identity | `RELEASE_NAME-tailscale-identity` | Identity bound to the gateway workload | — |
+| Policy | `RELEASE_NAME-tailscale-policy` | Grants the identity `reveal` on your auth key secret only | — |
+| Workload | `RELEASE_NAME-httpbin` | Example target that accepts internal traffic only from the gateway | `deployHttpbinExample: true` (default) |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+The template creates **no secret of its own**. The auth key lives only in the prerequisite secret described below.
 
 ## Prerequisites
 
-Complete the following in your Tailscale account before installing:
+You need a Tailscale account with admin access to its tailnet, plus one secret in your Control Plane org. Secrets are org-level, so no GVC flag is involved.
 
-### 1. Create an Auth Key
+<Steps>
+  <Step title="Generate a Tailscale auth key">
+    In the Tailscale admin console, open [Settings then Keys](https://login.tailscale.com/admin/settings/keys) and select **Generate auth key**. Enable both **Reusable** and **Ephemeral**.
 
-In the Tailscale [Admin UI → Settings → Keys](https://login.tailscale.com/admin/settings/keys), create a new auth key with **Reusable** and **Ephemeral** enabled. Save the key value, then store it in an opaque secret — it is not a template value:
+    The gateway keeps no Tailscale state on disk, so it joins the tailnet with this key every time its container starts. A reusable key lets it rejoin after a restart; an ephemeral key makes Tailscale remove the old device entry once it goes offline. The chart applies no ACL tags of its own, and the route approval example in the next step assumes an untagged key.
+  </Step>
+  <Step title="Store the auth key in an opaque secret">
+    Paste your key in place of the placeholder. The whole value of the secret is the key:
+
+    ```bash
+    printf '%s' 'tskey-auth-YOUR-KEY-HERE' | cpln secret create-opaque --name SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `authKeySecretName` to this name. Secret names are org-wide, so give each release its own.
+  </Step>
+  <Step title="Let Tailscale approve the advertised routes">
+    The gateway advertises three routes: `192.168.0.0/16`, `240.240.0.0/16`, and a `/32` host route to the internal DNS server of the selected `location` (looked up in `locationDNS`). Add an `autoApprovers` block to your [tailnet policy file](https://login.tailscale.com/admin/acls/file) so they are approved automatically. This example covers the default `aws-us-east-1` location, whose DNS server is `172.20.0.10`:
+
+    ```json
+    {
+      "autoApprovers": {
+        "routes": {
+          "192.168.0.0/16": ["autogroup:member"],
+          "240.240.0.0/16": ["autogroup:member"],
+          "172.20.0.10/32": ["autogroup:member"]
+        }
+      }
+    }
+    ```
+
+    For another location, replace `172.20.0.10/32` with that location's entry from `locationDNS`. Without `autoApprovers` you can still approve the routes by hand after install (see [Connecting](#connecting)).
+  </Step>
+  <Step title="Add split DNS for cpln.local">
+    In the Tailscale admin console [DNS page](https://login.tailscale.com/admin/dns), add a custom nameserver, restrict it to the domain `cpln.local`, and set its address to the `locationDNS` IP of your selected location (`172.20.0.10` for the default `aws-us-east-1`).
+  </Step>
+</Steps>
+
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** A name that points at a secret which does not exist installs successfully and then never starts. The container never runs, so `cpln logs` returns **zero lines**. The one place the reason appears is `status.versions[].message`:
 
 ```bash
-printf '%s' 'tskey-auth-YOUR-KEY-HERE' | cpln secret create-opaque --name my-tailscale-authkey --encoding plain -f -
+cpln workload get-deployments RELEASE_NAME-tailscale --gvc GVC_NAME -o yaml
 ```
 
-Set `authKeySecretName` to the name you used. Secret names are org-wide, so give each release its own.
-
-If the secret does not exist at install time the deployment wedges silently — `cpln logs` returns **zero lines**. Read `status.versions[].message` via `cpln workload get-deployments RELEASE_NAME-tailscale --gvc GVC_NAME -o yaml`; plain `cpln workload get` has no `versions` key.
-
-### 2. Update the Tailscale ACL
-
-Add `autoApprovers` to your [Tailscale ACL](https://login.tailscale.com/admin/acls/file) so that advertised routes are approved automatically:
-
-```json
-{
-  "autoApprovers": {
-    "routes": {
-      "192.168.0.0/16": ["autogroup:member"],
-      "240.240.0.0/16": ["autogroup:member"],
-      "10.0.0.0/16": ["autogroup:member"],
-      "172.20.0.10/32": ["autogroup:member"],
-      "10.1.0.10/32": ["autogroup:member"],
-      "10.194.112.10/32": ["autogroup:member"]
-    }
-  }
-}
-```
-
-If your location uses a DNS IP not listed above, add its `/32` entry here as well.
-
-### 3. Configure Tailscale DNS
-
-In the Tailscale [Admin UI → DNS tab](https://login.tailscale.com/admin/dns), add a custom nameserver scoped to the `cpln.local` domain. Use the DNS IP for your selected location from the `locationDNS` map in values (e.g. `172.20.0.10` for most AWS locations).
-
-If you need to reach per-replica stateful workload endpoints, add an additional custom nameserver scoped to `<GVC_NAME>.svc.cluster.local` using the same DNS IP.
+Plain `cpln workload get` has no `versions` key. Once the secret exists, the deployment recovers on its own after a few minutes, or immediately with `cpln workload force-redeployment RELEASE_NAME-tailscale --gvc GVC_NAME`.
+</Warning>
 
 ## Installation
+
+Install with the secret name from [Prerequisites](#prerequisites). Add `--set location=...` if the gateway should run somewhere other than `aws-us-east-1`:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/tailscale \
+  --version 1.3.0 --gvc GVC_NAME \
+  --set authKeySecretName=SECRET_NAME
+```
 
 To install, follow the instructions for your preferred method:
 
@@ -97,55 +111,26 @@ To install, follow the instructions for your preferred method:
     </Card>
 </CardGroup>
 
-## Upgrading From 1.2.x
-
-Version 1.3.0 removes `AuthKey` and changes two defaults.
-
-| | 1.2.x | 1.3.0 |
-|---|---|---|
-| Auth key | `AuthKey` value, written into a chart-owned secret | `authKeySecretName` → an opaque secret you create |
-| `image.tag` | `stable` — floating | `v1.102.3` — pinned |
-| `TS_HOSTNAME` | `cpln-test-new` | `cpln-tailscale` |
-
-<Warning>
-**Carrying `AuthKey` forward stops the upgrade.** It is rejected at render, so `cpln helm upgrade` fails and your existing gateway is left untouched and running:
-
-```text
-Error: execution error at (tailscale/templates/identity.yaml:1:4): tailscale: AuthKey was REMOVED
-— it is now an `opaque` secret you create, named by authKeySecretName, whose entire value is the
-auth key. Delete AuthKey from your values. See Prerequisites in the README.
-```
-</Warning>
-
-Create the secret ([Prerequisites](#prerequisites)), delete `AuthKey`, and set `authKeySecretName`. You can reuse the same key or generate a new one — unlike a database password, a Tailscale auth key only authorizes the device at join time, so replacing it is safe for a node that has already joined.
-
-<Note>
-**`TS_HOSTNAME` previously defaulted to `cpln-test-new`,** a leftover from testing that became the advertised tailnet name of every install that did not override it. If you see `cpln-test-new` in your Tailscale admin console, that is a pre-1.3.0 deployment. Changing it renames the device on your tailnet.
-</Note>
-
 ## Configuration
 
-The default `values.yaml` for this template:
+### Auth Key
 
 ```yaml
-# The single location where the Tailscale gateway will be active
+authKeySecretName: my-tailscale-authkey
+```
+
+### Location
+
+```yaml
+# Set this to a single location in your gvc
 location: aws-us-east-1
+```
 
-image:
-  repository: tailscale/tailscale
-  tag: v1.102.3 # pinned: `stable` floats, so installs are not reproducible
+The gateway runs in this location only and is suspended everywhere else, so the console shows the workload as `Partially Suspended`. The location must already be on your GVC and must have an entry in `locationDNS`.
 
-resources:
-  cpu: 500m
-  memory: 128Mi
+### Location DNS
 
-extraEnv:
-  - name: TS_HOSTNAME
-    value: cpln-tailscale # the name this device advertises on your tailnet
-  # - name: TS_EXTRA_ARGS
-  #   value: --advertise-exit-node
-
-# Internal DNS server IPs per location — used to advertise a DNS route to Tailscale clients
+```yaml
 locationDNS:
   aws-us-west-2: 172.20.0.10
   aws-us-east-1: 172.20.0.10
@@ -160,67 +145,54 @@ locationDNS:
   gcp-me-west1: 10.110.48.10
   azure-centralus: 10.1.0.10
   azure-eastus2: 10.1.0.10
-
-deployHttpbinExample: true
-
-authKeySecretName: my-tailscale-authkey # see Prerequisites — must exist before install
 ```
 
-### Auth Key
+Maps each location to its internal DNS server. The entry for `location` becomes the advertised `/32` route and is the address you give Tailscale split DNS. Leave the map as shipped unless your location is missing from it.
 
-- `authKeySecretName` — Name of the opaque secret holding your Tailscale auth key. The key must be created with the **Reusable** and **Ephemeral** options enabled. See [Prerequisites](#prerequisites).
+### Image and Resources
 
-### Location
+```yaml
+image:
+  repository: tailscale/tailscale
+  tag: v1.102.3 # pinned: `stable` floats, so installs are not reproducible
 
-- `location` — The single Control Plane location where the Tailscale gateway will run. All other locations in the GVC are suspended. Must match one of the locations configured in your GVC.
-
-The Tailscale workload will appear as `Partially Suspended` in the console — this is expected behavior.
-
-### Advertised Routes
-
-The gateway automatically advertises the following routes to Tailscale:
-
-| Route | Purpose |
-|-------|---------|
-| `192.168.0.0/16` | Control Plane internal network |
-| `240.240.0.0/16` | Control Plane internal network |
-| `<locationDNS[location]>/32` | Internal DNS server for the selected location |
-
-The `/32` DNS host route allows Tailscale clients to resolve `cpln.local` endpoints after configuring a custom nameserver in Tailscale DNS.
-
-### Location DNS
-
-- `locationDNS` — A map of Control Plane location names to their internal DNS server IPs. The IP for the selected `location` is advertised as a host route (`/32`) to enable `cpln.local` name resolution on Tailscale clients.
-
-If your location is not listed, add it to the map with the correct DNS IP for that location.
-
-### Resources and Image
-
-- `resources.cpu` / `resources.memory` — CPU and memory for the Tailscale gateway container.
-- `image.repository` / `image.tag` — Tailscale container image. Defaults to `tailscale/tailscale:stable`.
+resources:
+  cpu: 500m
+  memory: 128Mi
+```
 
 ### Extra Environment Variables
 
-- `extraEnv` — Additional environment variables passed to the Tailscale container. Common options:
-  - `TS_HOSTNAME` — The hostname the gateway registers under in your Tailscale network.
-  - `TS_EXTRA_ARGS` — Additional Tailscale daemon flags, e.g. `--advertise-exit-node` to use the gateway as an exit node.
+```yaml
+extraEnv:
+  - name: TS_HOSTNAME
+    value: cpln-tailscale # the name this device advertises on your tailnet
+  # - name: TS_EXTRA_ARGS
+  #   value: --advertise-exit-node
+```
+
+Each entry is passed to the Tailscale container as an environment variable. Give each release a distinct `TS_HOSTNAME` so gateways are easy to tell apart in the Tailscale admin console. The commented exit-node example is not part of the default install and has not been verified with this template.
 
 ### Example Workload
 
-- `deployHttpbinExample` — When `true`, deploys an httpbin test workload that only accepts internal connections from the Tailscale gateway. Use it to verify connectivity after setup.
-
-## Accessing GVC Workloads
-
-Once the gateway is running and connected to Tailscale:
-
-1. Ensure your local machine is connected to the same Tailscale network.
-2. Any GVC workload that grants internal access to the Tailscale workload can be reached via its `cpln.local` address:
-
-```text
-WORKLOAD_NAME.GVC_NAME.cpln.local:PORT
+```yaml
+deployHttpbinExample: true
 ```
 
-To grant access, add the Tailscale workload to a target workload's internal firewall:
+Creates `RELEASE_NAME-httpbin`, a small HTTP service that only the gateway may reach. Use it to prove the tailnet path works, then set it to `false`.
+
+## Connecting
+
+| What | Address | Notes |
+|---|---|---|
+| Any workload in the GVC | `WORKLOAD_NAME.GVC_NAME.cpln.local:PORT` | From a device on your tailnet, once the routes are approved, split DNS is set, and the target allows the gateway (below) |
+| Example workload | `RELEASE_NAME-httpbin.GVC_NAME.cpln.local:80` | Created when `deployHttpbinExample: true`; already allows the gateway |
+| Gateway on your tailnet | `cpln-tailscale` | The `TS_HOSTNAME` value, listed on the [Machines page](https://login.tailscale.com/admin/machines) |
+| Auth key | `cpln secret reveal SECRET_NAME -o yaml` | Your prerequisite secret |
+
+**Approve the routes.** If you did not set up `autoApprovers`, open the gateway on the [Machines page](https://login.tailscale.com/admin/machines), choose **Edit route settings**, and approve all three advertised routes. Until they are approved, the gateway shows as connected but carries no traffic to the GVC.
+
+**Allow the gateway on each target workload.** Traffic from tailnet devices reaches a workload from the gateway, so the target's internal firewall must admit `RELEASE_NAME-tailscale`. For example:
 
 ```yaml
 firewallConfig:
@@ -230,16 +202,129 @@ firewallConfig:
       - //gvc/GVC_NAME/workload/RELEASE_NAME-tailscale
 ```
 
+**Verify** from a laptop or other device that is connected to the same tailnet:
+
+```bash
+curl http://RELEASE_NAME-httpbin.GVC_NAME.cpln.local/headers
+```
+
+A JSON response proves the routes, split DNS and gateway are all working. Check the gateway's own output with:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-tailscale"}' --limit 50 --since 10m
+```
+
+## Operations
+
+### Upgrading from 1.2.x
+
+Version 1.3.0 removes the `AuthKey` value and changes two defaults.
+
+| | 1.2.x | 1.3.0 |
+|---|---|---|
+| Auth key | `AuthKey` value, written into a chart-owned secret `RELEASE_NAME-tailscale` | `authKeySecretName` names an opaque secret you create; the chart creates no secret |
+| `image.tag` | `stable` (floating) | `v1.102.3` (pinned) |
+| `TS_HOSTNAME` | `cpln-test-new` | `cpln-tailscale` |
+
+<Warning>
+**Carrying `AuthKey` forward stops the upgrade.** It is rejected at render, so `cpln helm upgrade` fails and your existing gateway is left untouched and running:
+
+```text
+Error: execution error at (tailscale/templates/identity.yaml:1:4): tailscale: AuthKey was REMOVED — it is now an `opaque` secret you create, named by authKeySecretName, whose entire value is the auth key. Delete AuthKey from your values. See Prerequisites in the README.
+```
+</Warning>
+
+<Steps>
+  <Step title="Create the auth key secret">
+    Follow [Prerequisites](#prerequisites). Use a new name, not `RELEASE_NAME-tailscale`, because the upgrade removes that chart-owned secret. You can reuse your current key or generate a new one.
+  </Step>
+  <Step title="Update your values">
+    Delete `AuthKey` and set `authKeySecretName`. If you relied on the old `cpln-test-new` device name, set `TS_HOSTNAME` in `extraEnv` explicitly; otherwise the device appears on your tailnet as `cpln-tailscale`.
+  </Step>
+  <Step title="Upgrade">
+    ```bash
+    cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/tailscale \
+      --version 1.3.0 --gvc GVC_NAME \
+      --set authKeySecretName=SECRET_NAME
+    ```
+  </Step>
+</Steps>
+
+### Rotating the Auth Key
+
+An auth key only authorizes the device when it joins, but the gateway rejoins with the key on every container start, so keep a valid key in the secret. To replace it, apply the whole secret with the new value:
+
+```bash
+cat > rotate.yaml <<'EOF'
+kind: secret
+name: SECRET_NAME
+type: opaque
+data:
+  encoding: plain
+  payload: NEW-VALUE
+EOF
+cpln apply -f rotate.yaml
+cpln secret reveal SECRET_NAME -o yaml
+```
+
+A running gateway does not pick up the new value by itself. Force a redeployment so it rejoins with the new key:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-tailscale --gvc GVC_NAME
+```
+
+### Scaling and Availability
+
+The gateway is a single replica in a single location. Do not run it in several locations: a subnet router advertising the same routes from several places gives Tailscale competing paths. If that location is unavailable, tailnet access to the GVC stops until it returns. The workloads themselves are unaffected.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The gateway never starts and cpln logs returns nothing">
+    **Cause:** the secret named by `authKeySecretName` does not exist, so the deployment is paused before the container starts.
+
+    **Fix:** read `status.versions[].message` with `cpln workload get-deployments RELEASE_NAME-tailscale --gvc GVC_NAME -o yaml`. It names the missing secret, for example `The secret SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Create the secret as in [Prerequisites](#prerequisites).
+  </Accordion>
+  <Accordion title="The gateway is online in Tailscale but workloads are unreachable">
+    **Cause:** the advertised routes are not approved, or the target workload's internal firewall does not admit the gateway.
+
+    **Fix:** approve the routes under **Edit route settings** on the [Machines page](https://login.tailscale.com/admin/machines), or add `autoApprovers` as in [Prerequisites](#prerequisites). Then allow `//gvc/GVC_NAME/workload/RELEASE_NAME-tailscale` in the target's `firewallConfig.internal`, as shown in [Connecting](#connecting). Test against `RELEASE_NAME-httpbin` first, since it already allows the gateway.
+  </Accordion>
+  <Accordion title="cpln.local names do not resolve on a tailnet device">
+    **Cause:** split DNS for `cpln.local` is missing, points at the wrong address, or the `/32` DNS route is not approved.
+
+    **Fix:** set the custom nameserver for `cpln.local` to the `locationDNS` entry for your `location`, and confirm that same address appears as an approved `/32` route on the gateway.
+  </Accordion>
+  <Accordion title="The advertised routes end in a bare /32 with no address">
+    **Cause:** `location` has no entry in `locationDNS`, so `TS_ROUTES` renders as `192.168.0.0/16,240.240.0.0/16,/32`.
+
+    **Fix:** add your location and its internal DNS server address to `locationDNS`, then upgrade the release.
+  </Accordion>
+  <Accordion title="No replica runs in any location">
+    **Cause:** `location` names a location that is not on your GVC. The workload is suspended everywhere else, so nothing runs.
+
+    **Fix:** compare `location` with `spec.staticPlacement.locationLinks` from `cpln gvc get GVC_NAME -o yaml`, set it to one of those locations, and upgrade.
+  </Accordion>
+  <Accordion title="The gateway dropped off the tailnet after running fine for weeks">
+    **Cause:** the auth key expired. The gateway rejoins with the key whenever its container restarts, and an expired key can no longer join.
+
+    **Fix:** generate a new reusable, ephemeral key and follow [Rotating the Auth Key](#rotating-the-auth-key).
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- Create the auth key secret before installing; a missing secret wedges the deployment with no logs.
+- Generate the key as **Reusable** and **Ephemeral**, and replace it before it expires.
+- Approve the three advertised routes and add `cpln.local` split DNS, or tailnet devices cannot reach anything.
+- Every workload you want to reach must allow `RELEASE_NAME-tailscale` in its internal firewall.
+- After rotating the key in the secret, force a redeployment of `RELEASE_NAME-tailscale`.
+- Never upgrade from 1.2.x with `AuthKey` still in your values; follow [Upgrading from 1.2.x](#upgrading-from-1-2-x).
+
 ## External References
 
-<CardGroup cols={2}>
-    <Card title="Tailscale Documentation" icon="book" href="https://tailscale.com/kb/">
-    Official Tailscale documentation
-    </Card>
-    <Card title="Tailscale Admin UI" icon="globe" href="https://login.tailscale.com/admin/">
-    Manage your Tailscale network, keys, ACLs, and DNS
-    </Card>
-    <Card title="Tailscale Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/tailscale">
-    View the source files, default values, and chart definition
-    </Card>
-</CardGroup>
+- [Tailscale documentation](https://tailscale.com/kb/)
+- [Subnet routers](https://tailscale.com/kb/1019/subnets)
+- [Auth keys](https://tailscale.com/kb/1085/auth-keys)
+- [Tailscale on Docker](https://tailscale.com/kb/1282/docker)
+- [Tailscale template source](https://github.com/controlplane-com/templates/tree/main/tailscale)
