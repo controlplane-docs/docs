@@ -1,7 +1,7 @@
 ---
 title: 'Billing API'
 description: 'Query priced charges for a billing account or org, list invoices and download them as PDF, set the monthly spend alert, and mint billing service account tokens through the billing API.'
-keywords: ['billing-ng', 'billing-ng.cpln.io', 'charges query', 'cost report', 'invoice pdf', 'spend alert', 'budget alert', 'billing token', 'cpln-bsat', 'finops', 'chargeback', 'account id']
+keywords: ['billing-ng', 'billing-ng.cpln.io', 'charges query', 'cost report', 'invoice pdf', 'budget alert', 'billing users', 'invoice email', 'billing token', 'cpln-bsat', 'finops', 'chargeback', 'account id']
 ---
 
 ## Billing API Overview
@@ -16,6 +16,9 @@ The billing API serves your [billing account](/concepts/billing): what its orgs 
 | [Read invoices](#invoices) and download them | `GET /account/{accountId}/charges/invoices…` |
 | [Manage the spend alert](#spend-alert) | `/account/{accountId}/alert` |
 | [Manage billing service account tokens](#billing-service-account-tokens) | `/account/{accountId}/service-account-token` |
+| [Read the account, list and create its orgs](#account-and-orgs) | `/account/{accountId}`, `/account/{accountId}/org` |
+| [Manage billing users](#billing-users) | `/account/{accountId}/user` |
+| [Manage invoice email recipients](#invoice-email-recipients) | `/account/{accountId}/invoice-delivery` |
 | [View and raise org quotas](/guides/manage-quotas) | `/org/{org}/quotas`, `/org/{org}/quota-increase-requests` |
 
 For the unpriced quantities behind these charges, use the [usage API](/reference/usage-api).
@@ -33,17 +36,19 @@ Three kinds of token work, depending on the endpoint:
 | Token | How to get it | Works on |
 | :--- | :--- | :--- |
 | **User token** | `cpln login`, then `cpln profile token <profile-name>` | Every endpoint, within the user's billing roles and org permissions |
-| **Billing service account token** (`cpln-bsat-…`) | [Created by a `billing_admin`](#billing-service-account-tokens) | Endpoints under `/account/{accountId}`, for its own account and within its roles |
+| **Billing service account token** (`cpln-bsat-…`) | [Created by a `billing_admin`](#billing-service-account-tokens) | Endpoints under `/account/{accountId}`, for its own account and within its roles, and `GET /chargeable_items` |
 | **Org service account key** | [Create a service account](/guides/create-service-account) and generate a key | Org endpoints: `/org/{org}/charges/-query` and the quota endpoints |
 
 Endpoints under `/account/{accountId}` check the caller's [billing role](/concepts/billing) on that account:
 
 | Endpoint | Required billing role |
 | :--- | :--- |
-| Query charges, list charge tag values, read invoices | `billing_admin` or `billing_viewer` |
-| Spend alert, billing service account tokens | `billing_admin` |
+| Read the account and list its orgs | `billing_admin`, `billing_viewer`, or `org_creator` |
+| Query charges, list charge tag values, read invoices, list billing users | `billing_admin` or `billing_viewer` |
+| Create an org | `billing_admin` or `org_creator` |
+| Spend alert, manage billing users, invoice email recipients, billing service account tokens | `billing_admin` |
 
-`POST /org/{org}/charges/-query` accepts either the `readMetrics` [permission](/reference/org#permissions) on the org, or `billing_admin` or `billing_viewer` on the account that pays for the org.
+`POST /org/{org}/charges/-query` accepts either the `readMetrics` [permission](/reference/org#permissions) on the org, or `billing_admin` or `billing_viewer` on the account that pays for the org. The `readUsage` permission does not grant access.
 
 A caller without the required role or permission receives `401` with `{"code":401,"error":"unauthorized"}`. Role changes, token revocations, and token expiry can take up to 5 minutes to apply, because authorization results are cached.
 
@@ -58,6 +63,12 @@ curl --request GET \
 ```
 
 Each item's `id` is the account ID to use in the paths below.
+
+<Warning>
+Use `id`, not the account object's `accountId` field, which holds the payment processor's customer ID. A path built from `accountId` returns `401`.
+</Warning>
+
+To find the account that pays for an org, call `GET /org/{org}/account` with `billing_admin` or `billing_viewer` on that account.
 
 ## Query Charges
 
@@ -77,11 +88,11 @@ Returns usage priced with your account's rate plan. The request body is the [usa
 | `aggregateByTimeStep` | boolean | No | `true` returns one period per `timeStep`; `false` returns one period for the whole range. |
 | `groupBy` | string[] | No | Tags that split each period into groups. Each key must be in every `aggregateBy`. |
 | `consumptionQueries` | object[] | Yes | Usage selections with `filterBy`, `aggregateBy`, and `chargeableItems`, as in the [usage query](/reference/usage-api#usage-query-request). |
-| `orgs` | string[] | No | Account endpoint only: names of orgs on the account to include. Defaults to every org on the account. |
+| `orgs` | string[] | No | Account endpoint only: names of [orgs on the account](#list-the-accounts-orgs) to include. Defaults to every org on the account. |
 | `detailed` | boolean | No | `true` returns results per billing period with the rate plan and each pricing tier. See [detailed charges](#detailed-charges). |
 
 <Warning>
-A row is priced only when its tags include every tag its [chargeable item](#list-chargeable-items) prices on. Put `metric` and `locationType` in `aggregateBy`, plus any other tag in the item's `consumptionTags`. A row that matches no chargeable item returns `"total": 0`. The `feature` tag is always added for you.
+A row is priced only when its tags include every tag its [chargeable item](#list-chargeable-items) prices on. Put `metric` and `locationType` in `aggregateBy`, plus any other tag in the item's `consumptionTags`, such as `performanceClass` for volume sets. A row that matches no chargeable item returns `"total": 0`. The `feature` tag is always added for you.
 </Warning>
 
 Pricing tiers are applied to the rows your query selects, starting from the first of the month. A query filtered to one GVC can therefore show different unit rates than the invoice, which tiers on the whole account.
@@ -167,7 +178,7 @@ curl --request POST \
 
 ### Detailed Charges
 
-With `"detailed": true`, the response is `detailedResults`: one entry for each billing period that overlaps the range. Each entry has the `accountState`, which carries the period's `ratePlan`, and its `results`. Each row also has a `details` array with one entry per pricing tier:
+With `"detailed": true`, the response is `detailedResults`: one entry for each billing period that overlaps the range. Each entry has the `accountState`, which carries the period's `ratePlan`, and `results`, an array of usage query responses. Each row also has a `details` array with one entry per pricing tier:
 
 | Field | Description |
 | :--- | :--- |
@@ -207,7 +218,7 @@ curl --request POST \
 }
 ```
 
-`tagValues` is in no particular order, so sort it yourself. It contains `""` when some matching usage lacks the tag.
+`tagValues` is in no particular order, so sort it yourself. It contains `""` when some matching usage lacks the tag. As on the usage API, the range always includes the month that begins at or after `endTime`.
 
 ## List Chargeable Items
 
@@ -270,9 +281,9 @@ curl --request GET \
           "status": "paid",
           "items": [
             {
-              "description": "my-org: CPU (vCPU-hour), Quantity: 1374.57, Rate: 0.3",
-              "quantity": 1374.57,
-              "charge": 41237,
+              "description": "my-org: memory (bytes * seconds), Quantity: 13950729216000, Rate: 0.0000000000068",
+              "quantity": 13950729216000,
+              "charge": 9487,
               "org": "my-org"
             }
           ]
@@ -286,10 +297,12 @@ curl --request GET \
 | Field | Description |
 | :--- | :--- |
 | `number` | Sequential invoice number. |
-| `totalCharge` | Invoice total in the smallest currency unit. `51247` is $512.47. |
+| `totalCharge` | Invoice total before credits, in the smallest currency unit. `51247` is $512.47. |
 | `status` | `paid`, `pending-payment`, `payment-failed`, `partially-paid`, or `partially-failed`. |
-| `periods[].items[]` | Line items, one per org and chargeable item, with `quantity` and `charge` in the smallest currency unit. |
-| `credits` | Credits applied to the invoice, as line items with negative charges. Omitted when there are none. |
+| `periods[].items[]` | Line items, one per org, chargeable item, and pricing tier. `quantity` is in the chargeable item's `unit`, the same raw unit the [usage API](/reference/usage-api#usage-metrics-and-units) returns, and `charge` is in the smallest currency unit. |
+| `credits` | Credits applied to the invoice, as line items with negative `charge`. Omitted when there are none. |
+
+The amount due is `totalCharge` plus the (negative) credit charges, and never less than `0`.
 
 Credits are applied by Control Plane and appear only on invoices. The billing API has no endpoint to list or add them.
 
@@ -297,13 +310,13 @@ Credits are applied by Control Plane and appear only on invoices. The billing AP
 
 `GET https://billing-ng.cpln.io/account/{accountId}/charges/invoices/pending`
 
-Returns `{"invoices": [...]}`: charges the account has accrued but not yet been billed for, such as the current month so far. The format is the same as [List Invoices](#list-invoices).
+Returns `{"invoices": [...]}`: charges the account has accrued but not yet been billed for, such as the current month so far. The format is the same as [List Invoices](#list-invoices). Add `?include-surcharges=true` to get only the current month's pending invoice with its surcharges and credits included, which is the full balance building up.
 
 ### Get or Download an Invoice
 
 `GET https://billing-ng.cpln.io/account/{accountId}/charges/invoices/{invoiceId}`
 
-Set the `Accept` header to `application/json` for the invoice object, or to `application/pdf` to download the PDF. Any other `Accept` value returns `400`.
+Set the `Accept` header to `application/json` for the invoice object, or to `application/pdf` to download the PDF. Any other value, including curl's default `*/*`, returns `400`. A `Content-Type` request header, if sent, takes precedence over `Accept`.
 
 ```bash
 curl --request GET \
@@ -338,9 +351,9 @@ Every 10 minutes, Control Plane compares the account's charges for the current c
 | Method | Purpose | Success |
 | :--- | :--- | :--- |
 | `POST` | Create the alert. A second create returns `409`. | `201` with the alert |
-| `PUT` | Change `amount` or `enabled`. This also re-arms an alert that already fired this month. | `200` with the alert |
+| `PUT` | Replace `amount` and `enabled`. Send both: an omitted `enabled` turns the alert off and an omitted `amount` sets it to `0`. This also re-arms an alert that already fired this month. | `200` with the alert |
 | `GET` | Read the alert. Returns `404` when none exists. | `200` with the alert |
-| `DELETE` | Remove the alert. | `200` |
+| `DELETE` | Remove the alert. Returns `500` when none exists. | `200` |
 
 The body wraps the alert in `alert` and rejects unknown fields:
 
@@ -372,7 +385,7 @@ Once the alert fires, the response also includes `lastTriggered` and `alertedTim
 
 ## Billing Service Account Tokens
 
-A billing service account token lets automation, such as a nightly cost export, call the billing API without a person's login. It belongs to one billing account and holds one or more billing roles. It works only on the endpoints under `/account/{accountId}` for that account. It is not an org credential and does not work on `api.cpln.io`, the usage API, or the `/org/{org}` billing endpoints.
+A billing service account token lets automation, such as a nightly cost export, call the billing API without a person's login. It belongs to one billing account and holds one or more billing roles. It works on the endpoints under `/account/{accountId}` for that account, and on `GET /chargeable_items`. It is not an org credential and does not work on `api.cpln.io`, the usage API, the `/org/{org}` billing endpoints, or `GET /account`.
 
 Every endpoint requires `billing_admin`.
 
@@ -429,17 +442,98 @@ Use it like any other token: `Authorization: Bearer cpln-bsat-...`.
 - `GET /account/{accountId}/service-account-token` lists the account's tokens in `items`, without their secrets. Each includes `lastUsedAt`, which is approximate.
 - `DELETE /account/{accountId}/service-account-token/{tokenId}` revokes a token and returns `204`, or `404` if the account has no such token. A revoked token can keep working for up to 5 minutes.
 
+## Account and Orgs
+
+### Get the Account
+
+`GET https://billing-ng.cpln.io/account/{accountId}` returns the account: `fullName`, `email`, `address`, `orgQuota`, `enabled`, `tou` (whether the Terms of Use are accepted), the card `paymentMethods` on file with their `last4` and `brand`, and the spend `alert` if one is set. It needs `billing_admin`, `billing_viewer`, or `org_creator`.
+
+### List the Account's Orgs
+
+`GET https://billing-ng.cpln.io/account/{accountId}/org` lists the orgs the account pays for. It needs `billing_admin`, `billing_viewer`, or `org_creator`, and works with a billing service account token, which cannot call `GET /account`. Use the names as `orgs` in a [charges query](#query-charges).
+
+```json
+{
+  "kind": "list",
+  "itemKind": "org",
+  "accountUUID": "a1b2c3d4-0000-4000-8000-000000000001",
+  "items": [
+    { "kind": "org", "name": "my-org", "accountId": "a1b2c3d4-0000-4000-8000-000000000001", "created": "2025-03-14T09:00:00Z" }
+  ]
+}
+```
+
+### Create an Org
+
+`POST https://billing-ng.cpln.io/account/{accountId}/org` creates an [org](/concepts/org) that bills to the account. It needs `billing_admin` or `org_creator`.
+
+| Field | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `org.name` | string | Yes | The org name. Org names are global and permanent. |
+| `org.description` | string | No | A description. |
+| `org.tags` | object | No | Tags to set on the org. |
+| `invitees` | string[] | No | Email addresses to invite to the new org. Required when a billing service account token creates the org, since a token cannot own it. |
+| `createSuperuserServiceAccount` | boolean | No | `true` also creates a service account with superuser access to the new org and returns its key once, in `superuserServiceAccountToken`. |
+
+```bash
+curl --request POST \
+  --url https://billing-ng.cpln.io/account/YOUR_ACCOUNT_ID/org \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE' \
+  --header 'Content-Type: application/json' \
+  --data '{ "org": { "name": "my-new-org" }, "invitees": ["jane@example.com"] }'
+```
+
+The account must have accepted the Terms of Use, have a valid payment method, be enabled, and be under its `orgQuota`; otherwise the request returns `400` naming the problem. A new org returns `201`; repeating the request for an org this account already created returns `200`.
+
+## Billing Users
+
+Billing users are the people on the account, each with one or more [billing roles](/concepts/billing). Adding one sends them an invitation email.
+
+| Method and path | Role | Purpose |
+| :--- | :--- | :--- |
+| `GET /account/{accountId}/user` | `billing_admin` or `billing_viewer` | List billing users |
+| `GET /account/{accountId}/user/email/{email}` | `billing_admin` or `billing_viewer` | Get one billing user |
+| `POST /account/{accountId}/user` | `billing_admin` | Add a billing user |
+| `PUT /account/{accountId}/user/email/{email}` | `billing_admin` | Replace a billing user's roles |
+| `DELETE /account/{accountId}/user/email/{email}` | `billing_admin` | Remove a billing user |
+
+`POST` and `PUT` take the user wrapped in `user`, with `roles` set to one or more of `billing_admin`, `billing_viewer`, and `org_creator`:
+
+```bash
+curl --request POST \
+  --url https://billing-ng.cpln.io/account/YOUR_ACCOUNT_ID/user \
+  --header 'Authorization: Bearer YOUR_TOKEN_HERE' \
+  --header 'Content-Type: application/json' \
+  --data '{ "user": { "email": "finance@example.com", "roles": ["billing_viewer"] } }'
+```
+
+Adding an existing user returns `409`. You cannot change or remove your own billing user; that returns `400`.
+
+## Invoice Email Recipients
+
+Each new invoice is emailed to the account's enabled invoice email recipients, for example an accounts-payable mailbox. `/account/{accountId}/invoice-delivery` manages that list and shows each delivery's status. Every endpoint needs `billing_admin`.
+
+| Method and path | Body | Response |
+| :--- | :--- | :--- |
+| `GET /account/{accountId}/invoice-delivery/recipients` | | `{"accountId": "...", "items": [...]}` |
+| `POST /account/{accountId}/invoice-delivery/recipients` | `{"email": "ap@example.com", "enabled": true}`. `enabled` defaults to `true` | `201` with the recipient. `409` if the address is already a recipient |
+| `PATCH /account/{accountId}/invoice-delivery/recipients/{recipientId}` | `{"enabled": false}` | The recipient |
+| `DELETE /account/{accountId}/invoice-delivery/recipients/{recipientId}` | | `204` |
+| `GET /account/{accountId}/invoice-delivery/deliveries?invoiceId=INVOICE_ID` | | The account's latest 500 invoice deliveries, optionally for one invoice |
+
+Each delivery has a `recipientEmail`, a `status` of `pending`, `in_progress`, `delivered`, `failed`, or `permanently_failed`, and the `attemptCount` and `errorMessages` of its delivery attempts.
+
 ## Billing API Errors
 
 Errors return a JSON body of the form `{"code": 400, "error": "message"}`.
 
 | Status | Cause |
 | :--- | :--- |
-| `400` | A body that is not valid JSON, an invalid field value, or an unsupported `Accept` header on an invoice download. |
+| `400` | A body that is not valid JSON, an invalid field value, an unsupported `Accept` header on an invoice download, or a missing or invalid `start` or `end` on List Invoices (a plain-text body). |
 | `401` | Missing or invalid token, or the caller lacks the required billing role or org permission. |
 | `404` | The invoice, alert, or token does not exist. |
 | `409` | The account already has a spend alert. |
-| `500` | Charge query validation failures, such as a `startTime` or `endTime` not on an hour boundary, an invalid `timeStep`, or a `groupBy` key missing from an `aggregateBy`. The message names the problem. |
+| `500` | Charge query validation failures, such as a `startTime` or `endTime` not on an hour boundary, an invalid `timeStep`, or a `groupBy` key missing from an `aggregateBy`; invoice list times not on an hour boundary; deleting a spend alert that does not exist. The message names the problem. |
 
 ## Learn More
 
