@@ -1,40 +1,66 @@
 ---
 title: etcd Multi-Location
 icon: /template-catalog/templates/icons/etcd-multi-location.png
-description: Deploy etcd Multi-Location on Control Plane using the Template Catalog. Covers configuration, volumes, quorum sizing, and a stretched key-value cluster with exactly one member per location.
-keywords: ['kv store', 'cross-region coordination', 'raft consensus', 'leader election', 'distributed lock', 'consul alternative', 'zookeeper alternative', 'geo-distributed', 'etcdctl', 'service discovery', 'config store', 'failover', 'auto-compaction', 'backend quota', 'nospace alarm']
+description: Deploy etcd Multi-Location on Control Plane using the Template Catalog. One stretched etcd cluster with exactly one member per location, sharing a single Raft quorum across regions. Installs into an existing GVC with at least two locations; no secrets to create.
+keywords: ['kv store', 'cross-region coordination', 'raft consensus', 'leader election', 'distributed lock', 'consul alternative', 'zookeeper alternative', 'geo-distributed', 'etcdctl', 'service discovery', 'config store', 'patroni dcs', 'auto-compaction', 'backend quota', 'nospace alarm']
 ---
-
-<Warning>
-**Version 2.0.0 no longer creates a GVC — it deploys into one you already have, and there is no in-place upgrade path from 1.x.** A `helm upgrade` across that boundary deletes the GVC the old release created and every workload, volume set and identity inside it. See [Migrating From Version 1](#migrating-from-version-1).
-</Warning>
 
 ## Overview
 
-etcd is a strongly consistent key-value store used as the coordination layer for leader election, distributed locking, and service configuration. This template deploys a **single stretched etcd cluster with exactly one member per Control Plane location**, sharing one raft quorum across regions, with raft timers tuned for cross-region round trips and auto-compaction enabled.
-
-It is also the consensus store used by the [`postgres-multi-location`](/template-catalog/templates/postgres-multi-location) template, and is independently useful as a cross-region coordination store for your own services.
+etcd is a strongly consistent key-value store used as the coordination layer for leader election, distributed locking, and shared configuration. This template deploys a **single stretched etcd cluster with exactly one member per Control Plane location**, sharing one Raft quorum across regions, with Raft timers tuned for cross-region round trips and auto-compaction enabled so the backend does not grow without bound. It is also the consensus store that [Postgres Multi-Location](/template-catalog/templates/postgres-multi-location) bundles for Patroni, and is independently useful as a cross-region coordination store for your own services.
 
 <Note>
-This template deploys into a GVC **you already have**, and that GVC must have at least 2 locations. It does not create, provision or manage a GVC. For a single-location cluster, use the [etcd](/template-catalog/templates/etcd) template instead.
+This template deploys into an existing [GVC](/reference/gvc) you already have; it does not create, provision or manage one. The GVC must have **at least two locations**, and every location you list in `global.locations` must already be one of them. A GVC location you do not list runs nothing — its deployment reads `This workload location is deactivated because maxScale is set to 0`. For a cluster in a single location use the [etcd](/template-catalog/templates/etcd) template instead.
 </Note>
 
 ### What Gets Created
 
-- **Stateful etcd Workload** — (`RELEASE_NAME-etcd`): one member in each configured location, using `replicaDirect` addressing so every member is individually reachable. Client API on `2379`, raft peer traffic on `2380`.
-- **Volume Set** — (`RELEASE_NAME-etcd-vs`): persistent storage per member at `/var/lib/etcd` for the raft write-ahead log and snapshots. ext4, general-purpose-ssd, final snapshot on delete, 7-day snapshot retention.
-- **Secret** — (`RELEASE_NAME-etcd-startup`): an opaque startup script that computes each member's name, peer URL, and the full cluster list at container start from the location it is running in.
-- **Identity & Two Policies** — An identity bound to the workload, granted `reveal` on the startup script secret and nothing else, plus `view` on **exactly the one GVC this release installs into**. The second grant is what lets each member read its own GVC's location list at boot; it is scoped to that single GVC, never to the whole org.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-etcd` | The etcd members: a stateful workload with exactly one replica in each location listed in `global.locations`; client API on port `2379`, peer traffic on port `2380` | — |
+| Volume Set | `RELEASE_NAME-etcd-vs` | `/var/lib/etcd` on every member (Raft write-ahead log and snapshots) — `ext4` on general-purpose SSD, snapshots retained 7 days, final snapshot on uninstall | — |
+| Secret | `RELEASE_NAME-etcd-startup` | The startup script that derives each member's name, peer URL and full cluster list at boot from the location it runs in | — |
+| Identity | `RELEASE_NAME-etcd-identity` | Bound to the workload so it can read the startup script and its own GVC | — |
+| Policy | `RELEASE_NAME-etcd-policy` | Grants the identity `reveal` on the startup secret and nothing else | — |
+| Policy | `RELEASE_NAME-etcd-gvc-policy` | Grants the identity `view` on exactly the one GVC the release is installed into, so each member can confirm at boot that the GVC really has every declared location | — |
 
-No GVC resource is created. Every resource above lands in the GVC you install into, and the members read that GVC's name from the platform at runtime rather than from Helm, so a hostname can never drift from where the workload actually runs.
+The template creates no credential secret: etcd here runs without TLS or authentication, and access is governed by the internal firewall (see [Internal Access](#internal-access)). Every member is named `RELEASE_NAME-etcd-LOCATION`, so `etcdctl member list` maps one-to-one onto your location list.
 
-Members find each other over per-replica internal DNS (`replica-0.RELEASE_NAME-etcd.LOCATION.GVC_NAME.cpln.local:2380`). There is no operator, no discovery service, and no join step — every member receives the full cluster list up front and they elect a leader among themselves.
+## Prerequisites
+
+<Steps>
+  <Step title="A GVC with at least two locations, covering every entry in global.locations">
+    This template deploys into an existing GVC and does not create one. Read the GVC's locations and compare them with the list you intend to install with:
+
+    ```bash
+    cpln gvc get GVC_NAME -o yaml
+    ```
+
+    `spec.staticPlacement.locationLinks` is the list. Every name you put in `global.locations` must appear there — a declared location the GVC lacks makes a fresh member refuse to start (see [Troubleshooting](#troubleshooting)). Three locations is the recommended production shape; see [Locations and Quorum](#locations-and-quorum).
+  </Step>
+</Steps>
+
+Nothing else is needed: no secret to create, no cloud account, no bucket, no custom domain.
 
 ## Installation
 
-The only prerequisite is **an existing GVC whose locations include every entry in `global.locations`** — read its list with `cpln gvc get GVC_NAME -o yaml` and compare `spec.staticPlacement.locationLinks` before you install. Nothing else is needed: no cloud account, no bucket, no pre-created secret, no custom domain.
+The default `global.locations` list (`aws-us-east-1`, `aws-us-west-2`) is only the smallest cluster the chart allows — set it to your GVC's own locations in a values file, then install:
 
-To install, follow the instructions for your preferred method:
+```yaml
+# etcd-locations.yaml — one etcd member per location; every name must already be in the GVC
+global:
+  locations:
+    - name: LOCATION_1
+    - name: LOCATION_2
+    - name: LOCATION_3
+```
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/etcd-multi-location \
+  --version 2.0.0 --gvc GVC_NAME -f etcd-locations.yaml
+```
+
+To install with another method, follow the instructions for your preferred tool:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -60,20 +86,11 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+Each subsection below shows the shipped default for one area of `values.yaml`. Override only what you need with a values file or `--set`.
+
+### Locations and Quorum
 
 ```yaml
-# ─── Locations ────────────────────────────────────────────────────────────────
-# This chart deploys into the GVC you install into — it does NOT create one.
-# Every location listed here MUST already exist in that GVC: a location the GVC
-# lacks contributes a declared etcd member that can never start, which shrinks
-# the cluster to a bare majority while every status surface reads healthy.
-# The members refuse to bootstrap in that state rather than form it.
-#
-# Lives under `global` so a parent chart (postgres-multi-location consumes this
-# one as a subchart) sets the list once and Helm propagates it here — the two
-# lists can then never be edited apart.
-
 global:
   # One etcd member per location. Minimum 2; 3 survives losing one location,
   # 5 survives losing two. See the quorum table in the README — 3 is the
@@ -83,46 +100,11 @@ global:
   locations:
     - name: aws-us-east-1
     - name: aws-us-west-2
-
-# ─── etcd ─────────────────────────────────────────────────────────────────────
-image: controlplanecorporation/etcd:0.1
-
-resources:
-  cpu: 500m
-  memory: 512Mi
-
-# Raft timers, tuned for cross-region round trips (measured 63-140 ms).
-# Raise both if your locations are more than ~250 ms apart.
-tuning:
-  heartbeatIntervalMs: 250 # ~0.5-1.5x the worst round trip between locations
-  electionTimeoutMs: 5000 # must be >= 10x heartbeatIntervalMs; maximum 50000
-  # etcd keeps every superseded revision until told otherwise, so compaction is
-  # required rather than optional and cannot be switched off here.
-  autoCompactionMode: periodic # periodic (retention is a duration) or revision (a revision count)
-  autoCompactionRetention: 1h # periodic needs an explicit unit (1h, 30m, 24h); revision takes a count
-  quotaBackendBytes: 0 # backend size limit in bytes; 0 = etcd's own default of 2 GiB
-
-volumeset:
-  capacity: 10 # initial capacity in GiB (minimum is 10)
-
-internalAccess:
-  type: same-gvc # options: same-gvc, same-org, workload-list
-  workloads: [] # only used when type is workload-list; the etcd workload is added automatically
-  #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
-
-# ─── Disaster recovery ────────────────────────────────────────────────────────
-recovery:
-  # EMERGENCY ONLY. Set to the surviving location's name to restart that member
-  # as a new single-member cluster after permanently losing quorum. Read the
-  # "Recovering from a lost location" section of the README first.
-  forceNewClusterInLocation: ""
 ```
 
-### Locations and Quorum
+- `global.locations` — The member map: one etcd member is deployed in each listed location, and at least two locations are required. Every name must already be a location of the GVC you install into. Each location runs exactly one member; a `replicas` value other than `1` fails the render in a standalone install.
 
-`global.locations` is the member map: one etcd member is deployed in each listed location, and at least 2 locations are required. **Every name in it must already be one of the locations of the GVC you install into.** The default list is the smallest cluster the chart allows rather than a recommendation — no built-in list can match your GVC, so set it before installing.
-
-The list lives under `global` so a parent chart — [`postgres-multi-location`](/template-catalog/templates/postgres-multi-location) consumes this template as a subchart — sets it once and Helm propagates it here. The two lists can then never be edited apart. Each location runs exactly one member; `replicas` is fixed at `1` and any other value fails a standalone render.
+The list lives under `global` so a parent chart — [Postgres Multi-Location](/template-catalog/templates/postgres-multi-location) bundles this template as a subchart — sets it once and Helm propagates it here; the two lists can then never be edited apart.
 
 etcd commits a write only when a **majority** of members accept it. Because there is exactly one member per location, the location is the failure domain:
 
@@ -133,62 +115,56 @@ etcd commits a write only when a **majority** of members accept it. Because ther
 | 4 | 3 | **1** | No better than 3, and costs more. |
 | 5 | 3 | **2** | Survives losing two locations. |
 
-With N locations you survive `floor((N-1)/2)` losses, so an even count never buys anything over the odd count below it. Two locations is permitted as a deliberate warm-standby topology, but it survives nothing automatically.
+With `N` locations you survive `floor((N-1)/2)` losses, so an even count never buys anything over the odd count below it. Two locations is permitted as a deliberate warm-standby topology, but it survives nothing automatically.
 
 <Note>
-Changing `global.locations` reprovisions the cluster: every member restarts with a new cluster list. This is not etcd's graceful `member add` / `member remove` path, so plan it as a maintenance window.
+Changing `global.locations` on a running release reprovisions the cluster: every member restarts with a new cluster list. This is not etcd's graceful `member add` / `member remove` path, so plan it as a maintenance window — and change the GVC's locations and this list together.
 </Note>
-
-### Matching the Location List to the GVC
-
-The platform does not validate the pairing in either direction, and both mismatches are dangerous in different ways. The template closes both.
-
-| `global.locations` | The GVC's locations | What happens |
-|---|---|---|
-| 3 | The same 3 | Correct. Survives losing one location. |
-| 3 | 2 of those 3 | Would otherwise **form and report healthy with zero fault tolerance** — a `new` bootstrap needs only a majority of the *declared* set. The template refuses to bootstrap instead. |
-| 3 | 1 of those 3 | Quorum is arithmetically unreachable. The template refuses to bootstrap rather than wait forever for an election that cannot complete. |
-| 3 | Those 3 plus another | The extra location runs **nothing** — the workload's default `minScale`/`maxScale` are `0`, and only the declared locations get a real replica count. Its deployment reads `This workload location is deactivated because maxScale is set to 0`. |
-
-Each member checks its own GVC at boot, using the scoped `view` grant described in [What Gets Created](#what-gets-created), and the check is deliberately asymmetric:
-
-- On a **fresh** data directory, any declared location the GVC lacks is a **hard failure**. The container exits with code `1` and logs a `[etcd] FATAL:` line naming the missing location and how many declared members could actually start.
-- On an **already-initialized** member it is a **warning only**, and the member keeps serving. A location removed from a GVC is indistinguishable from a location that is down, so failing here would turn "lost one member" into "lost the cluster".
-- If the GVC read itself fails — a control-plane blip, or a missing policy — the check is **skipped with a warning**. It never blocks a start on its own unavailability.
-
-Look for `[etcd]` lines in `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-etcd"}'` when a member will not come up.
 
 ### Image and Resources
 
-- `image` — The etcd image to run (etcd 3.6.5).
-- `resources.cpu` / `resources.memory` — CPU and memory allocated to each member (default: `500m`, `512Mi`).
+```yaml
+image: controlplanecorporation/etcd:0.1
+
+resources:
+  cpu: 500m
+  memory: 512Mi
+```
+
+- `image` — The etcd container image. The shipped tag carries etcd `3.6.5` together with `etcdctl` and `etcdutl`.
+- `resources.cpu` / `resources.memory` — CPU and memory limit for each member. See the [etcd hardware recommendations](https://etcd.io/docs/v3.6/op-guide/hardware/) for sizing guidance.
 
 ### Raft Tuning
 
+```yaml
+# Raise both if your locations are more than ~250 ms apart.
+tuning:
+  heartbeatIntervalMs: 250 # ~0.5-1.5x the worst round trip between locations
+  electionTimeoutMs: 5000 # must be >= 10x heartbeatIntervalMs; maximum 50000
+```
+
 - `tuning.heartbeatIntervalMs` — Leader heartbeat interval, roughly 0.5–1.5× the worst round trip between your locations.
-- `tuning.electionTimeoutMs` — How long a follower waits before campaigning. Must be at least 10× the heartbeat interval, and at most `50000`. Both bounds are enforced at render time.
+- `tuning.electionTimeoutMs` — How long a follower waits without a heartbeat before campaigning. Must be at least 10× the heartbeat interval and at most `50000`; both bounds are enforced at render time.
 
-The defaults detect a dead leader in about 5 seconds across an AWS us-east ↔ eu-central ↔ us-west triangle. Locations further apart (US ↔ Asia-Pacific is 350–400 ms) need both values raised in proportion.
-
-### Storage
-
-- `volumeset.capacity` — Persistent volume size in GiB per member for the raft write-ahead log and snapshots (minimum 10).
+The defaults suit locations within a few hundred milliseconds of each other, such as a US ↔ Europe spread. Locations further apart (US ↔ Asia-Pacific) need both values raised in proportion; see [Tuning for Latency](https://etcd.io/docs/v3.6/tuning/).
 
 ### Compaction and Backend Growth
 
-etcd never discards a superseded revision on its own. Every write creates a new revision and the old one is kept until a **compaction** removes it, so the backend grows with **time alone** whenever a client writes on a timer — Patroni, for example, renews its leader lease roughly every 10 seconds, which produces new revisions whether or not any application data changes. Measured on an otherwise idle cluster: about **151,000 revisions and 19 MB per day**, which reaches etcd's default 2 GiB backend quota in roughly **110 days**.
+etcd never discards a superseded revision on its own. Every write creates a new revision and the old one is kept until a **compaction** removes it, so the backend grows with time alone whenever a client writes on a timer — Patroni, for example, renews its leader lease every few seconds, producing new revisions whether or not any application data changes. Left uncompacted, an otherwise idle cluster reaches etcd's default 2 GiB backend quota in a matter of months.
 
-When the quota is reached, etcd raises a cluster-wide `NOSPACE` alarm and **every member goes read-only** until an operator intervenes. Auto-compaction is what prevents that. It has always been enabled in this template; since version `1.0.2` it is also configurable, alongside the backend quota:
+When the quota is reached, etcd raises a cluster-wide `NOSPACE` alarm and **every member goes read-only** until an operator intervenes. Auto-compaction is what prevents that, and this template configures it by default:
 
 ```yaml
 tuning:
+  # etcd keeps every superseded revision until told otherwise, so compaction is
+  # required rather than optional and cannot be switched off here.
   autoCompactionMode: periodic # periodic (retention is a duration) or revision (a revision count)
   autoCompactionRetention: 1h # periodic needs an explicit unit (1h, 30m, 24h); revision takes a count
   quotaBackendBytes: 0 # backend size limit in bytes; 0 = etcd's own default of 2 GiB
 ```
 
 - `tuning.autoCompactionMode` — How `autoCompactionRetention` is read. `periodic` treats it as a time window; `revision` treats it as a number of revisions to keep. There is no "off" — an unrecognized mode is rejected at render time.
-- `tuning.autoCompactionRetention` — How much history is kept before old revisions are discarded. The default `1h` keeps the backend flat and is the value this template is tested at. Raising it to `24h` or more buys a longer history window at the cost of a larger backend.
+- `tuning.autoCompactionRetention` — How much history is kept before old revisions are discarded. The default `1h` keeps the backend flat. Raising it to `24h` or more buys a longer history window at the cost of a larger backend.
 - `tuning.quotaBackendBytes` — Backend size ceiling in bytes. `0` (the default) means the flag is not passed at all and etcd applies its own 2 GiB limit. Leave it at `0` unless the keyspace genuinely outgrows that; 8 GiB (`8589934592`) is etcd's own suggested maximum, above which it warns at startup.
 
 <Warning>
@@ -199,21 +175,35 @@ tuning:
 **`quotaBackendBytes` takes a plain byte count, not a size suffix.** etcd itself refuses `--quota-backend-bytes 2Gi` at boot and the cluster would crash-loop, so a `2Gi`-style value is rejected at render time instead. Write `2147483648`.
 </Warning>
 
-Compaction is deliberately not switchable off: a retention of `0`, an unrecognized mode and a negative quota (which etcd reads as "no quota at all") are each rejected at render time. Each one produces a chart that installs cleanly and fails weeks later.
+Compaction is deliberately not switchable off: a retention of `0`, an unrecognized mode and a negative quota (which etcd reads as "no quota at all") are each rejected at render time, because each one produces a chart that installs cleanly and fails weeks later.
 
 <Note>
-**Compaction frees pages for reuse inside the backend file; it does not shrink the file.** The reported `dbSize` therefore plateaus rather than dropping, while `dbSizeInUse` falls back to the size of the live keyspace. That is the expected behavior and is sufficient to stay under the quota, because reclaimed pages are reused for new writes. Only `etcdctl defrag` returns space to the filesystem, and this template does not automate it — defragmentation blocks the member it runs on.
-
-Testing measured the mechanism directly on a shortened retention window: the compacted revision advanced from 1 to 4001, `dbSizeInUse` collapsed from 5.76 MB to 20,480 bytes while `dbSize` stayed at about 5.8 MB, and reads of pre-compaction revisions then failed with `required revision has been compacted`. On this template's own three-location run at the default `1h`, compaction fired at the one-hour mark, freed 569 KB, and `dbSize` stayed flat afterwards under load. The multi-day `dbSize` plateau is **derived from that mechanism rather than observed** over days.
+**Compaction frees pages for reuse inside the backend file; it does not shrink the file.** The reported `DB SIZE` therefore plateaus rather than dropping, while `DB SIZE IN USE` falls back to the size of the live keyspace. That is expected and is sufficient to stay under the quota, because reclaimed pages are reused for new writes. Only `etcdctl defrag` returns space to the filesystem, and this template does not automate it — defragmentation blocks the member it runs on.
 </Note>
 
 <Note>
 `etcdctl endpoint status` reports `QUOTA | 0 B` when `quotaBackendBytes` is `0`, because that column reflects the flag rather than the effective limit. The effective quota in that case is still etcd's 2 GiB default, which etcd logs at startup as `enabled backend quota with default value`.
 </Note>
 
+### Storage
+
+```yaml
+volumeset:
+  capacity: 10 # initial capacity in GiB (minimum is 10)
+```
+
+- `volumeset.capacity` — Size in GiB of the persistent volume each member gets for `/var/lib/etcd` (minimum 10). The volume set keeps snapshots for 7 days and takes a final snapshot when the release is uninstalled.
+
 ### Internal Access
 
-The `internalAccess` section controls which workloads can reach the client API on `2379`. Cross-location traffic inside one GVC is same-GVC traffic, so the default covers a stretched cluster with no extra rule.
+```yaml
+internalAccess:
+  type: same-gvc # options: same-gvc, same-org, workload-list
+  workloads: [] # only used when type is workload-list; the etcd workload is added automatically
+  #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
+
+- `internalAccess.type` — Controls which workloads can reach the client API on port `2379`. Traffic between locations inside one GVC is same-GVC traffic, so the default covers a stretched cluster with no extra rule.
 
 | Type | Description |
 |------|-------------|
@@ -221,82 +211,110 @@ The `internalAccess` section controls which workloads can reach the client API o
 | `same-org` | Allow access from all workloads in the same organization |
 | `workload-list` | Allow access only from the specific workloads listed in `internalAccess.workloads` |
 
-<Warning>
-**With `workload-list`, list only your clients — never the etcd workload itself.** The internal firewall governs *all* inbound internal traffic, including the raft peer traffic between the members of this same workload, so a list naming only clients used to cut the cluster off from itself: on an earlier version, every member was dead within about two minutes of the upgrade while Helm reported `upgraded successfully`. The template now appends its own workload link for you, so scoping access is safe — a client that is not listed is still refused, and the cluster stays whole.
-</Warning>
+- `internalAccess.workloads` — The workload links allowed in when `type` is `workload-list`. **List only your clients.** The members of this workload must also be able to reach each other, so the template appends its own workload link to the list for you; a client that is not listed is still refused, and the cluster stays whole.
 
 <Warning>
-There is deliberately no public access: etcd in this template runs without TLS and without authentication. Anything permitted by `internalAccess` has full read/write access to the entire keyspace. Use `workload-list` if the GVC contains workloads that should not have it.
+**etcd runs here without TLS or authentication.** There is deliberately no public access, and anything the internal firewall lets in has full read and write access to the whole keyspace. If the GVC holds workloads that should not have that, use `workload-list` and name the clients explicitly. A firewall change can take a few minutes to take effect; re-test rather than trusting the first response.
 </Warning>
 
-A firewall change takes roughly 30 seconds to a few minutes to take effect — over two minutes was measured on this template, and other templates have taken longer still. Re-test after waiting rather than concluding the setting was ignored.
+### Disaster Recovery
 
-### Connecting to etcd
+```yaml
+recovery:
+  # EMERGENCY ONLY. Set to the surviving location's name to restart that member
+  # as a new single-member cluster after permanently losing quorum. Read the
+  # "Recovering from a lost location" section of the README first.
+  forceNewClusterInLocation: ""
+```
 
-| Target | Address |
-|--------|---------|
-| Client API, load-balanced across locations | `RELEASE_NAME-etcd.GVC_NAME.cpln.local:2379` |
-| A specific location's member | `replica-0.RELEASE_NAME-etcd.LOCATION.GVC_NAME.cpln.local:2379` |
-| Raft peer traffic (members only) | Port `2380` |
+- `recovery.forceNewClusterInLocation` — Leave empty in normal operation. Set it to the name of the one **surviving** location only after quorum is permanently lost, following [Recovering From a Lost Location](#recovering-from-a-lost-location), and clear it again afterwards. The value must be one of the names in `global.locations`; anything else is rejected at render time.
 
-`GVC_NAME` is the GVC you installed the release into — the template creates none of its own.
+## Connecting
 
-Point clients at one endpoint per location so they can fail over. From inside the cluster:
+The cluster has no public endpoint: external inbound traffic is closed and no load balancer is created. Clients connect from inside the GVC, or from your machine through a port-forward.
+
+| What | Address | Notes |
+|---|---|---|
+| Client API from the same GVC | `http://RELEASE_NAME-etcd.GVC_NAME.cpln.local:2379` | Resolves to a member; the one address to give to clients |
+| A specific location's member | `http://replica-0.RELEASE_NAME-etcd.LOCATION.GVC_NAME.cpln.local:2379` | `LOCATION` is one of the names in `global.locations`; give a client one of these per location so it can fail over |
+| Peer traffic | port `2380` | Used by the members themselves; clients do not need it |
+| Credentials | none | No TLS and no authentication — access is decided by [Internal Access](#internal-access) |
+
+Always use the fully qualified hostname; the bare workload name is not reliably resolvable.
+
+Verify the cluster from inside one of its members. `etcdctl` is in the image and talks to the local member by default:
 
 ```bash
 cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl member list -w table
 cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl endpoint status --cluster -w table
+```
+
+`member list` should show one member per configured location, each named `RELEASE_NAME-etcd-LOCATION`, and `endpoint status --cluster` should show every member on the same `RAFT TERM` with exactly one `IS LEADER: true`. Then write and read a key:
+
+```bash
 cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl put /demo/key hello
 cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl --command-timeout=5s get /demo/key
 ```
 
-Every member is named `RELEASE_NAME-etcd-LOCATION`, so `member list` maps one-to-one onto your location list.
+From another workload in the GVC, point `etcdctl` (or your client library) at the service address:
+
+```bash
+etcdctl --endpoints=http://RELEASE_NAME-etcd.GVC_NAME.cpln.local:2379 put hello world
+etcdctl --endpoints=http://RELEASE_NAME-etcd.GVC_NAME.cpln.local:2379 get hello
+```
+
+To reach the cluster from your own machine, forward the client port and use a local `etcdctl` against `http://127.0.0.1:2379`:
+
+```bash
+cpln port-forward RELEASE_NAME-etcd 2379:2379 --gvc GVC_NAME
+```
+
+<Tip>
+Give long-lived clients a short command timeout (`etcdctl --command-timeout=5s`, or the equivalent in your client library). When fewer than a majority of members are reachable, etcd makes writes wait for quorum rather than failing immediately, so a client without a timeout appears to hang.
+</Tip>
+
+## Operations
+
+### Backing Up
+
+Two independent layers protect the data:
+
+- **Volume set snapshots.** The volume set `RELEASE_NAME-etcd-vs` keeps snapshots for 7 days and takes a final snapshot when the release is uninstalled; this is configured by the template and needs no action. To take one on demand in a given location:
+
+  ```bash
+  cpln volumeset snapshot create RELEASE_NAME-etcd-vs --gvc GVC_NAME --snapshot-name NAME --location LOCATION
+  ```
+
+- **An etcd snapshot file.** `etcdctl snapshot save` writes a consistent, hash-protected copy of the whole keyspace from one member — any member will do, since every member holds the full keyspace. The image ships `etcdctl` and `base64`, so the file can be pulled out through `cpln workload exec`. Pass it through `base64` on both sides — the exec stream is text-only and corrupts raw binary:
+
+  ```bash
+  cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd --quiet -- \
+    sh -c 'etcdctl snapshot save /tmp/snapshot.db >/dev/null 2>&1 && base64 /tmp/snapshot.db' \
+    | base64 -d > etcd-snapshot.db
+  ```
+
+  Then confirm the file is intact on your machine with `etcdutl`, which is part of every [etcd release](https://github.com/etcd-io/etcd/releases):
+
+  ```bash
+  etcdutl snapshot status etcd-snapshot.db -w table
+  ```
 
 <Note>
-Allow about two minutes of convergence after a cold install before concluding that a member is unreachable — cross-region service discovery can lag a workload reporting ready by well over a minute.
+The snapshot command above was checked against the shipped image's contents and the upstream `etcdctl` documentation, but has not been exercised against a live install of this template. Run it once on a test release and confirm `etcdutl snapshot status` reports the hash before you rely on it.
 </Note>
 
-### Ports
+### Restoring a Backup
 
-| Port | Protocol | Description |
-|------|----------|-------------|
-| `2379` | TCP | etcd client API (internal only) |
-| `2380` | TCP | Raft peer traffic between members |
+**Restoring is not a procedure this template performs or has verified.** The upstream path — `etcdutl snapshot restore` — rebuilds a data directory for every member with a new cluster ID and requires each member to be stopped and started from the rebuilt directory. This template manages the data directory through its startup script and gives you no supported way to stop a member and replace `/var/lib/etcd` on its volume. Restoring a volume set snapshot in place is likewise unverified for this template.
 
-## Failover Behavior
+If you must recover a keyspace, follow the [etcd disaster recovery guide](https://etcd.io/docs/v3.6/op-guide/recovery/) against a **new** release and rehearse it on a throwaway release first. For the loss of a minority or a majority of *locations* with the surviving members intact, see [Recovering From a Lost Location](#recovering-from-a-lost-location) instead — that path needs no snapshot. Where etcd came bundled with [Postgres Multi-Location](/template-catalog/templates/postgres-multi-location) as its Patroni consensus store, consult that page before attempting any etcd-level recovery.
 
-Measured on a three-location cluster (`aws-us-east-1`, `aws-eu-central-1`, `aws-us-west-2`) with the default 5 s election timeout:
+### Migrating From Version 1
 
-| Event | Result |
-|-------|--------|
-| Idle stability | 10.8 hours with zero spontaneous elections |
-| Leader crash | New leader elected in **5.59 s**, with 0 failed writes on a client pinned to a surviving follower |
-| Planned replica stop | Leadership handed over in **502 ms**, 0 failed writes across 570 samples |
-
-Write latency is bounded by one cross-region round trip, because the leader needs a follower acknowledgement before it can commit. Measured with the leader in `aws-eu-central-1`:
-
-| Client location | Write latency (p50) |
-|-----------------|---------------------|
-| `aws-eu-central-1` (co-located with the leader) | 95.7 ms |
-| `aws-us-east-1` | 185.7 ms |
-| `aws-us-west-2` (furthest from the leader) | 236.4 ms |
-
-A client co-located with the leader does not get local-write latency — one cross-region round trip is the floor for any stretched quorum.
-
-## Upgrades
+Versions before 2.0.0 created their own GVC; 2.0.0 deploys into one you already have.
 
 <Warning>
-**Every `helm upgrade` restarts all members at roughly the same time — a rollout of about 105 seconds, with 20–30 seconds of lost quorum inside it.** Measured on three locations and reproduced at 104 seconds on a second upgrade. Writes time out while quorum is gone, the cluster recovers on its own, and the data survives. **A no-op upgrade that changes nothing costs exactly the same**, so there is no cheaper kind of upgrade to plan around — treat every change, including one that only touches a firewall rule, as a short planned outage.
-</Warning>
-
-Nothing serializes the restart: the field that would limit it (`rolloutOptions.maxUnavailableReplicas`) is not retained by the platform, so the chart deliberately does not set it. Running more members per location has not been tested and should not be assumed to help.
-
-## Migrating From Version 1
-
-Versions before 2.0.0 created their own GVC. **Do not `helm upgrade` a 1.x release onto 2.0.0.** Once the chart stops declaring a GVC, Helm prunes the one the old release created — and deleting a GVC deletes every workload, volume set and identity inside it. Measured on a sibling template: everything was gone in about **six seconds**, while the command printed `upgraded successfully`.
-
-<Warning>
-The chart refuses to render when your values still carry the 1.x `global.gvc` key, so a values-carrying upgrade fails safely before any resource is touched. That guard **cannot** fire on an upgrade run with no values file at all, because it then sees only 2.0.0's own defaults. The procedure below is the safety; the render guard is only a backstop.
+**Do not `cpln helm upgrade` a 1.x release onto 2.0.0.** Once the chart stops declaring a GVC, Helm removes the one the old release created — and deleting a GVC deletes every workload, volume set and identity inside it. The chart refuses to render when your values still carry the 1.x `global.gvc` key, so a values-carrying upgrade fails safely before any resource is touched; that guard cannot fire on an upgrade run with no values at all. The procedure below is the safety; the render guard is only a backstop.
 </Warning>
 
 Install 2.0.0 as a **new release against an existing GVC**, move the keyspace across, then remove the old release.
@@ -305,51 +323,61 @@ Install 2.0.0 as a **new release against an existing GVC**, move the keyspace ac
   <Step title="Choose the target GVC">
     Pick a GVC whose locations are exactly the ones you want members in, and read them back with `cpln gvc get GVC_NAME -o yaml` — `spec.staticPlacement.locationLinks` is the list. Do **not** point the new release at the GVC the old release created: that GVC is still owned by the old Helm release, and uninstalling it later would take the new workloads with it.
   </Step>
-  <Step title="Snapshot the old cluster's keyspace">
+  <Step title="Export the old cluster's keyspace">
     ```bash
-    cpln workload exec OLD_RELEASE-etcd --gvc OLD_GVC_NAME --container etcd \
+    cpln workload exec OLD_RELEASE_NAME-etcd --gvc OLD_GVC_NAME --container etcd --quiet \
       -- etcdctl get "" --prefix -w json > keyspace.json
     ```
+
+    Alternatively take an `etcdctl snapshot save` file as shown in [Backing Up](#backing-up), if you prefer a hash-protected copy to keep.
   </Step>
   <Step title="Install 2.0.0 as a new release">
-    Replace `global.gvc.name` and `global.gvc.locations` in your old values with a single top-level `global.locations` list naming the chosen GVC's locations, then install into that GVC.
+    Replace `global.gvc.name` and `global.gvc.locations` in your old values with a single top-level `global.locations` list naming the chosen GVC's locations, then install into that GVC as shown in [Installation](#installation).
   </Step>
   <Step title="Confirm the new cluster, then write your keys into it">
-    `etcdctl member list -w table` must show one member per configured location before you load anything.
+    `etcdctl member list -w table` must show one member per configured location before you load anything. Write the exported keys with `etcdctl put` from your client, then point your clients at the new release's address.
   </Step>
   <Step title="Remove the old release">
-    Uninstalling the old release removes it **and the GVC it created**, including its volume sets. Run it against the GVC the old release was installed into.
+    ```bash
+    cpln helm uninstall OLD_RELEASE_NAME --gvc OLD_GVC_NAME
+    ```
+
+    Run it against the GVC the old release was *installed into*. Uninstalling removes the old release **and the GVC it created**, including its volume sets.
   </Step>
 </Steps>
 
-## Behavior Under Quorum Loss
+### Scaling and Availability
 
-When a majority of members is unreachable, the cluster stops committing writes. What that looks like from a client is easy to misread:
+- **Fault tolerance follows the location count, not the template.** The cluster keeps serving while a majority of members is up: 3 locations tolerate the loss of 1, 5 tolerate 2, and 2 tolerate none (see [Locations and Quorum](#locations-and-quorum)). If you want automatic failover, use three locations.
+- **Losing a minority of locations is survived automatically.** The remaining members elect a new leader among themselves and keep committing writes; a member that comes back with its volume intact rejoins on its own.
+- **Losing a majority stops writes but loses no committed data.** The survivors hold the current keyspace and wait for quorum. Writes hang rather than failing fast, so clients need a command timeout; serializable reads (`--consistency=s`) keep succeeding against stale data. If the lost locations are not coming back, follow [Recovering From a Lost Location](#recovering-from-a-lost-location).
+- **A `cpln helm upgrade` restarts the members together** — including an upgrade that changes nothing. Each member rejoins from its own volume and the keyspace is preserved, but expect a brief write outage while a leader is re-elected, so plan every upgrade as a short planned outage.
+- **Change the location count only as a planned reprovision.** Editing `global.locations` restarts every member with a new cluster list; the template performs no `etcdctl member add` or `member remove`. Change the GVC's locations and the list together.
+- **Do not run more than one member per location.** `global.locations[].replicas` must be `1`; a second member in a location adds cost and makes that location's loss count double against quorum.
 
-- **Writes hang rather than failing fast.** They block until they time out, so always give clients a short `--command-timeout` (or the client-library equivalent) — otherwise connections pile up against a cluster that cannot commit.
-- **Serializable reads keep succeeding against stale data.** A read issued with `--consistency=s` is served from the local member's own store and never notices the loss of quorum.
-- **`IS LEADER: true` is not proof of leadership.** An isolated survivor keeps reporting itself as leader for about 6 seconds while unable to commit anything. Health-check with a linearizable read (`etcdctl get KEY`, without `--consistency=s`), never with `endpoint status`.
+### Recovering From a Lost Location
 
-<Warning>
-Never suspend a location for this workload. Suspending and resuming a location permanently withdraws that location's endpoints from the other locations' service discovery while every status surface still reports healthy. Add or remove locations by editing the GVC and `global.locations` together instead.
-</Warning>
-
-## Recovering from a Lost Location
-
-`recovery.forceNewClusterInLocation` is for the case where quorum is **permanently** gone — with two locations, that is the loss of either one. It is not needed for a location that is coming back: a member that returns with its volume intact rejoins on its own in well under a minute.
+`recovery.forceNewClusterInLocation` is for the case where quorum is **permanently** gone — with two locations, that is the loss of either one. It is not needed for a location that is coming back: a member that returns with its volume intact rejoins on its own.
 
 <Steps>
   <Step title="Confirm the loss is permanent">
-  `etcdctl member remove` cannot help here, because removing a member itself requires quorum.
+    `etcdctl member remove` cannot help here, because removing a member itself requires quorum. If the location may return, wait for it instead.
   </Step>
   <Step title="Force a new single-member cluster">
-  Set `recovery.forceNewClusterInLocation` to the **surviving** location's name and upgrade the release. That member restarts as a single-member cluster rebuilt from its own write-ahead log and serves writes again immediately.
+    Set `recovery.forceNewClusterInLocation` to the **surviving** location's name and upgrade the release:
+
+    ```bash
+    cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/etcd-multi-location \
+      --version 2.0.0 --gvc GVC_NAME -f etcd-locations.yaml --set recovery.forceNewClusterInLocation=LOCATION
+    ```
+
+    That member restarts as a single-member cluster rebuilt from its own write-ahead log and serves writes again.
   </Step>
   <Step title="Clear the setting">
-  Set `recovery.forceNewClusterInLocation` back to `""` and upgrade again. Leaving it set means the flag fires on every future restart of that member.
+    Set `recovery.forceNewClusterInLocation` back to `""` and upgrade again. Leaving it set means the flag fires on every future restart of that member.
   </Step>
   <Step title="Reset the lost location's volume before it rejoins">
-  The evicted members still hold the old cluster ID and refuse to start until their data directory is cleared. Uninstall and reinstall, or delete that volume, so the member bootstraps fresh.
+    A member from the lost location still holds the old cluster ID and refuses to start until its data directory is cleared. Uninstall and reinstall, or delete that volume, so the member bootstraps fresh.
   </Step>
 </Steps>
 
@@ -358,15 +386,15 @@ Never set `recovery.forceNewClusterInLocation` to more than one location, and ne
 </Warning>
 
 <Note>
-**The render-time check only compares this value against `global.locations`, not against the GVC.** Naming a location the GVC does not have therefore passes validation, no member runs there, and the flag is silently never applied. Every surviving member logs a warning saying exactly that — `[etcd] WARNING: recovery.forceNewClusterInLocation is set to '...', which GVC '...' does not have` — so read the logs if a recovery appears to do nothing.
+The render-time check only compares this value against `global.locations`, not against the GVC. Naming a location the GVC does not have therefore passes validation, no member runs there, and the flag is never applied. Every surviving member logs a warning saying exactly that — see [Troubleshooting](#troubleshooting) if a recovery appears to do nothing.
 </Note>
 
-## If the Backend Quota Fills
+### If the Backend Quota Is Already Full
 
 Every version of this template compacts, so a default install does not accumulate revisions in the first place. A backend can still reach the quota if the keyspace itself is genuinely large, or if `autoCompactionRetention` has been raised far enough that the retained history outgrows 2 GiB.
 
 <Warning>
-**Turning compaction on, or tightening it, cannot rescue a cluster that has already filled its backend.** Compaction stops further growth; it never shrinks an existing backend file. Once etcd has raised a `NOSPACE` alarm, writes stay rejected until an operator compacts, defragments each member and disarms the alarm — a `helm upgrade` does none of that.
+**Turning compaction on, or tightening it, cannot rescue a cluster that has already filled its backend.** Compaction stops further growth; it never shrinks an existing backend file. Once etcd has raised a `NOSPACE` alarm, writes stay rejected until an operator compacts, defragments each member and disarms the alarm — a `cpln helm upgrade` does none of that.
 </Warning>
 
 The symptom usually surfaces in the client rather than in etcd. A Patroni replica that cannot renew its lease exits *cleanly*, so it restart-loops with `exitCode: 0` and `reason: Completed` and a climbing restart count — which reads as healthy and gets misdiagnosed as a database fault. Check etcd first.
@@ -378,9 +406,102 @@ cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl 
 cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl alarm list
 ```
 
-Add `--location LOCATION` to target a specific location's member; without it the CLI picks one for you and names it in its output. `endpoint status --cluster` reports every member from whichever one you reach.
-
 A `DB SIZE` close to 2.1 GB on every member, plus `NOSPACE` in the alarm list, confirms it. A healthy cluster prints nothing at all for `alarm list`. Recovery from there — compacting to a revision, defragmenting each member, then disarming the alarm — is an operator procedure this template deliberately does not perform, because each step is disruptive and the order matters. Follow etcd's [maintenance guide](https://etcd.io/docs/v3.6/op-guide/maintenance/) and plan it as a maintenance window.
+
+### Troubleshooting
+
+When a member will not come up, its own `[etcd]` log lines name the reason:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-etcd"} |= "[etcd]"' --limit 50 --since 10m
+```
+
+<AccordionGroup>
+  <Accordion title="Install fails: etcd-multi-location requires at least 2 locations in global.locations">
+    **Cause:** The template validates `global.locations` at render time and rejects a list with fewer than two entries before any resource is created. This also happens when a `--set global.locations[0].name=...` override replaces the whole list with a single entry.
+
+    **Fix:** Supply the full list in a values file (see [Installation](#installation)). For a single-location cluster use the [etcd](/template-catalog/templates/etcd) template.
+  </Accordion>
+  <Accordion title="Install or upgrade fails: the global.gvc values key was REMOVED">
+    **Cause:** Your values still carry the 1.x `global.gvc` block. Version 2.0.0 no longer creates a GVC and refuses to render rather than let an in-place upgrade delete the one the old release created.
+
+    **Fix:** Do not upgrade in place. Follow [Migrating From Version 1](#migrating-from-version-1): install 2.0.0 as a new release with `global.locations`, move the keyspace, then uninstall the old release.
+  </Accordion>
+  <Accordion title="Member exits with [etcd] FATAL: locations declared in global.locations are not in GVC">
+    **Symptom:** A freshly installed member exits with code `1`; its log names the missing location(s) and reads `That is a bare majority: the cluster would form, report healthy, and have ZERO fault tolerance`.
+
+    **Cause:** `global.locations` names a location the GVC does not have. The members in the other locations would still form a cluster, but one with no fault tolerance, so a fresh member refuses to bootstrap it. An already-initialized member logs the same condition as a `[etcd] WARNING` and keeps serving.
+
+    **Fix:** Add the missing location to the GVC, or remove it from `global.locations`, and redeploy. `cpln gvc get GVC_NAME -o yaml` shows the GVC's list under `spec.staticPlacement.locationLinks`.
+  </Accordion>
+  <Accordion title="Member exits with [etcd] FATAL: quorum is unreachable">
+    **Cause:** Fewer than a majority of the locations in `global.locations` exist in the GVC, so an election can never complete. A fresh member exits immediately rather than waiting forever; an already-initialized member logs a `[etcd] WARNING` and keeps running.
+
+    **Fix:** Add the missing locations to the GVC or remove them from `global.locations` so that the GVC has a majority of the declared list — ideally all of it — and redeploy.
+  </Accordion>
+  <Accordion title="Member exits with [etcd] FATAL: this member is running in location ..., which is not in the configured location list">
+    **Cause:** A replica started in a GVC location that `global.locations` does not list. Such a member can never appear in the cluster roster, so it exits rather than wait to join.
+
+    **Fix:** Either add that location to `global.locations` and upgrade, or remove it from the GVC. Normally an unlisted GVC location runs nothing at all; this line only appears if a replica was placed there anyway.
+  </Accordion>
+  <Accordion title="Log shows [etcd] WARNING: could not read the location list of GVC">
+    **Cause:** The member could not read its own GVC at boot — the API was briefly unavailable, or the `RELEASE_NAME-etcd-gvc-policy` policy is missing — so it skipped the location check and started anyway. The warning is informational; etcd runs normally.
+
+    **Fix:** Nothing, if the policy exists and the warning was transient. If it recurs on every start, confirm the policy with `cpln policy get RELEASE_NAME-etcd-gvc-policy -o yaml` and that it grants `view` on the GVC the release is installed into.
+  </Accordion>
+  <Accordion title="etcdctl hangs, then reports context deadline exceeded">
+    **Cause:** Fewer than a majority of members are reachable, so the cluster cannot commit writes; etcd waits for quorum rather than failing fast. Linearizable reads wait as well, while serializable reads (`--consistency=s`) keep answering from stale local data.
+
+    **Fix:** Check which members are healthy and whether any replica is restarting:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-etcd --gvc GVC_NAME -o yaml
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-etcd"}' --limit 50 --since 10m
+    ```
+
+    Once a majority is back, pending operations complete on their own. If the lost locations are gone for good, follow [Recovering From a Lost Location](#recovering-from-a-lost-location). Always give clients a `--command-timeout` so an outage surfaces as an error instead of a hang.
+  </Accordion>
+  <Accordion title="endpoint status shows IS LEADER: true but writes still hang">
+    **Cause:** `IS LEADER` is the member's own view of itself. A member cut off from the others can keep reporting itself as leader for a short while after it has lost the ability to commit anything.
+
+    **Fix:** Health-check with a linearizable read (`etcdctl --command-timeout=5s get KEY`, without `--consistency=s`), never with `endpoint status` alone. Then check `etcdctl endpoint health --cluster` and the deployment status as above.
+  </Accordion>
+  <Accordion title="Recovery appears to do nothing after setting recovery.forceNewClusterInLocation">
+    **Symptom:** Every surviving member logs `[etcd] WARNING: recovery.forceNewClusterInLocation is set to '...', which GVC '...' does not have`.
+
+    **Cause:** The value passed render-time validation because it is in `global.locations`, but the GVC has no such location, so no member runs there and `--force-new-cluster` is never applied.
+
+    **Fix:** Set `recovery.forceNewClusterInLocation` to a location the GVC actually has — the one whose member survived — and upgrade again.
+  </Accordion>
+  <Accordion title="Writes fail with etcdserver: mvcc: database space exceeded">
+    **Cause:** The backend quota is full and etcd has raised a cluster-wide `NOSPACE` alarm. Every member is read-only until the alarm is cleared.
+
+    **Fix:** Confirm with `etcdctl alarm list`, then follow [If the Backend Quota Is Already Full](#if-the-backend-quota-is-already-full). Upgrading the template alone does not clear it.
+  </Accordion>
+  <Accordion title="Reads fail with etcdserver: mvcc: required revision has been compacted">
+    **Cause:** A client asked for a revision older than the retention window — a `get --rev` or a watch resuming from a revision that auto-compaction has already discarded. With the default `autoCompactionRetention: 1h` only the last hour of history is readable.
+
+    **Fix:** Read the current revision instead, or restart the watch from the current revision. If your application genuinely needs a longer history, raise `tuning.autoCompactionRetention` (for example `24h`) and accept the larger backend.
+  </Accordion>
+  <Accordion title="Patroni replicas restart-loop with exitCode 0 and reason Completed">
+    **Cause:** The Postgres cluster's consensus store cannot accept writes — because this etcd cluster has lost quorum or its backend quota is full — so Patroni cannot renew its leader lease and exits cleanly. The restarts look healthy because the exit code is zero.
+
+    **Fix:** Run the two read-only commands in [If the Backend Quota Is Already Full](#if-the-backend-quota-is-already-full) and check `etcdctl endpoint health --cluster` before touching the database.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- **Do not `cpln helm upgrade` a 1.x release onto this version.** It deletes the GVC the old release created and everything inside it. Follow [Migrating From Version 1](#migrating-from-version-1).
+- **`global.locations` must match the GVC's locations.** A declared location the GVC lacks makes a fresh member refuse to start with a named `[etcd] FATAL` line; a GVC location you did not list runs nothing. Read the GVC's list with `cpln gvc get GVC_NAME -o yaml` before installing.
+- **Quorum arithmetic decides your failure tolerance.** Two locations survive zero losses. If you want automatic failover, use three.
+- **Every `cpln helm upgrade` restarts the members together, including a no-op one.** Expect a brief write outage; the data survives. Plan upgrades as a short planned outage.
+- **Changing `global.locations` reprovisions the cluster.** Plan it as a maintenance window and change the GVC's locations together with the list.
+- **Under quorum loss, writes hang rather than failing fast**, and serializable reads keep succeeding against stale data. Give clients a short command timeout and health-check with a linearizable read, never with `IS LEADER` alone.
+- **No TLS, no authentication.** Scope `internalAccess` with `workload-list` whenever the GVC holds workloads that should not read or write the keyspace; list only your clients.
+- **Compaction is required and cannot be switched off.** A full backend quota puts the cluster into a read-only `NOSPACE` alarm that an upgrade cannot clear.
+- **`recovery.forceNewClusterInLocation` is for a permanent loss of quorum only.** Never set it to more than one location, and clear it as soon as the cluster is back.
+- **Uninstalling deletes the volume sets, and with them the entire keyspace.** The volume set takes a final snapshot first.
 
 ## External References
 
@@ -388,14 +509,17 @@ A `DB SIZE` close to 2.1 GB on every member, plus `NOSPACE` in the alarm list, c
     <Card title="etcd Documentation" icon="book" href="https://etcd.io/docs/v3.6/">
     Official etcd documentation
     </Card>
-    <Card title="Maintenance and Compaction" icon="broom" href="https://etcd.io/docs/v3.6/op-guide/maintenance/">
-    Compaction, defragmentation, and clearing a NOSPACE alarm
+    <Card title="Clustering Guide" icon="circle-nodes" href="https://etcd.io/docs/v3.6/op-guide/clustering/">
+    Static bootstrapping and cluster membership
     </Card>
     <Card title="Tuning for Latency" icon="gauge" href="https://etcd.io/docs/v3.6/tuning/">
     Heartbeat and election timeout guidance for cross-region clusters
     </Card>
+    <Card title="Maintenance and Compaction" icon="broom" href="https://etcd.io/docs/v3.6/op-guide/maintenance/">
+    Compaction, defragmentation, and clearing a NOSPACE alarm
+    </Card>
     <Card title="Disaster Recovery" icon="life-ring" href="https://etcd.io/docs/v3.6/op-guide/recovery/">
-    Recovering an etcd cluster that has lost quorum
+    Snapshotting and restoring a cluster with etcdctl and etcdutl
     </Card>
     <Card title="etcd Multi-Location Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/etcd-multi-location">
     View the source files, default values, and chart definition
