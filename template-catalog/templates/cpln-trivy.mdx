@@ -1,143 +1,76 @@
 ---
 title: CPLN Trivy
 icon: /template-catalog/templates/icons/cpln-trivy.png
-description: Automated vulnerability scanning for images stored in a Control Plane image registry. Scans each image using Trivy, stores HTML reports in S3 or Azure File Share, and tags images with a direct link to their report. Covers the two prerequisite secrets, including the bearer token guarding the public report upload endpoint.
-keywords: ['trivy', 'vulnerability scanning', 'container security', 'image scanning', 'cve', 'security', 'devsecops', 'cpln-trivy', 'control plane security', 'prerequisite secret', 'bearer token', 'sbom', 'image tags']
+description: Scheduled Trivy vulnerability scanning for every image in your Control Plane registry, with HTML reports stored in your S3 bucket or Azure file share and linked from an image tag. Needs two opaque secrets, a service account and report storage first.
+keywords: ['trivy', 'vulnerability scanning', 'container security', 'image scanning', 'cve', 'security', 'devsecops', 'cpln-trivy', 'control plane security', 'prerequisite secret', 'bearer token', 'sbom', 'image tags', 'registry scanner']
 ---
 
 ## Overview
 
-CPLN Trivy automates vulnerability scanning for every image in your Control Plane image registry. A scheduled daemon queries the registry for unscanned images, runs Trivy against each one, and stores an HTML report in S3 or an Azure File Share. After each scan, the image is tagged with a direct link to its report — visible in the Control Plane console.
+CPLN Trivy scans the images in your Control Plane image registry for known vulnerabilities. A scheduled daemon finds images that have not been scanned yet (or whose last scan is older than `rescanAfter`), runs [Trivy](https://trivy.dev) against each one, and hands the HTML report to a small web server that stores it in your own S3 bucket or Azure file share. The daemon then tags the image with a direct link to its report, so the result is one click away in the Control Plane console.
+
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have, passed with `--gvc GVC_NAME` at install time.
+</Note>
 
 <Warning>
-**Upgrading an install created with `1.1.0` or earlier is a breaking change.** `postToken` is no longer a plain value; the bearer token now lives in an opaque secret you create, named by `postToken.secretName`. Put **the same token your install already uses** into that secret — a different one makes report uploads start failing with `401` while every status surface still reads healthy. See [Upgrading From 1.1.0](#upgrading-from-1-1-0).
+**A scan run covers every image in the organization, not only images this install created.** The daemon enumerates the whole registry, writes two tags to each image it scans, and uploads one report per image to your storage. Before pointing it at a production organization, decide on a `schedule` and set `rescanAfter` to `""` if you want each image scanned only once.
 </Warning>
 
-<Warning>
-**Running a scan tags and reports on every image in the organization, not only images this install created.** The daemon enumerates the whole registry, writes two tags to each image it scans, and uploads a report per image to your bucket. Before pointing this at a production organization, understand that it mutates images it did not create. Narrow the blast radius by setting `schedule` to a time you choose and `rescanAfter` to `""` for a first run.
-</Warning>
-
-### Architecture
-
-- **daemon** (cron workload) — Runs on a configurable schedule, queries the registry for images that do not yet have a `cpln/trivy-scan` tag, and orchestrates scanning. Includes a **trivy-api** sidecar that wraps the Trivy CLI and returns HTML vulnerability reports.
-- **web-server** (serverless workload) — Receives scan reports from the daemon, stores them in the configured storage backend, and serves them publicly via URL.
-
-After each scan, the daemon writes two tags to the image:
+After each scan the image carries two tags:
 
 | Tag | Value |
-|-----|-------|
-| `cpln/trivy-scan` | URL to the HTML vulnerability report |
+|---|---|
+| `cpln/trivy-scan` | URL of the HTML vulnerability report |
 | `cpln/trivy-scan-time` | Timestamp of the scan |
-
-Each run scans images that do not yet have a `cpln/trivy-scan` tag. When `rescanAfter` is set (default `7d`), images whose last scan is older than that window are scanned again and their report is refreshed in place at the same URL. Setting `rescanAfter` to `""` disables rescanning — then re-scanning an image requires removing its `cpln/trivy-scan` tag first.
-
-### How the Two Workloads Talk
-
-**The daemon reaches the web-server over the public internet, not over the GVC network.** The two workloads have no in-GVC path to each other, so the daemon posts each report to the web-server's public endpoint — and that endpoint gates writes on the bearer token alone.
-
-That is why the token is a prerequisite secret rather than internal plumbing. Through `1.1.0` it shipped as the value `postToken: changeme`, which meant an internet-facing write endpoint guarded by a string published in a public repository: anyone could upload content into the user's own bucket and have it served back as HTML from their report URLs. Nothing about that credential is unreachable from outside the GVC, which is exactly the condition the bundled-credential exception depends on.
 
 ### What Gets Created
 
-- **Cron Daemon Workload** — Trivy daemon with trivy-api sidecar, runs on a cron schedule.
-- **Serverless Web-Server Workload** — Report storage and serving, autoscales from 1–3 replicas.
-- **Identity & Policies** — An identity carrying the AWS or Azure cloud-account binding for report storage, plus least-privilege policies: `reveal` on exactly the two prerequisite secrets, `manage` on images so scan tags can be written, and `pull`/`view` for the scanning service account.
-- **No credential secrets** — The template creates no secrets of its own. Both the post token and the registry service account key live in secrets you create.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `daemon` | Cron workload running on `schedule`. Container `daemon` selects images and orchestrates scans; container `trivy-api` runs Trivy and returns an HTML report | — |
+| Workload | `web-server` | Serverless workload on port `8080` that receives reports from the daemon, stores them, and serves them by URL. Autoscales between `webServer.autoscaling.minScale` and `maxScale` | — |
+| Identity | `RELEASE_NAME-identity` | Shared by both workloads. Carries the AWS cloud-account binding with your IAM policy (`storage.type: s3`) or the Azure **Reader and Data Access** role at `storage.azureFileshare.scope` (`storage.type: azureFileshare`) | — |
+| Policy | `RELEASE_NAME-manage-images` | Grants the identity `manage` on all images in the org, so it can write the scan tags | — |
+| Policy | `RELEASE_NAME-trivy-credentials` | Grants the identity `reveal` on exactly the two prerequisite secrets named by `postToken.secretName` and `trivyAuth.secretName` | — |
+| Policy | `RELEASE_NAME-read-images` | Grants the service account named by `serviceAccountName` `pull` and `view` on all images in the org, so Trivy can pull what it scans | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+The workload names `daemon` and `web-server` do not include the release name, so install this template only once per GVC. The template creates no secrets of its own.
 
 ## Prerequisites
 
-**Two secrets must exist before you install.** Secrets are org-level, so no GVC flag is involved.
-
-### Report Post Token
-
-The bearer token the daemon presents when uploading a report. It guards a publicly reachable write endpoint, so treat it like any other internet-facing credential.
+Two opaque secrets, a service account and report storage must exist before you install. Secrets are org-level, so no GVC flag is involved. This template uses two secrets, so the commands below call them `POST_TOKEN_SECRET_NAME` and `REGISTRY_SECRET_NAME`.
 
 <Steps>
-  <Step title="Create the post token secret">
-    An [opaque secret](/guides/create-secret/opaque) with encoding `plain` whose payload is the token:
+  <Step title="Create the report post token secret">
+    The daemon presents this bearer token when it uploads a report to the web server. The upload endpoint is reachable from the public internet, and this token is the only thing guarding it. Create an [opaque secret](/guides/create-secret/opaque) holding a random token:
 
     ```bash
-    printf '%s' "$(openssl rand -hex 32)" | \
-      cpln secret create-opaque --name my-cpln-trivy-post-token --encoding plain -f -
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name POST_TOKEN_SECRET_NAME --encoding plain -f -
     ```
 
-    Set `postToken.secretName` to the name you used. Use `printf`, not `echo` — `echo` appends a newline that becomes part of the token.
+    Set `postToken.secretName` to this name.
   </Step>
-  <Step title="Read it back later">
-    `-o yaml` is required; without it the command prints the secret's metadata table rather than its payload:
+  <Step title="Create a registry service account and key">
+    Trivy pulls images from your registry as a service account. [Create a service account](https://docs.controlplane.com/reference/serviceaccount) (or pick an existing one), add a key to it, and copy the key value, which cannot be retrieved later. The template grants this service account `pull` and `view` on images.
 
+    Set `serviceAccountName` to the service account name.
+  </Step>
+  <Step title="Store the service account key in an opaque secret">
     ```bash
-    cpln secret reveal my-cpln-trivy-post-token -o yaml
+    printf '%s' 'SERVICE-ACCOUNT-KEY' | cpln secret create-opaque --name REGISTRY_SECRET_NAME --encoding plain -f -
     ```
+
+    Set `trivyAuth.secretName` to this name.
   </Step>
-</Steps>
+  <Step title="Prepare report storage">
+    Set `storage.type` to `s3` or `azureFileshare` and complete the matching steps.
 
-<Note>
-**The token is enforced, and only in the `Bearer` form.** Verified against the live public endpoint: a POST with no `Authorization` header, one with a wrong token, and one carrying the correct token *without* the `Bearer ` prefix were all refused with `401`; only `Authorization: Bearer <token>` was accepted. Report **reads** remain deliberately unauthenticated — the URL's SHA-256 hash is the only thing protecting a report.
-</Note>
-
-### Registry Service Account
-
-Trivy authenticates against the Control Plane image registry using a service account key stored in an **opaque** secret.
-
-<Steps>
-  <Step title="Create or select a service account">
-    Create a Control Plane service account (or use an existing one). Set `serviceAccountName` in `values.yaml` to its name — the template grants it image `pull` and `view` permissions automatically.
-  </Step>
-  <Step title="Generate a key">
-    Generate a key for the service account and copy the key value. It cannot be retrieved later.
-  </Step>
-  <Step title="Store the key in an opaque secret">
-    ```bash
-    printf '%s' 'your-service-account-key' | \
-      cpln secret create-opaque --name trivy-credentials --encoding plain -f -
-    ```
-  </Step>
-  <Step title="Reference the secret in values.yaml">
-    The template grants the workload identity `reveal` access automatically:
-    ```yaml
-    trivyAuth:
-      secretName: trivy-credentials
-    ```
-  </Step>
-</Steps>
-
-<Warning>
-**A missing prerequisite secret wedges the install rather than failing it.** `cpln helm install` still exits 0 and reports success, the resources are created, and the workload then never starts. Because the container never ran, `cpln logs` returns **zero lines**, which reads as a broken platform rather than a missing prerequisite.
-
-The only diagnostic is `status.versions[].message`, which names the missing secret:
-
-```bash
-cpln workload get-deployments web-server --gvc GVC_NAME -o yaml
-```
-
-```text
-The secret my-cpln-trivy-post-token no longer exists. Workload updates are
-paused until the secret is added or the reference to the secret removed.
-```
-
-It is **`get-deployments`** — plain `cpln workload get` has no `versions` key at all. Creating the missing secret clears the wedge on its own, but slowly: recovery here was measured at **9 minutes 15 seconds**, inside the 5.5–10.5 minute range seen across the catalog, so poll rather than time-boxing it. A forced redeployment shortcuts it to roughly 90 seconds. The previously deployed revision keeps serving reports throughout.
-</Warning>
-
-### Storage
-
-Choose a storage backend — either AWS S3 or Azure File Share. Set `storage.type` to the appropriate value and configure only that section.
-
-<Tabs>
-  <Tab title="AWS S3">
-    <Steps>
-      <Step title="Create an S3 bucket">
-        Create an S3 bucket in your AWS account to store scan reports. Set `storage.s3.bucket` and `storage.s3.region`.
-      </Step>
-      <Step title="Register a Cloud Account">
-        If you do not have one, [create an AWS Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) in Control Plane. Set `storage.s3.cloudAccountName` to its name.
-      </Step>
-      <Step title="Create an IAM policy">
-        Create an IAM policy scoped to your bucket (replace `YOUR_BUCKET_NAME`) and set `storage.s3.policyName` to its name:
+    <Tabs>
+      <Tab title="AWS S3">
+        1. Create an S3 bucket. Set `storage.s3.bucket` to its name and `storage.s3.region` to its region.
+        2. [Create an AWS cloud account](https://docs.controlplane.com/guides/create-cloud-account) in Control Plane if you do not have one. Set `storage.s3.cloudAccountName` to its name.
+        3. Create an IAM policy scoped to the bucket (replace `YOUR_BUCKET_NAME`) and set `storage.s3.policyName` to the policy name. Access is keyless: the identity receives temporary credentials, so no AWS keys are stored.
 
         ```json
         {
@@ -159,26 +92,52 @@ Choose a storage backend — either AWS S3 or Azure File Share. Set `storage.typ
             ]
         }
         ```
-      </Step>
-    </Steps>
-  </Tab>
-  <Tab title="Azure File Share">
-    <Steps>
-      <Step title="Create a storage account and file share">
-        Create an Azure storage account and file share. Set `storage.azureFileshare.accountName` and `storage.azureFileshare.fileShare`.
-      </Step>
-      <Step title="Register a Cloud Account">
-        If you do not have one, [create an Azure Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) in Control Plane. Set `storage.azureFileshare.cloudAccountName` to its name.
-      </Step>
-      <Step title="Set the scope">
-        Set `storage.azureFileshare.scope` to the full Azure resource scope for role assignment:
-        `/subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<name>`
-      </Step>
-    </Steps>
-  </Tab>
-</Tabs>
+      </Tab>
+      <Tab title="Azure File Share">
+        1. Create an Azure storage account and a file share in it. Set `storage.azureFileshare.accountName` and `storage.azureFileshare.fileShare`.
+        2. [Create an Azure cloud account](https://docs.controlplane.com/guides/create-cloud-account) in Control Plane if you do not have one. Set `storage.azureFileshare.cloudAccountName` to its name.
+        3. Set `storage.azureFileshare.scope` to the storage account's full resource ID, in the form `/subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<name>`. The template grants the identity the **Reader and Data Access** role at exactly that scope, and mounts the file share into the web server at `/app/data`.
+      </Tab>
+    </Tabs>
+  </Step>
+</Steps>
 
-Once both secrets exist and your storage backend is ready, install the template using your preferred method:
+<Warning>
+**Create both secrets before installing, or the deployment wedges silently.** A name that points at a secret which does not exist installs successfully and then never starts. The container never runs, so `cpln logs` returns no lines at all. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments web-server --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret my-cpln-trivy-post-token no longer exists. Workload updates are
+paused until the secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments`; plain `cpln workload get` has no `versions` key. Once you create the missing secret the workload recovers on its own after several minutes, or immediately with a forced redeployment:
+
+```bash
+cpln workload force-redeployment web-server --gvc GVC_NAME
+```
+</Warning>
+
+## Installation
+
+Install with the values for your storage, secrets and service account. This example uses S3:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/cpln-trivy \
+  --version 1.2.0 --gvc GVC_NAME \
+  --set storage.s3.cloudAccountName=CLOUD_ACCOUNT_NAME \
+  --set storage.s3.bucket=BUCKET_NAME \
+  --set storage.s3.region=AWS_REGION \
+  --set storage.s3.policyName=IAM_POLICY_NAME \
+  --set postToken.secretName=POST_TOKEN_SECRET_NAME \
+  --set trivyAuth.secretName=REGISTRY_SECRET_NAME \
+  --set serviceAccountName=SERVICE_ACCOUNT_NAME
+```
+
+For Azure, set `storage.type=azureFileshare` and the four `storage.azureFileshare.*` values instead of the `storage.s3.*` values. You can also install from the UI, Terraform or Pulumi:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -204,7 +163,9 @@ Once both secrets exist and your storage backend is ready, install the template 
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Storage
+
+Configure only the block that matches `storage.type`.
 
 ```yaml
 # Storage backend for vulnerability reports. Options: "s3" or "azureFileshare"
@@ -215,33 +176,41 @@ storage:
     cloudAccountName: my-aws-cloud-account # AWS cloud account name registered in Control Plane
     bucket: trivy-reports-bucket           # S3 bucket name
     region: us-east-1                      # AWS region
-    policyName: my-trivy-s3-policy         # IAM policy scoped to the bucket (see Prerequisites)
+    policyName: my-trivy-s3-policy         # Name of the IAM policy scoped to the bucket above
 
   azureFileshare:
-    cloudAccountName: my-azure-cloud-account
-    accountName: mystorageaccount
-    fileShare: trivy-reports
+    cloudAccountName: my-azure-cloud-account # Azure cloud account name registered in Control Plane
+    accountName: mystorageaccount            # Azure storage account name
+    fileShare: trivy-reports                 # Azure file share name
     scope: "" # /subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<name>
+```
 
-# Bearer token the daemon presents when posting reports to the web-server.
-# Name of a pre-existing CPLN opaque secret whose payload is the token (see Prerequisites).
+### Authentication
+
+Both secret names must point at secrets that already exist (see [Prerequisites](#prerequisites)).
+
+```yaml
 postToken:
-  secretName: my-cpln-trivy-post-token
+  secretName: my-cpln-trivy-post-token # opaque secret holding the report upload bearer token
 
-# Authentication for Trivy to pull images from the Control Plane image registry.
-# Name of a pre-existing CPLN opaque secret whose payload is the service account key (see Prerequisites).
 trivyAuth:
-  secretName: trivy-credentials
+  secretName: trivy-credentials # opaque secret holding the service account key
 
-# Control Plane service account that Trivy uses to pull images (see Prerequisites)
-serviceAccountName: trivy-service-account
+serviceAccountName: trivy-service-account # service account Trivy pulls images with
+```
 
-# Cron schedule for the scanning daemon
-schedule: "*/59 * * * *"
+### Scanning
 
-# Rescan images whose last scan is older than this (e.g. "7d", "24h"). Empty = scan once only.
-rescanAfter: 7d
+```yaml
+schedule: "*/59 * * * *" # cron schedule for the scanning daemon
+rescanAfter: 7d          # rescan images last scanned longer ago than this; "" = scan once only
+```
 
+`rescanAfter` must be a number followed by `d` (days) or `h` (hours), such as `7d` or `24h`. With an empty value each image is scanned once; see [Forcing a Rescan](#forcing-a-rescan) to scan it again.
+
+### Workloads
+
+```yaml
 daemon:
   image: ghcr.io/controlplane-com/cpln-trivy-daemon:1.2.0
   resources:
@@ -249,12 +218,12 @@ daemon:
     memory: 1Gi
   firewall:
     outboundAllowCIDR:
-      - 0.0.0.0/0
+      - 0.0.0.0/0 # must reach the Control Plane API and the web server
 
 trivyApi:
   image: ghcr.io/controlplane-com/cpln-trivy-trivy-api:1.2.0
   resources:
-    cpu: 2
+    cpu: 2      # scanning is CPU-bound; lowering this lengthens every run
     memory: 4Gi
 
 webServer:
@@ -267,139 +236,171 @@ webServer:
     maxScale: 3
   firewall:
     inboundAllowCIDR:
-      - 0.0.0.0/0
+      - 0.0.0.0/0 # the daemon uploads over this public path; reports are readable by URL
     outboundAllowCIDR:
-      - 0.0.0.0/0
+      - 0.0.0.0/0 # must reach S3 or Azure storage
 ```
 
-### Configuration Reference
+<Warning>
+**Narrowing `webServer.firewall.inboundAllowCIDR` also blocks the daemon.** The daemon delivers reports to the web server through its public endpoint, so if you restrict inbound access to keep reports private, include the address range your daemon's traffic leaves from, or uploads stop.
+</Warning>
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `storage.type` | `s3` | Storage backend for reports. Options: `s3`, `azureFileshare` |
-| `storage.s3.cloudAccountName` | — | AWS Cloud Account name registered in Control Plane |
-| `storage.s3.bucket` | — | S3 bucket name |
-| `storage.s3.region` | — | AWS region (e.g. `us-east-1`) |
-| `storage.s3.policyName` | — | Name of the IAM policy scoped to the bucket |
-| `storage.azureFileshare.cloudAccountName` | — | Azure Cloud Account name registered in Control Plane |
-| `storage.azureFileshare.accountName` | — | Azure storage account name |
-| `storage.azureFileshare.fileShare` | — | Azure file share name |
-| `storage.azureFileshare.scope` | — | Full Azure resource scope for role assignment |
-| `postToken.secretName` | `my-cpln-trivy-post-token` | Name of an existing opaque secret whose payload is the bearer token the daemon uploads with |
-| `trivyAuth.secretName` | `trivy-credentials` | Name of an existing opaque secret whose payload is the service account key |
-| `serviceAccountName` | `trivy-service-account` | Service account Trivy uses to pull images |
-| `schedule` | `*/59 * * * *` | Cron schedule for the scanning daemon |
-| `rescanAfter` | `7d` | Rescan images whose last scan is older than this (`<N>d` or `<N>h`). Empty string disables rescanning |
-| `daemon.resources.cpu` | `1` | CPU for the daemon container |
-| `daemon.resources.memory` | `1Gi` | Memory for the daemon container |
-| `trivyApi.resources.cpu` | `2` | CPU for the trivy-api sidecar |
-| `trivyApi.resources.memory` | `4Gi` | Memory for the trivy-api sidecar |
-| `webServer.autoscaling.minScale` | `1` | Minimum web-server replicas |
-| `webServer.autoscaling.maxScale` | `3` | Maximum web-server replicas |
+## Connecting
 
-<Note>
-Report URLs are publicly accessible by default — they contain an unguessable SHA-256 hash, but no authentication on reads. Restrict `webServer.firewall.inboundAllowCIDR` if reports must stay private. Narrowing it also blocks the daemon, which reaches the web-server by that same public path, so add the daemon's egress range when you do.
-</Note>
+The template has no login screen. Each scan result is an HTML report served by the `web-server` workload at the URL stored in the image's `cpln/trivy-scan` tag.
 
-<Note>
-`webServer.firewall.inboundAllowCIDR` defaults to `0.0.0.0/0` by design — that is how the daemon delivers reports. The token is what keeps that endpoint from accepting anyone's uploads; see [How the Two Workloads Talk](#how-the-two-workloads-talk).
-</Note>
+| What | Where | Notes |
+|---|---|---|
+| A scan report | The `cpln/trivy-scan` tag on the scanned image | Open the image in the Control Plane console and follow the tag link, or read it with `cpln image get` |
+| Web server (public) | `status.canonicalEndpoint` of the `web-server` workload | Read it with `cpln workload get web-server --gvc GVC_NAME -o yaml` |
+| Web server (internal) | Not reachable inside the GVC | Internal access is closed; the daemon uses the public endpoint |
+| Report upload token | Your `postToken.secretName` secret | `cpln secret reveal POST_TOKEN_SECRET_NAME -o yaml` |
+| Report storage | Your S3 bucket, or the Azure file share | Reports are stored there by the web server |
 
-## Upgrading From 1.1.0
+Report reads are not authenticated: anyone who has a report URL can open it. Upload requests must carry `Authorization: Bearer` followed by the token.
 
-Version `1.2.0` moved the report post token out of Helm values. Through `1.1.0` it shipped as `postToken: changeme` — a working, publicly documented token guarding an internet-facing write endpoint.
+### Reading Scan Results
+
+List every image that has been scanned:
+
+```bash
+cpln image query --tag cpln/trivy-scan --max 0 -o json | jq -r '.items[].name'
+```
+
+Print the report link and scan time for one image, then open the link in a browser:
+
+```bash
+cpln image get IMAGE_NAME:TAG -o json | jq -r '.tags["cpln/trivy-scan"], .tags["cpln/trivy-scan-time"]'
+```
+
+Images with no `cpln/trivy-scan` tag have not been scanned yet. The daemon picks them up on its next scheduled run.
+
+## Operations
+
+### Upgrading from 1.1.0
+
+Version `1.2.0` moved the report post token out of Helm values. Through `1.1.0` it was the plain value `postToken`; it is now an opaque secret you create, named by `postToken.secretName`.
 
 | | `1.1.0` and earlier | `1.2.0` |
 |---|---|---|
-| Post token | `postToken` — a plain string value | `postToken.secretName` — an opaque secret you create, whose payload is the token |
+| Post token | `postToken`, a plain string value | `postToken.secretName`, an opaque secret whose payload is the token |
 | Registry service account key | `trivyAuth.secretName` prerequisite secret | Unchanged |
-| Chart-created secret | Held the post token | None |
 
-<Warning>
-**Reuse the token your install already has.** The daemon and the web-server compare the same string, so a rotation that reaches only one of them fails every upload with `401` while both workloads still report healthy. If you generate a fresh token during the upgrade, both workloads pick it up together on the same rollout — but any token you had recorded elsewhere is then dead.
-</Warning>
-
-<Warning>
-**A `helm upgrade` that still sets `postToken` as a string is rejected before anything is applied.** A real `cpln helm upgrade` carrying the old shape failed at render, created no Helm revision, and left the running release healthy and untouched:
+An upgrade that still sets `postToken` as a string fails at render and leaves the running release untouched:
 
 ```text
-cpln-trivy: postToken is no longer a plain value in 1.2.0. Put the token in an opaque secret
-(encoding: plain) and set postToken.secretName to its name. Reuse the SAME token your install
-already has, or the daemon's uploads start returning 401.
+cpln-trivy: postToken is no longer a plain value in 1.2.0. Put the token in an opaque secret (encoding: plain) and set postToken.secretName to its name — see the README. Reuse the SAME token your install already has, or the daemon's uploads start returning 401.
 ```
 
-Leaving `postToken.secretName` empty is refused the same way.
-</Warning>
-
-To upgrade an existing install:
-
 <Steps>
-  <Step title="Create the post token secret">
-    Follow [Prerequisites](#prerequisites), putting your current token into it.
+  <Step title="Create the post token secret with your current token">
+    Put **the same token your install already uses** into a new opaque secret. A different token also works for this release, but anything outside it that used the old token stops working.
+
+    ```bash
+    printf '%s' 'CURRENT-POST-TOKEN' | cpln secret create-opaque --name POST_TOKEN_SECRET_NAME --encoding plain -f -
+    ```
   </Step>
-  <Step title="Drop the removed key from your values">
-    Remove the `postToken:` string and set `postToken.secretName` instead. Leave `trivyAuth.secretName` and `serviceAccountName` exactly as they are.
+  <Step title="Replace the removed key in your values">
+    Delete the `postToken:` string and set `postToken.secretName` to the secret name. Leave `trivyAuth.secretName` and `serviceAccountName` as they are.
   </Step>
-  <Step title="Upgrade">
-    Both workloads pick the token up on the rollout. Reports already stored keep their URLs.
+  <Step title="Upgrade the release">
+    ```bash
+    cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/cpln-trivy \
+      --version 1.2.0 --gvc GVC_NAME \
+      --set postToken.secretName=POST_TOKEN_SECRET_NAME
+    ```
+
+    Pass your other existing values (storage, `trivyAuth.secretName`, `serviceAccountName`) the same way you did at install. Reports already stored keep their URLs.
   </Step>
 </Steps>
 
-### Rotating the Token Later
+### Rotating Secrets
 
-Edit the secret, then restart **both** workloads together. They must agree; a rotation reaching only one leaves uploads failing `401` with nothing else looking wrong.
+Both prerequisite secrets are opaque, so rotate one by applying the whole secret with the new value. Save this as `rotate.yaml`:
 
-## Viewing Reports
-
-Once the daemon has run, navigate to any scanned image in the Control Plane console. The `cpln/trivy-scan` tag on the image contains a direct URL to the HTML vulnerability report. Opening that URL serves the report from the web-server.
-
-To list all scanned images via CLI:
-
-```bash
-cpln image query --tag cpln/trivy-scan --max -1 -o json | jq '.items[].name'
+```yaml
+kind: secret
+name: SECRET_NAME
+type: opaque
+data:
+  encoding: plain
+  payload: NEW-VALUE
 ```
 
-## Maintenance
-
-### Periodic Re-Scans
-
-With `rescanAfter` set (default `7d`), re-scans happen automatically: any image whose last scan is older than the window is scanned again on the next daemon run, and its report is refreshed at the same URL. Adjust the window (e.g. `24h` for daily) or set it to `""` to scan each image only once.
-
-### Force an Immediate Re-Scan
-
-To re-scan an image before its `rescanAfter` window elapses, remove its scan tags:
-
 ```bash
-cpln image tag my-image:latest --remove-tag cpln/trivy-scan --remove-tag cpln/trivy-scan-time
+cpln apply -f rotate.yaml
+cpln secret reveal SECRET_NAME -o yaml
 ```
 
-To reset all scan tags and trigger a full re-scan on the next daemon run:
+A running workload keeps the old value until it is redeployed, so force a redeployment afterwards.
+
+- **Post token:** the daemon and the web server must use the same token, so redeploy both together. If only one picks up the new token, uploads are refused with `401` while both workloads still look healthy.
+
+  ```bash
+  cpln workload force-redeployment daemon --gvc GVC_NAME
+  cpln workload force-redeployment web-server --gvc GVC_NAME
+  ```
+
+- **Service account key:** add a new key to the service account, put it in the `trivyAuth.secretName` secret, redeploy `daemon`, then delete the old key. No reinstall is needed.
+
+### Forcing a Rescan
+
+With `rescanAfter` set, images are rescanned automatically once their last scan is older than that window, and the report is replaced at the same URL. To rescan an image sooner, remove its scan tags so the next run treats it as unscanned:
 
 ```bash
-cpln image query --tag cpln/trivy-scan --max -1 -o json | jq -r '.items[].name' | \
-  xargs -I{} cpln image tag {} --remove-tag cpln/trivy-scan --remove-tag cpln/trivy-scan-time
+cpln image tag IMAGE_NAME:TAG --remove-tag cpln/trivy-scan --remove-tag cpln/trivy-scan-time
 ```
 
-The daemon will pick the images up on its next scheduled run.
+<Note>
+This command shape is taken from `cpln image tag --help` and has not been run against a live install.
+</Note>
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The workload never starts and cpln logs returns nothing">
+    **Cause:** a secret named by `postToken.secretName` or `trivyAuth.secretName` does not exist. `status.versions[].message` from `cpln workload get-deployments web-server --gvc GVC_NAME -o yaml` names it, for example `The secret my-cpln-trivy-post-token no longer exists.`
+
+    **Fix:** create the secret as in [Prerequisites](#prerequisites), then wait for recovery or run `cpln workload force-redeployment web-server --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Install or upgrade fails with postToken is no longer a plain value">
+    **Cause:** your values still set `postToken` as a string from `1.1.0` or earlier.
+
+    **Fix:** follow [Upgrading from 1.1.0](#upgrading-from-1-1-0).
+  </Accordion>
+  <Accordion title="Install fails with rescanAfter must be a number followed by d or h">
+    **Cause:** `rescanAfter` is not in the form `7d` or `24h`. The full error reads `rescanAfter must be a number followed by 'd' (days) or 'h' (hours), e.g. '7d' or '24h'`.
+
+    **Fix:** use a whole number followed by `d` or `h`, or `""` to scan each image only once.
+  </Accordion>
+  <Accordion title="Scans run but no new reports appear">
+    **Cause:** the web server refuses the daemon's uploads. This happens when the two workloads hold different post tokens after a rotation, or when `webServer.firewall.inboundAllowCIDR` no longer admits the daemon's traffic.
+
+    **Fix:** redeploy both workloads together after a token change, and widen the inbound CIDR list if you narrowed it. Check the daemon's output:
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="daemon"}' --limit 50 --since 10m
+    ```
+  </Accordion>
+  <Accordion title="The daemon logs a 404 tagging error">
+    **Cause:** an image was deleted while a run was in progress.
+
+    **Fix:** none needed. The run continues with the remaining images.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Create both prerequisite secrets before installing.** A missing one wedges the deployment with no log output at all; [Prerequisites](#prerequisites) gives the one command that diagnoses it.
-- **A scan touches every image in the organization**, not just images this install created — see the warning in [Overview](#overview).
-- **Rotating the post token requires restarting both workloads together** — see [Rotating the Token Later](#rotating-the-token-later).
-- **Report reads are unauthenticated.** Anyone with the URL can open a report.
-- **Scans take roughly 15–20 seconds per image** — about 30 minutes for 100 images on a first run. Overlapping runs are prevented, so a long run simply delays the next scheduled one.
-- **Rescans overwrite in place** — the report keeps its URL and `cpln/trivy-scan-time` is refreshed, so links saved from the console stay valid.
-- **Rotate the service account key** by adding a new key, updating the opaque secret's payload, then deleting the old key. No reinstall needed.
-- **The workloads are named `daemon` and `web-server` regardless of release name** — install this template only once per GVC.
+- **Create both prerequisite secrets before installing.** A missing one wedges the deployment with no log output.
+- **Every image in the organization is scanned and tagged**, not only images this install created.
+- **Report URLs are readable without authentication.** Narrow `webServer.firewall.inboundAllowCIDR` to keep them private, and keep the daemon's traffic allowed when you do.
+- **Redeploy `daemon` and `web-server` together after changing the post token.** They must agree or uploads fail with `401`.
+- **Runs never overlap.** A long run on a large registry delays the next scheduled run rather than starting a second one.
+- **Install once per GVC.** The workloads are always named `daemon` and `web-server`.
 
 ## External References
 
-<CardGroup cols={2}>
-  <Card title="Trivy Documentation" href="https://trivy.dev/latest/docs/" icon="shield-halved">
-    Official Trivy vulnerability scanner documentation
-  </Card>
-  <Card title="Create a Cloud Account" href="https://docs.controlplane.com/guides/create-cloud-account" icon="cloud">
-    Set up AWS or Azure cloud accounts for storage access
-  </Card>
-</CardGroup>
+- [Trivy documentation](https://trivy.dev/latest/docs/)
+- [Control Plane service accounts](https://docs.controlplane.com/reference/serviceaccount)
+- [Create a cloud account](https://docs.controlplane.com/guides/create-cloud-account)
+- [Control Plane image registry](https://docs.controlplane.com/reference/image)
