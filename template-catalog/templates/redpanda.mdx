@@ -1,96 +1,94 @@
 ---
 title: Redpanda
 icon: /template-catalog/templates/icons/redpanda.png
-description: Deploy a Kafka-compatible Redpanda streaming cluster on Control Plane. Covers the prerequisite SASL credential secrets, the console that has no login and is closed by default, the unauthenticated broker Admin API, Schema Registry, topic-data snapshots, external TLS access, and upgrading from template version 1.0.x.
-keywords: ['redpanda', 'kafka', 'kafka-compatible', 'event streaming', 'schema registry', 'sasl', 'scram', 'pandaproxy', 'redpanda console', 'rpk', 'message queue', 'streaming platform', 'port forward']
+description: Kafka-compatible Redpanda cluster of 1, 3 or 5 brokers with SASL auth, Schema Registry, optional HTTP Proxy and a Console closed to the internet. Deploys into an existing GVC; a dictionary secret per SASL user must exist before install.
+keywords: ['kafka alternative', 'event streaming', 'scram', 'pandaproxy', 'http proxy', 'rpk', 'message queue', 'streaming platform', 'port forward', 'raft', 'kafka wire protocol', 'volume snapshots', 'acl']
 ---
 
 ## Overview
 
-Redpanda is a Kafka-compatible streaming platform written in C++. It implements the Kafka wire protocol natively, so any Kafka client, SDK, or tool works without modification. This template deploys a stateful Redpanda broker cluster with SASL authentication, Schema Registry, an optional HTTP REST proxy, and an optional web console.
+Redpanda is a Kafka-compatible streaming platform written in C++. It implements the Kafka wire protocol natively, so any Kafka client, SDK, or tool works without modification. This template deploys a stateful Redpanda broker cluster with SASL authentication, Schema Registry, an optional HTTP Proxy, and an optional web console.
 
 SASL credentials are not template values. Each user comes from a dictionary secret you create before installing, so the credentials never pass through Helm and never land in the release. The console ships **closed to the internet**, because the build shipped here has no login of its own.
 
-<Warning>
-**Template version 1.1.0 is a breaking change.** `redpanda.auth.users[].username` and `redpanda.auth.users[].password` were removed in favour of `credentialsSecretName`, and the console's public firewall rule is no longer set. An install that still sets the old keys fails at render. See [Upgrading From Earlier Versions](#upgrading-from-earlier-versions).
-</Warning>
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have, and every resource it creates lands in that GVC.
+</Note>
 
 ### What Gets Created
 
-- **Stateful Redpanda Workload** — (`RELEASE_NAME-cluster`): 1, 3, or 5 brokers forming a Raft quorum, each with its own persistent volume. The container assembles `/etc/redpanda/redpanda.yaml` from the injected credentials at boot.
-- **Standard Redpanda Console Workload** *(optional, enabled by default)* — (`RELEASE_NAME-console`): the web UI for browsing topics, inspecting messages, managing consumer groups, and viewing Schema Registry schemas.
-- **Volume Set** — (`RELEASE_NAME-data`): one block volume per broker holding the topic data directory, with platform-managed snapshots.
-- **Startup-Script Secrets** — One opaque secret per workload holding the script that assembles the broker and console configuration files at boot. The template creates **no credential secret of its own**.
-- **Identity & Policy** — An identity bound to the workloads and a policy granting it `reveal` on exactly the script secrets plus each SASL credentials secret you named.
-- **Domain** *(optional)* — Created only when external Kafka access or a console domain is configured.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-cluster` | Redpanda brokers (stateful, `redpanda.replicas` replicas forming a Raft quorum) | — |
+| Workload | `RELEASE_NAME-console` | Redpanda Console web UI (standard, 1 replica) | `redpanda_console.enabled: true` (default) |
+| Volume set | `RELEASE_NAME-data` | One block volume per broker holding the topic data, with scheduled snapshots | — |
+| Secret | `RELEASE_NAME-init` | Startup script that assembles the broker configuration from the injected credentials | — |
+| Secret | `RELEASE_NAME-console-init` | Startup script that assembles the console configuration | `redpanda_console.enabled: true` (default) |
+| Identity | `RELEASE_NAME` | Identity bound to both workloads | — |
+| Policy | `RELEASE_NAME` | Grants the identity `reveal` on the two script secrets and on each SASL credentials secret you named | — |
+| Domain | your public address | TLS endpoint for external Kafka access or for the console | `redpanda.listeners.kafka.external` or `redpanda_console.domain` |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
-
-## Upgrading From Earlier Versions
-
-Template version 1.0.x took each SASL user's username and password as plain Helm values and shipped a working default for the superuser, and it published the console to `0.0.0.0/0`. Both changed in 1.1.0.
-
-| 1.0.x | 1.1.0 |
-|---|---|
-| `redpanda.auth.users[].username` | `username` key of the dictionary secret named by `credentialsSecretName` |
-| `redpanda.auth.users[].password` | `password` key of the same secret |
-| `redpanda_console.firewall.external_inboundAllowCIDR: "0.0.0.0/0"` | not set — the console is closed to the internet |
-
-Each removed key is rejected at render with a message naming its replacement, so a failing upgrade leaves the running release untouched.
-
-- **Create the secret with the username and password the cluster already uses.** SASL users live in the cluster's own metadata on disk, so changing this value does **not** change the password of an existing cluster — it only changes what the internal clients present, and a mismatch means they can no longer authenticate. Rotate a real user with `rpk security user update` and update the secret to match.
-- **The console's public URL now returns `403`.** Reach it with `cpln port-forward` (see [Redpanda Console](#redpanda-console)), or set `redpanda_console.firewall.external_inboundAllowCIDR` back explicitly — knowing the UI has no login at all.
+The template creates **no credential secret of its own**: every SASL user is a secret you create.
 
 ## Prerequisites
 
-**One secret per SASL user must exist before you install.** Every entry in `redpanda.auth.users` names a dictionary secret holding `username` and `password`. Secrets are org-level, so no GVC flag is involved.
+**One dictionary secret per SASL user must exist before you install.** Every entry in `redpanda.auth.users` names a dictionary secret holding the keys `username` and `password`. Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
   <Step title="Create the superuser credentials secret">
-    The **first** entry in `redpanda.auth.users` is the cluster superuser: the console, the Schema Registry client and (when enabled) the HTTP Proxy all authenticate to the brokers as it.
+    The **first** entry in `redpanda.auth.users` is the cluster superuser. The console, the Schema Registry client and (when enabled) the HTTP Proxy all authenticate to the brokers as this user.
 
     ```bash
-    cpln secret create-dictionary \
-      --name my-redpanda-admin-credentials \
+    cpln secret create-dictionary --name SECRET_NAME \
       --entry username=admin \
-      --entry password='CHOOSE-A-STRONG-PASSWORD'
+      --entry password='YOUR-STRONG-PASSWORD'
     ```
 
-    Set `redpanda.auth.users[0].credentialsSecretName` to the name you used.
+    Set `redpanda.auth.users[0].credentialsSecretName` to this name.
   </Step>
   <Step title="Add one secret per additional user">
-    Create another dictionary secret in the same shape for each extra SASL user, and add one `credentialsSecretName` entry per secret. Each additional user starts with no ACLs, so it can authenticate but cannot read or write anything until you grant it access.
+    Create another dictionary secret in the same shape for each extra SASL user, and add one `credentialsSecretName` entry per secret under `redpanda.auth.users`. An additional user starts with no ACLs: it can authenticate but cannot read or write anything until you grant it access (see [Troubleshooting](#troubleshooting)).
   </Step>
   <Step title="Read a secret back later">
-    The `-o yaml` is required — plain `cpln secret reveal` prints only a summary table, not the values:
+    The `-o yaml` is required. A bare `cpln secret reveal` prints only a summary table, not the values:
 
     ```bash
-    cpln secret reveal my-redpanda-admin-credentials -o yaml
+    cpln secret reveal SECRET_NAME -o yaml
     ```
   </Step>
 </Steps>
 
 <Warning>
-**Use `printf`, not `echo`, if you pipe a generated password in from elsewhere.** `echo` appends a newline, which Redpanda cannot carry in a config value. The startup script detects that and fails with a message naming the secret and key, rather than starting a cluster that rejects every login. Passwords containing quotes, colons and braces are handled correctly.
+**Use `printf`, not `echo`, if you pipe a generated password in from elsewhere.** `echo` appends a newline, which Redpanda cannot carry in a config value. The broker startup script detects that and fails with a message naming the secret and key, rather than starting a cluster that rejects every login. Passwords containing quotes, colons and braces are handled correctly.
 </Warning>
 
 <Warning>
-**Create the secrets before installing.** A name pointing at a secret that does not exist installs "successfully" and then wedges: every resource reports created, the workload never becomes ready, and **`cpln logs` returns zero lines** because no container ever starts. The only diagnostic is `status.versions[].message`:
+**Create the secrets before installing.** A `credentialsSecretName` pointing at a secret that does not exist installs "successfully" and then wedges: every resource reports created, the workload never becomes ready, and **`cpln logs` returns zero lines** because no container ever starts. The only diagnostic is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-cluster --gvc GVC_NAME -o yaml
 ```
 
-It names the missing secret: `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` The command is `get-deployments` — plain `cpln workload get` has no `versions` key at all. Creating the secret recovers the workload on its own: **poll for 5.5 to 10.5 minutes rather than time-boxing it.** `cpln workload force-redeployment RELEASE_NAME-cluster --gvc GVC_NAME` cuts that to roughly 90 seconds.
+It names the missing secret: `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` The command is `get-deployments` — plain `cpln workload get` has no `versions` key. Once the secret exists the workload recovers on its own after several minutes; to skip the wait:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-cluster --gvc GVC_NAME
+```
 </Warning>
 
-Nothing else is required for a default install. Exposing the brokers over the internet additionally needs a domain you control and a dedicated load balancer — see [External Access](#external-access).
+Nothing else is required for a default install. Exposing the brokers over the internet additionally needs a domain you control and a dedicated load balancer on the GVC — see [External Kafka Access](#external-kafka-access).
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+Install the template into an existing GVC, naming the superuser credentials secret you created:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/redpanda \
+  --version 1.2.0 --gvc GVC_NAME \
+  --set 'redpanda.auth.users[0].credentialsSecretName=SECRET_NAME'
+```
+
+To install using another method, follow the instructions for it:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -116,18 +114,22 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+Each block below matches the shipped `values.yaml` for the keys it shows.
+
+### Cluster Size and Resources
+
+`replicas` must be `1`, `3` or `5`; an even count cannot form a Raft quorum and is rejected at install. The shipped CPU limit-to-reservation ratio is 3:1 — if you raise `maxCpu`, raise `minCpu` with it, because a stateful workload rejects a ratio above 4:1.
 
 ```yaml
 redpanda:
-  name: cluster
+  name: cluster              # broker workload is named RELEASE_NAME-{name}
   image: redpandadata/redpanda:v26.1.9
-  replicas: 3
-  multiZone: false
-  env: []
+  replicas: 3                # 1, 3, or 5 — Raft needs an odd number for quorum
+  multiZone: false           # spread brokers across availability zones within a location
+  env: []                    # extra environment variables for the broker container
 
-  cpu: 1500m
-  memory: 4Gi
+  maxCpu: 1500m
+  maxMemory: 4Gi
   minCpu: 500m
   minMemory: 2Gi
   # smp: number of Seastar reactor threads — must match the container's vCPU count (floor of cpu limit).
@@ -135,7 +137,14 @@ redpanda:
   smp: 1
   # reserveMemory: memory set aside for the OS; Redpanda uses (memory - reserveMemory).
   reserveMemory: 1G
+```
 
+### Storage
+
+Each broker gets its own persistent volume. For high-throughput production workloads switch to `high-throughput-ssd` (minimum 200 GB). Topic data is the only durable state this template holds, and the scheduled snapshots are the only thing backing it up — see [Backing Up](#backing-up).
+
+```yaml
+redpanda:
   volume:
     initialCapacity: 10 # In GB
     performanceClass: general-purpose-ssd # For production workloads, switch to high-throughput-ssd (min 200GB) for higher IOPS
@@ -150,7 +159,16 @@ redpanda:
     #   enabled: true
     #   region: aws-us-east-2
     #   keyId: arn:aws:kms:us-east-2:1234567890:key/your-key-id
+```
 
+To encrypt the volumes with your own AWS KMS key, uncomment `customEncryption` and set `region` to the Control Plane location of the key and `keyId` to the key's full ARN. Custom encryption applies only when a volume is first created, and the key policy must grant Control Plane access before the volume is provisioned — see [custom encryption](/reference/volumeset#custom-encryption-aws) in the volume set reference.
+
+### Firewall
+
+The broker workload is reachable from the GVC only; external inbound and outbound are off unless you uncomment them. `inboundAllowWorkload` narrows internal access to specific workloads, and it is the control that limits who can reach the unauthenticated Admin API (see [Admin API Access](#admin-api-access)).
+
+```yaml
+redpanda:
   # To disable all traffic, comment out the corresponding rule. Docs: https://docs.controlplane.com/concepts/security#firewall
   firewall:
     internal_inboundAllowType: "same-gvc" # Options: same-org / same-gvc
@@ -158,7 +176,12 @@ redpanda:
     # inboundAllowWorkload:
     #   - //gvc/my-gvc/workload/my-app
     # external_outboundAllowCIDR: "0.0.0.0/0"
+```
 
+### Listeners
+
+```yaml
+redpanda:
   listeners:
     kafka:
       internal:
@@ -178,7 +201,23 @@ redpanda:
     pandaproxy:
       enabled: false
       port: 8082
+```
 
+| Listener | Port | Authentication |
+|---|---|---|
+| Kafka | `9092` | SASL (`SCRAM-SHA-256` by default) |
+| Admin API | `9644` | **None** — see [Admin API Access](#admin-api-access) |
+| Schema Registry | `8081` | HTTP basic, using the same SASL credentials |
+| HTTP Proxy | `8082` | HTTP basic, same credentials (disabled by default) |
+
+Set `pandaproxy.enabled: true` to produce and consume over REST without a Kafka client. The `external` listener is covered under [External Kafka Access](#external-kafka-access).
+
+### Authentication
+
+SASL is always on. Every user's credentials are a prerequisite secret (see [Prerequisites](#prerequisites)); the first entry is the cluster superuser.
+
+```yaml
+redpanda:
   # ─── SASL authentication ───────────────────────────────────────────────────
   auth:
     saslMechanism: SCRAM-SHA-256 # SCRAM-SHA-256 / SCRAM-SHA-512
@@ -195,10 +234,26 @@ redpanda:
       # - credentialsSecretName: my-redpanda-app-credentials
     # Extra usernames to grant superuser rights, for users created outside this chart.
     superusers: []
+```
 
+SASL users are created on the first boot of broker 0 and then live in the cluster's own metadata. Editing a credentials secret afterwards does not change the user's password — see [Rotating SASL Credentials](#rotating-sasl-credentials).
+
+### ACLs
+
+```yaml
+redpanda:
   acl:
     allowEveryoneIfNoAclFound: false
+```
 
+With `allowEveryoneIfNoAclFound: false` (the default), a client with no matching ACL is denied: a non-superuser with no ACLs can authenticate but sees no topics and cannot create one.
+
+### Cluster Identity and Extra Broker Configuration
+
+`cluster_id` is generated on first boot when left empty; set it explicitly to preserve the cluster identity across reinstalls. Any key under `extra_configurations` is written into the broker configuration at startup.
+
+```yaml
+redpanda:
   secrets:
     # Leave empty to auto-generate on first boot. Set explicitly to preserve identity across reinstalls.
     cluster_id: ""
@@ -208,13 +263,19 @@ redpanda:
     # log_retention_ms: 604800000
     # log_segment_size: 134217728
     # log_retention_bytes: -1
+```
 
+### Console
+
+The console workload is on by default and closed to the internet. `domain` publishes it on a custom domain over TLS and also requires `external_inboundAllowCIDR` to be set. Read [Redpanda Console](#redpanda-console) before opening either.
+
+```yaml
 redpanda_console:
   enabled: true
   name: console
   image: redpandadata/console:v3.7.4
-  cpu: 200m
-  memory: 256Mi
+  maxCpu: 200m
+  maxMemory: 256Mi
   minCpu: 50m
   minMemory: 64Mi
   replicas: 1
@@ -232,114 +293,18 @@ redpanda_console:
     external_outboundAllowCIDR: "0.0.0.0/0"
 ```
 
-### Cluster Size and Resources
-
-- `redpanda.name` — Suffix of the broker workload name, which is `RELEASE_NAME-{name}`.
-- `redpanda.replicas` — Number of brokers. Must be `1`, `3`, or `5`: an even count cannot form a Raft quorum and is rejected at install. Changing it changes cluster membership, so treat it as a deliberate operation.
-- `redpanda.cpu` / `redpanda.memory` — Limit per broker. `redpanda.minCpu` / `redpanda.minMemory` — reservation per broker. The shipped ratio is 3:1; if you raise `cpu`, raise `minCpu` with it, because a stateful workload rejects a CPU-to-reservation ratio above 4:1.
-- `redpanda.smp` — Number of Seastar reactor threads. It must match the floor of the CPU limit (`cpu: 1500m` → `smp: 1`). Without it, Seastar uses all node CPUs and divides memory across them, starving each shard.
-- `redpanda.reserveMemory` — Memory set aside for the OS. Redpanda uses `(memory - reserveMemory)`.
-- `redpanda.multiZone` — Spread brokers across availability zones within the location.
-- `redpanda.env` — Extra environment variables for the broker container.
-
-### Storage
-
-Each broker gets its own persistent volume. For high-throughput production workloads switch to `high-throughput-ssd` (minimum 200 GiB).
-
-- `redpanda.volume.initialCapacity` — Initial volume size in GB.
-- `redpanda.volume.performanceClass` — `general-purpose-ssd` or `high-throughput-ssd`.
-- `redpanda.volume.fileSystemType` — `xfs` (default) or `ext4`.
-- `redpanda.volume.snapshots.createFinalSnapshot` — Take a snapshot when the volume set is deleted.
-- `redpanda.volume.snapshots.retentionDuration` — How long each snapshot is kept.
-- `redpanda.volume.snapshots.schedule` — Cron expression in UTC for scheduled snapshots; an empty string disables them.
-
-Topic data is the only durable state this template holds, and nothing else backs it up, so the snapshot schedule is the backup story for a cluster that is not mirroring elsewhere.
-
-**Volume encryption** via AWS KMS is supported:
-
-```yaml
-redpanda:
-  volume:
-    customEncryption:
-      enabled: true
-      region: aws-us-east-2
-      keyId: arn:aws:kms:us-east-2:1234567890:key/your-key-id
-```
-
-<Note>
-After deploying with custom encryption enabled, open each created volume in the Control Plane console, click `spec`, and follow the **AWS Custom Encryption Instructions** to complete the setup.
-</Note>
-
-### Authentication
-
-SASL is always enabled, and every user's credentials are a prerequisite secret (see [Prerequisites](#prerequisites)). The first entry in the list becomes the cluster superuser.
-
-- `redpanda.auth.saslMechanism` — `SCRAM-SHA-256` (default) or `SCRAM-SHA-512`.
-- `redpanda.auth.users[].credentialsSecretName` — Name of the dictionary secret holding that user's `username` and `password`. At least one entry is required.
-- `redpanda.auth.superusers` — Extra usernames to grant superuser rights, for users created outside this chart.
-
-SASL users are created by broker 0 on first boot and then live in the cluster's own metadata. Editing a credentials secret afterwards does not rotate the user — update it with `rpk security user update` and change the secret to match.
-
-### ACLs
-
-- `redpanda.acl.allowEveryoneIfNoAclFound` — When `false` (default), a client with no matching ACL is denied. A non-superuser with no ACLs can authenticate but sees no topics and cannot create one.
-
-### Listeners
-
-| Listener | Port | Authentication |
-|----------|------|----------------|
-| Kafka | `9092` | SASL |
-| Admin API | `9644` | **None** — see [The Admin API Is Unauthenticated](#the-admin-api-is-unauthenticated) |
-| Schema Registry | `8081` | HTTP basic, using the same SASL credentials |
-| HTTP Proxy | `8082` | HTTP basic, same credentials *(disabled by default)* |
-
-Enable the HTTP Proxy to produce and consume over REST without a Kafka client:
-
-```yaml
-redpanda:
-  listeners:
-    pandaproxy:
-      enabled: true
-      port: 8082
-```
-
-### Extra Broker Configuration
-
-Pass any Redpanda broker property through `extra_configurations`; they are written into `redpanda.yaml` at startup. `redpanda.secrets.cluster_id` is generated on first boot when left empty — set it explicitly to preserve cluster identity across reinstalls.
-
-```yaml
-redpanda:
-  extra_configurations:
-    auto_create_topics_enabled: false
-    log_retention_ms: 604800000    # 7 days
-    log_segment_size: 134217728    # 128 MiB
-    log_retention_bytes: -1        # unlimited
-```
-
-### Firewall
-
-- `redpanda.firewall.internal_inboundAllowType` — Which workloads can reach the brokers: `same-gvc` (default) or `same-org`.
-- `redpanda.firewall.inboundAllowWorkload` — Narrow internal access to specific workloads by path. This is the control that limits who can reach the unauthenticated Admin API.
-- `redpanda.firewall.external_inboundAllowCIDR` / `external_outboundAllowCIDR` — Commented out by default. Comment a rule back in to allow that traffic.
-
-### Console
-
-- `redpanda_console.enabled` — Deploy the Redpanda Console workload (default `true`).
-- `redpanda_console.image`, `cpu`, `memory`, `minCpu`, `minMemory`, `replicas`, `timeoutSeconds` — Image, resources and request timeout for the console workload.
-- `redpanda_console.domain` — A custom domain for the console. It also requires external inbound to be open.
-- `redpanda_console.firewall.external_inboundAllowCIDR` — Commented out, so the console is closed to the internet. See [Redpanda Console](#redpanda-console) before uncommenting it.
-
 ## Connecting
 
 Redpanda is reachable from any workload in the same GVC:
 
 | What | Address | Credentials |
 |---|---|---|
-| Kafka API | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092` | SASL, from your credentials secret |
-| Admin API | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:9644` | **none** — unauthenticated for reads *and* writes |
+| Kafka API | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092` | SASL — `cpln secret reveal SECRET_NAME -o yaml` |
+| Admin API | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:9644` | **None** — unauthenticated for reads *and* writes |
 | Schema Registry | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:8081` | HTTP basic, same SASL credentials |
 | HTTP Proxy (if enabled) | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:8082` | HTTP basic, same SASL credentials |
-| Console (if enabled) | `cpln port-forward` — see [Redpanda Console](#redpanda-console) | none — the console has no login |
+| Console (if enabled) | `cpln port-forward` — see [Redpanda Console](#redpanda-console) | None — the console has no login |
+| Public Kafka endpoint (if configured) | `RELEASE_NAME-cluster-0-LOCATION.your-domain.com:9094` per broker — see [External Kafka Access](#external-kafka-access) | SASL over TLS |
 
 A specific broker replica is addressable directly:
 
@@ -348,14 +313,22 @@ RELEASE_NAME-cluster-0.RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092
 RELEASE_NAME-cluster-1.RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092
 ```
 
-Connect with `rpk` from a workload in the same GVC:
+Verify the cluster is healthy from inside a broker. `rpk cluster health` uses the Admin API, so it needs no password:
+
+```bash
+cpln workload exec RELEASE_NAME-cluster --gvc GVC_NAME \
+  --replica RELEASE_NAME-cluster-0 --container redpanda \
+  -- rpk cluster health -X admin.hosts=localhost:9644
+```
+
+Connect with `rpk` from a workload in the same GVC, using the username and password from your credentials secret:
 
 ```bash
 rpk topic list \
   -X brokers=RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092 \
   -X sasl.mechanism=SCRAM-SHA-256 \
   -X user=admin \
-  -X pass=YOUR_PASSWORD
+  -X pass='YOUR-STRONG-PASSWORD'
 ```
 
 For Kafka clients:
@@ -366,14 +339,20 @@ security.protocol=SASL_PLAINTEXT
 sasl.mechanism=SCRAM-SHA-256
 sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required \
   username="admin" \
-  password="YOUR_PASSWORD";
+  password="YOUR-STRONG-PASSWORD";
 ```
 
-## Redpanda Console
+The Schema Registry answers the Confluent-compatible API with HTTP basic auth, using the same credentials:
 
-**The console has no login in this build, and that is a licensing fact rather than a configuration gap.** Console authentication (OIDC and basic login) and role-based authorization are Redpanda **Enterprise** features. Unlicensed, the console runs in static service account mode: there is no login screen, every visitor shares the same access level, and that shared session carries the **cluster superuser's** SASL credentials. Anyone who can reach the console can browse and publish messages, create and delete topics, and manage consumer groups and ACLs.
+```bash
+curl -u admin:YOUR-STRONG-PASSWORD http://RELEASE_NAME-cluster.GVC_NAME.cpln.local:8081/subjects
+```
 
-Adding authentication was therefore not an option, so external inbound is closed by default. Reach the UI through a tunnel instead — the tunnel goes through Control Plane infrastructure and is independent of the firewall:
+### Redpanda Console
+
+**The console has no login in this build.** Console authentication (OIDC and basic login) and role-based authorization are Redpanda Enterprise features. Without a license there is no login screen, every visitor shares the same access level, and that shared session carries the **cluster superuser's** SASL credentials. Anyone who can reach the console can browse and publish messages, create and delete topics, and manage consumer groups and ACLs.
+
+External inbound is therefore closed by default. Reach the UI through a tunnel instead — it works with the firewall fully closed:
 
 ```bash
 cpln port-forward RELEASE_NAME-console 8080:8080 --gvc GVC_NAME
@@ -381,92 +360,248 @@ cpln port-forward RELEASE_NAME-console 8080:8080 --gvc GVC_NAME
 ```
 
 <Warning>
-Uncommenting `redpanda_console.firewall.external_inboundAllowCIDR` publishes an unauthenticated Kafka admin UI. Do it only behind your own authenticating proxy, or narrowed to a CIDR range you control — never `0.0.0.0/0`. Setting `redpanda_console.domain` also requires external inbound to be open. A firewall change takes roughly 30 seconds to a few minutes to propagate.
+Uncommenting `redpanda_console.firewall.external_inboundAllowCIDR` publishes an unauthenticated Kafka admin UI. Do it only behind your own authenticating proxy, or narrowed to a CIDR range you control — never `0.0.0.0/0`. Setting `redpanda_console.domain` also requires external inbound to be open. Allow a few minutes for a firewall change to take effect.
 </Warning>
 
-<Note>
-**The console crash-loops for about 34 seconds on a cold install**, logging a red `Invalid credentials` error. It has started before broker 0's `postStart` hook has created the SASL users, so its first run fails, and the platform restarts it into a working state. It self-heals with no action needed — do not go looking for a credential mistake in the first minute of a fresh install.
-</Note>
+### Admin API Access
 
-## The Admin API Is Unauthenticated
+The broker Admin API on port `9644` requires no credentials — **for writes as well as reads** — and under the default `same-gvc` firewall it is reachable by every workload in the GVC. A workload holding no credentials at all can create or delete SASL users, read the cluster topology, and list the SASL usernames through it.
 
-The broker Admin API on port `9644` requires no credentials — **for writes as well as reads** — and under the default `same-gvc` firewall it is reachable by every workload in the GVC. This was verified directly: a neighbouring workload holding no credentials at all created a SASL user through it and then deleted it again. Reads leak the cluster topology and the SASL usernames.
+It is not publicly reachable: external inbound on the broker workload is closed, so the exposure is bounded by the GVC. But **treat GVC membership as equivalent to cluster admin** until you narrow it with `redpanda.firewall.inboundAllowWorkload`, listing exactly the workloads that need broker access. The brokers' own health checks and the console depend on this listener, so it cannot simply be closed.
 
-It is not publicly reachable: external inbound on the broker workload is closed, so the exposure is bounded by the GVC. But **treat GVC membership as equivalent to cluster admin** until you narrow it, which you do with `redpanda.firewall.inboundAllowWorkload` — listing exactly the workloads that need broker access. The readiness probe, the `postStart` hook and the console all depend on this listener, so it cannot simply be closed.
-
-## External Access
+### External Kafka Access
 
 Redpanda brokers can be exposed over the internet with TLS via a public domain. Each broker advertises its own per-replica subdomain and Control Plane routes clients to the correct broker using SNI.
 
-### Requirements
+<Steps>
+  <Step title="Bring a domain and a dedicated load balancer">
+    You need a domain you control with DNS at your registrar, and a [dedicated load balancer](/reference/gvc#dedicated-load-balancer) enabled on the GVC — external TCP routing requires it.
+  </Step>
+  <Step title="Add the DNS records before deploying">
+    Disable proxying (for example Cloudflare's orange cloud) — TCP traffic must pass through directly. `GVC_ALIAS` is the GVC alias shown under the GVC's settings in the Control Plane console, and `LOCATION` is the GVC location a broker runs in (for example `aws-us-east-1`):
 
-1. **A domain you control** with DNS managed by your registrar.
-2. **Dedicated Load Balancer** enabled on your GVC — required for external TCP routing. See [Configure Domain](https://docs.controlplane.com/guides/configure-domain#dedicated-load-balancing).
-3. **DNS records added before deploying.** Disable proxying (for example Cloudflare's orange cloud) — TCP traffic must pass through directly:
+    | Type | Name | Value |
+    |---|---|---|
+    | TXT | `_cpln.your-domain.com` | your Control Plane org name or org ID |
+    | CNAME | `@` | `GVC_ALIAS.cpln.app` |
+    | CNAME | `_acme-challenge` | `_acme-challenge.cpln.app` |
+    | CNAME | `RELEASE_NAME-cluster-0-LOCATION` | `GVC_ALIAS.cpln.app` |
+    | CNAME | `RELEASE_NAME-cluster-1-LOCATION` | `GVC_ALIAS.cpln.app` |
 
-| Type | Name | Value |
-|------|------|-------|
-| TXT | `_cpln.your-domain.com` | your Control Plane org name or org ID |
-| CNAME | `@` | `{gvcAlias}.cpln.app` |
-| CNAME | `_acme-challenge` | `_acme-challenge.cpln.app` |
-| CNAME | `{clusterName}-0-{location}` | `{gvcAlias}.cpln.app` |
-| CNAME | `{clusterName}-N-{location}` | `{gvcAlias}.cpln.app` |
+    Add one CNAME per broker replica, pointing at the GVC gateway rather than at a direct replica address. The `_acme-challenge` record lets Control Plane issue the certificate via DNS-01. See the [Configure Domain](/guides/configure-domain) guide for the full DNS procedure.
+  </Step>
+  <Step title="Enable the external listener">
+    Uncomment the `external` block under `redpanda.listeners.kafka` and set `publicAddress` to your domain. The template then creates the domain resource, opens the extra container port and advertises the per-replica hostnames:
 
-Add one CNAME per broker replica, pointing at the GVC gateway rather than at a direct replica address. The `_acme-challenge` record lets Control Plane issue the certificate via DNS-01. Your GVC alias is under GVC settings in the Control Plane console.
+    ```yaml
+    redpanda:
+      listeners:
+        kafka:
+          external:
+            directReplicaRouting:
+              containerPort: 9094
+              publicAddress: your-domain.com
+    ```
+  </Step>
+  <Step title="Connect from outside">
+    Each broker advertises `RELEASE_NAME-cluster-N-LOCATION.your-domain.com`. Use them all as the bootstrap list:
 
-### External Access Configuration
+    ```bash
+    rpk topic list \
+      -X brokers=RELEASE_NAME-cluster-0-LOCATION.your-domain.com:9094,RELEASE_NAME-cluster-1-LOCATION.your-domain.com:9094 \
+      -X tls.enabled=true \
+      -X sasl.mechanism=SCRAM-SHA-256 \
+      -X user=admin \
+      -X pass='YOUR-STRONG-PASSWORD'
+    ```
 
-```yaml
-redpanda:
-  listeners:
-    kafka:
-      external:
-        directReplicaRouting:
-          containerPort: 9094
-          publicAddress: your-domain.com
-```
+    For Kafka clients, use `security.protocol=SASL_SSL`, `sasl.mechanism=SCRAM-SHA-256`, and the same bootstrap list.
+  </Step>
+</Steps>
 
-### Connecting Externally
+## Operations
 
-Each broker advertises `{clusterName}-{ordinal}-{location}.{domain}`. Use them all as the bootstrap list:
+### Backing Up
+
+Backups are **platform-managed volume snapshots** of `RELEASE_NAME-data`, one volume per broker — no cloud account or bucket is involved. By default a snapshot is taken daily at midnight UTC (`redpanda.volume.snapshots.schedule: 0 0 * * *`), kept for 7 days (`retentionDuration: 7d`), and a final snapshot is taken when the volume set is deleted (`createFinalSnapshot: true`). Set `schedule: ""` to keep only the final-on-delete snapshot.
+
+List the snapshots of the release's volume set:
 
 ```bash
-rpk topic list \
-  -X brokers=cluster-0-aws-us-east-1.your-domain.com:9094,cluster-1-aws-us-east-1.your-domain.com:9094 \
-  -X tls.enabled=true \
-  -X sasl.mechanism=SCRAM-SHA-256 \
-  -X user=admin \
-  -X pass=YOUR_PASSWORD
+cpln volumeset snapshot get RELEASE_NAME-data --gvc GVC_NAME
 ```
 
-For Kafka clients, use `security.protocol=SASL_SSL`, `sasl.mechanism=SCRAM-SHA-256`, and the same bootstrap list.
+Take an on-demand snapshot of one broker's volume (the volume index is the broker ordinal):
+
+```bash
+cpln volumeset snapshot create RELEASE_NAME-data --gvc GVC_NAME --snapshot-name NAME --location LOCATION --volume-index 0
+```
+
+<Note>
+Snapshots live in the platform storage layer alongside the volume, not off-site, and they are the only backup this template provides. If you need point-in-time recovery elsewhere, use Redpanda's tiered storage or mirror the topics you care about to another cluster.
+</Note>
+
+### Restoring a Backup
+
+**The restore path has not been verified for this template.** The platform can [restore a volume to one of its snapshots](/reference/volumeset#restorevolume) — the replica using that volume restarts and comes back on a fresh volume carrying the snapshot's data — but that restores **one broker's volume**, not the cluster. In a 3- or 5-broker cluster the other brokers keep their current data, so a single-volume restore is not a cluster-level point-in-time recovery, and how a restored broker reconciles with its peers has not been tested here.
+
+Treat the snapshots as protection against losing a volume, not as a tested recovery procedure. If you need to rely on them, rehearse the restore on a disposable cluster first and verify the topics and offsets you expect are present before trusting it in production.
+
+### Rotating SASL Credentials
+
+SASL users live in the cluster's metadata after first boot. Editing a credentials secret does **not** change the user's password — it only changes what the console and the internal Schema Registry and HTTP Proxy clients present at their next start. Rotate in this order:
+
+<Steps>
+  <Step title="Change the password in the cluster">
+    ```bash
+    cpln workload exec RELEASE_NAME-cluster --gvc GVC_NAME \
+      --replica RELEASE_NAME-cluster-0 --container redpanda \
+      -- rpk security user update admin --new-password 'NEW-STRONG-PASSWORD' --mechanism SCRAM-SHA-256 -X admin.hosts=localhost:9644
+    ```
+  </Step>
+  <Step title="Update the secret to match">
+    Set the `password` key of the user's dictionary secret to the new value, using the same `printf` precaution as at creation time. Until the next step runs, the console and the internal clients still present the old password and fail to authenticate.
+  </Step>
+  <Step title="Redeploy both workloads">
+    A secret change is only picked up when a replica starts, so force a redeployment of the console and the brokers:
+
+    ```bash
+    cpln workload force-redeployment RELEASE_NAME-console --gvc GVC_NAME
+    cpln workload force-redeployment RELEASE_NAME-cluster --gvc GVC_NAME
+    ```
+  </Step>
+</Steps>
+
+### Upgrading from 1.0.x
+
+Template version 1.0.x took each SASL user's username and password as plain Helm values and shipped a working default for the superuser, and it published the console to `0.0.0.0/0`. Both changed in 1.1.0.
+
+| 1.0.x | 1.1.0 and later |
+|---|---|
+| `redpanda.auth.users[].username` | `username` key of the dictionary secret named by `credentialsSecretName` |
+| `redpanda.auth.users[].password` | `password` key of the same secret |
+| `redpanda_console.firewall.external_inboundAllowCIDR: "0.0.0.0/0"` | not set — the console is closed to the internet |
+
+Each removed key is rejected at render with a message naming its replacement, so a failing upgrade leaves the running release untouched.
+
+- **Create the secret with the username and password the cluster already uses.** SASL users live in the cluster's own metadata on disk, so the secret does **not** change the password of an existing cluster — it only changes what the internal clients present, and a mismatch means they can no longer authenticate. To change the password itself, follow [Rotating SASL Credentials](#rotating-sasl-credentials).
+- **The console's public URL now returns `403`.** Reach it with `cpln port-forward` (see [Redpanda Console](#redpanda-console)), or set `redpanda_console.firewall.external_inboundAllowCIDR` back explicitly — knowing the UI has no login at all.
+
+### Upgrading from 1.1.0
+
+Template version 1.2.0 renames the resource limits in both blocks so it is no longer ambiguous which number is the ceiling. Rename these keys in your values; an upgrade that still carries the old names is refused at render with a message naming the replacement, and the running release is untouched.
+
+| 1.1.0 | 1.2.0 |
+|---|---|
+| `redpanda.cpu` | `redpanda.maxCpu` |
+| `redpanda.memory` | `redpanda.maxMemory` |
+| `redpanda_console.cpu` | `redpanda_console.maxCpu` |
+| `redpanda_console.memory` | `redpanda_console.maxMemory` |
+
+`minCpu` and `minMemory` are unchanged in both blocks.
+
+### Scaling and Availability
+
+- `redpanda.replicas` must be `1`, `3` or `5`. Changing it changes broker membership, so treat it as a deliberate cluster operation rather than a routine scale.
+- Topic data survives container restarts, reschedules and upgrades of the same release: each broker's volume is reattached to the same ordinal.
+- A rolling upgrade is **not serialized** for a stateful workload on this platform, so brokers may restart together. Configure producers and consumers to retry, and expect the first `helm upgrade` after an install to restart both workloads even when nothing changed.
+- `redpanda.multiZone: true` spreads the brokers across availability zones within each location.
+- The console is stateless; `redpanda_console.replicas` can be raised freely.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Workload never becomes ready and cpln logs returns nothing">
+    **Symptom:** every resource reports created, `RELEASE_NAME-cluster` never reaches ready, and `cpln logs` returns zero lines.
+
+    **Cause:** a `credentialsSecretName` names a secret that does not exist, so no container ever starts.
+
+    **Fix:** read the one place the missing secret is named, then create it:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-cluster --gvc GVC_NAME -o yaml
+    ```
+
+    Look for `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` in `status.versions[].message`. After creating the secret, `cpln workload force-redeployment RELEASE_NAME-cluster --gvc GVC_NAME` skips the wait for automatic recovery.
+  </Accordion>
+  <Accordion title="FATAL: key 'password' of the dictionary secret contains a newline">
+    **Symptom:** the broker container exits at start with `FATAL: key 'password' of the dictionary secret '<name>' (redpanda.auth.users[0]) contains a newline. This is usually a trailing newline added by echo`.
+
+    **Cause:** the secret value was piped in with `echo`, which appends a newline Redpanda cannot carry in a config value. The console reports the same condition as `FATAL: ... contains a newline — usually a trailing newline added by echo`.
+
+    **Fix:** recreate the secret with `printf '%s'` instead of `echo`, then force a redeployment of the affected workload.
+  </Accordion>
+  <Accordion title="Console logs Invalid credentials right after a fresh install">
+    **Symptom:** on a cold install the console restarts a few times, logging `Invalid credentials`.
+
+    **Cause:** the console started before broker 0 had created the SASL users, so its first connection attempt was rejected.
+
+    **Fix:** none needed — it self-heals once the brokers are healthy. Investigate a credential mismatch only if the error persists after the broker workload is ready.
+  </Accordion>
+  <Accordion title="redpanda.cpu was RENAMED to redpanda.maxCpu">
+    **Symptom:** `helm upgrade` or `helm install` fails at render with `redpanda: redpanda.cpu was RENAMED to redpanda.maxCpu` (or the same message for `redpanda.memory`, `redpanda_console.cpu`, `redpanda_console.memory`).
+
+    **Cause:** your values still carry the 1.1.0 key names.
+
+    **Fix:** rename the keys as listed under [Upgrading from 1.1.0](#upgrading-from-1-1-0). Nothing was applied; the running release is unchanged.
+  </Accordion>
+  <Accordion title="redpanda.auth.users[0].password was REMOVED in redpanda 1.1.0">
+    **Symptom:** render fails with `redpanda.auth.users[0].password was REMOVED in redpanda 1.1.0` or `redpanda.auth.users[0].username was REMOVED in redpanda 1.1.0`.
+
+    **Cause:** your values still carry 1.0.x SASL credentials as plain values.
+
+    **Fix:** move them into a dictionary secret and reference it with `credentialsSecretName` — see [Upgrading from 1.0.x](#upgrading-from-1-0-x).
+  </Accordion>
+  <Accordion title="redpanda.replicas must be 1, 3, or 5">
+    **Symptom:** render fails with `redpanda.replicas must be 1, 3, or 5 — Raft consensus requires an odd number for quorum.`
+
+    **Cause:** an even replica count, or more than five.
+
+    **Fix:** set `redpanda.replicas` to `1`, `3` or `5`.
+  </Accordion>
+  <Accordion title="A non-superuser authenticates but sees no topics">
+    **Symptom:** a client using an additional user's credentials connects, but `rpk topic list` returns nothing and produce or consume fails with an authorization error.
+
+    **Cause:** `redpanda.acl.allowEveryoneIfNoAclFound` is `false`, so a user with no ACLs is denied everything.
+
+    **Fix:** grant the user ACLs as the superuser, for example from inside a broker:
+
+    ```bash
+    cpln workload exec RELEASE_NAME-cluster --gvc GVC_NAME \
+      --replica RELEASE_NAME-cluster-0 --container redpanda \
+      -- rpk security acl create --allow-principal User:app --operation all --topic orders --group app-consumers \
+         -X brokers=localhost:9092 -X sasl.mechanism=SCRAM-SHA-256 -X user=admin -X pass='YOUR-STRONG-PASSWORD'
+    ```
+
+    See the [rpk security acl create](https://docs.redpanda.com/current/reference/rpk/rpk-security/rpk-security-acl-create/) reference for the full set of operations and resources.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- Every credentials secret named in `redpanda.auth.users` must exist **before** you install. Without one the deployment wedges with no log output at all; see [Prerequisites](#prerequisites) for the one diagnostic that names it.
+- Every credentials secret named in `redpanda.auth.users` must exist **before** you install; without one the deployment wedges with no log output — see [Prerequisites](#prerequisites).
 - **Anyone who can reach the console acts as the cluster superuser** — there is no login. Keep external inbound closed unless the console sits behind your own authenticating proxy.
-- **The broker Admin API on `9644` is unauthenticated for reads and writes** and open to the whole GVC by default — see [The Admin API Is Unauthenticated](#the-admin-api-is-unauthenticated).
-- **The console crash-loops for roughly 34 seconds on a cold install** with an `Invalid credentials` error, before the SASL users exist. It self-heals.
-- SASL users live in the cluster's metadata after first boot. Editing a credentials secret does not rotate the user; use `rpk security user update` and change the secret to match.
-- `redpanda.replicas` must be `1`, `3`, or `5`. An even count cannot form a Raft quorum and is rejected at install.
-- **A rolling upgrade is not serialized for a stateful workload**, so brokers may restart together. Configure producers and consumers to retry.
-- **The first Helm upgrade after an install re-applies resources** even with identical values, bouncing both workloads. Later upgrades are clean.
-- Topic data survives reschedules and reinstalls of the same release, and the volume set carries scheduled snapshots — but the snapshots are the only backup, so use tiered storage or a mirroring job if you need point-in-time recovery elsewhere.
+- **The broker Admin API on `9644` is unauthenticated for reads and writes** and open to the whole GVC by default — narrow it with `redpanda.firewall.inboundAllowWorkload`.
+- Editing a credentials secret does not change a SASL user's password; rotate with `rpk security user update`, update the secret, then force a redeployment — see [Rotating SASL Credentials](#rotating-sasl-credentials).
+- `redpanda.replicas` must be `1`, `3` or `5`; changing it changes cluster membership.
+- Brokers may restart together during an upgrade — configure producers and consumers to retry.
+- Volume snapshots are the only backup, and the restore path is unverified for this template — see [Restoring a Backup](#restoring-a-backup).
+- Set `redpanda.secrets.cluster_id` explicitly if you need the cluster identity to survive an uninstall and reinstall.
 
 ## External References
 
 <CardGroup cols={2}>
-  <Card title="Redpanda Documentation" href="https://docs.redpanda.com/" icon="book">
+  <Card title="Redpanda Documentation" href="https://docs.redpanda.com/current/" icon="book">
     Official Redpanda documentation
   </Card>
   <Card title="Redpanda Console Documentation" href="https://docs.redpanda.com/current/console/" icon="display">
-    Redpanda Console UI guide
+    Redpanda Console UI guide, including which features need an Enterprise license
   </Card>
   <Card title="rpk CLI Reference" href="https://docs.redpanda.com/current/reference/rpk/" icon="terminal">
     rpk command reference for managing Redpanda clusters
   </Card>
-  <Card title="Schema Registry API" href="https://docs.redpanda.com/current/develop/http-proxy/" icon="code">
-    Confluent-compatible Schema Registry and HTTP Proxy API reference
+  <Card title="Schema Registry" href="https://docs.redpanda.com/current/manage/schema-reg/" icon="code">
+    Managing schemas with Redpanda's Confluent-compatible Schema Registry
   </Card>
   <Card title="Redpanda Template" href="https://github.com/controlplane-com/templates/tree/main/redpanda" icon="github">
     View the source files, default values, and chart definition
