@@ -270,6 +270,8 @@ Flags: `--address`, `--location`, `--replica`.
 - `cpln helm install RELEASE CHART --gvc GVC` — Helm chart management
 - `cpln stack deploy --compose-file FILE --gvc GVC` — Docker Compose deployment
 
+`cpln stack deploy` and `cpln stack manifest` substitute `${VAR}` from the environment and `.env`, and honor `depends_on` conditions, by default; turn these off with `--no-interpolate` and `--no-deps`. `--env-file` replaces `.env`. `cpln stack deploy` also takes `--build` and `--wait-timeout`; `cpln stack rm` takes `--env-file` and `--no-interpolate`.
+
 ## Commands That DON'T Exist
 
 | Wrong | Correct |

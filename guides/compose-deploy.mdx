@@ -1,7 +1,7 @@
 ---
 title: Deploy Docker Compose Projects
 description: Convert and deploy Docker Compose projects to Control Plane with the cpln stack command.
-keywords: ['compose-up', 'docker-compose.yml', 'compose to cpln', 'cpln stack', 'compose migrate', 'multi-container app', 'service stack', 'kompose alternative']
+keywords: ['compose-up', 'docker-compose.yml', 'compose to cpln', 'cpln stack', 'compose migrate', 'multi-container app', 'service stack', 'kompose alternative', 'depends_on', 'env file', 'variable substitution', 'database migrations', '--interpolate']
 ---
 
 The `cpln stack` command deploys Docker Compose projects directly to Control Plane, automatically converting services, volumes, secrets, and networks to their Control Plane equivalents.
@@ -47,6 +47,16 @@ cpln stack deploy
 
 This reads your Compose file and deploys all services to Control Plane.
 
+| Option | Effect |
+|--------|--------|
+| `--build` | Build the image of every service that sets `build` and push it to your org's registry (on by default) |
+| `--interpolate` | Substitute variables such as `${VERSION}`, as docker compose does (on by default). See [Compose variables and env files](#compose-variables-and-env-files) |
+| `--env-file` | Read the variables from this file instead of the `.env` file next to the compose file |
+| `--deps` | Deploy in `depends_on` order, waiting for dependencies and running jobs (on by default). See [Compose service dependencies](#compose-service-dependencies) |
+| `--wait-timeout` | The seconds each dependency may take (600 by default) |
+
+Turn off an option that is on by default with its `--no-` form, such as `--no-deps`.
+
 See the [stack deploy](/cli-reference/commands/stack#stack-deploy) command reference for all options.
 
 ## Delete a project
@@ -56,6 +66,8 @@ Remove all resources created by a Compose deployment:
 ```bash
 cpln stack rm
 ```
+
+If the compose file references variables, for example `image: api:${VERSION}` next to `build`, set the same variables and pass the same `--env-file` options you deployed with.
 
 See the [stack rm](/cli-reference/commands/stack#stack-rm) command reference for details.
 
@@ -67,7 +79,173 @@ Generate Control Plane specs without deploying:
 cpln stack manifest
 ```
 
-This outputs the converted YAML so you can inspect or modify it before deployment.
+This outputs the converted YAML so you can inspect or modify it before deployment. It builds nothing unless you pass `--build`, and takes `--env-file`, `--no-interpolate` and `--no-deps` like `cpln stack deploy`.
+
+## Compose variables and env files
+
+`cpln stack` substitutes variables the way docker compose does:
+
+```bash
+VERSION=1.4.2 cpln stack deploy
+```
+
+Variables come from two places, and the environment wins over any file:
+
+1. The environment of the command.
+2. The `.env` file next to the compose file, or the files you name with `--env-file` in its place. Give `--env-file` more than once to layer files, a later file overriding an earlier one.
+
+```bash
+cpln stack deploy --env-file deploy/prod.env
+```
+
+| Syntax | Result |
+|--------|--------|
+| `${VAR}` or `$VAR` | The value of `VAR`. An unset variable becomes an empty string, with a warning |
+| `${VAR:-default}` | `default` when `VAR` is unset or empty |
+| `${VAR-default}` | `default` when `VAR` is unset |
+| `${VAR:?message}` | Stops with `message` when `VAR` is unset or empty |
+| `${VAR?message}` | Stops with `message` when `VAR` is unset |
+| `${VAR:+alternate}` | `alternate` when `VAR` is set and not empty, otherwise an empty string |
+| `${VAR+alternate}` | `alternate` when `VAR` is set, otherwise an empty string |
+| `$$` | A literal `$` |
+
+<Note>
+Only values are substituted, never keys. The contents of `env_file` files are used as written. Pass `--no-interpolate` to keep every value as written; `--env-file` cannot be combined with it.
+</Note>
+
+<Tip>
+To pass a literal `$` to a container, such as a shell variable in `command` or a password, write `$$`, as docker compose requires: `command: ["sh", "-c", "echo $$HOSTNAME"]`.
+</Tip>
+
+<Tip>
+Docker compose reads the same `.env` file for local runs. To deploy other values, set them in the environment or pass `--env-file`.
+</Tip>
+
+### Service env files
+
+`env_file` on a service is separate from the `.env` file above. It loads the variables of a file into the containers of that service, while `.env` and `--env-file` feed the substitution of the compose file itself. A missing `.env` file is fine; a missing `env_file` file is not.
+
+Each path resolves against the directory of the compose file. When a file does not exist, the command stops before it builds or deploys anything, as `docker compose up` does, and names the file and every service that reads it. To skip a file while it is missing, list it in the long syntax with `required: false`:
+
+```yaml
+services:
+  api:
+    image: api:1.4.2
+    env_file:
+      - common.env
+      - path: local.env
+        required: false
+```
+
+`common.env` must exist. `local.env` is read when it exists and skipped when it does not.
+
+When the same variable is set in more than one place, the order follows docker compose: a later env file in the list wins over an earlier one, and `environment` wins over every env file. A service that uses `extends` reads the env files it inherits first, so its own env files win over them.
+
+## Compose image names and tags
+
+`cpln stack deploy` builds the image of every service that sets `build` and pushes it to your org's registry:
+
+| Service sets | Image built and used |
+|--------------|----------------------|
+| `build` only | `SERVICE:1.0`, named after the service |
+| `build` and `image: NAME:TAG` | `NAME:TAG`, as docker compose names it |
+| `build` and `image: NAME` | `NAME:latest` |
+| `image` only | The image as written; nothing is built |
+
+The tag can come from a variable, so the same compose file tags images the same way locally and on Control Plane:
+
+```yaml compose.yaml
+services:
+  api:
+    image: api:${VERSION}
+    build: .
+  migrations:
+    image: api:${VERSION}    # runs the image that api builds
+    command: ["./migrate"]
+```
+
+```bash
+VERSION=1.4.2 cpln stack deploy
+```
+
+- Next to `build`, `image` must be a plain `NAME:TAG`. The image always goes to your org's registry, so a registry host or a path, such as `ghcr.io/acme/api:1.4.2`, is rejected.
+- Services that build the same image with the same build settings build it once. Building one image from different build settings is an error.
+- A service with `image` only that names an image another service builds, such as `migrations` above, runs that image from your org's registry.
+- `cpln stack manifest` builds nothing unless you pass `--build`; the manifest references the images either way.
+
+<Tip>
+Give each build its own tag, such as a version or a commit. A tag that is reused for new builds, such as `1.0`, needs `supportDynamicTags` on the workload to redeploy when the tag moves. See [Dynamic Tags](/reference/image#dynamic-tags).
+</Tip>
+
+## Compose service dependencies
+
+`cpln stack deploy` follows `depends_on` conditions the way `docker compose up` does. Pass `--no-deps` to ignore them and apply every workload at once.
+
+| Condition | What happens before a dependent is applied |
+|-----------|--------------------------------------------|
+| `service_started`, or a plain list of services | The dependency is applied |
+| `service_healthy` | The dependency reports ready. Its `healthcheck` becomes its readiness probe |
+| `service_completed_successfully` | The dependency runs once as a job and succeeds |
+
+A service that another waits for with `service_completed_successfully`, such as a database migration, converts to a [cron workload](/reference/workload/types#cron) that is suspended, so it never runs on a schedule. `cpln stack deploy` starts one execution in the first location of the GVC and waits for it to finish.
+
+```yaml compose.yaml
+services:
+  database:
+    image: postgres:16
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 5
+  migrations:
+    image: ghcr.io/acme/api:1.4.2
+    command: ["./migrate"]
+    depends_on:
+      database:
+        condition: service_healthy
+  api:
+    image: ghcr.io/acme/api:1.4.2
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+```
+
+<CodeGroup>
+
+```bash Command
+cpln stack deploy
+```
+
+```text Output
+Created /org/my-org/gvc/my-gvc/workload/migrations
+Created /org/my-org/gvc/my-gvc/workload/api
+Created /org/my-org/gvc/my-gvc/workload/database
+Updated workload 'migrations'
+Completed job 'migrations' in location 'aws-us-west-2'
+Updated workload 'api'
+```
+
+</CodeGroup>
+
+New services that wait on a dependency are created suspended before anything else deploys, then updated with their real spec when their turn comes, which is why they appear as both `Created` and `Updated`. This lets each dependency's internal firewall admit them from its first deploy.
+
+- `--wait-timeout` sets the seconds each wait may take, 600 by default.
+- When a dependency never becomes ready or its job fails, the services that need it are left as they were, the rest of the stack still deploys, and the command exits with an error that names both.
+- A dependency marked `required: false` is waited for, but never keeps its dependent from deploying.
+- A job serves no traffic, so its ports are dropped with a warning, and it cannot mount a named volume.
+- A dependency on a service that is not in the file (unless it is `required: false`), a cycle, or an unknown condition is an error, as in docker compose. So is waiting with `service_healthy` for a service that runs as a job.
+
+<Warning>
+A workload's type cannot change. If a service was deployed as a `standard` workload before it became a job, `cpln stack deploy` leaves that workload as it is, skips the services that wait for it, and explains your options. See [Workload type may not be changed](#workload-type-may-not-be-changed).
+</Warning>
+
+### Compose dependencies in manifests
+
+`cpln stack manifest` converts jobs the same way, but a manifest cannot carry the order: `cpln apply` creates every workload at once and starts no job, and the command prints a warning saying so. Deploy with `cpln stack deploy` to keep the order, or start each job yourself after applying:
+
+```bash
+cpln workload cron start migrations --location aws-us-west-2 --gvc my-gvc
+```
 
 ## Customize workloads with x-cpln
 
@@ -105,6 +283,10 @@ services:
 The `x-cpln` block **replaces** entire spec sections, and doesn't merge them. If you override `containers`, you must include all container configuration.
 </Warning>
 
+<Note>
+On a service that runs as a job, `x-cpln` applies on top of the cron workload. Overridden `defaultOptions` keep the job suspended unless they set `suspend` themselves, and `type` must stay `cron`.
+</Note>
+
 ### Available overrides
 
 | Key | Description |
@@ -141,6 +323,7 @@ The converter analyzes your service definition to select the appropriate workloa
 
 | Condition | Workload Type |
 |-----------|---------------|
+| Another service waits for it with `service_completed_successfully` | `cron` |
 | Service has volumes attached | `stateful` |
 | No volumes attached | `standard` |
 
@@ -168,10 +351,12 @@ Use `x-cpln` to override the automatically determined type if needed.
 | `deploy.replicas` | `minScale` and `maxScale` (set to same value) |
 | `healthcheck` | Readiness probe |
 | `ports` / `expose` | Container ports |
-| `environment` / `env_file` | Environment variables (`environment` processed first; `env_file` entries added only for keys not already defined) |
+| `environment` / `env_file` | Environment variables. `environment` wins over `env_file`, and a later env file wins over an earlier one. See [Service env files](#service-env-files) |
 | `working_dir` | Container working directory |
 | `command` | Container args |
 | `entrypoint` | Container command |
+| `image` next to `build` | Name and tag of the built image. See [Compose image names and tags](#compose-image-names-and-tags) |
+| `depends_on` | Deploy order, readiness waits and jobs. See [Compose service dependencies](#compose-service-dependencies) |
 
 ### Port protocol
 
@@ -237,6 +422,8 @@ Supported test formats:
 - CMD-SHELL: `['CMD-SHELL', 'curl http://localhost']` → `/bin/sh -c` wrapper
 - NONE: Disables the readiness probe
 
+Durations use the docker compose units `h`, `m`, `s`, `ms` and `us`, alone or combined such as `1m30s`, and are rounded up to whole seconds. A duration without a unit, such as `30`, is not a compose duration: it is ignored with a warning, and the platform default applies. A service that runs as a job gets no readiness probe.
+
 ### Network modes
 
 | Mode | Behavior |
@@ -291,7 +478,7 @@ The following Docker Compose features are **not supported**:
 | Feature | Status | Alternative |
 |---------|--------|-------------|
 | Directory bind mounts | Not supported | Use named volumes or file bind mounts |
-| `depends_on` ordering | Ignored | Services start independently; use health checks |
+| `depends_on` order with `cpln apply` | Not kept | Deploy with `cpln stack deploy`. See [Compose dependencies in manifests](#compose-dependencies-in-manifests) |
 | `links` | Ignored | Use network-based service discovery |
 | Dynamic GPU model/quantity | Limited | Hardcoded to NVIDIA T4, quantity 1 |
 | Multiple containers per service | Not supported | Create separate services |
@@ -320,16 +507,59 @@ The following Docker Compose features are **not supported**:
   - You have permissions to create secrets, identities, and policies
 </Accordion>
 
+<Accordion title="The env file ... does not exist">
+  The command stops before it builds or deploys anything, with an error such as:
+
+  ```text
+  ERROR: The env file '/home/me/app/.env' does not exist. Services 'api', 'worker' read it with env_file. Create the file, or give its env_file entry 'required: false' in the long syntax to skip it while it is missing.
+  ```
+
+  The `env_file` of each service named in the error lists this file. Create the file, or list it with `required: false` as shown in [Service env files](#service-env-files). The `.env` file that variable substitution reads is optional and never causes this error.
+</Accordion>
+
 <Accordion title="Directory bind mount error">
   Directory bind mounts are not supported. Convert to either:
   - Named volumes (for persistent data)
   - File bind mounts (for configuration files → converted to secrets)
 </Accordion>
 
-<Accordion title="Both image and build specified">
-  A service cannot have both `image` and `build` specified. Use one or the other:
-  - `image`: Pull from a registry
-  - `build`: Build and push to Control Plane registry
+<Accordion title="sets both build and image ... image must be a plain NAME:TAG">
+  The command stops with an error such as:
+
+  ```text
+  ERROR: api sets both build and image 'ghcr.io/acme/api:1.4.2'. A built image is pushed to the org registry, so image must be a plain NAME:TAG such as 'api:1.4.2'.
+  ```
+
+  A service that sets both `image` and `build` is built and tagged with the `image` name, and always pushed to your org's registry, so `image` cannot name another registry or hold an unresolved variable. To fix it:
+  - Remove a registry host or path, such as `ghcr.io/acme/`, from `image`.
+  - If `image` holds a variable, such as `api:${VERSION}`, set it and do not pass `--no-interpolate`. An empty tag, such as `api:`, means the variable is not set.
+</Accordion>
+
+<Accordion title="Workload type may not be changed">
+  `cpln stack deploy` fails with `Workload type may not be changed` and prints a hint that names each rejected workload, such as:
+
+  ```text
+  HINT: The platform cannot change the type of an existing workload, so it rejected 'migrations' as cron.
+  A service that another service waits for with service_completed_successfully becomes a cron workload, which changed 'migrations'. Pass --no-deps to deploy without that conversion, which also drops the depends_on order.
+  Changing the type is a last resort. The platform allows it only by deleting the workload and deploying it again, and the workload is down in between.
+  ```
+
+  The rejected workload keeps running its previous version, and the services that wait for it are not deployed. To keep the workload's current type:
+  - For a service that becomes a job, pass `--no-deps`. Every workload is then applied at once, with no jobs.
+  - For any other service, undo the change that set the new type, such as an added or removed named volume, or an `x-cpln` type.
+
+  Changing the type is a last resort. The platform allows it only by deleting the workload with `cpln workload delete` and deploying again, and the workload and everything that calls it are down in between. The CLI never deletes a workload for you.
+</Accordion>
+
+<Accordion title="Workload was not deployed because a dependency did not complete or become ready">
+  `cpln stack deploy` exits with errors such as:
+
+  ```text
+  Job 'migrations' failed in location 'aws-us-west-2': Error: exitCode: 3 message: ""
+  Workload 'api' was not deployed because 'migrations' did not complete successfully.
+  ```
+
+  A service is applied only once every dependency it waits for is ready or has completed, so the services that need a failed dependency keep their previous version. Check the dependency's logs with [cpln logs](/cli-reference/commands/logs), or its job executions with [cpln workload cron get](/cli-reference/commands/workload#workload-cron-get), fix it, and deploy again. For a dependency that needs longer than 600 seconds, raise `--wait-timeout`.
 </Accordion>
 
 <Accordion title="Services can't communicate">
