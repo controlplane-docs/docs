@@ -318,6 +318,10 @@ backup:
 
 ## Connecting
 
+<Warning>
+**Your application must retry — build it in from the start.** Restarts, upgrades and failovers are routine, and each one fails a few connections or statements for a few seconds even though the database stays up. Retry a failed connection with a short backoff (about 0.5–1 seconds) for 10–15 seconds, and retry a failed statement, making retried writes idempotent. Connection pools usually replace a broken connection but do not re-run the failed query for you. Details: [Scaling and Availability](#scaling-and-availability).
+</Warning>
+
 | What | Address | Notes |
 |---|---|---|
 | MySQL protocol (applications) | `RELEASE_NAME-server.GVC_NAME.cpln.local:4000` | `user` / `password` from the credentials secret; database `db` |
@@ -544,8 +548,23 @@ The upgrade restarts PD, TiKV and the TiDB servers. Replicas in the same locatio
 
 ### Scaling and Availability
 
+**What each failure needs.** Your application never has to pick another server for anything inside a location: the template and TiDB handle that, and the application needs only the ordinary retry described below. The one thing they cannot handle is the loss of a whole location, because a client reaches only the database in its own location.
+
+| Failure | Handled by | What it needs |
+|---|---|---|
+| A TiDB server | The template | `serverReplicas: 2` or more per location. With [ProxySQL](#connection-pooling-proxysql) no queries fail; without it, new connections fail for about 5 seconds |
+| A ProxySQL replica | The template | `proxysql.replicas: 2` (the default) |
+| A TiKV or PD node | TiDB (Raft elects a new leader) | At least 3 TiKV nodes and `pdReplicas: 3` (the default) |
+| A whole location | The template for the database; **your application** for its clients | The three-location layout in [Locations](#locations), and **your application running in at least 2 of the listed locations** behind a public endpoint that spans them. A workload's [canonical endpoint](/reference/workload/general#canonical-endpoint-global) already sends each request to the nearest healthy location |
+
+**Retry logic your application needs, with or without ProxySQL.** Every row above can still fail a connection or a statement for a moment:
+
+- **Retry failed connections** with a short backoff (about 0.5–1 seconds) for 10–15 seconds. Without ProxySQL, this is what covers a TiDB server crash: for several seconds new connections can still reach the server that died. ProxySQL retries those for you, but a ProxySQL replica that dies still drops the connections going through it.
+- **Retry a failed statement**, and make retried writes idempotent: a statement running on a process that fails returns an error, and may already have committed.
+- **Set a client timeout of 30 seconds or more**, so a brief write pause during a leader election is a delay rather than an error.
+
 - **Node loss.** The default shape (one location, three TiKV nodes, three PD members) keeps serving through the loss of a node. A TiDB server stays in service while TiKV is partly unavailable; affected statements return errors until TiKV recovers, without restarting the SQL tier.
-- **Location loss.** Needs at least three locations with PD spread one per location, as in the [Locations](#locations) example. Clients in the lost location cannot connect until it returns; clients elsewhere keep working.
+- **Location loss.** Needs at least three locations with PD spread one per location, as in the [Locations](#locations) example. Clients in the lost location cannot connect until it returns; clients elsewhere keep working, so run your application in at least 2 listed locations.
 - **SQL server loss.** Clients reach only the servers in their own location, so `serverReplicas: 2` or more is what keeps a location serving through a server failure. Adding [ProxySQL](#connection-pooling-proxysql) in front smooths that over further.
 - **Adding TiKV and tidb-server capacity.** Raise `locations[].tikvReplicas` or `locations[].serverReplicas` and upgrade. New TiKV stores register with PD and receive data; new tidb-server replicas join behind the same internal address.
 - **PD's replication factor is fixed at bootstrap.** It is the number of TiKV nodes you configure, capped at 3, and PD persists it — scaling TiKV up later does not raise it. Start with at least 3 TiKV nodes if you ever want 3-way replication.
@@ -720,11 +739,13 @@ If the init job is still deployed, set `autoCreateDatabase.deployInitWorkload: f
 
 ## Important Notes
 
+- **Your application must retry failed connections and statements** — without it, every upgrade and replica restart shows up as errors in your app. Retry with a short backoff for 10–15 seconds and make retried writes idempotent; see [Scaling and Availability](#scaling-and-availability).
 - **Never `helm upgrade` a 1.x release onto 2.x** — it deletes the GVC the 1.x chart created and everything in it. Install a new release: [Upgrading from 1.x](#upgrading-from-1-x).
 - **Create the credentials secret before installing.** Without it the deployment wedges silently; the only diagnostic is `status.versions[].message` from `cpln workload get-deployments`.
 - **Upgrading from 2.0.0 needs one values change**: replace each location's `replicas` with `tikvReplicas` and `serverReplicas`. See [Upgrading from 2.0.0](#upgrading-from-2-0-0).
 - **The GVC must contain every location you list**, and may contain more. A missing location is not caught at install: PD exits with `FATAL: locations declared in values are not in GVC ...`.
 - **Run clients in a listed location.** Clients reach only the TiDB servers in their own location; use `serverReplicas: 2` or more to keep a location serving through a server failure.
+- **Surviving a location loss needs your application in at least 2 locations** — see [Scaling and Availability](#scaling-and-availability).
 - **PD's replication factor is fixed when the cluster first bootstraps** (TiKV node count, capped at 3). Start with at least 3 TiKV nodes if you ever want 3-way replication.
 - **Use AWS S3 for backups.** The GCS path has never completed a verified backup on this template. The restore procedure is unverified — rehearse it.
 - **Keep `backup.image` and `images.*` on the same TiDB version.** `br` refuses a version mismatch.
