@@ -1,38 +1,91 @@
 ---
 title: Vaultwarden
 icon: /template-catalog/templates/icons/vaultwarden.png
-description: Deploy Vaultwarden on Control Plane using the Template Catalog. Self-hosted, Bitwarden-compatible password manager with a SQLite database on a persistent volume, served over HTTPS on the canonical endpoint. Covers registration lockdown, the optional admin panel and SMTP, and scheduled volume-snapshot backups.
-keywords: ['bitwarden alternative', 'bitwarden_rs', 'password manager', 'self-hosted vault', 'secrets vault', 'credential storage', 'passwords', 'passkey', 'webauthn', 'sqlite', '1password alternative', 'lastpass alternative', 'vaultwarden template']
+description: Deploy Vaultwarden on Control Plane into an existing GVC as a single-instance, Bitwarden-compatible password manager server with SQLite on a persistent volume, HTTPS on the canonical endpoint and scheduled snapshots. Nothing must exist first; admin panel and SMTP secrets are optional.
+keywords: ['bitwarden alternative', 'bitwarden_rs', 'self-hosted vault', 'credential storage', 'passkey', 'webauthn', 'sqlite', '1password alternative', 'lastpass alternative', 'admin token', 'argon2', 'signups', 'volume snapshots']
 ---
 
 ## Overview
 
-Vaultwarden is a lightweight, self-hosted password manager (AGPL-3.0) that is compatible with all official Bitwarden clients — browser extensions, desktop apps, and mobile apps. This template deploys a single stateful workload with its SQLite database on a persistent volume, served over HTTPS on the canonical `*.cpln.app` endpoint. Registration is open on a fresh install so you can onboard immediately; [lock it down](#important-notes) once your users are on board.
+Vaultwarden is a lightweight, self-hosted password manager server (AGPL-3.0) that is compatible with all official Bitwarden clients: browser extensions, desktop apps, and mobile apps. This template deploys one stateful Vaultwarden workload with its SQLite database on a persistent volume, serving the web vault, the client APIs, and live sync over HTTPS on the canonical `*.cpln.app` endpoint. Vault contents are end-to-end encrypted with each user's master password, so the server never holds readable passwords.
 
-### Architecture
+Registration is open on a fresh install so you can create your first accounts immediately; [turn it off](#first-run) once your users are on board.
 
-- **Vaultwarden** — A single-replica stateful workload serving the web vault, APIs, and websocket live-sync on port `80`. Its public `DOMAIN` is derived from the canonical endpoint at boot, so clients and passkeys bind to the correct URL with no manual configuration.
-- **SQLite on a persistent volume** — All state (accounts, vault items, attachments, sends, and the RSA key that signs login sessions) lives in a SQLite database on the workload's volume set; there is no external database dependency.
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have.
+</Note>
 
 ### What Gets Created
 
-- **Stateful Vaultwarden Workload** — A single replica serving the web vault, APIs, and websocket notifications on port `80`.
-- **Volume Set** — A 10 GiB persistent volume mounted at `/data` holding the SQLite database, attachments, sends, and RSA signing keys. Scheduled snapshots protect the data, and a final snapshot is kept on delete.
-- **Start-Script Secret** — An opaque secret whose boot script sets `DOMAIN` from the canonical endpoint.
-- **Identity & Policy** — An identity bound to the workload with a least-privilege policy granting `reveal` access to exactly the secrets it mounts (the start script, plus your admin and SMTP secrets only when you configure them).
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-vaultwarden` | Vaultwarden server: web vault, client APIs, and live sync (stateful, 1 replica, port `80`) | — |
+| Volume set | `RELEASE_NAME-vaultwarden-data` | `/data`: SQLite database, attachments, sends, and the RSA key that signs login sessions (10 GiB, scheduled snapshots, final snapshot on delete) | — |
+| Secret | `RELEASE_NAME-vaultwarden-start` | Start script that sets Vaultwarden's `DOMAIN` from the canonical endpoint at boot | — |
+| Identity | `RELEASE_NAME-vaultwarden-identity` | Workload identity | — |
+| Policy | `RELEASE_NAME-vaultwarden-policy` | `reveal` on the start-script secret, plus your admin and SMTP secrets only when you configure them | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+There is no external database: Vaultwarden talks only to its own volume and, when configured, your mail server.
 
 ## Prerequisites
 
-None for a default install — no secrets, cloud accounts, or external resources are required. The two secrets below are optional and only needed for the corresponding features.
+None for a default install. The two secrets below are optional, each enables one feature, and each must exist **before** you set its values key. Secrets are org-level, so no GVC flag is involved.
 
-- **Admin panel (`/admin`)** — Create, **before installing**, an [opaque secret](https://docs.controlplane.com/reference/secret#opaque) (`encoding: plain`) holding the argon2 hash of your admin token. Generate the hash with `docker run --rm -it vaultwarden/server:1.36.0 /vaultwarden hash` and store the full `$argon2...` output **as-is** — do not double the `$` signs (that is docker-compose escaping and will break login here). Set the secret's name in `admin.tokenSecretName`.
-- **Authenticated SMTP** — Create a [dictionary secret](https://docs.controlplane.com/reference/secret#dictionary) with exactly two keys, `username` and `password`, for your mail server, and set its name in `smtp.authSecretName`. Only needed when your relay requires authentication.
+<Steps>
+  <Step title="Optional - admin panel token">
+    The `/admin` panel stays disabled unless you provide an [opaque secret](/guides/create-secret/opaque) holding the argon2 hash of an admin token you choose. Generate the hash with the Vaultwarden binary itself; it prompts for the token twice and prints a string starting with `$argon2`:
 
-Install the template using your preferred method:
+    ```bash
+    docker run --rm -it vaultwarden/server:1.36.0 /vaultwarden hash
+    ```
+
+    Store the full output **as-is**. Do not double the `$` signs; that escaping is for docker-compose files only and breaks the login here. The single quotes below keep the shell from expanding them:
+
+    ```bash
+    printf '%s' 'PASTE_THE_ARGON2_HASH' | cpln secret create-opaque --name ADMIN_TOKEN_SECRET_NAME --encoding plain -f -
+    ```
+
+    Keep the plaintext token somewhere safe: it is what you type into the admin panel, and the hash cannot be reversed. Set `admin.tokenSecretName` to this name.
+  </Step>
+  <Step title="Optional - SMTP authentication">
+    Only needed when you configure `smtp.host` and your mail server requires a login. Create a [dictionary secret](/guides/create-secret/dictionary) with exactly two keys, `username` and `password`:
+
+    ```bash
+    cpln secret create-dictionary --name SMTP_AUTH_SECRET_NAME \
+      --entry username=vaultwarden@example.com \
+      --entry password='YOUR-SMTP-PASSWORD'
+    ```
+
+    Set `smtp.authSecretName` to this name.
+  </Step>
+</Steps>
+
+<Warning>
+**A secret named in values but missing wedges the deployment silently.** `cpln helm install` still succeeds and the workload never becomes ready. `cpln logs` returns nothing at all, because the container never ran. The only place the reason appears is `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-vaultwarden --gvc GVC_NAME -o yaml
+```
+
+Note this is `get-deployments`; plain `cpln workload get` has no `versions` key. Create the missing secret and the deployment recovers on its own, or force a redeployment to skip the wait:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-vaultwarden --gvc GVC_NAME
+```
+</Warning>
+
+Backups are scheduled volume set snapshots managed by the platform and need no bucket or cloud account. See [Backing Up](#backing-up).
+
+## Installation
+
+A default install needs no values at all:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/vaultwarden \
+  --version 1.1.0 --gvc GVC_NAME
+```
+
+Or follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -58,33 +111,37 @@ Install the template using your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Vaultwarden Instance
 
 ```yaml
 image: vaultwarden/server:1.36.0
 
 resources:
-  cpu: 500m
-  memory: 512Mi
+  maxCpu: 500m
+  maxMemory: 512Mi
   minCpu: 125m
   minMemory: 256Mi
 
 volumeset:
   capacity: 10 # GiB (minimum 10) — SQLite database, attachments, sends, and RSA keys
+```
 
-# ─── Backup ───────────────────────────────────────────────────────────────────
-# Scheduled, crash-consistent snapshots of the data volume, managed by the
-# platform (no cloud account or bucket required). SQLite recovers cleanly from a
-# snapshot via its WAL. A final snapshot is always taken on uninstall.
+The `resources` block exposes both a reservation and a limit, so the limit is named `maxCpu` / `maxMemory`. A values file that still carries the bare `cpu` or `memory` keys is refused at render with a message telling you to rename them (see [Upgrading from 1.0.0](#upgrading-from-1-0-0)). Size `volumeset.capacity` for your attachments and sends as well as the database.
+
+### Backup
+
+```yaml
 backup:
   enabled: true # periodic snapshots of the data volume
   schedule: "0 3 * * *" # cron in UTC — default daily at 03:00 (hourly is the most frequent the platform allows)
   retention: 7d # how long each snapshot is kept (e.g. 7d, 720h, 30d)
+```
 
-# ─── Sign-ups & Invitations ───────────────────────────────────────────────────
-# Registration is OPEN by default so a fresh install is immediately usable.
-# After onboarding your users, lock down: set allowed=false or restrict
-# registration with domainsWhitelist.
+Scheduled, crash-consistent snapshots of the data volume, managed by the platform. `backup.enabled: false` removes the schedule only; `backup.retention` still applies, and a final snapshot is taken when the release is uninstalled either way. See [Backing Up](#backing-up).
+
+### Sign-ups and Invitations
+
+```yaml
 signups:
   allowed: true # open registration on the public endpoint — turn off after onboarding
   domainsWhitelist: [] # email domains that may register even when allowed=false, e.g. [mycompany.com]
@@ -92,173 +149,262 @@ signups:
 
 invitations:
   allowed: true # existing org owners can invite users; invited emails may register
+```
 
-# ─── Admin Panel (/admin — disabled by default) ───────────────────────────────
-# To enable, create BEFORE install an opaque secret (encoding: plain) holding
-# the argon2 hash of your admin token:
-#   docker run --rm -it vaultwarden/server:1.36.0 /vaultwarden hash
+With `signups.allowed: true`, anyone who can reach the public endpoint can create an account. After your first accounts exist, set `signups.allowed: false`, or keep self-service registration for your own company with `signups.domainsWhitelist`. `signups.verify: true` is refused at render unless `smtp.host` is set.
+
+### Admin Panel
+
+```yaml
 admin:
   tokenSecretName: "" # name of your pre-created opaque secret (e.g. my-vaultwarden-admin-token); empty = /admin disabled
+```
 
-# ─── SMTP (optional — invites, verification, 2FA email) ───────────────────────
+Set `admin.tokenSecretName` to the opaque secret from [Prerequisites](#prerequisites) to enable `/admin`. Empty (the default) leaves the panel disabled. Settings saved in the panel take precedence over Helm values from then on; see [Important Notes](#important-notes).
+
+### SMTP
+
+```yaml
 smtp:
   host: "" # e.g. smtp.example.com; empty = all email features off
   port: 587
   security: starttls # options: starttls, force_tls, off
   from: "" # sender address (required when host is set)
   authSecretName: "" # pre-created dictionary secret with keys `username` and `password` (e.g. my-vaultwarden-smtp-auth); empty = unauthenticated relay
+```
 
-# ─── Privacy ──────────────────────────────────────────────────────────────────
+Email powers invitations, registration verification, and email-based two-step login. The chart refuses to render when `smtp.host` is set without `smtp.from`, or when `smtp.authSecretName` is set without `smtp.host`.
+
+### Privacy
+
+```yaml
 icons:
   disableDownload: false # set true to stop the server fetching site favicons (outbound requests reveal stored-site domains); clients then show letter placeholders
+```
 
+### Domain
+
+```yaml
 customDomain: "" # full URL of a custom domain (e.g. https://vault.example.com); empty = canonical *.cpln.app endpoint
+```
 
-# ─── Access ───────────────────────────────────────────────────────────────────
+When empty, the start script sets Vaultwarden's `DOMAIN` to the workload's canonical endpoint at boot, so attachment links, email links, and passkeys bind to the right URL with no configuration. Set `customDomain` only when you serve the vault on your own domain, and decide before users register passkeys; see [Important Notes](#important-notes).
+
+### Access
+
+```yaml
 publicAccess:
   enabled: true # Bitwarden clients (browser/desktop/mobile) connect via the canonical *.cpln.app HTTPS endpoint
 
 internalAccess: # internal firewall scope — keep closed for a password vault unless in-GVC callers need the API
   type: none # options: none, same-gvc, same-org, workload-list
   workloads: [] # used with workload-list
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
-### Vaultwarden Instance
+Bitwarden clients require HTTPS, which the canonical endpoint provides, so keep `publicAccess.enabled: true` unless you front the vault another way. With it disabled, external requests are refused at the edge.
 
-- `image` — The Vaultwarden container image.
-- `resources` — CPU and memory for the Vaultwarden container.
-- `volumeset.capacity` — Volume size in GiB (minimum 10) for the SQLite database, attachments, sends, and RSA keys.
-
-### Backup
-
-Scheduled, crash-consistent snapshots of the data volume, managed by the platform — no cloud account or bucket is required. See [Backing Up](#backing-up) for how snapshots and restores work.
-
-- `backup.enabled` — Take periodic snapshots of the data volume (default `true`).
-- `backup.schedule` — Cron expression in UTC (default `0 3 * * *`, daily at 03:00). The platform does not accept schedules more frequent than hourly.
-- `backup.retention` — How long each snapshot is kept, e.g. `7d`, `720h`, `30d`.
-
-### Sign-ups & Invitations
-
-- `signups.allowed` — Open registration on the public endpoint (default `true` so a fresh install is usable). **Turn this off after onboarding** — see [Important Notes](#important-notes).
-- `signups.domainsWhitelist` — Email domains that may register even when `signups.allowed` is `false`, e.g. `[mycompany.com]`. This also gates who can be invited.
-- `signups.verify` — Require email verification at registration. Requires `smtp.host`.
-- `invitations.allowed` — Allow existing organization owners to invite users; invited emails may then register.
-
-### Admin Panel
-
-- `admin.tokenSecretName` — Name of a pre-created opaque secret holding the argon2 hash of your admin token (see [Prerequisites](#prerequisites)). Empty (default) leaves the `/admin` panel disabled.
-
-### SMTP
-
-Configure an outbound mail server to send invitations, verification, and 2FA emails.
-
-- `smtp.host` — Mail server hostname. Empty (default) disables all email features.
-- `smtp.port` — SMTP port (default `587`).
-- `smtp.security` — `starttls`, `force_tls`, or `off`.
-- `smtp.from` — Sender address; required when `smtp.host` is set.
-- `smtp.authSecretName` — Name of a pre-created dictionary secret with `username` and `password` keys (see [Prerequisites](#prerequisites)). Empty means an unauthenticated relay.
-
-### Privacy
-
-- `icons.disableDownload` — Set to `true` to stop the server fetching site favicons. Those outbound requests reveal which sites users store; with downloads off, clients show letter placeholders instead.
-
-### Domain
-
-- `customDomain` — Full URL of a custom domain, e.g. `https://vault.example.com`. Empty (default) uses the canonical `*.cpln.app` endpoint. See the domain caution in [Important Notes](#important-notes) before changing this on a live vault.
-
-### Access
-
-- `publicAccess.enabled` — Serve Vaultwarden over HTTPS on the canonical `*.cpln.app` endpoint (default). Bitwarden clients require HTTPS, so keep this enabled unless you front the vault another way. When disabled, external requests are blocked at the edge and only in-GVC callers reach it per `internalAccess`.
-- `internalAccess.type` — Internal firewall scope of the Vaultwarden workload. Keep this closed (`none`, the default) for a password vault unless in-GVC callers need the API:
-
-| Type | Description |
-|------|-------------|
+| `internalAccess.type` | Description |
+|---|---|
 | `none` | No internal access (default). |
 | `same-gvc` | Allow access from all workloads in the same GVC. |
-| `same-org` | Allow access from all workloads in the same organization. |
-| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
+| `same-org` | Allow access from all workloads in the same org. |
+| `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads`. |
+
+Access changes are not instantaneous; re-test after a pause rather than concluding a knob did not work.
 
 ## Connecting
 
-| What | Value |
-|---|---|
-| Web vault (public) | `https://<canonical>.cpln.app` — `status.canonicalEndpoint` of `{release}-vaultwarden` |
-| Bitwarden apps | Set the self-hosted server URL to the same `https://<canonical>.cpln.app` |
-| Admin panel (optional) | `https://<canonical>.cpln.app/admin` — log in with your plaintext admin token |
-| Internal (if opened) | `http://{release}-vaultwarden.{gvc}.cpln.local:80` |
-| Login | The account you register in the web vault (registration is open by default) |
-
-### Clients and Live Sync
-
-Point any official Bitwarden client at the canonical endpoint via its self-hosted server URL, then log in with an account registered in the web vault. Live sync across open clients rides a websocket on the same HTTPS endpoint and works through the canonical endpoint with no extra configuration.
-
-## Backing Up
-
-Backups are **scheduled volume snapshots** managed by the platform — no cloud account or bucket is required. On the configured cron schedule the platform takes a crash-consistent snapshot of the data volume; SQLite recovers cleanly from one via its write-ahead log. Snapshots are pruned automatically after `backup.retention`, and a final snapshot is always taken when the release is uninstalled.
-
-- **Default schedule** — Daily at 03:00 UTC (`backup.schedule: "0 3 * * *"`), kept for 7 days (`backup.retention: 7d`).
-- **Minimum interval** — The platform does not accept schedules more frequent than hourly.
-
-List the snapshots for the release's volume set:
+The web vault, the client APIs, and the admin panel are all served on the Vaultwarden workload's canonical endpoint, which is public by default (`publicAccess.enabled: true`). Read it from `status.canonicalEndpoint`:
 
 ```bash
-cpln volumeset snapshot get {release}-vaultwarden-data --gvc {gvc} -o yaml
+cpln workload get RELEASE_NAME-vaultwarden --gvc GVC_NAME -o yaml
 ```
 
-<Note>
-Snapshots live in the platform storage layer alongside the volume, not off-site. They protect against data corruption and accidental changes, but losing the whole GVC would lose them too. For off-cluster durability, restore into a fresh install elsewhere or export vault data separately.
-</Note>
+| What | Address | Notes |
+|---|---|---|
+| Web vault | `https://CANONICAL_ENDPOINT` | Register and sign in here; HTTPS is provided by the canonical endpoint |
+| Bitwarden apps | `https://CANONICAL_ENDPOINT` | Enter as the self-hosted server URL in each client; clients require HTTPS |
+| Admin panel | `https://CANONICAL_ENDPOINT/admin` | Only when `admin.tokenSecretName` is set; sign in with the plaintext token, not the hash |
+| Health check | `https://CANONICAL_ENDPOINT/alive` | No authentication required |
+| Internal (same GVC) | `http://RELEASE_NAME-vaultwarden.GVC_NAME.cpln.local:80` | Closed by default (`internalAccess.type: none`); always use the fully qualified name |
+| Login | The account you register in the web vault | Your master password is never stored on the server and cannot be recovered |
 
-## Restoring a Backup
+Verify the server is up before you open the vault:
 
-Restore is **in-place** on the release's own volume set: the platform provisions a fresh volume from the chosen snapshot and swaps it in, then the workload restarts to remount it (about 90 seconds).
+```bash
+curl -s https://CANONICAL_ENDPOINT/alive
+```
 
-<Warning>
-Restoring reverts the volume to the exact snapshot state — any vault changes made after that snapshot are lost — and restarts the single-replica workload, so the vault is briefly unavailable during the swap.
-</Warning>
+A `200` means Vaultwarden is serving. With `publicAccess.enabled: false`, Bitwarden clients cannot reach the server, because they need an HTTPS URL. You can still check the server from your machine through a port-forward:
+
+```bash
+cpln port-forward RELEASE_NAME-vaultwarden 8080:80 --gvc GVC_NAME
+```
+
+Then run `curl -s http://localhost:8080/alive` in a second terminal.
+
+### First Run
+
+There is no setup wizard; the first user simply registers.
 
 <Steps>
-  <Step title="Find the snapshot to restore">
-    List snapshots and note the `name`, `location`, and `volumeIndex` of the one you want:
-
-    ```bash
-    cpln volumeset snapshot get {release}-vaultwarden-data --gvc {gvc} -o yaml
-    ```
+  <Step title="Create your account">
+    Open `https://CANONICAL_ENDPOINT`, choose **Create account**, and set a strong master password. The master password encrypts your vault and cannot be reset by anyone; without SMTP configured, password-hint emails are off too.
   </Step>
-  <Step title="Restore it in place">
-    Provision a fresh volume from the snapshot and swap it in. The workload restarts to remount it:
-
-    ```bash
-    cpln volumeset snapshot restore {release}-vaultwarden-data \
-      --snapshot-name <snapshot-name> \
-      --location <location> \
-      --volume-index 0 \
-      --gvc {gvc}
-    ```
+  <Step title="Connect your Bitwarden clients">
+    In each Bitwarden app or browser extension, select the self-hosted option on the login screen and enter `https://CANONICAL_ENDPOINT` as the server URL, then sign in with the account you just created.
   </Step>
-  <Step title="Verify">
-    Once the workload is ready again, log in to the web vault and confirm your items are present and decrypt correctly.
+  <Step title="Lock down registration">
+    Once your users have accounts, upgrade the release with `signups.allowed` set to `false`, or restrict registration with `signups.domainsWhitelist`. While registration is open, anyone who can reach the public endpoint can create an account. See the [CLI guide](/template-catalog/install-manage/cli) for upgrading a release.
   </Step>
 </Steps>
 
+## Operations
+
+### Backing Up
+
+On the cron schedule in `backup.schedule` (default daily at 03:00 UTC), the platform takes a crash-consistent snapshot of `RELEASE_NAME-vaultwarden-data`; SQLite recovers cleanly from one through its write-ahead log. Snapshots are pruned after `backup.retention` (default 7 days), and a final snapshot is always taken when the release is uninstalled. A snapshot covers everything on the volume: the database, attachments, sends, and the session-signing key.
+
+```bash
+# list snapshots for the release's volume set
+cpln volumeset snapshot get RELEASE_NAME-vaultwarden-data --gvc GVC_NAME
+
+# take one on demand
+cpln volumeset snapshot create RELEASE_NAME-vaultwarden-data --gvc GVC_NAME --snapshot-name NAME
+```
+
+Snapshots live in the platform storage layer alongside the volume, not off-site. They protect against corruption and accidental changes, but they are not an off-platform copy; for that, users can export their own vaults from the web vault or a Bitwarden client.
+
+### Restoring a Backup
+
+Restore is in place on the release's own volume set: the platform provisions a fresh volume from the chosen snapshot and swaps it in, and the single replica restarts to remount it. An in-place snapshot restore recovered an intact vault when this template was tested; the command flags below are taken from the CLI help and have not been exercised against a live install since. Rehearse on a throwaway release before you depend on it.
+
+<Warning>
+Restoring reverts the volume to the snapshot: every vault change made after it is lost, and the vault is unavailable while the only replica restarts.
+</Warning>
+
+<Steps>
+  <Step title="Find the snapshot">
+    List the snapshots and note the `name` and `location` of the one you want:
+
+    ```bash
+    cpln volumeset snapshot get RELEASE_NAME-vaultwarden-data --gvc GVC_NAME
+    ```
+  </Step>
+  <Step title="Restore it in place">
+    The volume set has one volume per replica and this workload has exactly one, so the volume index is `0`:
+
+    ```bash
+    cpln volumeset snapshot restore RELEASE_NAME-vaultwarden-data --gvc GVC_NAME \
+      --snapshot-name SNAPSHOT_NAME --location LOCATION_NAME --volume-index 0
+    ```
+  </Step>
+  <Step title="Verify">
+    Once the workload is ready again, sign in to the web vault and confirm your items are present and decrypt correctly.
+  </Step>
+</Steps>
+
+### Rotating the Admin Token
+
+The admin token is read from your opaque secret when the replica starts. To change it, generate a new hash as in [Prerequisites](#prerequisites), apply the whole secret with the new value, then force a redeployment:
+
+```yaml
+# admin-token-secret.yaml
+kind: secret
+name: ADMIN_TOKEN_SECRET_NAME
+type: opaque
+data:
+  encoding: plain
+  payload: 'PASTE_THE_NEW_ARGON2_HASH'
+```
+
+```bash
+cpln apply -f admin-token-secret.yaml
+cpln workload force-redeployment RELEASE_NAME-vaultwarden --gvc GVC_NAME
+```
+
+Skipping the redeployment produces no error: the old token simply keeps working until the replica restarts. The same apply-then-redeploy sequence rotates the SMTP credentials in `SMTP_AUTH_SECRET_NAME`.
+
+### Upgrading from 1.0.0
+
+Version 1.1.0 renames the resource limit keys: `resources.cpu` is now `resources.maxCpu` and `resources.memory` is now `resources.maxMemory`, so it is no longer ambiguous which number is the limit. Rename those two keys in your values before upgrading. An upgrade that still carries the old names is refused at render, before any resource is touched. Nothing else changed, and the volume and its data are unaffected.
+
+### Scaling and Availability
+
+Vaultwarden runs as **exactly one replica** on SQLite, and there is deliberately no `replicas` knob. Upstream does not support running multiple instances: replicas cannot share the data volume or notify each other of changes, and on this platform each stateful replica would get its own volume, so a second replica would serve a different, empty vault. Scale vertically by raising `resources.maxCpu` and `resources.maxMemory`, keeping `maxCpu` within 4:1 of `minCpu`.
+
+Any restart, from an upgrade that changes the container, a forced redeployment, or a replica being rescheduled, is a short full outage while the new replica starts and the volume reattaches. Data is not at risk, because the same volume reattaches. Bitwarden apps keep a local copy of the vault, so users can still read their items during the outage.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Deployment never becomes ready and the logs are empty">
+    **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-vaultwarden --gvc GVC_NAME -o yaml` shows `The secret ADMIN_TOKEN_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` (or the same for your SMTP secret) under `status.versions[].message`.
+
+    **Cause:** `admin.tokenSecretName` or `smtp.authSecretName` names a secret that does not exist.
+
+    **Fix:** Create it (see [Prerequisites](#prerequisites)), or clear the value and upgrade the release. The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-vaultwarden --gvc GVC_NAME` skips the wait.
+  </Accordion>
+  <Accordion title="Render fails saying resources.cpu was RENAMED to resources.maxCpu">
+    **Symptom:** `vaultwarden: resources.cpu was RENAMED to resources.maxCpu.` (or the same for `resources.memory`).
+
+    **Cause:** Your values use the 1.0.0 key names.
+
+    **Fix:** Rename them to `resources.maxCpu` and `resources.maxMemory` (see [Upgrading from 1.0.0](#upgrading-from-1-0-0)).
+  </Accordion>
+  <Accordion title="Render fails saying smtp.from is required when smtp.host is set">
+    **Symptom:** `vaultwarden: smtp.from is required when smtp.host is set — the sender address for outgoing mail`, or `vaultwarden: signups.verify requires smtp.host`, or `vaultwarden: smtp.authSecretName is set but smtp.host is empty`.
+
+    **Cause:** The SMTP settings are incomplete.
+
+    **Fix:** Set `smtp.host` and `smtp.from` together; set `signups.verify` and `smtp.authSecretName` only when `smtp.host` is set.
+  </Accordion>
+  <Accordion title="The admin panel rejects the token">
+    **Symptom:** `/admin` says the token is invalid.
+
+    **Cause:** Either the hash was stored with doubled `$` signs (docker-compose escaping), or you typed the hash instead of the plaintext token.
+
+    **Fix:** Sign in with the plaintext token you chose when generating the hash. If that still fails, re-apply the secret with the raw `$argon2...` string and force a redeployment (see [Rotating the Admin Token](#rotating-the-admin-token)).
+  </Accordion>
+  <Accordion title="A values change does not take effect">
+    **Symptom:** You upgraded the release with a new setting (for example `signups.allowed: false`) and Vaultwarden still behaves the old way.
+
+    **Cause:** Saving settings in the admin panel writes `/data/config.json`, which takes precedence over the environment the chart sets from values.
+
+    **Fix:** Change the setting in the admin panel instead, or remove the file and restart to return control to values:
+
+    ```bash
+    cpln workload exec RELEASE_NAME-vaultwarden --gvc GVC_NAME -- rm -f /data/config.json
+    cpln workload force-redeployment RELEASE_NAME-vaultwarden --gvc GVC_NAME
+    ```
+  </Accordion>
+  <Accordion title="Passkey logins fail after changing the domain">
+    **Symptom:** Passkey or security-key sign-in stops working after you set or changed `customDomain`.
+
+    **Cause:** WebAuthn credentials are bound to the exact URL they were registered on.
+
+    **Fix:** Users re-register their passkeys on the new URL. Choose the final domain before users register passkeys.
+  </Accordion>
+</AccordionGroup>
+
 ## Important Notes
 
-- **Lock down registration after onboarding.** Sign-ups are open by default so the install works immediately — which means anyone who can reach the public endpoint can register. Once your users are on board, set `signups.allowed=false`, or restrict with `signups.domainsWhitelist` (whitelisted domains can still register with sign-ups off).
-- **Vault contents are end-to-end encrypted** with each user's master password, and master passwords are unrecoverable. Without SMTP configured, password-hint emails are off, so a forgotten master password means a lost vault.
-- **Admin panel settings override Helm values.** Saving settings in `/admin` writes `/data/config.json`, which silently wins over environment variables from then on. If a values change does not take effect, delete that file to return control to values.
-- **Store the admin token hash raw.** Put the argon2 output (starting with `$argon2`) into the secret as-is — do not double the `$` signs; that escaping is for docker-compose only and breaks login here.
-- **Do not change the domain casually.** Passkey/WebAuthn logins are bound to the exact URL; switching between the canonical endpoint and a custom domain breaks them until re-registered.
-- **Single instance only** — upstream does not support running multiple instances, so the workload is pinned to 1 replica with no `replicas` knob. A restart is a short full outage (about a minute); Bitwarden apps keep a local offline copy of the vault, so users can still read their vault during it.
-- **Backups are in-platform, not off-site** — scheduled snapshots and the final snapshot on uninstall live in the platform storage layer next to the volume; losing the whole GVC would lose them too. See [Backing Up](#backing-up).
+- **Turn off open registration after onboarding.** Sign-ups are open by default; set `signups.allowed: false` or use `signups.domainsWhitelist`.
+- **Master passwords are unrecoverable.** Vault contents are end-to-end encrypted; a forgotten master password means a lost vault.
+- **Admin panel settings override Helm values.** Saving in `/admin` writes `/data/config.json`, which wins over values from then on.
+- **Store the admin token hash raw.** No doubled `$` signs, and sign in with the plaintext token, not the hash.
+- **Do not change the domain casually.** Passkeys are bound to the exact URL and break until re-registered.
+- **Rotating a secret needs a forced redeployment.** The old admin token or SMTP password keeps working until the replica restarts.
+- **Single instance only.** Every restart is a short outage; see [Scaling and Availability](#scaling-and-availability).
+- **Snapshots are not an off-platform copy.** Uninstalling deletes the volume set after a final snapshot; your own secrets survive.
 
 ## External References
 
 <CardGroup cols={2}>
     <Card title="Vaultwarden on GitHub" icon="github" href="https://github.com/dani-garcia/vaultwarden">
     Upstream source repository
-    </Card>
-    <Card title="Vaultwarden Wiki" icon="book" href="https://github.com/dani-garcia/vaultwarden/wiki">
-    Official documentation wiki
     </Card>
     <Card title="Enabling the Admin Page" icon="gear" href="https://github.com/dani-garcia/vaultwarden/wiki/Enabling-admin-page">
     How to configure and secure the /admin panel

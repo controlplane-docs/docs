@@ -1,110 +1,136 @@
 ---
 title: Debezium Server
 icon: /template-catalog/templates/icons/debezium-server.png
-description: Deploy Debezium Server on Control Plane for standalone Change Data Capture (CDC). Streams database changes from PostgreSQL, MySQL, MongoDB, SQL Server, or Oracle to Kafka, Redis, NATS, HTTP, AWS Kinesis, GCP Pub/Sub, Apache Pulsar, or Azure Event Hubs.
-keywords: ['debezium', 'cdc', 'change data capture', 'database streaming', 'postgresql cdc', 'mysql cdc', 'kafka connector', 'event streaming', 'data pipeline', 'wal', 'binlog']
+description: Debezium Server CDC from PostgreSQL, MySQL, MongoDB, SQL Server or Oracle to Kafka, Redis Streams, NATS JetStream, HTTP, Kinesis, Pub/Sub, Pulsar or Event Hubs. One single-replica connector. Deploys into an existing GVC; needs a dictionary credentials secret and a CDC-enabled source first.
+keywords: ['debezium', 'cdc', 'change data capture', 'database streaming', 'postgresql cdc', 'mysql cdc', 'logical replication', 'binlog', 'wal', 'outbox', 'kafka connect alternative', 'redis streams', 'nats jetstream', 'kinesis', 'pub/sub', 'event hubs', 'data pipeline']
 ---
-
-<Warning>
-**Version 1.2.0 moves every credential out of values.** The source database password, the offset and schema-history stores, all six sink types and the schema registry were plain values that ended up in your Helm release. They are now keys in one `dictionary` secret you create before installing, named by `credentialsSecretName`. Which keys you need depends on your source and sink — the template README lists them per combination.
-
-Five settings that were previously inferred from a credential being non-empty now have explicit switches: `source.mongodb.useConnectionString`, and `authEnabled` on the offset Redis store, the schema-history Redis store, the Redis sink and the Pulsar sink. An upgrade that still carries a removed credential is refused at render.
-</Warning>
 
 ## Overview
 
-Debezium Server is a standalone Change Data Capture (CDC) application that tails a database's transaction log and streams row-level change events to a messaging system. Unlike Debezium connectors that run inside Kafka Connect, Debezium Server runs as a self-contained process — no Kafka Connect cluster required.
+[Debezium Server](https://debezium.io/documentation/reference/stable/operations/debezium-server.html) is a standalone change data capture (CDC) application. It reads a database's change stream — the write-ahead log for PostgreSQL, the binlog for MySQL — turns every row-level insert, update and delete into an event, and delivers it to a messaging system, with no Kafka Connect cluster involved.
 
-This template deploys Debezium Server on Control Plane with configurable source connectors, multiple sink options, flexible offset storage, and Universal Cloud Identity integration for AWS and GCP sinks.
+This template runs one Debezium Server connector: one source database and one sink. It deploys neither the source nor the sink — both must already exist and be reachable from the workload. Every credential the connector uses comes from a [dictionary secret](/guides/create-secret/dictionary) you create before installing, so no password passes through Helm or lands in the release.
 
-### Architecture
-
-- **Debezium workload** — Reads the source database's replication stream (WAL for PostgreSQL, binlog for MySQL, oplog for MongoDB), converts each change to a structured event, and delivers it to the configured sink. Stateful when using file-based offset storage; stateless when using Redis or JDBC offset storage.
-- **pgdog.toml / application.properties** — Rendered as a secret and mounted at startup. Defines the source, sink, serialization format, and offset storage settings.
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create or manage a GVC.
+</Note>
 
 ### What Gets Created
 
-- **Standard Debezium Server Workload** — Single-replica CDC workload.
-- **Volume Set** — For offset and schema history persistence *(only when using file offset storage)*.
-- **Identity & Policy** — Identity with access to credential secrets, and cloud account access when using Kinesis or Pub/Sub sinks.
-- **Secrets** — Three opaque secrets: Debezium configuration (`application.properties`), credentials (passwords for source, sink, offset storage), and a startup entrypoint script.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-debezium` | Debezium Server (1 replica, health port `8080`). Stateful while offsets or schema history use `file` storage, stateless otherwise | — |
+| Volume Set | `RELEASE_NAME-debezium-data` | Offset and schema-history files at `/debezium/data` on an `ext4` volume; a final snapshot is kept for 7 days when the volume is deleted | Created only when `source.offset.storage: file` (the default), or for MySQL and SQL Server when `source.schemaHistory.storage: file` |
+| Secret | `RELEASE_NAME-debezium-config` | The generated `application.properties`; credentials appear in it only as environment-variable references | — |
+| Secret | `RELEASE_NAME-debezium-credentials` | Non-sensitive connection details derived from your values — hostnames, usernames, URLs | — |
+| Secret | `RELEASE_NAME-debezium-entrypoint` | PostgreSQL heartbeat startup script | `source.type: postgres` with `source.postgres.heartbeatIntervalMs` above `0` |
+| Identity | `RELEASE_NAME-debezium-identity` | Workload identity; carries the cloud account link for the Kinesis or Pub/Sub sink | — |
+| Policy | `RELEASE_NAME-debezium-policy` | Grants the identity `reveal` on your credentials secret and the template's own secrets — nothing else | — |
 
 ## Prerequisites
 
-### Source Database
+Two things must be in place before you install: a source database configured for CDC, and the credentials secret.
 
-Configure your source database to allow Debezium to read its replication stream before deploying.
+<Steps>
+  <Step title="Configure the source database for change data capture">
+    A source left on default settings produces a connector that starts, connects and never emits a change, so do this first.
 
-<Tabs>
-  <Tab title="PostgreSQL">
-    <Steps>
-      <Step title="Enable logical replication">
-        Add the following to `postgresql.conf` and restart PostgreSQL:
-        ```properties
-        wal_level = logical
-        max_replication_slots = 4
-        max_wal_senders = 4
-        ```
-        When using the [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) template, set `postgres.walLevel: logical` in its values before installing.
-      </Step>
-      <Step title="Create a publication">
-        ```sql
-        CREATE PUBLICATION dbz_publication FOR ALL TABLES;
-        ```
-        Debezium creates the replication slot automatically on first connect.
-      </Step>
-      <Step title="Grant permissions">
-        ```sql
-        GRANT USAGE ON SCHEMA public TO debezium;
-        GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium;
-        ALTER USER debezium REPLICATION;
-        ```
-      </Step>
-    </Steps>
-  </Tab>
-  <Tab title="MySQL">
-    <Steps>
-      <Step title="Enable binary logging">
-        Add the following to `my.cnf` and restart MySQL:
-        ```properties
-        server-id         = 1
-        log_bin           = mysql-bin
-        binlog_format     = ROW
-        binlog_row_image  = FULL
-        ```
-      </Step>
-      <Step title="Grant permissions">
-        ```sql
-        GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT
-          ON *.* TO 'debezium'@'%';
-        ```
-      </Step>
-    </Steps>
-  </Tab>
-  <Tab title="MongoDB">
-    MongoDB must be running as a replica set. Debezium tails the oplog; no additional configuration is needed beyond connection credentials with `read` access to the databases you want to capture.
-  </Tab>
-  <Tab title="SQL Server">
-    CDC must be enabled on the SQL Server instance and on each database/table you want to capture:
-    ```sql
-    EXEC sys.sp_cdc_enable_db;
-    EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = 'my_table', @role_name = NULL;
+    **PostgreSQL** — enable logical replication in `postgresql.conf` and restart the server:
+
+    ```ini
+    wal_level = logical
+    max_replication_slots = 4
+    max_wal_senders = 4
     ```
-  </Tab>
-</Tabs>
 
-### Cloud Sinks (Kinesis / Pub/Sub)
+    Create the publication named in `source.postgres.publicationName` and give the connector user replication rights:
 
-For AWS Kinesis or GCP Pub/Sub sinks, set up a Cloud Account in Control Plane before installing:
+    ```sql
+    CREATE PUBLICATION dbz_publication FOR ALL TABLES;
+    GRANT USAGE ON SCHEMA public TO debezium;
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium;
+    ALTER USER debezium REPLICATION;
+    ```
 
-- **Kinesis**: [Create an AWS Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) and enable it under `sink.kinesis.cloudAccount`.
-- **Pub/Sub**: [Create a GCP Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) and enable it under `sink.pubsub.cloudAccount`.
+    Debezium creates the replication slot named in `source.postgres.slotName` on first connect.
 
-To install, follow the instructions for your preferred method:
+    **MySQL** — enable row-based binary logging in `my.cnf` and restart the server:
+
+    ```ini
+    server-id = 1
+    log_bin = mysql-bin
+    binlog_format = ROW
+    binlog_row_image = FULL
+    ```
+
+    ```sql
+    GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'debezium'@'%';
+    ```
+
+    **MongoDB, SQL Server and Oracle** — follow the setup section of the matching upstream [connector guide](https://debezium.io/documentation/reference/stable/connectors/). This template has no extra steps for them.
+  </Step>
+  <Step title="Create the credentials secret">
+    One [dictionary secret](/guides/create-secret/dictionary) holds every credential the connector needs. Secrets are org-level, so no GVC flag is involved, and secret names are org-wide — give each release its own. Include only the keys your configuration uses:
+
+    | Key | Needed when |
+    |---|---|
+    | `sourcePassword` | Always — the source database password |
+    | `mongodbConnectionString` | `source.type: mongodb` with `source.mongodb.useConnectionString: true` |
+    | `offsetRedisPassword` | `source.offset.storage: redis` with `source.offset.redis.authEnabled: true` |
+    | `offsetJdbcPassword` | `source.offset.storage: jdbc` |
+    | `schemaHistoryRedisPassword` | MySQL or SQL Server, `source.schemaHistory.storage: redis` with `authEnabled: true` |
+    | `schemaHistoryJdbcPassword` | MySQL or SQL Server, `source.schemaHistory.storage: jdbc` |
+    | `kafkaSaslPassword` | `sink.type: kafka` with `sink.kafka.saslUsername` set |
+    | `sinkRedisPassword` | `sink.type: redis` with `sink.redis.authEnabled: true` |
+    | `natsPassword` | `sink.type: nats-jetstream` with `sink.nats.username` set |
+    | `httpPassword` | `sink.type: http` with `sink.http.authType: basic` |
+    | `httpBearerToken` | `sink.type: http` with `sink.http.authType: bearer` |
+    | `pulsarAuthToken` | `sink.type: pulsar` with `sink.pulsar.authEnabled: true` |
+    | `eventhubsConnectionString` | `sink.type: eventhubs` |
+    | `schemaRegistryPassword` | `format.schemaRegistry.url` and `format.schemaRegistry.username` both set |
+
+    For the default PostgreSQL-to-Kafka shape that is a single key:
+
+    ```bash
+    cpln secret create-dictionary --name SECRET_NAME \
+      --entry sourcePassword='YOUR-DATABASE-PASSWORD'
+    ```
+
+    Add one `--entry` per extra key, for example `--entry kafkaSaslPassword='YOUR-SASL-PASSWORD'` for a SASL-authenticated Kafka. Read the secret back with `cpln secret reveal SECRET_NAME -o yaml`.
+
+    Set `credentialsSecretName` to this name.
+  </Step>
+</Steps>
+
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `credentialsSecretName` is blank, but a name that points at a secret which does not exist — or that lacks a key your configuration references — installs successfully and then never starts. The container never runs, so `cpln logs` returns zero lines. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-debezium --gvc GVC_NAME -o yaml
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the missing secret repairs the deployment on its own within several minutes, or run `cpln workload force-redeployment RELEASE_NAME-debezium --gvc GVC_NAME` to skip the wait.
+</Warning>
+
+The Kinesis and Pub/Sub sinks also need a Control Plane [cloud account](/guides/create-cloud-account) — see [Sink](#sink).
+
+## Installation
+
+Install from the marketplace registry with your secret, your source connection and your Kafka brokers. Replace `DATABASE_HOST`, `DATABASE_NAME`, `DATABASE_USER` and `KAFKA_BOOTSTRAP_SERVERS` with your own values:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/debezium-server \
+  --version 1.2.0 --gvc GVC_NAME \
+  --set credentialsSecretName=SECRET_NAME \
+  --set source.database.hostname=DATABASE_HOST \
+  --set source.database.name=DATABASE_NAME \
+  --set source.database.user=DATABASE_USER \
+  --set sink.kafka.bootstrapServers=KAFKA_BOOTSTRAP_SERVERS
+```
+
+For any other source or sink, put the settings from [Configuration](#configuration) in a values file and pass it with `-f`.
+
+Or follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -130,350 +156,453 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-### Quick Start Examples
+Each block below is the shipped default for that part of `values.yaml`.
 
-**PostgreSQL → Kafka:**
-```yaml
-source:
-  type: postgres
-  database:
-    hostname: my-postgres.my-gvc.cpln.local
-    port: 5432
-    name: mydb
-    user: debezium
-    password: secret
-  serverName: myserver
-  tableIncludeList: "public.users,public.orders"
-  postgres:
-    slotName: debezium_slot
-    publicationName: dbz_publication
-
-sink:
-  type: kafka
-  kafka:
-    bootstrapServers: kafka.my-gvc.cpln.local:9092
-    topic: cdc-events
-```
-
-**MySQL → Redis Streams:**
-```yaml
-source:
-  type: mysql
-  database:
-    hostname: mysql.my-gvc.cpln.local
-    port: 3306
-    name: mydb
-    user: debezium
-    password: secret
-  serverName: myserver
-  mysql:
-    serverId: 85744
-    includeSchemaChanges: true
-
-sink:
-  type: redis
-  redis:
-    address: redis.my-gvc.cpln.local:6379
-    streamName: cdc-stream
-```
-
-**PostgreSQL → AWS Kinesis (Universal Cloud Identity):**
-```yaml
-source:
-  type: postgres
-  database:
-    hostname: my-rds.us-east-1.rds.amazonaws.com
-    port: 5432
-    name: mydb
-    user: debezium
-    password: secret
-  serverName: myserver
-
-sink:
-  type: kinesis
-  kinesis:
-    region: us-east-1
-    streamName: cdc-events
-    credentialsProvider: default
-    cloudAccount:
-      enabled: true
-      name: my-aws-account
-```
-
-### Full `values.yaml`
+### Image and Resources
 
 ```yaml
 image: quay.io/debezium/server:3.0
 
+# REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+# A `dictionary` secret holding every credential this connector needs. Which keys
+# it must contain depends on your source and sink; the README lists them per
+# combination. Credentials are not values because they are issued by systems you
+# own — a value would put them in the Helm release.
+credentialsSecretName: my-debezium-credentials
+
 resources:
   cpu: 500m
   memory: 512Mi
-
-source:
-  type: postgres  # options: postgres, mysql, mongodb, sqlserver, oracle
-
-  database:
-    hostname: ""
-    port: 5432
-    name: ""
-    user: ""
-    password: ""
-
-  serverName: "dbserver1"
-  tableIncludeList: ""
-  tableExcludeList: ""
-
-  postgres:
-    slotName: "debezium"
-    publicationName: "dbz_publication"
-    pluginName: "pgoutput"        # options: pgoutput, decoderbufs
-    slotDropOnStop: false
-    heartbeatIntervalMs: 0        # set to 5000 for HA/patroni setups
-    heartbeatActionQuery: ""
-
-  mysql:
-    serverId: 85744
-    includeSchemaChanges: true
-
-  mongodb:
-    connectionString: ""
-    replicaSet: ""
-
-  sqlserver:
-    databaseNames: ""
-    snapshotMode: "initial"       # options: initial, schema_only, initial_only
-
-  oracle:
-    pdbName: ""
-    logMiningStrategy: "online_catalog"
-
-  offset:
-    storage: file  # options: file, redis, jdbc
-    flushIntervalMs: 10000
-    flushTimeoutMs: 60000
-
-    file:
-      filename: "/debezium/data/offsets.dat"
-
-    redis:
-      address: ""
-      key: "debezium:offsets"
-      password: ""
-      ssl: false
-
-    jdbc:
-      url: ""
-      user: ""
-      password: ""
-      tableName: "debezium_offsets"
-
-  schemaHistory:              # MySQL and SQL Server only
-    storage: file             # options: file, redis, jdbc
-    file:
-      filename: "/debezium/data/schema-history.dat"
-    redis:
-      address: ""
-      key: "debezium:schema-history"
-      password: ""
-      ssl: false
-    jdbc:
-      url: ""
-      user: ""
-      password: ""
-      tableName: "debezium_schema_history"
-
-  errors:
-    retryDelayInitialMs: 300
-    retryDelayMaxMs: 10000
-    maxRetries: -1              # -1 = infinite retries
-
-sink:
-  type: kafka  # options: kafka, redis, nats-jetstream, http, kinesis, pubsub, pulsar, eventhubs
-
-  kafka:
-    bootstrapServers: ""
-    topic: ""
-    securityProtocol: "PLAINTEXT"
-    saslMechanism: ""
-    saslUsername: ""
-    saslPassword: ""
-
-  redis:
-    address: ""
-    password: ""
-    ssl: false
-    streamName: ""
-
-  nats:
-    url: ""
-    subject: ""
-    username: ""
-    password: ""
-
-  http:
-    url: ""
-    headers: {}
-    authType: ""              # options: none, basic, bearer
-    username: ""
-    password: ""
-    bearerToken: ""
-
-  kinesis:
-    region: ""
-    streamName: ""
-    credentialsProvider: "default"
-    cloudAccount:
-      enabled: false
-      name: ""
-
-  pubsub:
-    projectId: ""
-    topic: ""
-    cloudAccount:
-      enabled: false
-      name: ""
-
-  pulsar:
-    serviceUrl: ""
-    topic: ""
-    authPluginClassName: ""
-    authToken: ""
-
-  eventhubs:
-    connectionString: ""
-    hubName: ""
-
-format:
-  key: json    # options: json, avro, protobuf
-  value: json
-  schemaRegistry:
-    url: ""
-    username: ""
-    password: ""
-
-volumeset:
-  capacity: 10                         # GiB — only used with file offset storage
-  performanceClass: general-purpose-ssd
-
-firewall:
-  internal:
-    inboundAllowType: same-gvc         # options: none, same-gvc, same-org, workload-list
-    workloads: []
-  external:
-    outboundAllowCIDR:
-      - 0.0.0.0/0
 ```
 
-### Supported Sources
+The workload always runs exactly one replica — Debezium Server is a single connector process, and there is no replica knob.
 
-| Database | Default Port | Key Settings |
-|----------|-------------|--------------|
-| PostgreSQL | `5432` | `slotName`, `publicationName`, `pluginName` |
-| MySQL | `3306` | `serverId`, `includeSchemaChanges` |
-| MongoDB | `27017` | `connectionString`, `replicaSet` |
-| SQL Server | `1433` | `databaseNames`, `snapshotMode` |
-| Oracle | `1521` | `pdbName`, `logMiningStrategy` |
+### Source Connection
 
-### Supported Sinks
+```yaml
+source:
+  # Database type: postgres, mysql, mongodb, sqlserver, oracle
+  type: postgres
 
-| Sink | Key Settings | Notes |
-|------|--------------|-------|
-| Kafka | `bootstrapServers`, `topic` | No Kafka Connect required |
-| Redis | `address`, `streamName` | Redis Streams |
-| NATS JetStream | `url`, `subject` | Cloud-native messaging |
-| HTTP | `url` | Webhooks and custom endpoints |
-| AWS Kinesis | `region`, `streamName` | Uses Universal Cloud Identity |
-| GCP Pub/Sub | `projectId`, `topic` | Uses Universal Cloud Identity |
-| Apache Pulsar | `serviceUrl`, `topic` | Optional token auth |
-| Azure Event Hubs | `connectionString`, `hubName` | Kafka-compatible protocol |
+  # Database connection settings
+  database:
+    hostname: "db.example.com"  # Required: database hostname or IP
+    port: 5432             # Default port varies by type (postgres:5432, mysql:3306, mongodb:27017, sqlserver:1433, oracle:1521)
+    name: "mydb"           # Required: database name (or SID for Oracle)
+    user: "dbuser"         # Required: database username
+    # password comes from the `sourcePassword` key of your credentials secret
+
+  # Server name used as prefix for topic names
+  serverName: "dbserver1"
+
+  # Tables to capture (comma-separated, e.g., "public.users,public.orders")
+  # Leave empty to capture all tables
+  tableIncludeList: ""
+
+  # Tables to exclude (comma-separated)
+  tableExcludeList: ""
+```
+
+`source.database.port` follows the source type when left empty; the shipped `5432` suits PostgreSQL, so change it for any other source. `serverName` becomes the prefix of every topic, stream or subject the connector writes to.
+
+### Connector-Specific Settings
+
+Only the block that matches `source.type` is used.
+
+```yaml
+source:
+  # PostgreSQL-specific settings
+  postgres:
+    slotName: "debezium"                  # Replication slot name
+    publicationName: "dbz_publication"    # Publication name
+    pluginName: "pgoutput"                # Logical decoding plugin: pgoutput (default), decoderbufs
+    slotDropOnStop: false                 # Keep replication slot on stop (required for HA/failover)
+    heartbeatIntervalMs: 0               # Heartbeat interval in ms (0=disabled; set 5000 for HA)
+    heartbeatActionQuery: ""              # SQL executed on heartbeat (e.g., "UPDATE debezium_heartbeat SET ts = now() WHERE id = 1")
+
+  # MySQL-specific settings
+  mysql:
+    serverId: 85744                       # Unique server ID for MySQL replication
+    includeSchemaChanges: true            # Include DDL events
+
+  # MongoDB-specific settings
+  mongodb:
+    # Set true to connect with a full connection string instead of hostname/port.
+    # The string itself is the `mongodbConnectionString` key of your credentials
+    # secret, because it embeds credentials.
+    useConnectionString: false
+    replicaSet: ""                        # Replica set name
+
+  # SQL Server-specific settings
+  sqlserver:
+    databaseNames: ""                     # Comma-separated database names to capture
+    snapshotMode: "initial"               # Snapshot mode: initial, schema_only, initial_only
+
+  # Oracle-specific settings
+  oracle:
+    pdbName: ""                           # Pluggable database name
+    logMiningStrategy: "online_catalog"   # Log mining strategy: online_catalog, redo_log_catalog
+```
+
+For PostgreSQL with `heartbeatIntervalMs` above `0`, a startup step runs before the server: it creates a `debezium_heartbeat` table (columns `id` and `ts`, seeded with row `1`) and creates the replication slot if it does not exist yet. That table is what the commented `heartbeatActionQuery` example updates. If the step fails it logs a warning and Debezium Server starts anyway, so read the logs after enabling it.
 
 ### Offset Storage
 
-Debezium tracks its position in the source database's replication stream using offset storage. If the process restarts, it resumes from the last committed offset.
-
-| Backend | Persistence | Notes |
-|---------|------------|-------|
-| `file` | Volume Set mounted at `/debezium/data` | Default. Simple, requires a Volume Set. |
-| `redis` | Redis key | No Volume Set needed. Use with an existing Redis instance. |
-| `jdbc` | Relational table | No Volume Set needed. Use with an existing PostgreSQL/MySQL instance. |
-
-### Schema History (MySQL and SQL Server only)
-
-MySQL and SQL Server connectors track DDL changes in a schema history store. Configure `source.schemaHistory.storage` with the same backend options as offset storage (`file`, `redis`, or `jdbc`).
-
-### Serialization Formats
-
-Events can be serialized as JSON, Avro, or Protobuf. For Avro or Protobuf, configure a Schema Registry:
+Offsets record how far through the change stream the connector has read, so a restart resumes instead of re-snapshotting the source.
 
 ```yaml
-format:
-  key: avro
-  value: avro
-  schemaRegistry:
-    url: http://schema-registry.my-gvc.cpln.local:8081
-    username: ""
-    password: ""
+source:
+  # Offset storage configuration
+  offset:
+    # Storage type: file, redis, jdbc
+    storage: file
+
+    # Flush settings
+    flushIntervalMs: 10000               # How often offsets flush to storage (ms)
+    flushTimeoutMs: 60000                # Timeout for offset flush operations (ms)
+
+    # File storage settings (requires volumeset)
+    file:
+      filename: "/debezium/data/offsets.dat"
+
+    # Redis storage settings
+    redis:
+      address: ""                         # Redis address (e.g., redis.mygvc.cpln.local:6379)
+      key: "debezium:offsets"             # Redis key for offsets
+      authEnabled: false                  # true = read `offsetRedisPassword` from your credentials secret
+      ssl: false                          # Enable SSL/TLS
+
+    # JDBC storage settings
+    jdbc:
+      url: ""                             # JDBC URL (e.g., jdbc:postgresql://host:5432/dbname)
+      user: ""                            # JDBC username
+      # password comes from the `offsetJdbcPassword` key of your credentials secret
+      tableName: "debezium_offsets"       # Table name for storing offsets
 ```
 
-### Universal Cloud Identity
+| `storage` | Where offsets live | Workload |
+|---|---|---|
+| `file` | The `RELEASE_NAME-debezium-data` volume | Stateful, volume created |
+| `redis` | A key in your existing Redis | Stateless, no volume |
+| `jdbc` | A table in your existing relational database | Stateless, no volume |
 
-AWS Kinesis and GCP Pub/Sub sinks support credential-free access via Control Plane's Universal Cloud Identity — no access keys or service account JSON files are needed.
+### Schema History
 
-Enable by setting `cloudAccount.enabled: true` and providing the Cloud Account name registered in Control Plane:
+Used only by MySQL and SQL Server, which must track DDL changes. The backends are the same three as offset storage.
+
+```yaml
+source:
+  # Schema history storage (required for MySQL and SQL Server)
+  schemaHistory:
+    # Storage type: file, redis, jdbc (only used for mysql/sqlserver)
+    storage: file
+
+    # File storage settings
+    file:
+      filename: "/debezium/data/schema-history.dat"
+
+    # Redis storage settings
+    redis:
+      address: ""
+      key: "debezium:schema-history"
+      authEnabled: false                  # true = read `schemaHistoryRedisPassword` from your credentials secret
+      ssl: false
+
+    # JDBC storage settings
+    jdbc:
+      url: ""
+      user: ""
+      # password comes from the `schemaHistoryJdbcPassword` key of your credentials secret
+      tableName: "debezium_schema_history"
+```
+
+### Error Retries
+
+```yaml
+source:
+  # Error retry configuration
+  errors:
+    retryDelayInitialMs: 300             # Initial retry delay (ms)
+    retryDelayMaxMs: 10000               # Max retry delay (ms)
+    maxRetries: -1                       # Max retries (-1 = infinite)
+```
+
+### Sink
+
+Set `sink.type` and fill in only that sink's block. Every sink writes one destination per captured table, named from its prefix and the table.
 
 ```yaml
 sink:
-  type: kinesis
+  # Sink type: kafka, redis, nats-jetstream, http, kinesis, pubsub, pulsar, eventhubs
+  type: kafka
+
+  # Kafka sink settings
+  kafka:
+    bootstrapServers: "kafka.my-gvc.cpln.local:9092"  # Required: Kafka bootstrap servers
+    topic: ""                             # Topic prefix (events sent to {topic}.{table})
+    securityProtocol: "PLAINTEXT"         # Security protocol: PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL
+    saslMechanism: ""                     # SASL mechanism: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+    saslUsername: ""                      # SASL username
+    # saslPassword comes from the `kafkaSaslPassword` key of your credentials secret
+
+  # Redis sink settings (Redis Streams)
+  redis:
+    address: ""                           # Required: Redis address (e.g., redis.mygvc.cpln.local:6379)
+    authEnabled: false                    # true = read `sinkRedisPassword` from your credentials secret
+    ssl: false                            # Enable SSL/TLS
+    streamName: ""                        # Stream name prefix (events sent to {streamName}.{table})
+
+  # NATS JetStream sink settings
+  nats:
+    url: ""                               # Required: NATS URL (e.g., nats://nats.mygvc.cpln.local:4222)
+    subject: ""                           # Subject prefix (events sent to {subject}.{table})
+    username: ""                          # NATS username
+    # password comes from the `natsPassword` key of your credentials secret
+
+  # HTTP sink settings (webhooks)
+  http:
+    url: ""                               # Required: HTTP endpoint URL
+    headers: {}                           # Additional headers (key-value pairs)
+    authType: ""                          # Auth type: none, basic, bearer
+    username: ""                          # Basic auth username
+    # password / bearerToken come from the `httpPassword` / `httpBearerToken`
+    # keys of your credentials secret, per authType
+
+  # AWS Kinesis sink settings (uses Universal Cloud Identity)
   kinesis:
-    region: us-east-1
-    streamName: my-stream
-    credentialsProvider: default
+    region: ""                            # Required: AWS region
+    streamName: ""                        # Required: Kinesis stream name
+    credentialsProvider: "default"        # Use "default" for Universal Cloud Identity
+    # Cloud account for Universal Cloud Identity
     cloudAccount:
-      enabled: true
-      name: my-aws-account
+      enabled: false
+      name: ""                            # AWS cloud account name in Control Plane
+
+  # GCP Pub/Sub sink settings (uses Universal Cloud Identity)
+  pubsub:
+    projectId: ""                         # Required: GCP project ID
+    topic: ""                             # Topic prefix (events sent to {topic}.{table})
+    # Cloud account for Universal Cloud Identity
+    cloudAccount:
+      enabled: false
+      name: ""                            # GCP cloud account name in Control Plane
+
+  # Apache Pulsar sink settings
+  pulsar:
+    serviceUrl: ""                        # Required: Pulsar service URL
+    topic: ""                             # Topic prefix
+    authPluginClassName: ""               # Auth plugin class (e.g., org.apache.pulsar.client.impl.auth.AuthenticationToken)
+    authEnabled: false                    # true = read `pulsarAuthToken` from your credentials secret
+
+  # Azure Event Hubs sink settings
+  eventhubs:
+    # connectionString comes from the `eventhubsConnectionString` key of your credentials secret
+    hubName: ""                           # Required: Event Hub name
 ```
 
-## Health Checks
+| `sink.type` | Required values | Credentials secret keys |
+|---|---|---|
+| `kafka` | `bootstrapServers` | `kafkaSaslPassword` when `saslUsername` is set |
+| `redis` | `address` | `sinkRedisPassword` when `authEnabled: true` |
+| `nats-jetstream` | `url` | `natsPassword` when `username` is set |
+| `http` | `url` | `httpPassword` or `httpBearerToken`, per `authType` |
+| `kinesis` | `region`, `streamName` | None — uses the cloud account |
+| `pubsub` | `projectId` | None — uses the cloud account |
+| `pulsar` | `serviceUrl` | `pulsarAuthToken` when `authEnabled: true` |
+| `eventhubs` | `hubName` | `eventhubsConnectionString` (always) |
 
-Debezium Server exposes Quarkus health endpoints:
+**Kafka with SASL** needs both `saslMechanism` and `saslUsername` set, plus `kafkaSaslPassword` in the secret. The template always generates a `PlainLoginModule` JAAS configuration, which matches `saslMechanism: PLAIN`.
 
-| Endpoint | Purpose |
-|----------|---------|
-| `/q/health/ready` | Connector is ready and connected to source |
-| `/q/health/live` | Server process is alive |
+**Pulsar token auth** needs both `authPluginClassName` (for example `org.apache.pulsar.client.impl.auth.AuthenticationToken`) and `authEnabled: true`, plus `pulsarAuthToken` in the secret — set all three together.
 
-## Troubleshooting
+**Kinesis and Pub/Sub** authenticate through a Control Plane [cloud account](/guides/create-cloud-account) instead of keys. Set `cloudAccount.enabled: true` and `cloudAccount.name` to your cloud account. The template links that cloud account to the workload identity — with the `pubsub` scope for GCP — but attaches no AWS IAM policy and no GCP role, so grant the identity access to your stream or topic yourself. Inspect the identity with:
 
-<Accordion title="Connector not starting">
-- Verify database hostname and port are reachable from the GVC (check `firewall.external.outboundAllowCIDR`).
-- Confirm the database user has the required replication permissions.
-- View startup logs: `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-debezium"}'`
-</Accordion>
+```bash
+cpln identity get RELEASE_NAME-debezium-identity --gvc GVC_NAME -o yaml
+```
 
-<Accordion title="Offset storage errors">
-- **File storage**: confirm the Volume Set is mounted and has sufficient capacity.
-- **Redis/JDBC**: verify connectivity, credentials, and that the backend is accessible within the GVC.
-</Accordion>
+The cloud sinks have not been verified end to end on this version.
 
-<Accordion title="Sink delivery failures">
-- Verify the sink endpoint is reachable from the workload.
-- For Kinesis/Pub/Sub: confirm the Cloud Account is configured and has the correct IAM/IAM permissions.
-- For Kafka with SASL: verify `saslUsername`, `saslPassword`, and `saslMechanism` match the broker config.
-</Accordion>
+### Serialization Format
+
+```yaml
+format:
+  key: json                               # Key format: json, avro, protobuf
+  value: json                             # Value format: json, avro, protobuf
+
+  # Schema registry settings (for avro/protobuf)
+  schemaRegistry:
+    url: ""                               # Schema registry URL
+    username: ""                          # Schema registry username
+    # password comes from the `schemaRegistryPassword` key of your credentials secret
+```
+
+The schema registry is used only when `key` or `value` is `avro` or `protobuf` and `url` is set. With a `username`, put the password in the secret as `schemaRegistryPassword`.
+
+### Storage
+
+Used only when a volume is created (see [Offset Storage](#offset-storage)).
+
+```yaml
+volumeset:
+  capacity: 10                            # Initial capacity in GiB (minimum 10)
+  performanceClass: general-purpose-ssd   # Performance class: general-purpose-ssd, high-throughput-ssd
+```
+
+### Firewall
+
+```yaml
+firewall:
+  internal:
+    inboundAllowType: same-gvc            # Options: none, same-gvc, same-org, workload-list
+    workloads: []                         # Workload list for inbound access (when type is workload-list)
+  external:
+    outboundAllowCIDR:
+      - 0.0.0.0/0                         # Allow all outbound by default (required for database connectivity)
+```
+
+The workload has no public endpoint. `firewall.internal` controls who in Control Plane can reach port `8080`; `firewall.external.outboundAllowCIDR` must allow the source database and the sink. A firewall change can take several minutes to take effect.
+
+## Connecting
+
+Debezium Server exposes only health endpoints; change events go to your sink.
+
+| What | Address | Notes |
+|---|---|---|
+| Health, all checks | `http://RELEASE_NAME-debezium.GVC_NAME.cpln.local:8080/q/health` | Reachable per `firewall.internal.inboundAllowType` |
+| Readiness | `/q/health/ready` on port `8080` | The workload readiness probe |
+| Liveness | `/q/health/live` on port `8080` | The workload liveness probe |
+| Change events | Your sink | One destination per table, prefixed by the sink prefix and `source.serverName` |
+| Credentials | `cpln secret reveal SECRET_NAME -o yaml` | The keys you created. Never stored in the Helm release |
+
+To check health from your own machine, tunnel to the workload and query it:
+
+```bash
+cpln port-forward RELEASE_NAME-debezium 8080:8080 --gvc GVC_NAME
+```
+
+```bash
+curl http://127.0.0.1:8080/q/health
+```
+
+To confirm events flow, read the connector log for snapshot and streaming progress or errors, then change a row in a captured table and look for the event in your sink:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-debezium"}' --limit 50 --since 10m
+```
+
+## Operations
+
+### Backing Up
+
+With `file` storage the offsets and schema history live on the `RELEASE_NAME-debezium-data` volume, which Control Plane snapshots; a final snapshot is kept for 7 days when the volume is deleted. Take one on demand before a risky change:
+
+```bash
+cpln volumeset snapshot create RELEASE_NAME-debezium-data --gvc GVC_NAME --snapshot-name NAME
+```
+
+```bash
+cpln volumeset snapshot get RELEASE_NAME-debezium-data --gvc GVC_NAME
+```
+
+With `redis` or `jdbc` storage, back up that store instead. The captured data itself lives in the source database and the sink.
+
+### Restoring a Backup
+
+Restoring offsets from a volume snapshot has not been verified on this template. If offsets are lost, the connector re-snapshots the source on its next start, then resumes streaming — correct, but expensive on large tables.
+
+### Upgrading from 1.1.x
+
+Version 1.2.0 moves every credential out of values. The source password, the offset and schema-history store passwords, every sink credential and the schema-registry password are now keys in the credentials secret, and five switches replace settings that used to be inferred from a credential being set: `source.mongodb.useConnectionString`, and `authEnabled` on `source.offset.redis`, `source.schemaHistory.redis`, `sink.redis` and `sink.pulsar`.
+
+1. Create the credentials secret with a key for every credential your release uses (see [Prerequisites](#prerequisites)).
+2. Remove every removed credential from your values file, set `credentialsSecretName`, and set the new switches that apply.
+3. Upgrade with the full values file:
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/debezium-server \
+  --version 1.2.0 --gvc GVC_NAME \
+  -f values.yaml \
+  --set credentialsSecretName=SECRET_NAME
+```
+
+The values file must use the chart's nesting, exactly as the blocks in [Configuration](#configuration) show. A flat dotted key is accepted without error and silently changes nothing.
+
+An upgrade that still carries a removed credential is refused before anything is changed, with an error such as:
+
+```text
+debezium-server: source.database.password was REMOVED — every credential is now a key in the `dictionary` secret named by credentialsSecretName. Delete it from your values; see Prerequisites in the README for the key names.
+```
+
+### Scaling and Availability
+
+The connector is a single replica and cannot be scaled out. For PostgreSQL behind a failover-capable cluster, keep `source.postgres.slotDropOnStop: false` and set `source.postgres.heartbeatIntervalMs` (for example `5000`); the heartbeat also keeps the slot advancing on a low-traffic source.
+
+### Rotating Credentials
+
+Apply the whole secret with the new value — `cpln secret update` cannot change values — then force a redeployment, because a running replica keeps the old value:
+
+```yaml
+kind: secret
+name: SECRET_NAME
+type: dictionary
+data:
+  sourcePassword: NEW-PASSWORD
+```
+
+```bash
+cpln apply -f rotate.yaml
+cpln secret reveal SECRET_NAME -o yaml
+cpln workload force-redeployment RELEASE_NAME-debezium --gvc GVC_NAME
+```
+
+Include every key the secret already holds in `rotate.yaml`; the apply replaces the whole secret.
+
+### Removing a Connector
+
+`helm uninstall` does not touch the source database. On PostgreSQL the replication slot stays behind, and PostgreSQL retains WAL for an inactive slot indefinitely until the disk fills. Drop it once the connector is gone:
+
+```sql
+SELECT pg_drop_replication_slot('debezium');
+```
+
+Use the name from `source.postgres.slotName`.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Workload never starts and logs are empty">
+    **Cause:** the credentials secret, or a key your configuration references, does not exist. **Fix:** read `status.versions[].message` with `cpln workload get-deployments RELEASE_NAME-debezium --gvc GVC_NAME -o yaml`, create the secret or add the key, and wait or force a redeployment.
+  </Accordion>
+  <Accordion title="Connector is healthy but no events arrive">
+    **Cause:** the source is not configured for CDC — PostgreSQL without `wal_level = logical` or the publication, MySQL without row-based binlog — or the table is outside `tableIncludeList`. **Fix:** complete the source steps in [Prerequisites](#prerequisites), then check the connector log for snapshot and streaming messages.
+  </Accordion>
+  <Accordion title="Source disk fills with WAL">
+    **Cause:** a replication slot is not advancing — the connector was removed and its slot left behind, or a quiet source never moves the slot forward. **Fix:** drop abandoned slots (see [Removing a Connector](#removing-a-connector)) and set `source.postgres.heartbeatIntervalMs` on a low-traffic source.
+  </Accordion>
+  <Accordion title="Install or upgrade fails with credentialsSecretName is required">
+    **Cause:** `credentialsSecretName` is blank. **Fix:** set it to the name of your credentials secret.
+  </Accordion>
+  <Accordion title="Upgrade fails with was REMOVED">
+    **Cause:** your values still carry a credential that 1.2.0 moved into the secret. **Fix:** follow [Upgrading from 1.1.x](#upgrading-from-1-1-x).
+  </Accordion>
+  <Accordion title="Connector re-snapshots the whole source">
+    **Cause:** the offsets were lost — the volume was deleted with `file` storage, or the Redis key or JDBC table was cleared. **Fix:** keep the volume or store between reinstalls; see [Restoring a Backup](#restoring-a-backup).
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- Configure the source for CDC before installing; otherwise the connector runs healthy and emits nothing.
+- Deleting the volume (or clearing the Redis key or JDBC table) loses the offsets and forces a full re-snapshot.
+- Drop the PostgreSQL replication slot when you remove a connector, or retained WAL will fill the source disk.
+- One release runs one connector; capture several sources with several releases, each with its own `source.postgres.slotName` and credentials secret.
+- After rotating a credential in the secret, force a redeployment — a running replica keeps the old value.
 
 ## External References
 
-<CardGroup cols={2}>
-  <Card title="Debezium Server Documentation" href="https://debezium.io/documentation/reference/stable/operations/debezium-server.html" icon="server">
-    Full Debezium Server configuration reference
-  </Card>
-  <Card title="Debezium Connectors" href="https://debezium.io/documentation/reference/stable/connectors/" icon="database">
-    Source connector configuration for each supported database
-  </Card>
-  <Card title="CDC Pipeline Template" href="/template-catalog/templates/cdc-pipeline" icon="arrow-right-arrow-left">
-    Deploy a complete CDC pipeline (PostgreSQL HA + Kafka + Debezium) in one step
-  </Card>
-  <Card title="Create a Cloud Account" href="https://docs.controlplane.com/guides/create-cloud-account" icon="cloud">
-    Set up AWS or GCP cloud accounts for Kinesis and Pub/Sub sinks
-  </Card>
-</CardGroup>
+- [Debezium Server documentation](https://debezium.io/documentation/reference/stable/operations/debezium-server.html)
+- [Debezium connectors](https://debezium.io/documentation/reference/stable/connectors/)
+- [Debezium PostgreSQL connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html)
+- [Debezium MySQL connector](https://debezium.io/documentation/reference/stable/connectors/mysql.html)
+- [CDC Pipeline template](/template-catalog/templates/cdc-pipeline) — PostgreSQL Highly Available, Kafka and Debezium Server in one install

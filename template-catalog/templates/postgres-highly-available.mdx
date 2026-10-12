@@ -1,87 +1,88 @@
 ---
 title: PostgreSQL Highly Available
 icon: /template-catalog/templates/icons/postgresql.png
-description: Deploy PostgreSQL Highly Available on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, Patroni clustering with etcd consensus and HAProxy, and optional backups to S3, GCS, or MinIO Covers Patroni cluster metrics scraped into the built-in Grafana stack.
-keywords: ['pg ha', 'postgres ha', 'postgres cluster', 'streaming replication', 'leader election', 'rds alternative', 'aurora alternative', 'pgbouncer', 'wal', 'failover', 'primary replica']
+description: Patroni-managed PostgreSQL 17 cluster with etcd consensus, automatic failover and an HAProxy leader endpoint in one location, plus optional PgBouncer pooling and logical or WAL-G backups to S3, GCS or MinIO. Deploys into an existing GVC and needs a dictionary credentials secret created first.
+keywords: ['pg ha', 'postgres ha', 'postgres cluster', 'streaming replication', 'leader election', 'rds alternative', 'aurora alternative', 'connection pooler', 'point-in-time recovery', 'patronictl', 'pg_dumpall', 'primary replica', 'database template']
 ---
-
-<Warning>
-**Two things to check when upgrading an existing cluster.**
-
-**Confirm you have a base backup.** WAL archiving on its own cannot restore a cluster — it replays *from* a base backup. If you run `wal-g` backups, list what is actually in your bucket before relying on them:
-
-```bash
-cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --container wal-g-backup \
-  -- wal-g backup-list
-```
-
-**Upgrading does not retune a running cluster.** Patroni's consensus timeouts are written to etcd when the cluster is first created, and the chart is never read again afterwards. A new install picks up the current values; an existing cluster keeps the ones it was created with. To move a running cluster, use the `patronictl edit-config` command in the template README.
-</Warning>
 
 ## Overview
 
-PostgreSQL Highly Available deploys a production-ready PostgreSQL cluster using Patroni for automatic leader election and failover, with etcd providing distributed consensus. An optional HAProxy workload routes all write traffic to the current primary replica, providing a stable connection endpoint regardless of which replica holds the leader role.
+PostgreSQL Highly Available deploys a multi-member PostgreSQL 17 cluster in one location. [Patroni](https://patroni.readthedocs.io/) manages the members, elects a leader and fails over automatically when the leader is lost; a dedicated [etcd](/template-catalog/templates/etcd) cluster holds the consensus state. An HAProxy workload gives applications one stable address that always routes to the current leader, and an optional PgBouncer in front of it pools connections. Backups are optional, in two modes: scheduled `pg_dumpall` dumps, or continuous WAL archiving with [WAL-G](https://github.com/wal-g/wal-g).
+
+Database credentials are **not** template values. The cluster reads its username, password and database name from a [dictionary secret](/guides/create-secret/dictionary) you create before installing, so no password passes through Helm or lands in the release. The template creates no credential secret of its own.
 
 <Note>
-For production use, maintain at least 3 PostgreSQL replicas and 3 etcd replicas. etcd requires an odd number of replicas (3, 5, 7) for quorum.
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create or manage a GVC. Every workload runs in each location the GVC has, so use a GVC with a single location for this template.
 </Note>
 
 ### What Gets Created
 
-- **Stateful Patroni PostgreSQL Workload** — A Patroni-managed PostgreSQL cluster with configurable replica count and resources. Each replica has its own volume. Leadership is gracefully handed off before any replica is shut down, ensuring write availability is maintained during deployments and restarts.
-- **etcd Workload** — A dedicated etcd cluster providing distributed consensus for Patroni leader election.
-- **HAProxy Leader-Routing Workload** *(optional, enabled by default)* — Routes write traffic to the current primary replica, providing a stable connection endpoint during failover.
-- **PgBouncer Workload** *(optional)* — A connection pooler deployed in front of HAProxy, multiplexing application connections into a smaller pool of real database connections.
-- **Volume Set** — Persistent storage for PostgreSQL data, with optional autoscaling.
-- **Secrets** — A dictionary secret with database credentials; opaque secrets for the Patroni startup script, HAProxy startup script, and WAL-G backup script (created as needed).
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to all required secrets, and cloud storage access when backup is enabled.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni-managed PostgreSQL 17 members (stateful, `replicas` replicas, TCP `5432`, Patroni REST API `8008`); container `patroni-postgres` | — |
+| Workload | `RELEASE_NAME-etcd` | Consensus store for leader election (stateful, `etcd.replicas` replicas, TCP `2379`/`2380`); container `etcd` | — |
+| Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy routing TCP `5432` to the current leader; health on `8404`, stats on `8405`; container `haproxy` | `proxy.enabled: true` (default), forced on by `pgbouncer.enabled: true` |
+| Workload | `RELEASE_NAME-pgbouncer` | PgBouncer connection pooler in front of HAProxy (TCP `5432`); container `pgbouncer` | `pgbouncer.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha-backup` | Cron job running `pg_dumpall` through HAProxy to S3, GCS or MinIO; container `backup` | `backup.enabled: true` with `backup.mode: logical` |
+| Container | `wal-g-backup` on `RELEASE_NAME-postgres-ha` | Sidecar that takes a WAL-G base backup from the leader every `backup.walg.intervalSeconds` | `backup.enabled: true` with `backup.mode: wal-g` |
+| Volume Set | `RELEASE_NAME-postgres-ha-vs` | One `ext4` general-purpose SSD volume per member holding `PGDATA`; a final snapshot is taken when the volume set is deleted and kept 7 days | — |
+| Volume Set | `RELEASE_NAME-etcd-vs` | One volume per etcd member | — |
+| Identity | `RELEASE_NAME-postgres-ha-identity` | Shared by the members, proxy, pooler and backup workloads; carries the cloud account binding when backups use AWS or GCP | — |
+| Policy | `RELEASE_NAME-postgres-ha-policy` | Grants the identity `reveal` on the chart's startup-script secrets and on exactly the credential secrets you created | — |
+| Identity, Policy | `RELEASE_NAME-etcd-identity`, `RELEASE_NAME-etcd-policy` | The etcd cluster's own identity and `reveal` grant on its startup script | — |
+| Secret | `RELEASE_NAME-postgres-proxy-startup` | Patroni startup script, mounted into every member | — |
+| Secret | `RELEASE_NAME-patroni-startup` | HAProxy startup script | `proxy.enabled: true` |
+| Secret | `RELEASE_NAME-wal-g-backup-script` | WAL-G sidecar script | — |
+| Secret | `RELEASE_NAME-etcd-startup` | etcd startup script | — |
+| Secret | `RELEASE_NAME-postgres-config` | Non-sensitive backup settings (bucket, region, MinIO endpoint) | `backup.enabled: true` |
 
 ## Prerequisites
 
+One secret must exist before you install. It holds the credentials your applications put in their connection strings. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. Patroni creates that user as the cluster superuser and that database the first time the cluster is initialized, and uses the same password for its internal replication role:
+
+    ```bash
+    cpln secret create-dictionary --name CREDENTIALS_SECRET_NAME \
+      --entry username=postgres \
+      --entry password='YOUR-STRONG-PASSWORD' \
+      --entry database=mydb
+    ```
+
+    Set `config.credentialsSecretName` to this name. Read it back later with `cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml` — a bare `cpln secret reveal` prints only a summary table, not the values. Secret names are org-wide, so give each release its own.
+  </Step>
+</Steps>
+
 <Warning>
-**Version `2.5.0` is a breaking change.** The `postgres` block was removed: `postgres.username`, `postgres.password` and `postgres.database` are now a prerequisite secret. An install or upgrade that still sets any of them **fails at render**, before anything is applied, and the error names the replacement. If you are running `2.4.x`, read [Upgrading From 2.4.x](#upgrading-from-24x) first.
-</Warning>
-
-**One `dictionary` secret must exist before you install.** These are the credentials your applications put in their connection strings, so they are not values — putting them in values would land them in the Helm release.
-
-```bash
-cpln secret create-dictionary --name my-postgres-ha-credentials \
-  --entry username=myuser \
-  --entry password='YOUR-STRONG-PASSWORD' \
-  --entry database=mydb
-```
-
-Set `config.credentialsSecretName` to the name you used. Secret names are organization-wide, so give each release its own.
-
-<Warning>
-**If the secret does not exist at install time, the deployment wedges silently.** `cpln logs` returns **zero lines** — the container never starts, so it has nothing to log. The one place the reason appears is `status.versions[].message`:
+**Create the secret before installing, or the deployment wedges silently.** A `config.credentialsSecretName` that points at a secret which does not exist installs successfully and then never starts. The container never runs, so `cpln logs` returns zero lines. The one place the reason appears is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-postgres-ha --gvc GVC_NAME -o yaml
 ```
 
-Note this is `get-deployments` — plain `cpln workload get` has no `versions` field. Creating the secret repairs the deployment on its own in roughly 5.5 to 10.5 minutes, or force a redeployment to skip the wait.
+```text
+The secret CREDENTIALS_SECRET_NAME no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the missing secret repairs the deployment on its own within several minutes, or run `cpln workload force-redeployment RELEASE_NAME-postgres-ha --gvc GVC_NAME` to skip the wait.
 </Warning>
 
-Enabling backups to MinIO needs a second `dictionary` secret — see [Backup Prerequisites](#backup-prerequisites).
-
-## Upgrading From 2.4.x
-
-Delete the `postgres:` block from your values, create the credentials secret above, and set `config.credentialsSecretName`.
-
-<Warning>
-**Use the credentials your cluster already has.** They were applied when the data directory was first initialised and are still what PostgreSQL enforces. Putting *new* values in the secret does not change the running database — it just gives your applications a password that no longer works.
-</Warning>
-
-Versions `2.4.2` and earlier shipped `username: username` and `password: password` as defaults. If your cluster is still running those, treat them as compromised: they are published in a public repository. Change them inside PostgreSQL with `ALTER ROLE ... WITH PASSWORD` and put the new value in the secret.
+Backups are optional and need a bucket plus, for AWS or GCP, a Control Plane [cloud account](/guides/create-cloud-account); MinIO backups need a second dictionary secret holding `accessKey` and `secretKey` — see [Backing Up](#backing-up). Nothing else is required for a default install.
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+Install the chart from the marketplace registry, pointing it at the secret you created:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/postgres-highly-available \
+  --version 2.7.0 --gvc GVC_NAME \
+  --set config.credentialsSecretName=CREDENTIALS_SECRET_NAME
+```
+
+Or follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -107,7 +108,9 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+Each block below is the shipped default for that part of `values.yaml`.
+
+### Cluster and Resources
 
 ```yaml
 replicas: 3
@@ -118,28 +121,75 @@ resources:
   maxCpu: 1
   maxMemory: 2Gi
 
+# Patroni's Prometheus metrics are scraped by the platform automatically on the
+# REST API port — no knob, no exporter. See "Cluster metrics" in the README.
 image: controlplanecorporation/patroni-postgres:0.7
 
-config:
-  # REQUIRED prerequisite `dictionary` secret holding `username`, `password`
-  # and `database`. It must EXIST BEFORE INSTALL.
-  credentialsSecretName: my-postgres-ha-credentials
-
 multiZone: false
+```
 
+- `replicas` — Number of PostgreSQL members. Keep at least 3 for a cluster that survives the loss of one member; one member is the leader and accepts writes, the others stream from it.
+- `multiZone` — Spread the members across availability zones within the location, when the location supports it.
+
+<Note>
+On a stateful workload the ratio of `maxCpu` to `minCpu` may not exceed 4:1. Raising `maxCpu` without raising `minCpu` can cross that limit and is rejected when the workload is applied.
+</Note>
+
+### Credentials
+
+```yaml
+config:
+  # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+  # A `dictionary` secret holding exactly three keys: `username`, `password` and
+  # `database`. If it does not exist at install time the deployment WEDGES
+  # silently — `cpln logs` returns nothing at all. See Prerequisites in the
+  # README for the exact `cpln secret create-dictionary` command.
+  credentialsSecretName: my-postgres-ha-credentials
+```
+
+The three keys are applied when the cluster is first initialized. Changing the secret afterwards does not change the stored passwords — see [Rotating the Password](#rotating-the-password).
+
+### Storage
+
+```yaml
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
   autoscaling:
-    enabled: false
-    maxCapacity: 100 # Maximum capacity in GiB
-    minFreePercentage: 10 # Trigger scaling when free space drops below this percentage
-    scalingFactor: 1.2 # Multiply current capacity by this factor when scaling up
+    enabled: false # Set to true to enable autoscaling
+    maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
+    minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
+    scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
+```
 
+Each member has its own volume of this size. The cluster caps the WAL retained for a member that is offline at a quarter of `volumeset.capacity`, so a member that stays down does not fill the leader's disk; a member that exceeds the cap is re-cloned from the leader when it returns.
+
+### Internal Access
+
+```yaml
 internal_access:
   type: same-gvc # options: same-gvc, same-org, workload-list
-  workloads: # Note: can only be used if type is same-gvc or workload-list
+  workloads:  # Note: can only be used if type is same-gvc or workload-list
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
+| Type | Who can reach port `5432` |
+|------|-------------|
+| `same-gvc` | Every workload in the same GVC |
+| `same-org` | Every workload in the same org |
+| `workload-list` | Only the workloads listed in `internal_access.workloads` |
+
+The same setting is applied to the members, the HAProxy workload and the PgBouncer workload. A change can take several minutes to take effect — re-test before concluding it did not apply.
+
+<Warning>
+With `workload-list`, the list must also contain the release's own workloads, because the members replicate from each other and HAProxy, PgBouncer and the backup job all connect to them: `//gvc/GVC_NAME/workload/RELEASE_NAME-postgres-ha`, `//gvc/GVC_NAME/workload/RELEASE_NAME-postgres-ha-proxy`, and `RELEASE_NAME-pgbouncer` and `RELEASE_NAME-postgres-ha-backup` when they are enabled — plus your applications. A list without them leaves HAProxy waiting for members it cannot reach.
+</Warning>
+
+### etcd Cluster
+
+The bundled [etcd](/template-catalog/templates/etcd) template provides the consensus store. Its own values are passed through under `etcd`:
+
+```yaml
 etcd:
   replicas: 3
   resources:
@@ -157,9 +207,50 @@ etcd:
     capacity: 10 # initial capacity in GiB (minimum is 10)
   internal_access:
     type: same-gvc # options: same-gvc, same-org, workload-list
-    workloads:
+    workloads:  # Note: can only be used if type is same-gvc or workload-list
       #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
+- `etcd.replicas` — Must be an **odd** number of at least 3 (3, 5, 7); the chart refuses other values at render. Choose it at install time — the etcd template does not support changing the member count on a running release.
+- `etcd.internal_access` — Must allow the PostgreSQL members to reach etcd on port `2379`. With `workload-list`, include `//gvc/GVC_NAME/workload/RELEASE_NAME-postgres-ha` and `//gvc/GVC_NAME/workload/RELEASE_NAME-etcd`.
+
+#### etcd History Compaction
+
+Patroni renews its leader lease every few seconds and every renewal is a new etcd revision, so the etcd backend grows with time alone unless old revisions are compacted. Uncompacted, an otherwise idle cluster reaches etcd's 2 GiB backend quota in a matter of months, etcd raises a `NOSPACE` alarm and goes read-only, and the PostgreSQL members can no longer renew their leases. The `etcd.tuning` defaults — `periodic`, `1h` and `0` (etcd's own 2 GiB limit) — keep the backend flat and should be left alone. The [etcd template](/template-catalog/templates/etcd#compaction-and-backend-growth) documents the mechanism, the accepted value formats and the read-only inspection commands.
+
+Template versions before `2.4.2` did not compact — see [Upgrading From a Version Before 2.4.2](#upgrading-from-a-version-before-2-4-2).
+
+### HAProxy Leader Endpoint
+
+Only the leader accepts writes; the other members are read-only. HAProxy checks every member's Patroni REST API and sends port `5432` traffic only to the one that reports itself primary, so applications keep one address through a failover.
+
+```yaml
+proxy: # HA Proxy endpoint to write to leader replica. Automatically enabled when pgbouncer is enabled.
+  enabled: true
+  image: haproxy:2.9
+  resources:
+    cpu: 100m
+    memory: 128Mi
+  minReplicas: 2
+  maxReplicas: 2
+```
+
+| Endpoint on `RELEASE_NAME-postgres-ha-proxy` | Purpose |
+|---|---|
+| `:5432` | PostgreSQL, routed to the current leader |
+| `:8404/healthz` | Returns healthy while at least one member reports itself primary |
+| `:8405/stats` | HAProxy stats page showing each member's health-check state |
+
+<Note>
+HAProxy must be enabled for `logical` backups, which connect through it. It is forced on when `pgbouncer.enabled: true`. HAProxy reads the member list from `replicas` when it starts, so after changing `replicas` force a redeployment of `RELEASE_NAME-postgres-ha-proxy`.
+</Note>
+
+### PgBouncer Connection Pooling
+
+PgBouncer multiplexes many application connections into a smaller pool of real database connections. It connects to HAProxy, so leader routing and failover are handled for it, and it reads the same credentials secret — nothing extra to configure. When enabled it becomes the endpoint your applications connect to.
+
+```yaml
 pgbouncer:
   enabled: false
   image: edoburu/pgbouncer:v1.25.1-p0
@@ -173,28 +264,37 @@ pgbouncer:
   resources:
     cpu: 200m
     memory: 128Mi
+```
 
-proxy: # HAProxy endpoint to write to leader replica. Automatically enabled when pgbouncer is enabled.
-  enabled: true
-  image: haproxy:2.9
-  resources:
-    cpu: 100m
-    memory: 128Mi
-  minReplicas: 2
-  maxReplicas: 2
+| `poolMode` | Behaviour |
+|------|-------------|
+| `transaction` | The server connection is held for one transaction. Best for most web and API workloads; not compatible with `SET` variables, temporary tables or advisory locks. |
+| `session` | Held for the whole client session. Compatible with everything, less reuse — raise `defaultPoolSize` to your expected concurrency. |
+| `statement` | Returned after every statement. Transactions are not supported. |
 
+<Warning>
+**`maxDbConnections` is enforced per PgBouncer replica, not across the deployment.** PgBouncer replicas do not coordinate, so the real ceiling on server connections is `maxReplicas × maxDbConnections` — 4 × 100 = 400 with the shipped values, against a cluster `max_connections` of 100, of which 3 are reserved for superuser maintenance. Size `maxReplicas × maxDbConnections` to stay under 97, and treat `defaultPoolSize` the same way, or clients get `remaining connection slots are reserved` under load instead of being queued.
+</Warning>
+
+PgBouncer autoscales on requests per second between `minReplicas` and `maxReplicas`.
+
+### Backup
+
+Two modes share the same provider settings. `logical` runs a cron workload that dumps every database and role with `pg_dumpall` through HAProxy; `wal-g` adds a sidecar to each member that archives WAL continuously and takes a base backup from the leader every `backup.walg.intervalSeconds`. Each provider's bucket, cloud account and policy steps are under [Backing Up](#backing-up).
+
+```yaml
 backup:
   enabled: false
   mode: logical  # logical or wal-g
-  resources:
+  resources: # applies to whichever mode is enabled
     cpu: 100m
-    memory: 128Mi
+    memory: 512Mi # 128Mi OOMKills wal-g mid-backup (exitCode 137) and silently produces no base backup
 
-  logical:
+  logical: # logical backup settings
     image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0 # tag 17.1.0 = Postgres 17, 18.1.0 = Postgres 18
-    schedule: "0 2 * * *" # cron schedule, default is daily at 2am UTC
+    schedule: "0 2 * * *" # cron schedule, default isdaily at 2am UTC
 
-  walg:
+  walg: # wal-g backup settings
     intervalSeconds: 21600 # interval in seconds between backups, default is every 6 hours
 
   # storage settings are applied to whichever mode is enabled
@@ -205,201 +305,126 @@ backup:
     region: us-east-1
     cloudAccountName: my-s3-cloud-account
     policyName: pg-ha-backup-policy
-    prefix: postgres/backups
+    prefix: postgres/backups # folder name where your backups will be stored
 
   gcp:
     bucket: pg-ha-backup-bucket
     cloudAccountName: my-gcs-cloud-account
-    prefix: postgres/backups
+    prefix: postgres/backups # folder name where your backups will be stored
 
   minio: # Backup to a self-hosted MinIO workload (or any S3-compatible endpoint)
     endpoint: http://my-minio-workload:9000 # e.g. http://WORKLOAD_NAME:9000 for an internal MinIO template deployment
     bucket: pg-ha-backup-bucket
-    # REQUIRED prerequisite `dictionary` secret holding `accessKey` and
-    # `secretKey`, only when backups are enabled with provider: minio
+    # REQUIRED PREREQUISITE SECRET when provider is `minio` — a `dictionary`
+    # secret holding `accessKey` and `secretKey`. See Backup setup in the README.
     credentialsSecretName: my-postgres-ha-minio-credentials
-    prefix: postgres/backups
+    prefix: postgres/backups # folder name where your backups will be stored
 ```
 
-### Credentials
+| Mode | What is written | Restores to |
+|------|-------------|---|
+| `logical` | One `postgres-TIMESTAMP.sql.gz` object per run of `backup.logical.schedule` | Any PostgreSQL 17 server, by replaying the SQL |
+| `wal-g` | Continuous WAL segments (`archive_timeout` 60 s, zstd) plus a base backup every `backup.walg.intervalSeconds` | An empty data directory, to the latest base backup or a point in time |
 
-- `config.credentialsSecretName` — Name of the `dictionary` secret holding `username`, `password` and `database`. PostgreSQL creates that user and that database on first boot, and this is the credential your applications put in their connection strings.
+## Connecting
 
-The secret must exist before you install — see [Prerequisites](#prerequisites). The cluster reads it through `cpln://secret/...` references, so the values appear in neither the Helm release nor the stored workload spec.
+This template exposes no public endpoint. Everything below is reachable from inside the GVC, subject to `internal_access.type`.
 
-<Note>
-These credentials are only applied on first startup, when the data directory is empty. Rotating the secret afterwards does not change the stored password; change it inside PostgreSQL with `ALTER ROLE ... WITH PASSWORD` and update the secret to match.
-</Note>
+| What | Address | Notes |
+|---|---|---|
+| PostgreSQL, writes and reads | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432` | HAProxy routes to the current leader. Use this unless PgBouncer is enabled. |
+| PostgreSQL, pooled | `RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432` | Only when `pgbouncer.enabled: true`. Prefer it when the pooler is on. |
+| Any member, unrouted | `RELEASE_NAME-postgres-ha.GVC_NAME.cpln.local:5432` | Reaches whichever member answers, which may be a read-only replica. For diagnostics only. |
+| HAProxy health and stats | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:8404/healthz`, `:8405/stats` | HTTP. |
+| Credentials | `cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml` | The `username`, `password` and `database` keys. Never stored in the Helm release. |
 
-### PostgreSQL Cluster
+To verify from your own machine, tunnel to HAProxy and connect with `psql`:
 
-- `replicas` — Number of PostgreSQL replicas. Minimum 3 recommended for production.
-- `resources.minCpu` / `resources.minMemory` — Minimum CPU and memory guaranteed per replica.
-- `resources.maxCpu` / `resources.maxMemory` — Maximum CPU and memory per replica.
-- `multiZone` — Spread replicas across availability zones within the location.
-
-### Storage
-
-- `volumeset.capacity` — Initial volume size in GiB (minimum 10). Each replica gets its own volume.
-- `volumeset.autoscaling.enabled` — Automatically expand the volume as it fills. When enabled:
-  - `maxCapacity` — Maximum volume size in GiB.
-  - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
-  - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
-
-### etcd Cluster
-
-- `etcd.replicas` — Number of etcd replicas. Must be an **odd number** (3, 5, 7) for quorum.
-- `etcd.resources.cpu` / `etcd.resources.memory` — CPU and memory per etcd replica.
-- `etcd.multiZone` — Spread etcd replicas across availability zones.
-- `etcd.volumeset.capacity` — Initial volume size for etcd data in GiB.
-- `etcd.internal_access.type` — Controls which workloads can reach the etcd cluster.
-
-#### etcd History Compaction
-
-`etcd.tuning.autoCompactionMode`, `etcd.tuning.autoCompactionRetention` and `etcd.tuning.quotaBackendBytes` control how much revision history the bundled etcd cluster keeps and how large its backend may grow. The defaults — `periodic`, `1h` and `0` (etcd's own 2 GiB limit) — are the right settings for a Patroni consensus store and should be left alone. The [etcd template](/template-catalog/templates/etcd#compaction-and-backend-growth) documents the mechanism, the accepted value formats, and the read-only commands for inspecting a cluster.
-
-<Warning>
-**Template versions before `2.4.2` did not compact the bundled etcd cluster.** Patroni renews its leader lease about every 10 seconds and every renewal creates a revision, so etcd grows with time alone — roughly 19 MB per day on an idle cluster — and reaches its 2 GiB backend quota in about 110 days. etcd then goes read-only across the whole cluster, and the PostgreSQL replicas restart-loop with `exitCode: 0` and `reason: Completed`, which reads as healthy and is easily mistaken for a database fault. Upgrade to `2.4.2` or later to turn compaction on.
-
-Upgrading prevents further growth but cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade — see [If the Backend Quota Is Already Full](/template-catalog/templates/etcd#if-the-backend-quota-is-already-full).
-</Warning>
-
-### HAProxy (Strongly Recommended)
-
-In a Patroni cluster, only the leader replica accepts writes — other replicas are read-only. HAProxy automatically routes write traffic to the current leader, providing a stable connection endpoint even during failover.
-
-HAProxy exposes two HTTP endpoints on the proxy workload for observability:
-
-| Endpoint | Description |
-|---|---|
-| `:8404/healthz` | Returns healthy when at least one primary backend is reachable, unhealthy otherwise |
-| `:8405/stats` | Live stats page showing connection counts and the health status of each replica |
-
-- `proxy.enabled` — Deploy the HAProxy leader-routing workload (default: `true`).
-- `proxy.resources.cpu` / `proxy.resources.memory` — CPU and memory per HAProxy replica.
-- `proxy.minReplicas` / `proxy.maxReplicas` — Replica count for the proxy workload.
-
-<Note>
-HAProxy must be enabled (`proxy.enabled: true`) for logical backups to function correctly. WAL-G backups do not require the proxy.
-</Note>
-
-### Internal Access
-
-- `internal_access.type` — Controls which workloads can connect to PostgreSQL on port `5432`:
-
-| Type | Description |
-|------|-------------|
-| `same-gvc` | Allow access from all workloads in the same GVC |
-| `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from specific workloads listed in `workloads` |
-
-### PgBouncer Connection Pooling
-
-PgBouncer is an optional connection pooler that sits in front of HAProxy, multiplexing application connections into a smaller pool of real database connections. HAProxy handles leader routing and failover transparently — PgBouncer is unaware of which PostgreSQL replica is the primary.
-
-Enabling PgBouncer **automatically enables HAProxy**, as it is required for leader-aware routing in the HA cluster.
-
-When enabled, PgBouncer becomes the primary connection endpoint:
-
-```text
-RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432
+```bash
+cpln port-forward RELEASE_NAME-postgres-ha-proxy 5432:5432 --gvc GVC_NAME
 ```
 
-- `pgbouncer.poolMode` — Controls how connections are reused:
-
-| Mode | Description |
-|------|-------------|
-| `transaction` | Connection held only for the duration of a transaction, then returned to the pool. Best for most web and API workloads. Not compatible with session-level features (`SET` variables, temporary tables, advisory locks). |
-| `session` | Connection held for the entire client session. Compatible with all PostgreSQL features but provides less reuse. Increase `defaultPoolSize` to match your expected concurrent client count. |
-| `statement` | Connection returned after every statement. Transactions are not supported. Rarely used. |
-
-- `pgbouncer.defaultPoolSize` — Number of real PostgreSQL connections PgBouncer maintains per pod (default: `25`).
-- `pgbouncer.maxClientConn` — Maximum number of client connections PgBouncer accepts per pod (default: `1000`).
-- `pgbouncer.maxDbConnections` — Hard cap on total PostgreSQL connections across **all** PgBouncer pods. Prevents connection blowout when PgBouncer scales out — set this to a value the PostgreSQL primary can safely handle (default: `100`).
-- `pgbouncer.minReplicas` / `pgbouncer.maxReplicas` — PgBouncer autoscales on RPS between these bounds. Increase `maxReplicas` for high-throughput workloads.
-- `pgbouncer.resources.cpu` / `pgbouncer.resources.memory` — Resources allocated to each PgBouncer pod.
-
-### Application Retry Logic
-
-Your application should implement retry logic on database connections. Several normal cluster events surface transient errors to the client:
-
-- **Patroni failover** — During a leader election, the old primary steps down and a new one is promoted. HAProxy detects the change and re-routes writes, but connections in flight during the transition may receive a connection reset or brief refusal.
-- **Rolling restarts and deployments** — Each replica is restarted in turn. Leadership is handed off gracefully before the leader shuts down, but applications may see a momentary connection disruption while the new leader is established and HAProxy updates its routing.
-- **Scale down** — Removing replicas triggers a shutdown sequence. If the departing replica held the leader role, a new election occurs and writes are unavailable until the new leader is ready.
-
-These events are expected and short-lived. Implementing exponential backoff with retry on connection errors ensures your application recovers automatically without surfacing errors to end users.
-
-### Connecting to PostgreSQL
-
-Connect to PostgreSQL through the HAProxy workload, which always routes to the current leader:
-
-```text
-RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432
+```bash
+psql "postgresql://USERNAME:PASSWORD@127.0.0.1:5432/DATABASE" -c 'select pg_is_in_recovery()'
 ```
 
-### Backup
+`pg_is_in_recovery()` returns `f` through HAProxy, because it always reaches the leader. The same query on a member directly returns `t` on a replica:
 
-Two backup modes are available. Set `backup.enabled: true`, choose a `mode`, and configure the storage provider.
+```bash
+cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --replica RELEASE_NAME-postgres-ha-0 --container patroni-postgres -- psql -h 127.0.0.1 -U USERNAME -d DATABASE -c 'select pg_is_in_recovery()'
+```
 
-| Mode | Description |
-|------|-------------|
-| `logical` | Scheduled SQL dumps via `pg_dump`. Portable and suitable for smaller databases. Requires HAProxy to be enabled. |
-| `wal-g` | Continuous WAL archiving with point-in-time recovery. Suitable for larger databases requiring minimal data loss. Runs as a sidecar container alongside PostgreSQL. |
+Use `--replica` to pick a member (`RELEASE_NAME-postgres-ha-0` through `RELEASE_NAME-postgres-ha-N`); without it the CLI picks one for you. The superuser credentials are already present in the container's environment, so `psql` does not prompt.
 
-- `backup.mode` — `logical` or `wal-g`.
-- `backup.provider` — `aws`, `gcp`, or `minio`.
-- `backup.resources.cpu` / `backup.resources.memory` — Resources allocated to the backup container.
+Applications should retry on connection errors with backoff. A failover, a rolling restart or a scale-down moves the leader, and connections open at that moment are reset while HAProxy re-routes to the new leader.
 
-**Logical backup settings:**
-- `backup.logical.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
+## Operations
 
-**WAL-G backup settings:**
-- `backup.walg.intervalSeconds` — Interval between base backups in seconds (default: `21600`, every 6 hours).
+### Checking Cluster State
 
-## Cluster Metrics
+Patroni's own tool shows every member, its role, its state and its replication lag:
 
-From version 2.7.0, Patroni's Prometheus metrics are scraped into Control Plane's built-in metrics stack automatically. There is no exporter to run and nothing to configure — they appear in Grafana alongside the standard workload metrics, labelled by `workload`, `replica`, and `container`.
+```bash
+cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --replica RELEASE_NAME-postgres-ha-0 --container patroni-postgres -- patronictl -c /tmp/patroni_config.yml list
+```
+
+`/tmp/patroni_config.yml` is the configuration the startup script writes in each member; `patronictl` needs it to find etcd. The same tool shows the cluster-wide settings Patroni keeps in etcd:
+
+```bash
+cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --replica RELEASE_NAME-postgres-ha-0 --container patroni-postgres -- patronictl -c /tmp/patroni_config.yml show-config
+```
+
+For HAProxy's view of the members — which one passes the primary health check — tunnel to the stats page and open `http://127.0.0.1:8405/stats` in a browser:
+
+```bash
+cpln port-forward RELEASE_NAME-postgres-ha-proxy 8405:8405 --gvc GVC_NAME
+```
+
+#### Cluster Metrics
+
+From template version 2.7.0, Patroni's Prometheus metrics are scraped into Control Plane's built-in metrics stack automatically — there is no exporter to run and nothing to configure. They appear in the built-in Grafana alongside the standard workload metrics, labelled by `workload`, `replica` and `container`.
 
 | Metric | Tells you |
 |---|---|
-| `patroni_primary` | Which replica currently holds the leader lock — `1` on exactly one member. |
-| `patroni_replica` | Which members are followers. |
-| `patroni_postgres_streaming` | Whether a follower is actually streaming from the primary. |
-| `patroni_xlog_location` | WAL position per member — the basis for replication lag. |
-| `patroni_postgres_timeline` | Timeline number; increments on every failover. |
-| `patroni_dcs_last_seen` | When this member last reached etcd. |
-| `patroni_failsafe_mode_is_active` | `1` while the primary is riding out an etcd outage instead of demoting. |
-| `patroni_cluster_unlocked` | `1` when no member holds the leader lock. |
+| `patroni_primary` | Which member holds the leader lock — `1` on exactly one member |
+| `patroni_replica` | Which members are followers |
+| `patroni_postgres_streaming` | Whether a follower is actually streaming from the leader |
+| `patroni_xlog_location` | WAL position per member — the basis for replication lag |
+| `patroni_postgres_timeline` | Timeline number; increments on every failover |
+| `patroni_dcs_last_seen` | When this member last reached etcd |
+| `patroni_failsafe_mode_is_active` | `1` while the leader is riding out an etcd outage instead of demoting |
+| `patroni_cluster_unlocked` | `1` when no member holds the leader lock |
 
-Worth alerting on: `patroni_primary` summing to anything other than `1` across the cluster, `patroni_cluster_unlocked` staying `1`, or `patroni_postgres_streaming` dropping to `0` on a follower.
+Worth alerting on: `patroni_primary` summing to anything other than `1` across the cluster, `patroni_cluster_unlocked` staying `1`, or `patroni_postgres_streaming` dropping to `0` on a follower. These are cluster-state metrics, not database performance — connection counts, cache hit ratio and slow queries would need a `postgres_exporter`, which this template does not include.
 
-<Note>
-These are **cluster-state** metrics, not database performance. They answer who is primary, whether replication is streaming, and whether a failover happened — not connection counts, cache hit ratio, or slow queries. Those would require a `postgres_exporter` sidecar, which this template does not include.
-</Note>
+### Backing Up
 
-You can also query them directly from the org's Prometheus federation endpoint:
+Backups are off by default. Enable them with `backup.enabled: true`, pick a `backup.mode` and a `backup.provider`, and complete that provider's setup below first.
 
-```bash
-curl -H "Authorization: Bearer $(cpln profile token)" \
-  --get --data-urlencode 'match[]=patroni_primary' \
-  'https://metrics.cpln.io/metrics/org/ORG_NAME/api/v1/federate'
-```
+- **`logical`** — `RELEASE_NAME-postgres-ha-backup` runs on `backup.logical.schedule`, connects through HAProxy with the `username` and `password` from your credentials secret, and uploads `postgres-TIMESTAMP.sql.gz` under `backup.PROVIDER.prefix`. HAProxy must be enabled.
+- **`wal-g`** — every member gets a `wal-g-backup` sidecar and PostgreSQL archives each WAL segment to the bucket as it completes (`archive_timeout` 60 s). The sidecar on whichever member is the leader takes a base backup every `backup.walg.intervalSeconds`, retrying every minute until one succeeds — including right after a failover. WAL archiving on its own cannot restore a cluster; it replays *from* a base backup. Confirm one exists before relying on this mode:
 
-## Backup Prerequisites
+  ```bash
+  cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --container wal-g-backup -- wal-g backup-list
+  ```
 
-### AWS S3
-
-Before enabling backup with `provider: aws`, complete the following in your AWS account:
-
-1. Create an S3 bucket. Set `backup.aws.bucket` to the bucket name and `backup.aws.region` to its region.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
-3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+  The sidecar does not prune old backups; manage retention in the bucket.
 
 <Warning>
-**Version 2.5.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
-
-**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
+**A zero-length `logical` backup object is a failed run, not a backup.** If `pg_dumpall` cannot reach the cluster, the upload still writes a tiny empty gzip under a normal-looking timestamped name and the job exits non-zero. Check the object size before restoring from it — a real dump is kilobytes at minimum. Keep `backup.resources.memory` at the shipped `512Mi` or above in `wal-g` mode: at `128Mi` the sidecar is OOM-killed mid-backup (`exitCode 137`) and produces no base backup.
 </Warning>
+
+#### Backup Prerequisites
+
+Complete the steps for your provider before enabling backups.
+
+#### AWS S3
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+
+2. If you do not have one yet, create a Control Plane [cloud account](/guides/create-cloud-account) for the AWS account holding the bucket. Set `backup.aws.cloudAccountName` to its name.
+
+3. Create an IAM policy scoped to exactly that bucket, replacing `YOUR_BUCKET_NAME`:
 
 ```json
 {
@@ -428,129 +453,325 @@ Before enabling backup with `provider: aws`, complete the following in your AWS 
 }
 ```
 
-4. Set `backup.aws.policyName` to the name of the policy created in step 3.
-5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+4. Set `backup.aws.policyName` to that policy's name. The template attaches it to the workload identity together with `cpln-connector` and nothing else — the bucket in your policy is the only storage the backup containers can reach. Upgrading from `2.5.0` or earlier narrows this further; see [Upgrading From 2.5.0](#upgrading-from-2-5-0).
 
-### GCS
+#### GCS
 
-Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
 
-1. Create a GCS bucket. Set `backup.gcp.bucket` to the bucket name.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
-3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
-4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+2. Create a Control Plane [cloud account](/guides/create-cloud-account) for the GCP project holding the bucket, and set `backup.gcp.cloudAccountName` to its name.
 
-### MinIO
+3. Grant the cloud account's service account the **Storage Admin** role. The template additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket in `backup.gcp.bucket`.
 
-Before enabling backup with `provider: minio`, ensure your MinIO instance is accessible:
+#### MinIO
 
-1. Create a bucket in MinIO. Set `backup.minio.bucket` to its name.
-2. Set `backup.minio.endpoint` to the MinIO S3 API address including the port. For the `minio` marketplace template deployed in the same GVC, use `http://WORKLOAD_NAME:9000`.
-3. Create a [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `accessKey` and `secretKey`, and set `backup.minio.credentialsSecretName` to its name. For the `minio` template these are its `admin.username` and `admin.password`:
+No cloud account is needed — the backup containers authenticate with a second prerequisite secret. Both modes work: `wal-g` uses its native S3-compatible support with path-style addressing.
+
+1. Create the bucket in MinIO. Set `backup.minio.bucket` to its name.
+
+2. Set `backup.minio.endpoint` to the S3 API address including the port. For the [minio](/template-catalog/templates/minio) template deployed in the same GVC that is `http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000`.
+
+3. Create a [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `accessKey` and `secretKey`, and set `backup.minio.credentialsSecretName` to its name. For the `minio` template these are its admin username and password:
 
 ```bash
-cpln secret create-dictionary --name my-postgres-ha-minio-credentials \
+cpln secret create-dictionary --name MINIO_CREDENTIALS_SECRET_NAME \
   --entry accessKey=MINIO_ACCESS_KEY \
   --entry secretKey=MINIO_SECRET_KEY
 ```
-4. Set `backup.minio.prefix` to the folder path where backups will be stored.
+
+The policy this template creates grants the identity `reveal` on this secret as well as the database credentials secret. If the secret does not exist at install time the deployment wedges exactly as described in [Prerequisites](#prerequisites).
+
+### Restoring a Backup
 
 <Note>
-MinIO backup requires no Control Plane Cloud Account — credentials are passed directly. Both `logical` and `wal-g` modes are supported; WAL-G uses its native S3-compatible storage support (`AWS_ENDPOINT` + path-style addressing).
+Neither restore path has been rehearsed against this template. The `logical` commands are the standard way to replay a `pg_dumpall` script and match what the backup job writes; the `wal-g` outline follows the chart's configuration and WAL-G's documentation. Rehearse whichever you depend on against a scratch release before you need it.
 </Note>
 
-## Restoring a Backup
+#### Logical
 
-### Logical
+Each backup is a gzip-compressed `pg_dumpall` script, so it is restored by connecting **through HAProxy** to the `postgres` maintenance database as the superuser from your credentials secret; the script recreates the roles and databases it contains, and HAProxy guarantees the writes land on the leader. Run the commands from a client that can reach both the bucket and the cluster — a workload inside the GVC, or your own machine with `cpln port-forward RELEASE_NAME-postgres-ha-proxy 5432:5432 --gvc GVC_NAME` open and `--host=127.0.0.1` in place of the internal hostname.
 
-Run the following from a client with access to the backup bucket. Connect through the proxy workload so the restore targets the current leader.
+<Tabs>
+  <Tab title="AWS S3">
+    ```bash
+    export PGPASSWORD="PASSWORD"
 
-**AWS S3:**
+    aws s3 cp "s3://BUCKET_NAME/PREFIX/postgres-TIMESTAMP.sql.gz" - \
+      | gunzip \
+      | psql \
+          --host=RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local \
+          --port=5432 \
+          --username=USERNAME \
+          --dbname=postgres
 
-```sh
-export PGPASSWORD="PASSWORD"
+    unset PGPASSWORD
+    ```
+  </Tab>
+  <Tab title="GCS">
+    ```bash
+    export PGPASSWORD="PASSWORD"
 
-aws s3 cp "s3://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
-  | gunzip \
-  | psql \
-      --host=RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local \
-      --port=5432 \
-      --username=USERNAME \
-      --dbname=postgres
+    gsutil cp "gs://BUCKET_NAME/PREFIX/postgres-TIMESTAMP.sql.gz" - \
+      | gunzip \
+      | psql \
+          --host=RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local \
+          --port=5432 \
+          --username=USERNAME \
+          --dbname=postgres
 
-unset PGPASSWORD
+    unset PGPASSWORD
+    ```
+  </Tab>
+  <Tab title="MinIO">
+    ```bash
+    export PGPASSWORD="PASSWORD"
+    export AWS_ACCESS_KEY_ID="MINIO_ACCESS_KEY"
+    export AWS_SECRET_ACCESS_KEY="MINIO_SECRET_KEY"
+    aws configure set default.s3.addressing_style path
+
+    aws s3 cp "s3://BUCKET_NAME/PREFIX/postgres-TIMESTAMP.sql.gz" - --endpoint-url "http://MINIO_ENDPOINT:9000" \
+      | gunzip \
+      | psql \
+          --host=RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local \
+          --port=5432 \
+          --username=USERNAME \
+          --dbname=postgres
+
+    unset PGPASSWORD AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    ```
+  </Tab>
+</Tabs>
+
+`already exists` errors for the superuser, the `repl` replication role and the database that the cluster created at first boot are expected; the rest of the script loads normally. Restore into an empty cluster (a fresh install, or one whose databases you have dropped) to avoid duplicate-object errors on existing tables. The replicas receive the restored data through normal streaming replication — nothing is needed on them.
+
+#### WAL-G
+
+WAL-G restores into an **empty** data directory, which this template has no automation for: a running member already has a data directory, and Patroni refuses to adopt a data directory whose system identifier does not match the cluster recorded in etcd. The procedure below is the shape of a manual restore. It is **unverified** on this template — treat it as an outline to rehearse, not a runbook.
+
+1. List the base backups and pick one (`LATEST` is also accepted by `backup-fetch`):
+
+   ```bash
+   cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --container wal-g-backup -- wal-g backup-list
+   ```
+
+2. Install a **new** release of this template into the GVC with `backup.enabled: false`, and stop it before Patroni initializes — or run a one-off workload of your own using the same `image`, with a fresh volume set mounted at `/var/lib/postgresql/data` and the same `WALG_*`/`AWS_*` environment the sidecar has (compare `cpln workload get RELEASE_NAME-postgres-ha --gvc GVC_NAME -o yaml`).
+
+3. In that container, fetch the base backup into the empty `PGDATA` and configure recovery. The chart already sets `restore_command: wal-g wal-fetch %f %p`; for a point in time add `recovery_target_time`:
+
+   ```bash
+   wal-g backup-fetch /var/lib/postgresql/data/pgdata BACKUP_NAME
+   ```
+
+4. Start PostgreSQL once on that data directory so it replays WAL to the target and finishes recovery, then point the new release's members at the recovered volume and let Patroni initialize a new cluster from it.
+
+5. **Change `backup.aws.prefix` (or the GCS / MinIO prefix) before re-enabling `wal-g` backups** on the restored cluster — it has a new system identifier and must not archive into the old cluster's prefix.
+
+If you cannot rehearse this, rely on `logical` backups for recovery and treat `wal-g` as an archive.
+
+### Rotating the Password
+
+Patroni writes its configuration from the secret each time a member starts and applies the password to the database only when the cluster is first initialized. After that the stored passwords live in PostgreSQL, so a rotation touches three places, and the order matters. **This procedure has not been rehearsed on this template — practise it on a scratch release first.**
+
+1. Update the `password` key in your credentials secret to the new value — for example with `cpln apply -f` of the full secret manifest — so any member that restarts from now on reads the new one. Nothing running changes yet: workloads resolve a secret only when a replica starts.
+
+2. On the leader (through HAProxy), change **both** roles that share the password. The replication role `repl` was created with the same password as the superuser, and every member's Patroni configuration will expect the new one after its next restart:
+
+   ```sql
+   ALTER ROLE USERNAME WITH PASSWORD 'NEW-STRONG-PASSWORD';
+   ALTER ROLE repl WITH PASSWORD 'NEW-STRONG-PASSWORD';
+   ```
+
+3. Force a redeployment of the members, then of PgBouncer if it is enabled, so every process holds the new password. Expect a brief write outage while the members restart:
+
+   ```bash
+   cpln workload force-redeployment RELEASE_NAME-postgres-ha --gvc GVC_NAME
+   cpln workload force-redeployment RELEASE_NAME-pgbouncer --gvc GVC_NAME
+   ```
+
+The `logical` backup job reads the secret fresh on its next scheduled run and needs nothing else.
+
+### Upgrading From a Version Before 2.4.2
+
+Template versions before `2.4.2` did not compact the bundled etcd cluster, so its backend grows with time alone and goes read-only once it reaches the 2 GiB quota — after which the PostgreSQL members restart-loop with `exitCode: 0` and `reason: Completed`, which reads as healthy and is easily mistaken for a database fault. Upgrading turns compaction on and stops further growth, but it cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade. Check first, with the read-only commands in [If the Backend Quota Is Already Full](/template-catalog/templates/etcd#if-the-backend-quota-is-already-full), run against `RELEASE_NAME-etcd`.
+
+### Upgrading From 2.4.x
+
+Template version `2.5.0` removed the `postgres` block. `postgres.username`, `postgres.password` and `postgres.database` are now the prerequisite dictionary secret named by `config.credentialsSecretName`, and MinIO backup credentials moved the same way. An upgrade that still carries any of the old keys is refused at render, before anything is applied, so your running cluster is left untouched:
+
+```text
+postgres-highly-available: the `postgres` block was REMOVED in 2.5.0. `postgres.username`,
+`postgres.password` and `postgres.database` are now a `dictionary` secret you create, named by
+`config.credentialsSecretName`, holding the keys `username`, `password` and `database`. Delete the
+`postgres:` block from your values. See Prerequisites in the README.
 ```
 
-**GCS:**
+| | 2.4.x | 2.5.0 and later |
+|---|---|---|
+| Database credentials | `postgres.username`, `postgres.password`, `postgres.database` values | `config.credentialsSecretName` → a dictionary secret you create |
+| Where they were stored | `RELEASE_NAME-postgres-config`, created by the chart | Only in your secret; `RELEASE_NAME-postgres-config` now holds backup settings and is created only when backups are enabled |
+| MinIO backup credentials | `backup.minio.accessKey`, `backup.minio.secretKey` values | `backup.minio.credentialsSecretName` → a dictionary secret you create |
 
-```sh
-export PGPASSWORD="PASSWORD"
+<Steps>
+  <Step title="Read the credentials the cluster already uses">
+    An existing cluster keeps the credentials it was initialized with. Recover them **before** upgrading, from your values file or from the secret the old version created:
 
-gsutil cp "gs://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
-  | gunzip \
-  | psql \
-      --host=RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local \
-      --port=5432 \
-      --username=USERNAME \
-      --dbname=postgres
+    ```bash
+    cpln secret reveal RELEASE_NAME-postgres-config -o yaml
+    ```
+  </Step>
+  <Step title="Create the prerequisite secret with those same values">
+    Follow [Prerequisites](#prerequisites) using the existing `username`, `password` and `database`. Different values here do not change the database — they leave every member unable to authenticate after its next restart.
+  </Step>
+  <Step title="Remove the old keys from your values">
+    Delete the `postgres:` block and set `config.credentialsSecretName`. If you back up to MinIO, replace `backup.minio.accessKey` and `backup.minio.secretKey` with `backup.minio.credentialsSecretName`.
+  </Step>
+  <Step title="Upgrade, then rotate any default password">
+    Versions `2.4.2` and earlier shipped `username: username` and `password: password` as defaults, published in the public template repository. If your cluster still runs them, treat them as compromised and follow [Rotating the Password](#rotating-the-password) after the upgrade.
+  </Step>
+</Steps>
 
-unset PGPASSWORD
-```
+<Warning>
+**The chart no longer writes credentials into `RELEASE_NAME-postgres-config`.** Anything outside this release that read that secret by name — another workload's environment, a policy, a parent chart bundling this template — must be pointed at the secret you created instead. A reference to a key that no longer exists wedges the referring workload silently.
+</Warning>
 
-**MinIO:**
+### Upgrading From 2.5.0
 
-```sh
-export PGPASSWORD="PASSWORD"
-export AWS_ACCESS_KEY_ID="MINIO_ACCESS_KEY"
-export AWS_SECRET_ACCESS_KEY="MINIO_SECRET_KEY"
-aws configure set default.s3.addressing_style path
+Template version `2.5.1` removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to every bucket in your AWS account and contains no write actions, so it never carried the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit. **Update your IAM policy to the full action list in [AWS S3](#aws-s3) before upgrading**; if it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only.
 
-aws s3 cp "s3://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - --endpoint-url "http://MINIO_ENDPOINT:9000" \
-  | gunzip \
-  | psql \
-      --host=RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local \
-      --port=5432 \
-      --username=USERNAME \
-      --dbname=postgres
+### Upgrading From a Version Before 2.6.0
 
-unset PGPASSWORD AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-```
+Two things changed in `2.6.0` that an upgrade does not apply to a cluster that already exists:
 
-### WAL-G
+- **Patroni's consensus timeouts.** The chart now initializes new clusters with `ttl: 45`, `loop_wait: 10` and `retry_timeout: 15`. Earlier versions asked for `ttl: 30` with `retry_timeout: 30`, a combination Patroni silently clamps rather than rejecting, so those clusters tolerated a shorter etcd outage than configured before demoting a healthy leader. Patroni reads these values only while the data directory is empty; afterwards they live in etcd, and an existing cluster keeps the ones it was created with. Move it with `patronictl` — all three together, because Patroni requires `loop_wait + 2 × retry_timeout ≤ ttl` and quietly rewrites the others when one is changed alone:
 
-WAL-G point-in-time restore requires an empty data directory. Follow these steps:
+  ```bash
+  cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --replica RELEASE_NAME-postgres-ha-0 --container patroni-postgres -- patronictl -c /tmp/patroni_config.yml edit-config --force -s ttl=45 -s loop_wait=10 -s retry_timeout=15
+  ```
 
-1. Run `wal-g backup-list` to identify the desired backup.
-2. Stop the PostgreSQL workload.
-3. Create a new Volume Set for the restored data.
-4. Run a one-off restore workload with the new Volume Set mounted at `/var/lib/postgresql/data` and run:
+  Confirm with the `show-config` command in [Checking Cluster State](#checking-cluster-state).
 
-```sh
-wal-g backup-fetch /var/lib/postgresql/data/pgdata <backup_name>
-```
+- **Enabling `wal-g` on an existing cluster.** Before `2.6.0`, turning on `backup.mode: wal-g` after the cluster was initialized did not start WAL archiving — only a fresh install archived. From `2.6.0` the archive settings apply to running members when they restart, so enabling `wal-g` on an upgraded cluster works; verify with `wal-g backup-list` as in [Backing Up](#backing-up).
 
-5. Re-point the PostgreSQL workload to the restored Volume Set and restart.
-6. After the restore, change `backup.walg.prefix` before re-enabling backups to avoid system identifier conflicts.
+Also note that `failsafe_mode` is on for clusters created from `2.6.0`: when the leader loses etcd but every member still answers its REST API, it keeps serving instead of demoting. A cluster created earlier gains it only through `edit-config -s failsafe_mode=true`.
+
+### Scaling and Availability
+
+- **Leader loss fails over automatically.** When the leader stops answering, Patroni promotes the most up-to-date replica and HAProxy's health checks move port `5432` to it. Writes are refused in between and connections open at that moment are reset — build retry with backoff into your applications.
+- **Planned restarts hand leadership off first.** Before a leader is stopped, the chart asks Patroni to switch over to a replica, so a rolling restart costs a few seconds of refused writes rather than a full failover. A `cpln helm upgrade` that changes the member workload can restart members together; expect a brief write outage and plan upgrades as maintenance.
+- **Losing etcd does not fail the cluster over.** With `failsafe_mode` on, a leader that cannot reach etcd keeps serving as long as every other member still answers its REST API, and only a member Patroni recorded as eligible can win the next leader race. An etcd outage that also hides a replica still demotes the leader.
+- **A member that stays down is re-cloned, not fatal.** WAL retained for an absent member is capped at a quarter of `volumeset.capacity`; past that, its slot is dropped and it re-clones from the leader when it returns.
+- **Keep `replicas` at 3 or more and `etcd.replicas` odd.** Two members cannot fail over safely, and an even etcd count adds nothing to its fault tolerance. Choose `etcd.replicas` at install time.
+- **Changing `replicas` on a running release** adds or removes members; a removed member that held the leader role triggers a failover. Afterwards force a redeployment of `RELEASE_NAME-postgres-ha-proxy` so HAProxy picks up the new member list.
+- **The first `cpln helm upgrade` after an install** can re-apply resources that did not change and restart them. Plan it as a short outage.
+- **`multiZone: true`** on the members and on etcd spreads each across zones within the location, when the location supports it.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Workload never becomes ready and cpln logs returns nothing">
+    **Symptom:** the install succeeds, `RELEASE_NAME-postgres-ha` stays not ready indefinitely, and `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres-ha"}' --limit 50 --since 10m` returns zero lines.
+
+    **Cause:** `config.credentialsSecretName` (or, with MinIO backups, `backup.minio.credentialsSecretName`) names a secret that does not exist, so the container is never started. The message is only visible in `status.versions[].message`:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-postgres-ha --gvc GVC_NAME -o yaml
+    ```
+
+    ```text
+    The secret CREDENTIALS_SECRET_NAME no longer exists. Workload updates are paused until the
+    secret is added or the reference to the secret removed.
+    ```
+
+    **Fix:** create the secret as in [Prerequisites](#prerequisites). The deployment recovers on its own within several minutes, or run `cpln workload force-redeployment RELEASE_NAME-postgres-ha --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Upgrade fails with 'the postgres block was REMOVED in 2.5.0'">
+    **Symptom:** `cpln helm upgrade` stops before touching any resource:
+
+    ```text
+    Error: ... postgres-highly-available: the `postgres` block was REMOVED in 2.5.0. `postgres.username`,
+    `postgres.password` and `postgres.database` are now a `dictionary` secret you create, named by
+    `config.credentialsSecretName` ...
+    ```
+
+    `backup.minio.accessKey` / `backup.minio.secretKey` produce the same kind of message under their own names.
+
+    **Cause:** your values still carry keys that were removed in 2.5.0.
+
+    **Fix:** follow [Upgrading From 2.4.x](#upgrading-from-2-4-x). Your running cluster is unaffected until the upgrade succeeds.
+  </Accordion>
+  <Accordion title="HAProxy logs 'waiting for patroni endpoints to answer before starting haproxy'">
+    **Symptom:** `RELEASE_NAME-postgres-ha-proxy` never becomes ready and `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres-ha-proxy"}' --limit 50 --since 10m` repeats `pg-ha proxy: waiting for patroni endpoints to answer before starting haproxy — pgN (...) not responding yet`.
+
+    **Cause:** HAProxy will not start until every member's Patroni REST API answers on port `8008`. Either the members are still starting (normal for the first minutes of an install), or `internal_access.type: workload-list` does not include the proxy workload, so it cannot reach them.
+
+    **Fix:** wait for `RELEASE_NAME-postgres-ha` to become ready. If it is ready and HAProxy still waits, add `//gvc/GVC_NAME/workload/RELEASE_NAME-postgres-ha-proxy` to `internal_access.workloads` as described in [Internal Access](#internal-access). The container gives up and restarts after ten minutes, so it recovers on its own once the members are reachable.
+  </Accordion>
+  <Accordion title="Members restart-loop with exitCode 0 and reason Completed">
+    **Symptom:** the PostgreSQL members restart repeatedly with a climbing restart count in `cpln workload get-deployments RELEASE_NAME-postgres-ha --gvc GVC_NAME -o yaml`, each exit reading `exitCode: 0` and `reason: Completed`, while nothing in the database logs looks wrong.
+
+    **Cause:** etcd has gone read-only. A Patroni member that cannot renew its lease exits cleanly, so the failure reads as healthy. The usual reason is an uncompacted etcd backend that has reached its 2 GiB quota and raised a `NOSPACE` alarm (template versions before `2.4.2`).
+
+    **Fix:** check etcd first, with two read-only commands:
+
+    ```bash
+    cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl endpoint status --cluster -w table
+    cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl alarm list
+    ```
+
+    A healthy cluster prints nothing for `alarm list`. `NOSPACE` confirms it; recovery is the operator procedure in [If the Backend Quota Is Already Full](/template-catalog/templates/etcd#if-the-backend-quota-is-already-full), followed by an upgrade to `2.4.2` or later so it does not recur.
+  </Accordion>
+  <Accordion title="Clients get 'remaining connection slots are reserved' through PgBouncer">
+    **Symptom:** under load, connections through `RELEASE_NAME-pgbouncer` fail with `FATAL: remaining connection slots are reserved for roles with the SUPERUSER attribute` (or `... for non-replication superuser connections`) instead of waiting in the pool.
+
+    **Cause:** `pgbouncer.maxDbConnections` is enforced per PgBouncer replica, so `maxReplicas × maxDbConnections` server connections can be opened against a cluster `max_connections` of 100 (97 usable).
+
+    **Fix:** lower `pgbouncer.maxDbConnections` or `pgbouncer.maxReplicas` so their product stays under 97, and keep `pgbouncer.defaultPoolSize` within the same budget — see [PgBouncer Connection Pooling](#pgbouncer-connection-pooling).
+  </Accordion>
+  <Accordion title="wal-g backup-list shows no base backup, or the sidecar restarts with exitCode 137">
+    **Symptom:** `wal-g backup-list` prints nothing hours after enabling `backup.mode: wal-g`, and `cpln workload get-deployments RELEASE_NAME-postgres-ha --gvc GVC_NAME -o yaml` shows the `wal-g-backup` container restarting with `exitCode: 137`.
+
+    **Cause:** the sidecar is being OOM-killed mid-backup. Nothing is logged from inside the container when that happens; `backup.resources.memory` is below what `wal-g backup-push` needs.
+
+    **Fix:** set `backup.resources.memory` to at least the shipped `512Mi` and upgrade. The sidecar retries every minute, so a base backup appears shortly after it has enough memory.
+  </Accordion>
+  <Accordion title="Apply rejected with 'The ratio between cpu and minCpu must be less than 4:1'">
+    **Symptom:** an install or upgrade fails and the member workload is not created or updated.
+
+    **Cause:** `resources.maxCpu` is more than four times `resources.minCpu`, which the platform rejects on a stateful workload.
+
+    **Fix:** raise `resources.minCpu` or lower `resources.maxCpu` so the ratio is at most 4:1.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- **Create the credentials secret before installing.** A reference to a secret that does not exist wedges the members with no log output; see [Prerequisites](#prerequisites) for the one command that shows the reason.
+- **Connect through HAProxy** (`RELEASE_NAME-postgres-ha-proxy`), or PgBouncer when enabled. A member reached directly may be a read-only replica.
+- **Credentials are applied only when the cluster is first initialized**, and the `repl` replication role shares the superuser password. Rotate in the order given in [Rotating the Password](#rotating-the-password).
+- **Keep `replicas` at 3 or more and `etcd.replicas` odd**, and choose `etcd.replicas` at install time.
+- **Do not change `etcd.tuning` to disable compaction** — an uncompacted etcd takes the whole cluster read-only months later.
+- **With `workload-list` access, list the release's own workloads** as well as your applications, or HAProxy cannot reach the members.
+- **Confirm a `wal-g` base backup exists** with `wal-g backup-list` before relying on that mode; WAL alone cannot be restored.
+- **Restore procedures are unverified on this template** — rehearse the one you depend on against a scratch release.
+- **`cpln helm uninstall` deletes both volume sets** and the data with them. Your credentials secrets are yours and are left alone.
+- **Upgrading from 2.4.x is a breaking change** — the removed keys stop the upgrade rather than resetting a password. See [Upgrading From 2.4.x](#upgrading-from-2-4-x).
 
 ## External References
 
 <CardGroup cols={2}>
     <Card title="Patroni Documentation" icon="book" href="https://patroni.readthedocs.io/">
-    Patroni automatic failover documentation
+    Patroni configuration, REST API and `patronictl` reference
     </Card>
-    <Card title="PostgreSQL Documentation" icon="database" href="https://www.postgresql.org/docs/">
-    Official PostgreSQL documentation
+    <Card title="PostgreSQL Documentation" icon="database" href="https://www.postgresql.org/docs/17/">
+    Official PostgreSQL 17 documentation
     </Card>
-    <Card title="etcd Documentation" icon="server" href="https://etcd.io/docs/v3.6/">
-    Official etcd documentation
+    <Card title="WAL-G for PostgreSQL" icon="github" href="https://github.com/wal-g/wal-g/blob/master/docs/PostgreSQL.md">
+    WAL-G commands, storage variables and restore guidance
     </Card>
     <Card title="PgBouncer Documentation" icon="database" href="https://www.pgbouncer.org/config.html">
     PgBouncer configuration reference
     </Card>
-    <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/postgres-backup">
-    Source code for the PostgreSQL backup container image
-    </Card>
     <Card title="PostgreSQL HA Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/postgres-highly-available">
-    View the source files, default values, and chart definition
+    Source files, default values, and chart definition
     </Card>
 </CardGroup>

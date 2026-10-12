@@ -1,43 +1,112 @@
 ---
 title: CDC Pipeline
 icon: /template-catalog/templates/icons/cdc-pipeline.png
-description: Deploy a complete Change Data Capture pipeline on Control Plane in a single install. Bundles PostgreSQL HA (Patroni + etcd + HAProxy), Apache Kafka (KRaft), and Debezium Server with auto-coordinated credentials, WAL settings, and internal DNS.
-keywords: ['cdc', 'change data capture', 'debezium', 'kafka', 'postgresql', 'event streaming', 'data pipeline', 'patroni', 'kraft', 'postgres to kafka', 'database replication']
+description: Change data capture in one install. A three-member PostgreSQL Highly Available source, a three-broker Kafka cluster and a Debezium Server connector, wired together with shared credentials and internal hostnames. Deploys into an existing GVC; needs a Kafbat UI configuration secret first.
+keywords: ['cdc', 'change data capture', 'debezium', 'kafka', 'postgresql', 'postgres to kafka', 'event streaming', 'data pipeline', 'patroni', 'kraft', 'logical replication', 'outbox', 'kafka connect alternative', 'fivetran alternative']
 ---
 
 ## Overview
 
-The CDC Pipeline is a meta-template that deploys a complete, pre-wired Change Data Capture pipeline in a single install. It bundles three production-ready templates — PostgreSQL HA, Apache Kafka, and Debezium Server — and automatically coordinates the credentials, WAL settings, and internal hostnames that would otherwise require manual configuration between them.
+CDC Pipeline deploys a complete change data capture stack in a single release. It reimplements nothing: it bundles three catalog templates as dependencies — [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) as the source database, [Kafka](/template-catalog/templates/kafka) as the event transport, and [Debezium Server](/template-catalog/templates/debezium-server) as the connector that reads the database's change stream and publishes every row-level insert, update and delete to Kafka. This chart adds only the glue: one credentials secret for the database, the internal hostnames each component uses to reach the others, and checks at render time that the shared credentials agree.
 
-### Architecture
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create or manage a GVC. Every workload runs in each location the GVC has, so use a GVC with a single location.
+</Note>
 
-- **PostgreSQL HA** (Patroni + etcd + HAProxy) — Source database with logical replication enabled (`wal_level = logical`). HAProxy routes writes to the current primary; replicas are addressable directly.
-- **Kafka** (KRaft, no ZooKeeper) — Event streaming platform. Debezium publishes change events here; consumers read from it.
-- **Debezium Server** — CDC connector that tails the PostgreSQL WAL, converts row-level changes to structured events, and produces them to Kafka via SASL_PLAINTEXT.
-
-Internal DNS names are automatically derived from the release name at install time:
-
-| Service | Internal Hostname |
-|---------|------------------|
-| PostgreSQL (via HAProxy) | `{release-name}-postgres-ha-proxy.{gvc}.cpln.local:5432` |
-| Kafka | `{release-name}-cluster.{gvc}.cpln.local:9092` |
-| Debezium | `{release-name}-debezium.{gvc}.cpln.local` |
+<Warning>
+**Version 1.0.4 does not deliver change events with its default configuration.** The bundled PostgreSQL cluster starts with `wal_level = replica`, while Debezium's `pgoutput` decoding needs `wal_level = logical`; `database.walLevel` is checked at render but is not applied to the database. Kafka also enforces ACLs and the chart grants none to the `debezium` user. Both are described under [Troubleshooting](#troubleshooting). Treat this release as a starting point you must finish configuring, and verify events arrive before you rely on it.
+</Warning>
 
 ### What Gets Created
 
-Everything from each bundled template:
-
-- **From PostgreSQL HA**: Stateful PostgreSQL Workload (3 replicas), etcd cluster, HAProxy workload, Volume Sets, secrets, identity and policy.
-- **From Kafka**: Stateful Kafka broker workloads (KRaft, 3 replicas), Kafka Exporter, JMX Exporter, Kafbat UI, Volume Sets, secrets, identity and policy.
-- **From Debezium Server**: Standard Debezium Server Workload, Volume Set (file offset storage), secrets, identity and policy.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni-managed PostgreSQL 17 members (stateful, 3 replicas, TCP `5432`); container `patroni-postgres` | — |
+| Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy routing TCP `5432` to the current leader (standard, 2 replicas); container `haproxy` | — |
+| Workload | `RELEASE_NAME-etcd` | Consensus store for PostgreSQL leader election (stateful, 3 replicas); container `etcd` | — |
+| Workload | `RELEASE_NAME-pgbouncer` | PgBouncer connection pooler in front of HAProxy | `postgres-highly-available.pgbouncer.enabled: true` |
+| Workload | `RELEASE_NAME-cluster` | Kafka brokers in KRaft mode (stateful, 3 replicas, SASL client listener on `9092`); containers `kafka`, `kafka-orchestrator`, `kafka-exporter`, `jmx-exporter` | — |
+| Workload | `RELEASE_NAME-kafbat-ui` | Kafbat UI web console for Kafka, public by default | `kafka.kafbat_ui.enabled: true` (default) |
+| Workload | `RELEASE_NAME-client` | Kafka CLI tools container for testing from inside the GVC; container `kafka` | — |
+| Workload | `RELEASE_NAME-debezium` | Debezium Server connector (stateful, 1 replica, health on `8080`); container `debezium-server` | — |
+| Volume Set | `RELEASE_NAME-postgres-ha-vs` | One volume per PostgreSQL member holding the data directory | — |
+| Volume Set | `RELEASE_NAME-etcd-vs` | One volume per etcd member | — |
+| Volume Set | `RELEASE_NAME-logs-0`, `RELEASE_NAME-logs-1` | Kafka log directories, with daily snapshots | — |
+| Volume Set | `RELEASE_NAME-debezium-data` | Debezium offsets and schema history | — |
+| Secret | `my-cdc-pipeline-db-credentials` | Dictionary with the database `username`, `password` and `database`, created by this chart from `database.*`. Its name is `postgres-highly-available.config.credentialsSecretName` and is **not** prefixed with the release name | — |
+| Secret | `RELEASE_NAME-secrets` | KRaft cluster ID and the Kafka controller, inter-broker and admin passwords | — |
+| Secret | `RELEASE_NAME-controller-configuration`, `RELEASE_NAME-init`, `RELEASE_NAME-jmx-exporter-conf` | Kafka broker configuration, startup script and JMX exporter rules | — |
+| Secret | `RELEASE_NAME-debezium-config`, `RELEASE_NAME-debezium-credentials`, `RELEASE_NAME-debezium-entrypoint` | Debezium `application.properties`, the connection details and passwords it reads, and its startup script | — |
+| Secret | `RELEASE_NAME-postgres-proxy-startup`, `RELEASE_NAME-patroni-startup`, `RELEASE_NAME-etcd-startup`, `RELEASE_NAME-wal-g-backup-script` | PostgreSQL, HAProxy and etcd startup scripts | — |
+| Identity, Policy | `RELEASE_NAME-postgres-ha-identity` / `RELEASE_NAME-postgres-ha-policy`, `RELEASE_NAME-etcd-identity` / `RELEASE_NAME-etcd-policy`, `RELEASE_NAME` / `RELEASE_NAME`, `RELEASE_NAME-kafbat-ui` / `RELEASE_NAME-kafbat-ui`, `RELEASE_NAME-debezium-identity` / `RELEASE_NAME-debezium-policy` | One identity per component, each granted `reveal` on exactly the secrets that component mounts | — |
 
 ## Prerequisites
 
-This template has no external prerequisites — PostgreSQL, Kafka, and Debezium are all deployed together and auto-configured. To install, follow the instructions for your preferred method:
+<Steps>
+  <Step title="Create the Kafbat UI configuration secret">
+    Kafbat UI is on by default and reads its whole configuration from an **opaque** secret mounted as a file, which must exist **before** you install. Replace `ADMIN_PASSWORD` with the value you will pass as `kafka.kafka.listeners.client.sasl.admin.password` and `UI_PASSWORD` with the login you want for the console. The full file format is in the [Kafbat configuration reference](https://ui.docs.kafbat.io/configuration/configuration-file).
+
+    ```bash
+    cat > kafbat-config.yaml <<'CONF'
+    kafka:
+      clusters:
+        - name: cdc-pipeline
+          bootstrapServers: RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092
+          properties:
+            security.protocol: SASL_PLAINTEXT
+            sasl.mechanism: PLAIN
+            sasl.jaas.config: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"ADMIN_PASSWORD\";"
+    auth:
+      type: LOGIN_FORM
+    spring:
+      security:
+        user:
+          name: admin
+          password: UI_PASSWORD
+    CONF
+    cat kafbat-config.yaml | cpln secret create-opaque --name SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `kafka.kafbat_ui.configuration_secret` to this name. If you do not want the console, install with `--set kafka.kafbat_ui.enabled=false` instead and skip this step.
+
+    <Warning>
+    If the secret is missing, the install still succeeds, `cpln logs` returns nothing for `RELEASE_NAME-kafbat-ui`, and the workload never becomes ready. The only place the missing secret is named is `status.versions[].message`:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-kafbat-ui --gvc GVC_NAME -o yaml
+    ```
+
+    Create the secret and the deployment recovers on its own after a few minutes, or force it with `cpln workload force-redeployment RELEASE_NAME-kafbat-ui --gvc GVC_NAME`.
+    </Warning>
+  </Step>
+  <Step title="Choose the passwords and the KRaft cluster ID">
+    The database password, the Kafka passwords and the KRaft cluster ID are template values. Every default starts with `change-me-cdc-pipeline-`; those defaults are placeholders, not working secrets, so replace each one. Generate the KRaft cluster ID with the Kafka tooling, using the same image the brokers run:
+
+    ```bash
+    docker run --rm apache/kafka:3.9.1 /opt/kafka/bin/kafka-storage.sh random-uuid
+    ```
+
+    The cluster ID is written into the Kafka log volumes at first start and cannot be changed afterwards without a new cluster.
+  </Step>
+</Steps>
+
+## Installation
+
+Install into an existing GVC. The database password and the `debezium` Kafka password are each passed twice, because the database and Kafka read one copy and Debezium the other:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/cdc-pipeline \
+  --version 1.0.4 --gvc GVC_NAME \
+  --set database.password=DB_PASSWORD \
+  --set debezium-server.source.database.password=DB_PASSWORD \
+  --set kafka.kafka.secrets.kraft_cluster_id=KRAFT_CLUSTER_ID \
+  --set kafka.kafka.secrets.inter_broker_password=INTER_BROKER_PASSWORD \
+  --set kafka.kafka.secrets.controller_password=CONTROLLER_PASSWORD \
+  --set kafka.kafka.listeners.client.sasl.admin.password=ADMIN_PASSWORD \
+  --set kafka.kafka.listeners.client.sasl.passwords=DEBEZIUM_KAFKA_PASSWORD \
+  --set debezium-server.sink.kafka.saslPassword=DEBEZIUM_KAFKA_PASSWORD \
+  --set kafka.kafbat_ui.configuration_secret=SECRET_NAME
+```
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -63,152 +132,396 @@ This template has no external prerequisites — PostgreSQL, Kafka, and Debezium 
 
 ## Configuration
 
-The first thing to do after installing is **replace every `change-me-cdc-pipeline-*` placeholder value** with real secrets. The template validates at deploy time that shared credentials are consistent — mismatches are caught before any workload starts.
+Each block shows the shipped defaults for one area of `values.yaml`. Only the keys you change need to go in your values file. The bundled components take their own values under `postgres-highly-available`, `kafka` and `debezium-server`; the linked component pages explain each option, but this release pins older component versions than those pages describe.
 
-### Shared Credentials
+### Database Credentials
 
-These values are used by multiple components and must be set once in a coordinated way. The default `values.yaml` pre-wires them:
-
-**PostgreSQL ↔ Debezium:**
-
-| Setting | PostgreSQL path | Debezium path |
-|---------|----------------|---------------|
-| Database name | `postgres-highly-available.postgres.database` | `debezium-server.source.database.name` |
-| Username | `postgres-highly-available.postgres.username` | `debezium-server.source.database.user` |
-| Password | `postgres-highly-available.postgres.password` | `debezium-server.source.database.password` |
-
-**Kafka ↔ Debezium:**
-
-| Setting | Kafka path | Debezium path |
-|---------|-----------|---------------|
-| SASL username | `kafka.kafka.listeners.client.sasl.users` | `debezium-server.sink.kafka.saslUsername` |
-| SASL password | `kafka.kafka.listeners.client.sasl.passwords` | `debezium-server.sink.kafka.saslPassword` |
-
-### Deploy-time Validation
-
-The template validates at install time that:
-
-- `postgres-highly-available.postgres.walLevel` is set to `logical` (required for CDC)
-- Database credentials match between the PostgreSQL and Debezium blocks
-- Debezium's Kafka SASL username appears in Kafka's configured user list
-
-If any of these are mismatched, the install fails with a descriptive error before any resources are created.
-
-### Key Configuration Sections
-
-#### What Tables to Capture
-
-Set `debezium-server.source.tableIncludeList` to a comma-separated list of `schema.table` names:
+The bundled database exists only to serve the pipeline, so its credentials are values and the chart writes them into the secret named by `postgres-highly-available.config.credentialsSecretName`. They must match the `debezium-server.source.database` values, which the chart checks at render.
 
 ```yaml
-debezium-server:
-  source:
-    tableIncludeList: "public.users,public.orders,public.products"
+database:
+  username: cdc_user
+  password: "change-me-cdc-pipeline-postgres" # replace; pass the same value as debezium-server.source.database.password
+  name: cdcdb
+  walLevel: logical # must stay logical; checked at render but not applied to the database in 1.0.4
 ```
 
-Leave empty to capture all tables.
-
-#### Debezium Heartbeat (Recommended)
-
-The default configuration enables Debezium heartbeats every 5 seconds to keep the replication slot active and prevent WAL accumulation during low-traffic periods.
-
-After the pipeline is running, create the heartbeat table in PostgreSQL:
-
-```sql
-CREATE TABLE IF NOT EXISTS debezium_heartbeat (id INT PRIMARY KEY, ts TIMESTAMPTZ);
-INSERT INTO debezium_heartbeat VALUES (1, now());
-```
-
-#### Resource Sizing
-
-Adjust resources per component based on your workload:
+### PostgreSQL Highly Available
 
 ```yaml
 postgres-highly-available:
+  replicas: 3
+
   resources:
     minCpu: 500m
     minMemory: 1Gi
     maxCpu: 1
     maxMemory: 2Gi
 
-kafka:
-  kafka:
-    cpu: 1000m
-    memory: 2000Mi
+  image: controlplanecorporation/patroni-postgres:0.7
 
-debezium-server:
-  resources:
-    cpu: 500m
-    memory: 512Mi
+  config:
+    credentialsSecretName: my-cdc-pipeline-db-credentials # created by this chart, not by you; give each release in an org its own name
+
+  multiZone: false
+
+  volumeset:
+    capacity: 10
+    autoscaling:
+      enabled: false
+      maxCapacity: 100
+      minFreePercentage: 10
+      scalingFactor: 1.2
+
+  internal_access:
+    type: same-gvc
+
+  etcd:
+    replicas: 3 # odd, at least 3; choose at install time
+    resources:
+      cpu: 500m
+      memory: 512Mi
+    multiZone: false
+    volumeset:
+      capacity: 10
+    internal_access:
+      type: same-gvc
+
+  pgbouncer:
+    enabled: false
+
+  proxy:
+    enabled: true # Debezium connects through HAProxy; keep it on
+    image: haproxy:2.9
+    resources:
+      cpu: 100m
+      memory: 128Mi
+    minReplicas: 2
+    maxReplicas: 2
+
+  backup:
+    enabled: false
 ```
 
-#### Component Versions
+See [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) for what each option does.
 
-| Component | Template Version | Software Version |
-|-----------|-----------------|-----------------|
-| PostgreSQL HA | 2.4.2 | PostgreSQL 17 (Patroni) |
-| Kafka | 4.0.1 | Apache Kafka 3.9.1 (KRaft) |
-| Debezium Server | 1.1.1 | Debezium 3.0 |
+### Kafka
 
-<Warning>
-**Versions `1.0.0` and `1.0.1` did not compact the etcd cluster inside the bundled PostgreSQL HA store**, so etcd's backend grows with time alone and goes read-only once it reaches its 2 GiB quota — after roughly 110 days — taking PostgreSQL failover with it. This template bundles PostgreSQL HA unconditionally, with no toggle to opt out, so **every install on `1.0.0` or `1.0.1` is affected**; see [etcd History Compaction](/template-catalog/templates/postgres-highly-available#etcd-history-compaction) for the mechanism and the symptoms. Upgrade to `1.0.2` or later to turn compaction on: that stops further growth but cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade.
-</Warning>
+The broker, listener, ACL and secret settings, plus the optional consoles. The exporter blocks (`kafka.kafka_exporter`, `kafka.jmx_exporter`) and `kafka.kafka_client` ship with working defaults; see [Kafka](/template-catalog/templates/kafka) for them.
 
-### Using External PostgreSQL or Kafka
+```yaml
+kafka:
+  kafka:
+    name: cluster # broker workload is RELEASE_NAME-cluster
+    image: apache/kafka:3.9.1
+    replicas: 3
+    multiZone: false
+    logDirs: /opt/kafka/logs-0,/opt/kafka/logs-1
+    volumes:
+      logs:
+        initialCapacity: 10
+        performanceClass: general-purpose-ssd
+        fileSystemType: ext4
+        snapshots:
+          createFinalSnapshot: true
+          retentionDuration: 7d
+          schedule: 0 0 * * *
+        autoscaling:
+          maxCapacity: 1000
+          minFreePercentage: 20
+          scalingFactor: 1.2
+    cpu: 1000m
+    memory: 2000Mi
+    minCpu: 250m
+    minMemory: 2000Mi
+    firewall:
+      internal_inboundAllowType: "same-gvc"
+    listeners:
+      client:
+        protocol: SASL_PLAINTEXT
+        name: CLIENT
+        containerPort: 9092
+        sasl:
+          admin:
+            username: admin # ACL super user; use it for consumers and for Kafbat UI
+            password: "change-me-cdc-pipeline-kafka-admin"
+          users: "debezium" # comma-separated; must contain debezium-server.sink.kafka.saslUsername
+          passwords: "change-me-cdc-pipeline-kafka-debezium" # one per user, same order; the debezium entry must equal debezium-server.sink.kafka.saslPassword
+    acl:
+      superUsers: "User:admin" # semicolon-separated, e.g. User:admin;User:debezium
+      allowEveryoneIfNoAclFound: false
+    secrets:
+      kraft_cluster_id: "change-me-cdc-pipeline-kraft-cluster-id" # generate with kafka-storage.sh random-uuid
+      inter_broker_password: "change-me-cdc-pipeline-inter-broker"
+      controller_password: "change-me-cdc-pipeline-controller"
+    extra_configurations:
+      default.replication.factor: 3
+      auto.create.topics.enable: true # Debezium's topics are created on first write
+      log.retention.hours: 168
 
-To replace the bundled PostgreSQL or Kafka with an external instance, override the hostname/bootstrap servers explicitly. The template will still deploy the other bundled components:
+  kafbat_ui:
+    enabled: true
+    name: kafbat-ui
+    image: ghcr.io/kafbat/kafka-ui
+    cpu: 300m
+    memory: 1000Mi
+    minCpu: 100m
+    minMemory: 400Mi
+    replicas: 1
+    configuration_secret: kafka-kafbat-ui-config # opaque secret you create before installing (see Prerequisites)
+    firewall:
+      external_inboundAllowCIDR: "0.0.0.0/0" # the console is reachable from the internet by default
+      external_outboundAllowCIDR: "0.0.0.0/0"
+
+  kafka_rest_proxy:
+    enabled: false
+
+  kafka_ui:
+    enabled: false
+```
+
+### Debezium Server
+
+The connector's source and sink. `hostname` and `bootstrapServers` are filled in from the release name when left empty, so the defaults already point at the bundled database and brokers.
 
 ```yaml
 debezium-server:
+  image: quay.io/debezium/server:3.0
+
+  resources:
+    cpu: 500m
+    memory: 512Mi
+
   source:
+    type: postgres
+
     database:
-      hostname: "my-external-postgres.example.com"
+      hostname: ""  # empty = RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local
+      port: 5432
+      name: cdcdb # must equal database.name
+      user: cdc_user # must equal database.username
+      password: "change-me-cdc-pipeline-postgres" # must equal database.password
+
+    serverName: "dbserver1" # topic prefix; events go to dbserver1.SCHEMA.TABLE
+    tableIncludeList: "" # comma-separated schema.table list, e.g. public.users,public.orders; empty = all tables
+    tableExcludeList: ""
+
+    postgres:
+      slotName: "debezium"
+      publicationName: "dbz_publication"
+      pluginName: "pgoutput"
+      slotDropOnStop: false
+      heartbeatIntervalMs: 5000
+      heartbeatActionQuery: "UPDATE debezium_heartbeat SET ts = now() WHERE id = 1"
+
+    offset:
+      storage: file
+      file:
+        filename: "/debezium/data/offsets.dat"
 
   sink:
+    type: kafka
     kafka:
-      bootstrapServers: "my-external-kafka.example.com:9092"
+      bootstrapServers: ""                          # empty = RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092
+      topic: ""
+      securityProtocol: "SASL_PLAINTEXT"
+      saslMechanism: "PLAIN"
+      saslUsername: "debezium" # must appear in kafka.kafka.listeners.client.sasl.users
+      saslPassword: "change-me-cdc-pipeline-kafka-debezium" # must equal kafka.kafka.listeners.client.sasl.passwords
+
+  format:
+    key: json
+    value: json
+
+  volumeset:
+    capacity: 10
+    performanceClass: general-purpose-ssd
+
+  firewall:
+    internal:
+      inboundAllowType: same-gvc
+      workloads: []
+    external:
+      outboundAllowCIDR:
+        - 0.0.0.0/0
 ```
 
-When using an external PostgreSQL, ensure logical replication is already enabled (`wal_level = logical`) before installing.
+Before the connector starts, its startup step creates the `debezium_heartbeat` table and, once `wal_level` is `logical`, the `debezium` replication slot in the source database, so the heartbeat needs no manual SQL. Pointing `hostname` or `bootstrapServers` at a database or Kafka outside this release still deploys the bundled components, and the render-time credential checks still apply. This release bundles Debezium Server chart 1.1.1, where credentials are values; the [Debezium Server](/template-catalog/templates/debezium-server) page documents a later version that reads them from a secret.
 
-## Connecting Consumers to Kafka
+## Connecting
 
-Applications consuming change events connect to Kafka using SASL_PLAINTEXT. The internal Kafka bootstrap address:
+Nothing in the pipeline is public except Kafbat UI. Everything else is reachable from inside the GVC.
 
-```text
-{release-name}-cluster.{gvc}.cpln.local:9092
+| What | Address | Notes |
+|---|---|---|
+| Source database, writes and reads | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432` | HAProxy routes to the current leader. User `database.username`, database `database.name` |
+| Kafka bootstrap server | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092` | `security.protocol=SASL_PLAINTEXT`, `sasl.mechanism=PLAIN`. Read with the `admin` user |
+| Change event topics | `dbserver1.SCHEMA.TABLE`, for example `dbserver1.public.customers` | Prefix is `debezium-server.source.serverName`; JSON keys and values |
+| Debezium health | `http://RELEASE_NAME-debezium.GVC_NAME.cpln.local:8080/q/health` | Readiness at `/q/health/ready`, liveness at `/q/health/live` |
+| Kafbat UI | `status.canonicalEndpoint` of `RELEASE_NAME-kafbat-ui` | Login from `spring.security.user` in your configuration secret |
+| Database credentials | `cpln secret reveal my-cdc-pipeline-db-credentials -o yaml` | Use the name you set in `postgres-highly-available.config.credentialsSecretName` |
+| Kafka credentials | `cpln secret reveal RELEASE_NAME-secrets -o yaml` | KRaft cluster ID and the admin, controller and inter-broker passwords |
+
+Read the Kafbat UI endpoint from the workload:
+
+```bash
+cpln workload get RELEASE_NAME-kafbat-ui --gvc GVC_NAME -o yaml
 ```
 
-Example Kafka client properties:
+To exercise the pipeline end to end, first write to the source database. Tunnel to HAProxy from your own machine:
 
-```properties
-bootstrap.servers={release-name}-cluster.{gvc}.cpln.local:9092
+```bash
+cpln port-forward RELEASE_NAME-postgres-ha-proxy 5432:5432 --gvc GVC_NAME
+```
+
+Then, in a second terminal, create a table and insert a row:
+
+```bash
+psql "postgresql://cdc_user:DB_PASSWORD@127.0.0.1:5432/cdcdb" -c 'create table if not exists customers (id int primary key, name text)'
+psql "postgresql://cdc_user:DB_PASSWORD@127.0.0.1:5432/cdcdb" -c "insert into customers values (1, 'first')"
+```
+
+Next, read the change events from Kafka with the bundled client workload. Open a shell on it:
+
+```bash
+cpln workload connect RELEASE_NAME-client --gvc GVC_NAME
+```
+
+Inside it, write the admin credentials to a client properties file, list the topics and consume the table's topic:
+
+```bash
+cat > /tmp/client.properties <<'CONF'
 security.protocol=SASL_PLAINTEXT
 sasl.mechanism=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
-  username="debezium" \
-  password="your-kafka-debezium-password";
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="ADMIN_PASSWORD";
+CONF
+
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092 \
+  --command-config /tmp/client.properties --list
+
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092 \
+  --consumer.config /tmp/client.properties --topic dbserver1.public.customers --from-beginning
 ```
 
-Change events are published to topics named `{serverName}.{schema}.{table}` — e.g. `dbserver1.public.users`.
+If no `dbserver1.` topic appears, read the connector log and see [Troubleshooting](#troubleshooting):
 
-## Kafbat UI
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-debezium"}' --limit 50 --since 10m
+```
 
-The Kafbat UI (Kafka web dashboard) is included and enabled by default. Access it via `cpln workload connect` or configure its `firewall.external_inboundAllowCIDR` to expose it externally.
+Applications in the GVC consume the same way, with these client properties and the bootstrap address above. To give a consumer its own Kafka user rather than `admin`, append it to the comma-separated `kafka.kafka.listeners.client.sasl.users` list, with its password at the same position in `passwords`, and give it access, either with Kafka ACLs or by listing it in `kafka.kafka.acl.superUsers`.
+
+## Operations
+
+### Backing Up
+
+Every volume set in the pipeline takes a final snapshot when it is deleted and keeps it for seven days; the Kafka log volume sets also take a snapshot daily at 00:00 UTC. Take extra snapshots before a risky change. The source database is the system of record:
+
+```bash
+cpln volumeset snapshot create RELEASE_NAME-postgres-ha-vs --gvc GVC_NAME --snapshot-name pre-upgrade
+cpln volumeset snapshot get RELEASE_NAME-postgres-ha-vs --gvc GVC_NAME
+```
+
+The Debezium offsets on `RELEASE_NAME-debezium-data` record how far the connector has read; losing them makes it snapshot the source again from the start:
+
+```bash
+cpln volumeset snapshot create RELEASE_NAME-debezium-data --gvc GVC_NAME --snapshot-name pre-upgrade
+```
+
+The bundled PostgreSQL template's own backups (`pg_dumpall` or WAL-G to object storage) are switched off here with `postgres-highly-available.backup.enabled: false`. Turning them on through this chart has not been verified; see [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) for how they work in the standalone template.
+
+### Restoring a Backup
+
+Restoring any of this pipeline's volume snapshots has not been verified. A restored database whose replication slot no longer matches the Debezium offsets, or Kafka brokers whose metadata no longer matches their peers, may not resume cleanly. Rely on PostgreSQL and Kafka replication for the loss of a single member, and treat snapshots as a last resort.
+
+### Upgrading from 1.0.1
+
+Versions 1.0.0 and 1.0.1 bundle a PostgreSQL Highly Available release that does not compact its etcd cluster, so etcd's backend grows with time alone until it reaches its 2 GiB quota and goes read-only, taking PostgreSQL failover with it. Every install of those versions is affected, because the database cannot be switched off. Upgrading to 1.0.2 or later turns compaction on and stops further growth, but it cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade. The mechanism and the checks are on the PostgreSQL Highly Available page under [etcd History Compaction](/template-catalog/templates/postgres-highly-available#etcd-history-compaction).
+
+### Upgrading from 1.0.3
+
+Version 1.0.4 moved the database credentials. They used to be `postgres-highly-available.postgres.username`, `.password`, `.database` and `.walLevel`; they are now `database.username`, `database.password`, `database.name` and `database.walLevel`, and this chart creates the credentials secret named by `postgres-highly-available.config.credentialsSecretName`. Old keys left under `postgres-highly-available.postgres` are no longer read.
+
+An existing database keeps the credentials it was created with, so set `database.*` to those exact values; different values leave the members unable to authenticate after their next restart. Recover them before upgrading, from your values file or from the secret the earlier version created:
+
+```bash
+cpln secret reveal RELEASE_NAME-postgres-config -o yaml
+```
+
+This upgrade path has not been verified end to end. Snapshot the database volume set first, as shown under [Backing Up](#backing-up).
+
+### Scaling and Availability
+
+- The source database runs three Patroni members behind HAProxy and fails over automatically when the leader is lost; Debezium connects through HAProxy, which routes to the current leader, and its startup step creates the replication slot.
+- Kafka runs three brokers with a replication factor of 3. `kafka.kafka.replicas` accepts 1, 3, 4 or 5; see [Kafka](/template-catalog/templates/kafka) for the rules.
+- Debezium Server is a single replica and cannot be scaled out.
+- Keep `postgres-highly-available.etcd.replicas` odd, and choose it at install time.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Debezium is running but no change events reach Kafka">
+    **Cause:** in version 1.0.4 this is expected with the defaults, for up to three reasons. The bundled PostgreSQL cluster runs with `wal_level = replica`, which `pgoutput` logical decoding cannot use; `database.walLevel` is validated but not applied. Kafka enforces ACLs with `allowEveryoneIfNoAclFound: false`, and the `debezium` user is neither a super user nor granted any ACL. Or `debezium-server.sink.kafka.saslPassword` differs from the `debezium` entry in `kafka.kafka.listeners.client.sasl.passwords` — the render-time check compares only the user name.
+
+    **Fix:** read the connector log, filtered server-side, to see which applies:
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-debezium"} |= "ERROR"' --limit 50 --since 10m
+    ```
+
+    Align the two Kafka passwords if they differ. Adding `User:debezium` to `kafka.kafka.acl.superUsers` puts it in the brokers' super-user list. Patroni keeps `wal_level` in its cluster-wide configuration, so it is not changed by any value of this chart. Neither change has been verified end to end on this template.
+  </Accordion>
+  <Accordion title="Kafbat UI never becomes ready and cpln logs shows nothing">
+    **Cause:** the secret named in `kafka.kafbat_ui.configuration_secret` did not exist when the workload was created. The container never starts, so there is no log output.
+
+    **Fix:** read `status.versions[].message` from `cpln workload get-deployments RELEASE_NAME-kafbat-ui --gvc GVC_NAME -o yaml` to see which secret is missing, create it as shown in [Prerequisites](#prerequisites), then wait a few minutes or run `cpln workload force-redeployment RELEASE_NAME-kafbat-ui --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Install fails with Credential mismatch or Database mismatch">
+    **Cause:** `database.username`, `database.password` or `database.name` differs from `debezium-server.source.database.user`, `.password` or `.name`. The error text still calls the database side `postgres-highly-available.postgres`, the name these keys had before 1.0.4.
+
+    **Fix:** set both sides to the same values; the install line in [Installation](#installation) passes the password twice for this reason.
+  </Accordion>
+  <Accordion title="Install fails with Kafka SASL mismatch">
+    **Cause:** `debezium-server.sink.kafka.saslUsername` does not appear in `kafka.kafka.listeners.client.sasl.users`.
+
+    **Fix:** add the user to the Kafka list, or set `saslUsername` to a user already in it.
+  </Accordion>
+  <Accordion title="Install fails with database.walLevel must be logical for CDC">
+    **Cause:** `database.walLevel` was set to something other than `logical`.
+
+    **Fix:** leave it at `logical`.
+  </Accordion>
+  <Accordion title="Two releases in one org use the same database credentials secret">
+    **Cause:** the database credentials secret is named `my-cdc-pipeline-db-credentials` by default, without the release name, and secrets are org-wide.
+
+    **Fix:** give every release in the org its own `postgres-highly-available.config.credentialsSecretName`.
+  </Accordion>
+  <Accordion title="Source disk fills with WAL">
+    **Cause:** a replication slot is not advancing — the connector stopped reading, or a slot was left behind after `debezium-server.source.postgres.slotName` changed. PostgreSQL keeps WAL for an inactive slot indefinitely.
+
+    **Fix:** drop the abandoned slot on the source, using its name:
+
+    ```sql
+    SELECT pg_drop_replication_slot('debezium');
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- In version 1.0.4 the pipeline does not deliver change events with its defaults; see [Troubleshooting](#troubleshooting) and verify events arrive before relying on it.
+- Replace every `change-me-cdc-pipeline-` value before installing; they are plain template values and land in the Helm release.
+- Pass the database password and the `debezium` Kafka password to both the component that owns them and `debezium-server`; only the database values and the Kafka user name are checked at render.
+- `kafka.kafka.secrets.kraft_cluster_id` is fixed once the brokers have started.
+- Kafbat UI is open to the internet by default; set a strong console login or narrow `kafka.kafbat_ui.firewall.external_inboundAllowCIDR`.
+- Give each release its own `postgres-highly-available.config.credentialsSecretName`; the default name is shared org-wide.
+- Uninstalling deletes every volume set — the source database, the Kafka topics and the Debezium offsets; final snapshots are kept for seven days.
+- Component versions are pinned in this chart (PostgreSQL Highly Available 2.5.0, Kafka 4.0.1, Debezium Server 1.1.1) and change only with a new CDC Pipeline version.
 
 ## External References
 
-<CardGroup cols={2}>
-  <Card title="Debezium Server Template" href="/template-catalog/templates/debezium-server" icon="arrow-right-arrow-left">
-    Deploy Debezium Server standalone against any PostgreSQL, MySQL, or other source
-  </Card>
-  <Card title="PostgreSQL Highly Available Template" href="/template-catalog/templates/postgres-highly-available" icon="database">
-    The HA PostgreSQL template bundled in this pipeline
-  </Card>
-  <Card title="Kafka Template" href="/template-catalog/templates/kafka" icon="bezier-curve">
-    The Kafka template bundled in this pipeline
-  </Card>
-  <Card title="Debezium Documentation" href="https://debezium.io/documentation/" icon="book">
-    Full Debezium connector and server reference
-  </Card>
-</CardGroup>
+- [Debezium PostgreSQL connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html)
+- [Debezium Server](https://debezium.io/documentation/reference/stable/operations/debezium-server.html)
+- [PostgreSQL logical decoding](https://www.postgresql.org/docs/current/logicaldecoding.html)
+- [Apache Kafka documentation](https://kafka.apache.org/documentation/)
+- [Patroni dynamic configuration](https://patroni.readthedocs.io/en/latest/dynamic_configuration.html)

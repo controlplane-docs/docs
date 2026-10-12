@@ -1,51 +1,90 @@
 ---
 title: LiteLLM
 icon: /template-catalog/templates/icons/litellm.png
-description: Deploy LiteLLM on Control Plane using the Template Catalog. An OpenAI-compatible LLM gateway and proxy — one endpoint in front of 100+ providers with virtual API keys, per-key and per-team spend tracking, budgets, rate limiting, and routing — backed by PostgreSQL and Redis. Covers the prerequisite secret, model list, Redis auth, scaling, and access.
-keywords: ['litellm', 'llm gateway', 'llm proxy', 'openai-compatible api', 'ai gateway', 'llm router', 'virtual api keys', 'llm spend tracking', 'rate limiting', 'openai proxy', 'self-hosted llm gateway', 'litellm alternative', 'openrouter alternative', 'litellm template']
+description: Deploy LiteLLM, the OpenAI-compatible LLM gateway with virtual keys, spend tracking, budgets and rate limiting, on Control Plane. A stateless proxy tier (one replica by default, scale with a knob) over bundled PostgreSQL and Sentinel Redis. Needs an existing GVC and a pre-created dictionary secret.
+keywords: ['litellm', 'llm gateway', 'llm proxy', 'openai-compatible api', 'ai gateway', 'llm router', 'virtual api keys', 'llm spend tracking', 'openai proxy', 'self-hosted llm gateway', 'openrouter alternative', 'portkey alternative', 'model fallbacks', 'litellm template']
 ---
 
 ## Overview
 
-LiteLLM is an OpenAI-compatible LLM gateway and proxy: a single endpoint in front of 100+ model providers, with virtual API keys, per-key and per-team spend tracking and budgets, rate limiting, and routing with fallbacks. This template deploys the stateless LiteLLM proxy tier backed by PostgreSQL (virtual keys, spend, teams, budgets) and Redis (shared rate-limit counters and response cache). Clients call it exactly as they would call OpenAI — point any OpenAI SDK at the endpoint and swap in a LiteLLM key.
+LiteLLM is an OpenAI-compatible LLM gateway and proxy: a single endpoint in front of 100+ model providers, with virtual API keys, per-key and per-team spend tracking and budgets, rate limiting, and routing with fallbacks. This template deploys the stateless LiteLLM proxy tier (API and Admin UI on port `4000`) backed by a bundled PostgreSQL for virtual keys, spend, teams, and budgets, and a bundled Sentinel-managed Redis for rate-limit counters and the response cache shared across proxy replicas. Clients call it exactly as they would call OpenAI — point any OpenAI SDK at the endpoint and swap in a LiteLLM key.
 
-### Architecture
-
-- **LiteLLM proxy** — A stateless `standard` workload serving the OpenAI-compatible API and Admin UI on port `4000`. Runs a single replica by default; set `litellm.replicas` to `2` or more for an always-on tier with zero-downtime rolling restarts. All state lives in PostgreSQL and Redis, so replicas are independent — no clustering.
-- **PostgreSQL** ([postgres](/template-catalog/templates/postgres) subchart) — The durable store for virtual keys, spend, teams, and budgets. The DB-bundled proxy image runs its Prisma migrations automatically on boot.
-- **Redis + Sentinel** ([redis](/template-catalog/templates/redis) subchart, optional via `redis.enabled`) — Shared rate-limit / budget counters and response cache across proxy replicas.
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have — it does not create or manage a GVC.
+</Note>
 
 ### What Gets Created
 
-- **Standard LiteLLM Workload** — One or more stateless replicas serving the API and Admin UI on port `4000`.
-- **Stateful PostgreSQL Workload** — Single-replica Postgres with a persistent volume set for keys and spend.
-- **Redis Workloads** *(optional)* — A Redis master-replica set with Redis Sentinel for rate limits and cache.
-- **Config Secret** — The model/provider list mounted into the proxy as `config.yaml`.
-- **DB-credentials Secret** — Assembles the proxy's `DATABASE_URL`.
-- **Identity & Policy** — An identity bound to the proxy with least-privilege `reveal` on exactly its own secrets and your prerequisite secret.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-litellm` | LiteLLM proxy: OpenAI-compatible API and Admin UI on port `4000` (standard, `litellm.replicas` replicas) | — |
+| Workload | `RELEASE_NAME-postgres` | Bundled PostgreSQL from the [postgres](/template-catalog/templates/postgres) template — virtual keys, spend, teams, and budgets (stateful, 1 replica) | — |
+| Workload | `RELEASE_NAME-postgres-backup` | Cron job that dumps the database to object storage on a schedule | `postgres.backup.enabled: true` |
+| Workload | `RELEASE_NAME-redis` | Bundled Redis from the [redis](/template-catalog/templates/redis) template — shared rate-limit counters and response cache (stateful, `redis.redis.replicas` replicas) | `redis.enabled: true` (default) |
+| Workload | `RELEASE_NAME-sentinel` | Redis Sentinel that monitors the Redis master as `mymaster` and promotes a replica on failure (stateful, `redis.sentinel.replicas` replicas) | `redis.enabled: true` (default) |
+| Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory | — |
+| Secret | `RELEASE_NAME-litellm-config` | Opaque secret the chart creates with the proxy's `config.yaml` (model list and Redis cache block), mounted at `/app/config.yaml` | — |
+| Secret | `RELEASE_NAME-litellm-db` | Dictionary secret the chart creates (`postgresUsername`, `postgresPassword`) from which the proxy assembles `DATABASE_URL` | — |
+| Secret | the name in `postgres.config.credentialsSecretName` | Dictionary secret the chart creates (`username`, `password`, `database`) and hands to the bundled PostgreSQL | — |
+| Secret | `RELEASE_NAME-redis-config`, `RELEASE_NAME-sentinel-config` | Redis and Sentinel configuration files created by the bundled redis template | `redis.enabled: true` (default) |
+| Secret | `RELEASE_NAME-redis-auth-password` | Redis master password, created by the bundled redis template and wired into the proxy's cache config | `redis.redis.auth.password.enabled: true` |
+| Identity | `RELEASE_NAME-litellm-identity` | Bound to the proxy workload | — |
+| Policy | `RELEASE_NAME-litellm-policy` | Grants that identity `reveal` on exactly the secrets it reads: the config and database secrets, your prerequisite secret, and the Redis password secret when auth is on | — |
+| Identity | `RELEASE_NAME-pg-identity` | Bound to the bundled PostgreSQL (and its backup job) | — |
+| Policy | `RELEASE_NAME-pg-policy` | Grants the PostgreSQL identity `reveal` on its credentials secret only | — |
+| Identity | `RELEASE_NAME-redis-identity`, `RELEASE_NAME-sentinel-identity` | Bound to the Redis and Sentinel workloads | `redis.enabled: true` (default) |
+| Policy | `RELEASE_NAME-redis-policy`, `RELEASE_NAME-sentinel-policy` | Grant those identities `reveal` on their configuration secrets | `redis.enabled: true` (default) |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+Your master key, salt key, and provider API keys are **not** created by the template — see [Prerequisites](#prerequisites).
 
 ## Prerequisites
 
-**You must create a dictionary secret before installing.** The proxy references it by name (`secrets.name`, default `my-litellm-secrets`) and will not become healthy until it exists — a missing secret wedges the deployment and makes it look broken. Create it first, in the same GVC, as a **dictionary** secret containing:
+LiteLLM needs three kinds of credential that never pass through Helm values: the **master key** that gates the Admin API and UI and mints virtual keys, the **salt key** that encrypts provider keys stored in PostgreSQL, and one **provider API key** per entry in `litellm.providerEnv`. All of them live in a single [dictionary secret](/guides/create-secret/dictionary) you create **before** installing; the chart references it by name and grants the proxy identity `reveal` on exactly that secret.
 
-- `LITELLM_MASTER_KEY` — the admin key (format `sk-...`); gates the Admin API/UI and mints virtual keys.
-- `LITELLM_SALT_KEY` — encrypts provider keys stored in PostgreSQL. **Write-once — never rotate it** (rotating corrupts every stored provider key).
-- one key per name in `litellm.providerEnv` (default: `OPENAI_API_KEY`) — the actual provider API key.
+<Steps>
+  <Step title="Create the dictionary secret">
+    The keys `LITELLM_MASTER_KEY` and `LITELLM_SALT_KEY` are required and must start with `sk-`. Add one more entry for every environment-variable name listed in `litellm.providerEnv` (the default list is just `OPENAI_API_KEY`), holding that provider's real API key:
 
-Create it with the CLI (add one entry per provider key you use):
+    ```bash
+    cpln secret create-dictionary --name LITELLM_SECRET_NAME \
+      --entry LITELLM_MASTER_KEY="sk-$(openssl rand -hex 24)" \
+      --entry LITELLM_SALT_KEY="sk-$(openssl rand -hex 24)" \
+      --entry OPENAI_API_KEY='YOUR-OPENAI-API-KEY'
+    ```
+
+    Set `secrets.name` to this name. Secrets are org-level, so no GVC flag is involved.
+  </Step>
+  <Step title="Back the salt key up outside Control Plane">
+    `LITELLM_SALT_KEY` is write-once: it encrypts every provider key stored in PostgreSQL, and changing it corrupts all of them. The master key can be rotated later; the salt key cannot once models or keys are stored. Keep a copy somewhere safe.
+  </Step>
+</Steps>
+
+<Warning>
+Create the secret **before** installing. Installing without it reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
 
 ```bash
-cpln secret create-dictionary --name my-litellm-secrets \
-  --entry LITELLM_MASTER_KEY=sk-$(openssl rand -hex 24) \
-  --entry LITELLM_SALT_KEY=sk-$(openssl rand -hex 24) \
-  --entry OPENAI_API_KEY=sk-...your-openai-key...
+cpln workload get-deployments RELEASE_NAME-litellm --gvc GVC_NAME -o yaml
 ```
 
-Install the template using your preferred method:
+The message reads `The secret LITELLM_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Creating the secret lets the deployment recover on its own; `cpln workload force-redeployment RELEASE_NAME-litellm --gvc GVC_NAME` skips the wait.
+</Warning>
+
+Everything else works with the defaults. The bundled database password is template-managed plumbing — the chart creates the PostgreSQL credentials secret for you — and scheduled database backups, which need a bucket and cloud account, are described under [Backing Up](#backing-up).
+
+## Installation
+
+Once your dictionary secret exists, install from the marketplace registry, pointing `secrets.name` at it and replacing the bundled database password:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/litellm \
+  --version 1.1.0 --gvc GVC_NAME \
+  --set secrets.name=LITELLM_SECRET_NAME \
+  --set postgres.credentials.password='YOUR-DB-PASSWORD'
+```
+
+Installing a second LiteLLM release in the same org? Also set `postgres.config.credentialsSecretName` to a name no other release uses — secret names are org-wide.
+
+Other ways to install and manage the template:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -71,144 +110,414 @@ Install the template using your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### LiteLLM Proxy
 
 ```yaml
 litellm:
-  # DB-bundled image variant — runs Prisma `migrate deploy` on boot.
-  image: ghcr.io/berriai/litellm-database:v1.93.0
-  replicas: 1                 # 1 = proven single-replica; 2+ = always-on, zero-downtime restarts
+  image: ghcr.io/berriai/litellm-database:v1.93.0 # DB-bundled image — runs Prisma migrations on boot; pin a concrete tag, never main-stable/latest
+  replicas: 1 # proven single-replica shape; set >=2 for the scaled/HA tier (keep redis on for shared rate limits)
   resources:
     minCpu: 250m
     maxCpu: 1000m
     minMemory: 1Gi
     maxMemory: 2Gi
-  storeModelInDb: true        # also manage models via the Admin UI (persisted in Postgres)
-  # Model/provider list seeded into config.yaml. api_key values reference env vars
-  # supplied via the prerequisite secret (never inline real keys here).
-  modelList:
+  storeModelInDb: true # also manage models via the Admin UI (persisted in Postgres)
+  modelList: # seeded into config.yaml; api_key values reference env-var NAMES, never literal keys
     - model_name: gpt-4o-mini
       litellm_params:
         model: openai/gpt-4o-mini
         api_key: os.environ/OPENAI_API_KEY
-  # Env-var NAMES (non-sensitive) exposed to the proxy from the prerequisite secret.
-  # Every name here must exist as a key in the secrets.name dictionary secret.
-  providerEnv:
+  providerEnv: # env-var NAMES exposed to the proxy from the prerequisite secret — each must be a key in it
     - OPENAI_API_KEY
+```
 
-# Prerequisite dictionary secret — MUST EXIST BEFORE INSTALL (see Prerequisites).
+Every `api_key` in `modelList` points at an environment variable (`os.environ/NAME`), and every such name must appear in both `providerEnv` and your prerequisite secret. Adding a provider is therefore three edits: a new `modelList` entry, its variable name in `providerEnv`, and the key itself in the secret.
+
+### Prerequisite Secret
+
+```yaml
 secrets:
-  name: my-litellm-secrets
+  name: my-litellm-secrets # dictionary secret with LITELLM_MASTER_KEY, LITELLM_SALT_KEY + every providerEnv key — MUST exist before install
+```
 
+### Access
+
+```yaml
 publicAccess:
-  enabled: true               # key-gated *.cpln.app endpoint (UI + API); false = internal-only
+  enabled: true # key-gated *.cpln.app endpoint (UI + API); false = internal-only
 internalAccess:
-  type: same-gvc              # options: none, same-gvc, same-org, workload-list
-  workloads: []               # used only with workload-list
+  type: same-gvc # none | same-gvc | same-org | workload-list
+  workloads: [] # used only with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
-# PostgreSQL — virtual keys / spend / budgets
+| `internalAccess.type` | Who can reach the proxy over the internal network |
+|---|---|
+| `none` | No workload |
+| `same-gvc` | Every workload in the same GVC (default) |
+| `same-org` | Every workload in the same org |
+| `workload-list` | Only the workloads listed in `internalAccess.workloads` |
+
+The public endpoint is key-gated, not open: every request still needs a valid master or virtual key. A change to either access knob takes a couple of minutes to take effect after the upgrade reports success.
+
+### Bundled PostgreSQL
+
+The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. The chart builds the credentials secret from `postgres.credentials.*` for you — nothing to create before installing.
+
+```yaml
 postgres:
   image: postgres:18
-  credentials: # the chart writes these into the secret named below — nothing for you to create
+  credentials: # the chart writes these into the secret named below
     username: litellm
-    password: change-me-litellm-pg     # change before installing
+    password: change-me-litellm-pg # change before installing — seeds the database on first boot
     database: litellm
   config:
-    credentialsSecretName: my-litellm-db-credentials # secret names are org-wide — give each release its own
+    credentialsSecretName: my-litellm-db-credentials # chart-created; secret names are org-wide, so give each release its own
   resources:
     minCpu: 250m
     maxCpu: 1000m
     minMemory: 512Mi
     maxMemory: 1Gi
   volumeset:
-    capacity: 10              # initial capacity in GiB (minimum is 10)
+    capacity: 10 # GiB (minimum is 10)
+  backup:
+    enabled: false # scheduled pg_dumpall to object storage — see Backing Up
+    schedule: "0 2 * * *" # daily at 02:00 UTC
+    provider: aws # aws | gcp | minio
+```
 
-# Redis (Sentinel HA) — rate limits / cache
+### Bundled Redis
+
+Redis is the [redis](/template-catalog/templates/redis) template as a subchart: a Sentinel-managed master-replica set that the proxy reaches through Sentinel (master name `mymaster`), so a failover is transparent to it. It holds the rate-limit and budget counters and the response cache that all proxy replicas share.
+
+```yaml
 redis:
-  enabled: true               # false = in-memory per-replica rate limiting (not shared)
+  enabled: true # gates the dependency; false = in-memory per-replica rate limiting
   redis:
     image: redis:7.4
     replicas: 3
     auth:
       password:
-        enabled: false        # true = require AUTH; wires the master password into LiteLLM's cache config
-        value: change-me-litellm-redis
+        enabled: false # true = require AUTH; the master password is wired into LiteLLM's cache config
+        value: change-me-litellm-redis # change before enabling
+    resources:
+      cpu: 200m
+      memory: 256Mi
+      minCpu: 80m
+      minMemory: 128Mi
   sentinel:
     image: redis:7.4
     replicas: 3
+    resources:
+      cpu: 200m
+      memory: 256Mi
+      minCpu: 80m
+      minMemory: 128Mi
 ```
 
-### LiteLLM proxy
+Redis ships authless by default, with the same-GVC firewall as the boundary. Set `redis.redis.auth.password.enabled: true` to require `AUTH`: the redis template then creates `RELEASE_NAME-redis-auth-password`, and the chart passes that master password into the proxy's cache config. Sentinel authentication must stay off — the proxy sends only the master password, and the chart refuses to render if `redis.sentinel.auth` is enabled.
 
-- `litellm.image` — The DB-bundled LiteLLM proxy image (`litellm-database`), which runs Prisma migrations on boot. Pin a concrete tag.
-- `litellm.replicas` — Number of stateless proxy replicas. `1` is the proven single-replica shape; `2` or more gives an always-on tier where rolling restarts cycle one replica at a time with no downtime. Keep Redis enabled at `2`+ so rate limits are shared across replicas.
-- `litellm.resources` — CPU and memory per replica.
-- `litellm.storeModelInDb` — When `true`, models added through the Admin UI/API are persisted in PostgreSQL alongside the static `modelList`.
-- `litellm.modelList` — The model/provider list seeded into the mounted `config.yaml`. Each entry's `api_key` references an environment variable name (`os.environ/OPENAI_API_KEY`) — never a literal key.
-- `litellm.providerEnv` — The environment-variable **names** exposed to the proxy from the prerequisite secret. Every name here must exist as a key in that dictionary secret.
-
-### Prerequisite secret
-
-- `secrets.name` — Name of the user-created dictionary secret holding `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, and every `providerEnv` key. It must exist **before** install — see [Prerequisites](#prerequisites).
-
-### Access
-
-- `publicAccess.enabled` — Serve the API and Admin UI on the canonical `*.cpln.app` HTTPS endpoint (default). The endpoint is **key-gated** — a valid master or virtual key is always required. Set to `false` for an internal-only instance.
-- `internalAccess.type` — Internal firewall scope of the proxy workload:
-
-| Type | Description |
-|------|-------------|
-| `none` | No internal access. |
-| `same-gvc` | Allow access from all workloads in the same GVC (default). |
-| `same-org` | Allow access from all workloads in the same organization. |
-| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`. |
-
-### PostgreSQL
-
-- `postgres.credentials.password` — The bundled database password. **Change it before installing.**
-- `postgres.config.credentialsSecretName` — Name of the dictionary secret the chart creates from those three values and hands to the bundled PostgreSQL. Secret names are organization-wide, so give each release its own name; a second release left on the default is **refused at install** and creates nothing, leaving the first release untouched.
-- `postgres.volumeset.capacity` — Initial volume size in GiB (minimum 10).
-
-PostgreSQL stores all virtual keys, spend, teams, and budgets.
-
-### Redis
-
-- `redis.enabled` — When `true` (default), deploys Redis + Sentinel for shared rate-limit counters and response cache. When `false`, no Redis is created and each proxy replica rate-limits in-memory (not shared across replicas).
-- `redis.redis.auth.password.enabled` — When `false` (default), Redis runs authless with the same-GVC firewall as the boundary. Set to `true` to require AUTH; the master password is then wired into the proxy's cache config. Both paths are tested end to end, including Sentinel monitoring the auth-protected master.
-- `redis.redis.replicas` / `redis.sentinel.replicas` — Redis and Sentinel replica counts.
+<Note>
+The database password seeds PostgreSQL on first boot and is not updated by later value edits. Uninstalling the release deletes the volume set; reinstall to reset.
+</Note>
 
 ## Connecting
 
-| Target | Address | Credentials |
+| What | Address | Notes |
 |---|---|---|
-| Public API + Admin UI | `https://<canonical>.cpln.app` (UI at `/ui`) | `LITELLM_MASTER_KEY` (Bearer token / UI login) |
-| Internal (same GVC) | `http://{release}-litellm.{gvc}.cpln.local:4000` | `LITELLM_MASTER_KEY` |
-| OpenAI-compatible calls | `POST /chat/completions` with `Authorization: Bearer <key>` | master key or a minted virtual key |
+| Public API and Admin UI | `https://<canonical>.cpln.app` | Assigned automatically while `publicAccess.enabled` is `true`. Read it from `status.canonicalEndpoint` with `cpln workload get RELEASE_NAME-litellm --gvc GVC_NAME -o yaml`. The Admin UI is at `/ui`. |
+| OpenAI-compatible base URL (internal) | `http://RELEASE_NAME-litellm.GVC_NAME.cpln.local:4000` | Reachable per `internalAccess.type`. Point other workloads' OpenAI SDKs here (`/v1/chat/completions`, `/v1/models`, …). |
+| Health | `/health/readiness`, `/health/liveliness` | The endpoints the readiness and liveness probes use, on the same host. |
+| Master key | `LITELLM_MASTER_KEY` in your prerequisite secret | `cpln secret reveal LITELLM_SECRET_NAME -o yaml`. Send it as `Authorization: Bearer …`; it is also the Admin UI password. |
+| PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | `username` / `password` / `database` from `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `postgres.config.credentialsSecretName`. |
+| Redis | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` (Sentinel, master `mymaster`); `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` | Internal only. Password is the `password` key of `cpln secret reveal RELEASE_NAME-redis-auth-password -o yaml` when auth is on. |
 
-The canonical `*.cpln.app` hostname appears under `status.canonicalEndpoint` (`cpln workload get {release}-litellm -o yaml`). Point any OpenAI SDK at this base URL and pass a LiteLLM key.
+Verify the proxy answers with your master key — the response lists the models from `modelList`:
 
-## Managing Virtual Keys
+```bash
+curl https://<canonical>.cpln.app/v1/models \
+  -H "Authorization: Bearer YOUR-MASTER-KEY"
+```
 
-Rather than handing out the master key, mint scoped virtual keys — each with its own budget and rate limits — and give those to your applications and teams. Spend is tracked per key in PostgreSQL.
+With `publicAccess.enabled: false` there is no public endpoint; reach the proxy from your machine through a tunnel instead, then use `http://localhost:4000` (UI at `http://localhost:4000/ui`) in place of the canonical endpoint:
+
+```bash
+cpln port-forward RELEASE_NAME-litellm 4000:4000 --gvc GVC_NAME
+```
+
+### First Run
+
+The Admin UI is gated by the master key from the first request, so there is no setup wizard to race — but the master key should not be what your applications use.
+
+<Steps>
+  <Step title="Wait for the proxy to report ready">
+    PostgreSQL comes up first, then the proxy runs its database migrations and starts serving. On a cold install the proxy can start before the database accepts connections, log a `P1001` error, and restart once; it recovers on its own.
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-litellm --gvc GVC_NAME -o yaml
+    ```
+  </Step>
+  <Step title="Sign in to the Admin UI">
+    Open `/ui` on the canonical endpoint (or the port-forward URL). The username is `admin` and the password is your `LITELLM_MASTER_KEY`.
+  </Step>
+  <Step title="Mint a virtual key for each application">
+    Create keys with their own budgets and rate limits under **Virtual Keys** in the UI, or with the API as shown in [Managing Virtual Keys](#managing-virtual-keys), and hand those out instead of the master key.
+  </Step>
+  <Step title="Point an OpenAI SDK at the proxy">
+    Set the SDK's base URL to the canonical endpoint (or the internal address for workloads in the same GVC) and its API key to a virtual key. The model names are the `model_name` values from `modelList`, plus any models added through the UI while `litellm.storeModelInDb` is `true`.
+  </Step>
+</Steps>
+
+## Operations
+
+### Managing Virtual Keys
+
+Rather than handing out the master key, mint scoped virtual keys — each with its own budget, rate limits, and allowed models — and give those to your applications and teams. Spend is tracked per key in PostgreSQL.
 
 ```bash
 curl -X POST https://<canonical>.cpln.app/key/generate \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H "Authorization: Bearer YOUR-MASTER-KEY" \
   -H "Content-Type: application/json" \
-  -d '{"key_alias": "team-a", "max_budget": 10}'
+  -d '{"key_alias": "team-a", "models": ["gpt-4o-mini"], "max_budget": 10}'
 ```
 
-The response includes a new `sk-...` key usable on `/chat/completions` and `/v1/models`. Manage keys, teams, and budgets visually in the Admin UI at `/ui`.
+The response includes a new `sk-…` key usable on `/v1/chat/completions` and `/v1/models`. Keys, teams, and budgets can also be managed visually in the Admin UI at `/ui`. Rate limits are enforced across all proxy replicas only while Redis is enabled; see [Scaling and Availability](#scaling-and-availability).
+
+### Backing Up
+
+Scheduled backups of the bundled PostgreSQL are off by default. Enabling `postgres.backup.enabled: true` adds one cron workload, `RELEASE_NAME-postgres-backup`, that runs `pg_dumpall` on the schedule and uploads a gzipped dump to your bucket under the configured prefix. Pick a `postgres.backup.provider` and complete the matching setup **before** installing or upgrading with it on.
+
+<Tabs>
+  <Tab title="AWS S3">
+    ```yaml
+    postgres:
+      backup:
+        enabled: true
+        provider: aws
+        aws:
+          bucket: my-postgres-bucket
+          region: us-east-1
+          cloudAccountName: my-s3-cloud-account
+          policyName: my-postgres-backup-policy # bucket-scoped IAM policy
+          prefix: postgres/backups
+    ```
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create an S3 bucket. Set `postgres.backup.aws.bucket` and `postgres.backup.aws.region` to match.
+      </Step>
+      <Step title="Set up a cloud account">
+        If you do not have one, [create a cloud account](/guides/create-cloud-account) for the AWS account holding the bucket. Set `postgres.backup.aws.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a bucket-scoped IAM policy">
+        Create an IAM policy with the JSON below (replace `YOUR_BUCKET_NAME`) and set `postgres.backup.aws.policyName` to its name:
+
+        ```json
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:ListBucket",
+                "s3:GetObjectVersion",
+                "s3:DeleteObjectVersion",
+                "s3:GetBucketLocation",
+                "s3:AbortMultipartUpload",
+                "s3:ListBucketMultipartUploads",
+                "s3:ListMultipartUploadParts"
+              ],
+              "Resource": [
+                "arn:aws:s3:::YOUR_BUCKET_NAME",
+                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+              ]
+            }
+          ]
+        }
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    ```yaml
+    postgres:
+      backup:
+        enabled: true
+        provider: gcp
+        gcp:
+          bucket: my-postgres-bucket
+          cloudAccountName: my-gcs-cloud-account
+          prefix: postgres/backups
+    ```
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create a GCS bucket. Set `postgres.backup.gcp.bucket` to its name.
+      </Step>
+      <Step title="Set up a cloud account">
+        [Create a cloud account](/guides/create-cloud-account) for the GCP project holding the bucket and set `postgres.backup.gcp.cloudAccountName` to its name.
+      </Step>
+      <Step title="Grant storage access">
+        Grant the cloud account's service account the **Storage Admin** (`roles/storage.admin`) role on the project. The chart additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket in `postgres.backup.gcp.bucket`.
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="MinIO / S3-compatible">
+    ```yaml
+    postgres:
+      backup:
+        enabled: true
+        provider: minio
+        minio:
+          endpoint: http://my-minio-workload:9000 # S3 API address including the port
+          bucket: my-postgres-bucket
+          credentialsSecretName: my-postgres-minio-credentials # dictionary secret with accessKey + secretKey
+          prefix: postgres/backups
+    ```
+
+    <Steps>
+      <Step title="Create a bucket">
+        Create the bucket on your server. Set `postgres.backup.minio.bucket` to its name and `postgres.backup.minio.endpoint` to the S3 API address including the port — for the [MinIO](/template-catalog/templates/minio) template in the same GVC, `http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000`.
+      </Step>
+      <Step title="Create the credentials secret">
+        Create a dictionary secret with the server's keys and set `postgres.backup.minio.credentialsSecretName` to its name. No cloud account is involved.
+
+        ```bash
+        cpln secret create-dictionary --name BACKUP_MINIO_SECRET_NAME \
+          --entry accessKey=YOUR-ACCESS-KEY \
+          --entry secretKey='YOUR-SECRET-KEY'
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+<Warning>
+A zero-length backup object is a failed run, not a backup. If the dump cannot reach the database, the upload still writes a near-empty gzip under a normal timestamped filename. Check the object size before you rely on one.
+</Warning>
+
+The database dump covers virtual keys, spend, teams, budgets, and any models added through the UI. It does not cover your prerequisite secret — the salt key in particular is needed to read the provider keys stored in that dump, so keep it backed up alongside. Redis holds only counters and cache and is not backed up.
+
+### Restoring a Backup
+
+Each backup is a gzipped plain-SQL `pg_dumpall` archive. Restoring means replaying that SQL into the bundled PostgreSQL. The one transport that carries a dump into the container intact is `cpln workload exec` with `--stdin` and a `base64` wrapper on both ends — raw binary piped through exec is corrupted:
+
+```bash
+gunzip -c BACKUP_FILE.sql.gz | base64 | cpln workload exec RELEASE_NAME-postgres --gvc GVC_NAME \
+  --container postgresql --stdin --quiet -- sh -c 'base64 -d | psql -U "$POSTGRES_USER" -d postgres'
+```
+
+Two constraints make this a planned operation: the archive contains `CREATE ROLE` and `CREATE DATABASE` statements, so a straight replay collides with the database the proxy already created and migrated on first boot; and no proxy replica may be connected while you drop and recreate that database before the replay. The restored data is only readable with the same `LITELLM_SALT_KEY` the dump was taken under.
+
+<Warning>
+This restore path has not been exercised against this template end to end. Rehearse it on a throwaway release before you depend on it. Restoring from a volume set snapshot is likewise unverified here.
+</Warning>
+
+### Upgrading from 1.0.0
+
+Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. LiteLLM absorbed that change rather than passing it on — the chart now creates the credentials secret itself — so there is **no new prerequisite**, only a rename of three keys:
+
+| Removed key (1.0.0) | Replacement (1.1.0) |
+|---|---|
+| `postgres.config.username` | `postgres.credentials.username` |
+| `postgres.config.password` | `postgres.credentials.password` |
+| `postgres.config.database` | `postgres.credentials.database` |
+
+Move the three keys, keep the same values so the running database still matches, and upgrade in place. A values file that still carries an old key fails the render with the **postgres template's** message (`config.username was REMOVED in postgres 3.4.0`), which tells you to create a dictionary secret yourself — ignore that advice here; this template creates it, and the database password stays a value exactly as before.
+
+<Note>
+The first `helm upgrade` after an install can restart the bundled PostgreSQL and Redis even when their values are unchanged, so expect a brief interruption.
+</Note>
+
+### Scaling and Availability
+
+`litellm.replicas` sets how many proxy replicas run. The proxy is stateless — all state lives in PostgreSQL and Redis — so replicas need no peer discovery and a rolling restart cycles one at a time. Set it to `2` or more for an always-on tier:
+
+```yaml
+litellm:
+  replicas: 2
+redis:
+  enabled: true
+```
+
+<Warning>
+Keep `redis.enabled: true` whenever `litellm.replicas` is above `1`. Rate-limit and budget counters are shared only through Redis; without it each replica counts in memory, so the effective limit becomes the configured value multiplied by the replica count.
+</Warning>
+
+The bundled Redis is already highly available: three Redis replicas with three Sentinels, and the proxy connects through Sentinel so a master failover needs no reconfiguration. The bundled PostgreSQL is a single instance on a persistent volume set, which survives restarts, redeploys, and upgrades under the same release name. Scale-out proxy replicas run the boot-time database migration as a no-op.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Deployment never becomes ready and the logs are empty">
+    **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-litellm --gvc GVC_NAME -o yaml` shows `The secret LITELLM_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
+
+    **Cause:** The prerequisite dictionary secret named by `secrets.name` does not exist, or it is missing one of the keys the workload references (`LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, or a name listed in `litellm.providerEnv`).
+
+    **Fix:** Create the secret with every required key (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-litellm --gvc GVC_NAME` skips the wait.
+  </Accordion>
+  <Accordion title="Readiness never passes after the secret exists">
+    **Symptom:** The proxy container starts but `/health/readiness` keeps failing and the deployment does not reach ready.
+
+    **Cause:** The readiness check is database-aware. The proxy cannot reach the bundled PostgreSQL, or the migration it runs on boot has not completed.
+
+    **Fix:** Check that `RELEASE_NAME-postgres` is ready, then read the proxy's logs:
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-litellm"} |= "ERROR"' --limit 50 --since 10m
+    ```
+
+    A single `P1001` (cannot reach database server) followed by one restart on a cold install is normal and recovers on its own.
+  </Accordion>
+  <Accordion title="Second install refused as managed by a different release">
+    **Symptom:** Installing a second LiteLLM release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
+
+    **Cause:** Both releases use the same `postgres.config.credentialsSecretName`. Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
+
+    **Fix:** Set `postgres.config.credentialsSecretName` to a distinct name for the second release and install again.
+  </Accordion>
+  <Accordion title="Render fails because the Redis password value is required">
+    **Symptom:** `litellm: redis.redis.auth.password.value is required when redis.redis.auth.password.enabled is true — LiteLLM's cache config reads this master password`.
+
+    **Cause:** `redis.redis.auth.password.enabled` is `true` with an empty `redis.redis.auth.password.value`.
+
+    **Fix:** Set `redis.redis.auth.password.value` to the password the bundled Redis should require, or set `enabled` back to `false`.
+  </Accordion>
+  <Accordion title="Render fails because Sentinel auth must stay disabled">
+    **Symptom:** `litellm: redis.sentinel.auth must stay disabled — LiteLLM sends only the master password, not a sentinel password`.
+
+    **Cause:** `redis.sentinel.auth.password.enabled` or `redis.sentinel.auth.fromSecret.enabled` is `true`. The proxy authenticates to the Redis master only, so a Sentinel password would lock it out.
+
+    **Fix:** Leave both Sentinel auth toggles at `false`. Use `redis.redis.auth.password.enabled: true` to protect the master; the same-GVC firewall is the boundary for Sentinel.
+  </Accordion>
+  <Accordion title="Upgrade from 1.0.0 fails asking you to create a dictionary secret">
+    **Symptom:** The render fails with `config.username was REMOVED in postgres 3.4.0` and the postgres template's advice to create a prerequisite dictionary secret.
+
+    **Cause:** Your values file still carries `postgres.config.username`, `postgres.config.password`, or `postgres.config.database`.
+
+    **Fix:** Rename them to `postgres.credentials.*` as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0). Do not create a secret yourself — this template creates it.
+  </Accordion>
+  <Accordion title="Requests are rejected with 401 on the public endpoint">
+    **Symptom:** API calls return `401`, including on the public endpoint.
+
+    **Cause:** The endpoint is key-gated. The request carries no `Authorization: Bearer` header, or the key is not the master key or a valid virtual key for the requested model.
+
+    **Fix:** Send the master key or a virtual key minted for that model (see [Managing Virtual Keys](#managing-virtual-keys)). Compare the master key you are sending with `cpln secret reveal LITELLM_SECRET_NAME -o yaml`.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **The prerequisite secret must exist before install.** `secrets.name` is a dictionary secret with `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, and every `providerEnv` key. A missing secret wedges the deployment.
-- **`LITELLM_SALT_KEY` is write-once — never rotate it.** It encrypts stored provider keys; changing it corrupts every stored key. The master key may be rotated.
-- **The endpoint is key-gated, not open.** Public access still requires a valid master or virtual key — hand out virtual keys with budgets and limits rather than the master key.
-- **Keep Redis enabled for `replicas` ≥ 2.** Without it, each replica rate-limits in-memory, so the effective limit becomes N× the configured value.
-- **Redis ships authless by default** (same-GVC firewall is the boundary). Set `redis.redis.auth.password.enabled: true` to require AUTH; the master password is then wired into the proxy's cache config.
-- **PostgreSQL data survives reinstalls of the proxy** — to reset virtual keys and spend you must also reinstall the database (which deletes its volume set).
-- **First install self-heals a brief DB-timing gap.** On a cold install the proxy can start before PostgreSQL accepts connections and log a `P1001` error with one restart; it recovers automatically once the database is ready (about 1.5–2 minutes to healthy). No action needed.
+- **Create the prerequisite secret before installing.** `secrets.name` must be a dictionary secret with `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, and every `litellm.providerEnv` key; without it the deployment wedges silently.
+- **Never rotate `LITELLM_SALT_KEY`.** It encrypts the provider keys stored in PostgreSQL; changing it corrupts every stored key. The master key may be rotated — force a redeployment of `RELEASE_NAME-litellm` afterwards so the proxy picks up the new value.
+- **Hand out virtual keys, not the master key.** The public endpoint is key-gated, and virtual keys carry their own budgets, rate limits, and model lists.
+- **Keep Redis enabled for `litellm.replicas` of 2 or more.** Otherwise rate limits are counted per replica.
+- **Redis is authless by default**, bounded by the same-GVC firewall. Set `redis.redis.auth.password.enabled: true` (with a changed `value`) to require a master password; Sentinel auth must stay off.
+- **Give each release its own `postgres.config.credentialsSecretName`.** Secret names are org-wide; a second release on the default name is refused at install.
+- **Change `postgres.credentials.password` before installing.** It seeds the database on first boot and later value edits do not change it.
+- **PostgreSQL data survives proxy restarts and redeploys.** To reset virtual keys and spend, uninstall the whole release — that deletes the volume set.
 
 ## External References
 

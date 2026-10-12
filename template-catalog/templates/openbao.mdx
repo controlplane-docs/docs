@@ -1,50 +1,171 @@
 ---
 title: OpenBao
 icon: /template-catalog/templates/icons/openbao.png
-description: Deploy OpenBao on Control Plane using the Template Catalog. The Linux Foundation's open-source fork of HashiCorp Vault — an identity-based secrets engine with a Vault-compatible API and CLI, integrated raft storage, and hands-free auto-unseal from a platform secret, AWS KMS, or GCP Cloud KMS.
-keywords: ['openbao', 'bao', 'vault alternative', 'hashicorp vault fork', 'secrets engine', 'kv v2', 'dynamic secrets', 'pki', 'transit encryption', 'auto-unseal', 'unseal key', 'raft storage', 'aws kms', 'gcp cloud kms', 'self-hosted secrets']
+description: Single-node OpenBao secrets engine (the open-source fork of HashiCorp Vault) with a Vault-compatible API, web UI, raft storage and auto-unseal from a static key, AWS KMS or GCP Cloud KMS. Deploys into an existing GVC; the default static seal needs one opaque unseal-key secret created before install.
+keywords: ['bao', 'vault alternative', 'kv v2', 'dynamic secrets', 'pki', 'transit encryption', 'unseal key', 'recovery keys', 'root token', 'operator init', 'aws kms', 'gcp cloud kms', 'raft snapshot', 'secrets management', 'self-hosted secrets']
 ---
 
 ## Overview
 
-OpenBao is the Linux Foundation's open-source (MPL-2.0) fork of HashiCorp Vault: an identity-based secrets engine with a Vault-compatible API and CLI, covering KV v2 storage, dynamic secrets, PKI, and transit encryption. This template deploys a single-node OpenBao server with integrated raft storage on a persistent volume set, and auto-unseal so the server comes back on its own after every restart.
+OpenBao is the Linux Foundation's open-source (MPL-2.0) fork of HashiCorp Vault: an identity-based secrets engine with a Vault-compatible API and CLI, covering KV v2 storage, dynamic secrets, PKI and transit encryption. This template deploys one OpenBao server with integrated raft storage on a persistent volume and auto-unseal, so the server comes back unsealed on its own after every restart with no operator action.
 
-If you are choosing between catalog templates: OpenBao is the Vault-compatible engine for workloads that need dynamic secrets, PKI, transit, or existing Vault tooling, while [Infisical](/template-catalog/templates/infisical) is an application-secrets workflow platform with a team-oriented web UI. The two solve different problems and can be run side by side.
+If you are choosing between catalog templates: OpenBao is the Vault-compatible engine for workloads that need dynamic secrets, PKI, transit or existing Vault tooling, while [Infisical](/template-catalog/templates/infisical) is an application-secrets workflow platform with a team-oriented web UI. The two solve different problems and can run side by side.
 
-### Architecture
-
-- **OpenBao server** — A single `stateful` workload serving the HTTP API and web UI on port `8200`, configured from a rendered HCL config file. Storage is OpenBao's integrated raft backend, written to a persistent volume set at `/openbao/data`.
-- **Auto-unseal** — The encryption barrier is unwrapped automatically on every boot in one of three seal modes: `static` (a 32-byte key held in a Control Plane secret you create), `awskms`, or `gcpckms`. Both KMS modes are keyless — the workload identity reaches the KMS key through a Control Plane [cloud account](https://docs.controlplane.com/guides/create-cloud-account), with no static cloud credentials in the container.
-- **Private by default** — External access is off (`publicAccess.enabled: false`); the server is reachable only from inside the GVC until you turn it on.
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create or manage a GVC.
+</Note>
 
 ### What Gets Created
 
-- **Stateful OpenBao Workload** — One replica serving the API and UI on port `8200`.
-- **Volume Set** — Persistent raft storage for all secrets, auth configuration, and cluster state. A final snapshot is retained for 7 days when the volume set is deleted.
-- **Config Secret** — An opaque secret holding the rendered HCL server config, file-mounted into the container.
-- **Identity & Policy** — An identity bound to the workload with `reveal` on exactly the secrets it mounts. In the KMS seal modes the identity also carries the keyless cloud access used to reach the KMS key.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-openbao` | OpenBao server (stateful, 1 replica, container `openbao`): HTTP API and web UI on port `8200`, integrated raft storage | — |
+| Volume Set | `RELEASE_NAME-openbao-data` | `/openbao/data` — the raft store holding every secret, auth mount, policy and the cluster state, on a 10 GiB `ext4` general-purpose SSD volume; a final snapshot is taken when the volume set is deleted and kept 7 days | — |
+| Secret | `RELEASE_NAME-openbao-config` | Opaque secret holding the rendered HCL server configuration, file-mounted at `/openbao/config/config.hcl` | — |
+| Identity | `RELEASE_NAME-openbao-identity` | Bound to the workload; in the `awskms` and `gcpckms` seal modes it also carries the cloud account link the server uses to reach your KMS key | — |
+| Policy | `RELEASE_NAME-openbao-policy` | Grants the identity `reveal` on the config secret and, in `static` mode, on the unseal-key secret you created — nothing else | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+The template creates **no unseal key and no OpenBao credentials of its own**. In the default `static` seal mode the unseal key lives in a secret you create; the root token and recovery keys exist only in the output of the one-time initialization you run.
 
 ## Prerequisites
 
-Prerequisites depend on the seal mode you choose.
+What must exist before install depends on the seal mode (`seal.type`). The default is `static`.
 
-**Static seal (the default): create the unseal-key secret before installing.** The workload references it by name (`seal.static.secretName`, default `my-openbao-unseal-key`) and the deployment wedges until the secret exists. Create it as an **opaque** secret holding a 32-byte key:
+### Static Seal
 
-```bash
-printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name my-openbao-unseal-key --encoding plain -f -
-```
+One opaque secret must exist before you install. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Create the unseal-key secret">
+    An [opaque secret](/guides/create-secret/opaque) with encoding `plain` whose payload is a 32-byte key. OpenBao accepts the key hex-encoded, which is what `openssl rand -hex 32` produces:
+
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `seal.static.secretName` to this name. Use `printf`, not `echo` — `echo` appends a newline that becomes part of the key.
+  </Step>
+  <Step title="Keep a copy of the key outside Control Plane">
+    The key wraps OpenBao's encryption barrier: without it the raft data on the volume cannot be read. Read it back with `cpln secret reveal SECRET_NAME -o yaml` (a bare `reveal` prints only a summary table) and store a copy in a second system, such as a password manager or offline vault.
+  </Step>
+</Steps>
 
 <Warning>
-The unseal key is **write-once — never change or delete this secret.** It wraps OpenBao's encryption barrier; losing or rotating the key makes every stored secret permanently unrecoverable. Back the key up somewhere safe outside this instance.
+**The unseal key is write-once. Never change or delete this secret.** The chart configures a single static key with no previous-key fallback, so rotating the value in place, or losing it, makes every stored secret permanently unrecoverable — a reinstall cannot bring them back.
 </Warning>
 
-**KMS seal modes (`awskms` / `gcpckms`)** need a KMS key, a Control Plane cloud account, and a key-scoped grant instead — see [Auto-unseal setup](#auto-unseal-setup-kms-modes). No unseal-key secret is required in these modes.
+<Warning>
+**Create the secret before installing, or the deployment wedges silently.** The chart refuses to render when `seal.static.secretName` is blank, but a name pointing at a secret that does not exist installs successfully and then never starts. The container never runs, so `cpln logs` returns zero lines. The one place the reason appears is `status.versions[].message`:
 
-Install the template using your preferred method:
+```bash
+cpln workload get-deployments RELEASE_NAME-openbao --gvc GVC_NAME -o yaml
+```
+
+```text
+The secret SECRET_NAME no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
+```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the missing secret repairs the deployment on its own within several minutes, or run `cpln workload force-redeployment RELEASE_NAME-openbao --gvc GVC_NAME` to skip the wait.
+</Warning>
+
+### KMS Auto-unseal Setup
+
+Skip this section if you keep the default `static` seal. The `awskms` and `gcpckms` modes need no unseal-key secret: the server encrypts and decrypts its barrier key through your KMS key, and the workload identity reaches the key through a Control Plane [cloud account](/guides/create-cloud-account), so no cloud credential is stored in the container or in your values.
+
+<Tabs>
+  <Tab title="AWS KMS">
+    The chart binds the identity to your cloud account with your IAM policy (alongside the platform's `cpln-connector` policy), so the identity is usable as soon as it is created and no post-install step is needed.
+
+    <Steps>
+      <Step title="Create or pick a symmetric KMS key">
+        Set `seal.aws.kmsKeyId` to the key ARN (a key ID or alias also works) and `seal.aws.region` to the key's region.
+      </Step>
+      <Step title="Register a Cloud Account">
+        If you do not have one, [create an AWS Cloud Account](/guides/create-cloud-account). Set `seal.aws.cloudAccountName` to its name.
+      </Step>
+      <Step title="Create a key-scoped IAM policy">
+        Create a customer-managed IAM policy with the JSON below, replacing the resource with your key ARN, and set `seal.aws.policyName` to the policy name. These are the three actions the `awskms` seal uses; grant them on the one key, never with a broad managed policy.
+
+        ```json
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "kms:Encrypt",
+                        "kms:Decrypt",
+                        "kms:DescribeKey"
+                    ],
+                    "Resource": "arn:aws:kms:us-east-1:111111111111:key/YOUR_KEY_ID"
+                }
+            ]
+        }
+        ```
+      </Step>
+      <Step title="Install with seal.type set to awskms">
+        Pass `--set seal.type=awskms` together with the four `seal.aws.*` values. The server boots ready and uninitialized, exactly as in static mode — continue with [First Run](#first-run).
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="GCP Cloud KMS">
+    GCP access is keyless as well, but the key grant is applied **after** install. The chart deliberately attaches **no IAM binding** to the identity: a Cloud KMS key is not a resource the identity can be bound to directly, and the only binding Control Plane offers for GCP is project-wide, which would grant far more than one key. The identity therefore carries only the cloud account link, the platform materializes a service account from it, and you grant that account two roles on the single key once its name exists.
+
+    <Steps>
+      <Step title="Create a key ring and crypto key">
+        Create a symmetric crypto key in Cloud KMS and fill in `seal.gcp.project`, `seal.gcp.region` (the key ring location, for example `global` or `us-east1`), `seal.gcp.keyRing` and `seal.gcp.cryptoKey`.
+      </Step>
+      <Step title="Register a Cloud Account">
+        If you do not have one, [create a GCP Cloud Account](/guides/create-cloud-account). Set `seal.gcp.cloudAccountName` to its name.
+      </Step>
+      <Step title="Install with seal.type set to gcpckms">
+        Pass `--set seal.type=gcpckms` together with the five `seal.gcp.*` values. The install reports success, and the workload then restarts repeatedly until the grant in the next step exists — that is expected, not a fault.
+      </Step>
+      <Step title="Read the generated service account name">
+        The identity's `status.objectName` is the local part of the service account the platform created for it:
+
+        ```bash
+        cpln identity get RELEASE_NAME-openbao-identity --gvc GVC_NAME -o yaml
+        ```
+
+        The service account is `OBJECT_NAME@GCP_PROJECT.iam.gserviceaccount.com`.
+      </Step>
+      <Step title="Grant both roles on that one key">
+        Replace the placeholders with the values from `seal.gcp.*` and the service account from the previous step:
+
+        ```bash
+        for ROLE in roles/cloudkms.cryptoKeyEncrypterDecrypter roles/cloudkms.viewer; do
+          gcloud kms keys add-iam-policy-binding CRYPTO_KEY \
+            --keyring KEY_RING --location KEY_RING_LOCATION --project GCP_PROJECT \
+            --member "serviceAccount:OBJECT_NAME@GCP_PROJECT.iam.gserviceaccount.com" --role "$ROLE"
+        done
+        ```
+
+        Both roles are required: `cryptoKeyEncrypterDecrypter` performs the seal and unseal operations, and `cloudkms.viewer` supplies the `cloudkms.cryptoKeys.get` call OpenBao makes at startup. Grant them on the key itself, never project-wide.
+      </Step>
+    </Steps>
+
+    <Warning>
+    **Until the grant exists, the workload crash-loops** with `PermissionDenied … cloudkms.cryptoKeys.get` in its logs. Once both roles are granted it recovers on its own — no redeploy or reinstall is needed. To confirm the identity reached GCP, check `status.gcp.usable` in `cpln identity get RELEASE_NAME-openbao-identity --gvc GVC_NAME -o yaml`.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Installation
+
+Install the chart from the marketplace registry, pointing the default static seal at the unseal-key secret you created:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/openbao \
+  --version 1.0.0 --gvc GVC_NAME \
+  --set seal.static.secretName=SECRET_NAME
+```
+
+For a KMS seal, set `seal.type` and the matching `seal.aws.*` or `seal.gcp.*` keys instead of `seal.static.secretName` — see [KMS Auto-unseal Setup](#kms-auto-unseal-setup).
+
+Or follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -70,7 +191,9 @@ Install the template using your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+Each block below is the shipped default for that part of `values.yaml`.
+
+### OpenBao Server
 
 ```yaml
 openbao:
@@ -81,7 +204,17 @@ openbao:
     maxCpu: 1000m
     minMemory: 256Mi
     maxMemory: 1Gi
+```
 
+The image is pinned to the `2.6.x` line on purpose: OpenBao 2.7 moves the built-in KMS auto-unseal mechanisms into external plugins, so a blind bump would break the `awskms` and `gcpckms` seal modes. Raise `maxMemory` for large secret sets or heavy PKI use.
+
+<Note>
+On a stateful workload the ratio of `maxCpu` to `minCpu` may not exceed 4:1, and the defaults sit exactly at that limit. Raising `maxCpu` without raising `minCpu` crosses it and is rejected when the workload is applied.
+</Note>
+
+### Seal and Auto-unseal
+
+```yaml
 # How the encryption barrier is unwrapped on boot. One mode only.
 seal:
   type: static              # static | awskms | gcpckms
@@ -94,7 +227,7 @@ seal:
     secretName: my-openbao-unseal-key
 
   # awskms: keyless auto-unseal via AWS KMS through a Control Plane cloud account.
-  # Create the KMS key + a scoped IAM policy before install.
+  # Create the KMS key + a scoped IAM policy (JSON in README) before install.
   aws:
     kmsKeyId: arn:aws:kms:us-east-1:111111111111:key/my-openbao-kms-key # key ARN (or ID/alias)
     region: us-east-1
@@ -108,169 +241,218 @@ seal:
     keyRing: my-openbao-keyring
     cryptoKey: my-openbao-key
     cloudAccountName: my-gcs-cloud-account
+```
 
+`seal.type` selects exactly one mode; only that mode's sub-block is used and the others are ignored.
+
+| Mode | How the barrier is unwrapped | What the chart does | What you provide |
+|---|---|---|---|
+| `static` (default) | With a 32-byte key read from a Control Plane opaque secret, injected into the container as an environment variable | Grants the identity `reveal` on the secret named in `seal.static.secretName` | The prerequisite secret — see [Static Seal](#static-seal) |
+| `awskms` | Encrypt/decrypt calls to your AWS KMS key through the cloud account | Binds the identity to the cloud account with `seal.aws.policyName` and the platform's `cpln-connector` policy | KMS key, cloud account and the key-scoped IAM policy — see [KMS Auto-unseal Setup](#kms-auto-unseal-setup) |
+| `gcpckms` | Encrypt/decrypt calls to your Cloud KMS key through the cloud account | Links the identity to the cloud account with no IAM binding | Key ring, crypto key, cloud account and a post-install grant on the key — see [KMS Auto-unseal Setup](#kms-auto-unseal-setup) |
+
+In every mode the server unseals itself on boot with no operator action. In the KMS modes no unseal key is mounted and no cloud access key is issued to the container.
+
+<Warning>
+**Do not change `seal.type` after the server has been initialized.** The seal wraps the existing data, so switching modes requires an OpenBao [seal migration](https://openbao.org/docs/concepts/seal/) — it is not a values change, and a server restarted under a different seal cannot unseal its data.
+</Warning>
+
+### Storage
+
+```yaml
 volumeset:
   capacity: 10 # GiB (minimum 10) — raft data: all secrets, auth config, cluster state
+```
 
+The volume holds the raft store: every secret, auth mount, policy and the cluster state. Data survives restarts, redeployments and `helm upgrade`. Uninstalling deletes the volume set (a final snapshot is kept for 7 days), and a reinstall comes up uninitialized.
+
+### Access
+
+```yaml
 publicAccess:
   enabled: false # true = HTTPS API + web UI on the auto *.cpln.app endpoint
 internalAccess:
   type: same-gvc # none | same-gvc | same-org | workload-list
   workloads: [] # used only with workload-list
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
-### OpenBao Server
+Public access is off by default: a fresh server is uninitialized and its first login is the root token, so initialize it and configure authentication over a private tunnel first (see [First Run](#first-run)), then set `publicAccess.enabled: true` and upgrade the release when you want the API and web UI on the `*.cpln.app` endpoint. A change to either access knob can take several minutes to take effect — re-test before concluding it did not apply.
 
-- `openbao.image` — The official OpenBao image. The template pins `2.6.x` deliberately: OpenBao 2.7 moves the KMS auto-unseal mechanisms into external plugins, so a blind bump would break the `awskms` and `gcpckms` seal modes.
-- `openbao.resources` — CPU and memory for the server container. The defaults run a single node comfortably; raise `maxMemory` for large secret sets or heavy PKI use.
-
-### Seal and Auto-unseal
-
-`seal.type` selects exactly one mode, and only that mode's sub-block is used:
-
-| Mode | How the barrier is unwrapped | What you must provide |
-|------|------------------------------|-----------------------|
-| `static` (default) | From a 32-byte key held in a Control Plane opaque secret | The prerequisite secret, named in `seal.static.secretName` |
-| `awskms` | Keyless AWS KMS encrypt/decrypt through a Control Plane cloud account | KMS key, cloud account, and a scoped IAM policy — see [AWS KMS setup](#auto-unseal-setup-kms-modes) |
-| `gcpckms` | Keyless GCP Cloud KMS encrypt/decrypt through a Control Plane cloud account | Key ring, crypto key, cloud account, and a post-install key grant — see [GCP Cloud KMS setup](#auto-unseal-setup-kms-modes) |
-
-In every mode the server unseals itself on boot with no operator action. In the KMS modes there is no static credential anywhere: the container is issued no cloud access keys, and no unseal key is mounted.
-
-<Warning>
-**Do not change `seal.type` after the server has been initialized.** The seal wraps the existing data, so switching modes requires an OpenBao seal migration — it is not a values change.
-</Warning>
-
-### Storage
-
-- `volumeset.capacity` — Initial volume size in GiB (minimum 10). This volume holds the raft store: every secret, auth mount, policy, and the cluster state.
-
-Data survives restarts, redeployments, and `helm upgrade`. Uninstalling deletes the volume set (a final snapshot is kept for 7 days), so a reinstall comes up uninitialized.
-
-### Access
-
-- `publicAccess.enabled` — `false` by default. When set to `true`, the API and web UI are served over HTTPS on the automatically assigned `*.cpln.app` canonical endpoint. While it is `false`, external requests are rejected at the edge.
-- `internalAccess.type` — Internal firewall scope of the server workload:
-
-| Type | Description |
+| Type | Who can reach port `8200` internally |
 |------|-------------|
-| `none` | No internal access. |
-| `same-gvc` | Allow access from all workloads in the same GVC (default). |
-| `same-org` | Allow access from all workloads in the same organization. |
-| `workload-list` | Allow access only from workloads listed in `internalAccess.workloads`, e.g. `//gvc/GVC_NAME/workload/WORKLOAD_NAME`. |
-
-## Auto-unseal Setup (KMS Modes)
-
-Skip this section if you are using the default `static` seal.
-
-<Tabs>
-  <Tab title="AWS KMS">
-    Access is keyless: the workload identity federates into your AWS account through a Control Plane cloud account, so no credentials are stored in the container or in your values.
-
-    <Steps>
-      <Step title="Create or pick a symmetric KMS key">
-        Set `seal.aws.kmsKeyId` to the key ARN (an ID or alias also works) and `seal.aws.region` to the key's region.
-      </Step>
-      <Step title="Set up a Cloud Account">
-        If you do not have one, [create an AWS Cloud Account](https://docs.controlplane.com/guides/create-cloud-account). Set `seal.aws.cloudAccountName` to its name.
-      </Step>
-      <Step title="Create a scoped IAM policy">
-        Create an IAM policy with the JSON below, replacing the resource with your key ARN, and set `seal.aws.policyName` to the policy name.
-
-        ```json
-        {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": [
-                        "kms:Encrypt",
-                        "kms:Decrypt",
-                        "kms:DescribeKey"
-                    ],
-                    "Resource": "arn:aws:kms:us-east-1:111111111111:key/YOUR_KEY_ID"
-                }
-            ]
-        }
-        ```
-      </Step>
-    </Steps>
-
-    No post-install step is needed — the identity carries the policy from the moment it is created, and the server boots ready (uninitialized) as usual.
-  </Tab>
-
-  <Tab title="GCP Cloud KMS">
-    GCP access is keyless as well, but the key grant is applied **after** install, because the service account name only exists once the identity has been created.
-
-    <Steps>
-      <Step title="Create a key ring and crypto key">
-        Create a symmetric crypto key in Cloud KMS and fill in `seal.gcp.project`, `seal.gcp.region` (the key ring location, e.g. `us-east1`), `seal.gcp.keyRing`, and `seal.gcp.cryptoKey`.
-      </Step>
-      <Step title="Set up a Cloud Account">
-        If you do not have one, [create a GCP Cloud Account](https://docs.controlplane.com/guides/create-cloud-account). Set `seal.gcp.cloudAccountName` to its name.
-      </Step>
-      <Step title="Install, then grant access on that one key">
-        Read the generated service account name from the identity, then grant both required roles on the crypto key:
-
-        ```bash
-        cpln identity get {release}-openbao-identity --gvc {gvc} -o json | jq -r '.status.objectName'
-        # the service account is {objectName}@{project}.iam.gserviceaccount.com
-
-        SA={objectName}@{project}.iam.gserviceaccount.com
-        for ROLE in roles/cloudkms.cryptoKeyEncrypterDecrypter roles/cloudkms.viewer; do
-          gcloud kms keys add-iam-policy-binding {cryptoKey} \
-            --keyring {keyRing} --location {region} --project {project} \
-            --member "serviceAccount:$SA" --role "$ROLE"
-        done
-        ```
-      </Step>
-    </Steps>
-
-    Both roles are required: `cryptoKeyEncrypterDecrypter` performs the seal and unseal, and `cloudkms.viewer` supplies the `cloudkms.cryptoKeys.get` call OpenBao makes at startup. Grant them on the key itself, never project-wide.
-
-    <Warning>
-    **Until the grant exists, the workload crash-loops** with `PermissionDenied … cloudkms.cryptoKeys.get`. This is expected before the grant, and it heals itself roughly 30 seconds afterwards — no redeploy or reinstall needed. To confirm the identity reached GCP, check `status.gcp.usable` in `cpln identity get {release}-openbao-identity --gvc {gvc} -o yaml`.
-    </Warning>
-  </Tab>
-</Tabs>
-
-## Initializing OpenBao
-
-The server boots reachable but **uninitialized** — that is the expected state right after install. Initialize it exactly once:
-
-```bash
-cpln workload exec {release}-openbao --gvc {gvc} --container openbao -- bao operator init
-```
-
-<Warning>
-**Save the printed recovery keys and initial root token immediately.** They are shown once, only in your terminal, and are stored nowhere — the template never sees them and cannot recover them.
-</Warning>
-
-From then on every restart auto-unseals with zero manual steps; a replaced replica is back unsealed and serving in roughly two minutes. Log in with `bao login <root-token>` or through the web UI, create scoped auth (for example userpass or OIDC), then revoke the root token per standard practice.
-
-The `bao` CLI is present in the container with `BAO_ADDR` preset, so any `cpln workload exec … -- bao …` command works without extra flags — for example `bao status` to check the seal state.
+| `none` | No workload |
+| `same-gvc` | Every workload in the same GVC |
+| `same-org` | Every workload in the same org |
+| `workload-list` | Only the workloads listed in `internalAccess.workloads`, as `//gvc/GVC_NAME/workload/WORKLOAD_NAME` |
 
 ## Connecting
 
-| Target | Address | Credentials |
+| What | Address | Notes |
 |---|---|---|
-| Internal (same GVC) | `http://{release}-openbao.{gvc}.cpln.local:8200` | OpenBao token / auth method |
-| Public API + UI (if enabled) | `https://<canonical>.cpln.app` (UI at `/ui/`) | OpenBao token / auth method |
-| Health | `GET /v1/sys/health` | none |
+| Local access (default, public access off) | `http://localhost:8200` through `cpln port-forward RELEASE_NAME-openbao 8200:8200 --gvc GVC_NAME` | Web UI at `http://localhost:8200/ui/`. Works regardless of the firewall settings. |
+| Public API and web UI | `status.canonicalEndpoint` of the workload, over `https://` | Only with `publicAccess.enabled: true`. Read it with `cpln workload get RELEASE_NAME-openbao --gvc GVC_NAME -o yaml`. Web UI at `/ui/`. |
+| Internal (same GVC) | `http://RELEASE_NAME-openbao.GVC_NAME.cpln.local:8200` | Reachable from other workloads per `internalAccess.type`. Point `BAO_ADDR` (or `VAULT_ADDR` for Vault tooling) at it. |
+| Health | `GET /v1/sys/health` on any of the above | No authentication. `200` initialized and unsealed, `501` not yet initialized, `503` sealed. |
+| Credentials | Root token and recovery keys from `bao operator init` | Printed once, in your terminal, and stored nowhere by the template. After that, whatever auth methods you enable. |
 
-External clients use `https://` — the platform edge terminates TLS. Same-GVC clients use plain `http://` over the mesh's mTLS. The canonical hostname appears under `status.canonicalEndpoint` in `cpln workload get {release}-openbao --gvc {gvc} -o yaml`.
+The API is Vault-compatible, so existing Vault clients and SDKs work by pointing their address at one of the endpoints above. The `bao` CLI is present in the container with `BAO_ADDR` preset, so any `bao` command runs through `cpln workload exec` without extra flags. Verify the server is up:
 
-Because the API is Vault-compatible, existing Vault clients, SDKs, and the `vault` CLI can talk to this endpoint by pointing their address at it.
+```bash
+cpln workload exec RELEASE_NAME-openbao --gvc GVC_NAME --container openbao -- bao status
+```
+
+Right after install the output shows `Initialized false` and `Sealed true` — that is the expected state until you initialize it.
+
+### First Run
+
+The server boots reachable but **uninitialized**. Initialize it exactly once; from then on every restart auto-unseals.
+
+<Steps>
+  <Step title="Initialize the server">
+    ```bash
+    cpln workload exec RELEASE_NAME-openbao --gvc GVC_NAME --container openbao -- bao operator init
+    ```
+
+    Because every seal mode in this template is an auto-unseal seal, the command prints **recovery keys** (five shares, three needed, by default) and the **initial root token** rather than Shamir unseal keys. Pass `-recovery-shares` and `-recovery-threshold` to change the split.
+  </Step>
+  <Step title="Store the output somewhere safe">
+    The recovery keys and root token are shown once, only in your terminal, and are stored nowhere — the template never sees them and cannot recover them. Put the root token and each recovery key share in a password manager or an offline store, ideally with the shares held by different people. If the output is lost before it is saved, the only way back is to wipe the volume and initialize again.
+  </Step>
+  <Step title="Confirm the server unsealed itself">
+    ```bash
+    cpln workload exec RELEASE_NAME-openbao --gvc GVC_NAME --container openbao -- bao status
+    ```
+
+    `Initialized true` and `Sealed false` means the seal mechanism is working; the server will return to this state on its own after every restart.
+  </Step>
+  <Step title="Log in">
+    Open a tunnel and use the web UI or the `bao` CLI from your own machine:
+
+    ```bash
+    cpln port-forward RELEASE_NAME-openbao 8200:8200 --gvc GVC_NAME
+    ```
+
+    In a browser, open `http://localhost:8200/ui/`, choose the **Token** method and paste the root token. From a terminal with `bao` installed, point it at the tunnel and log in — `bao login` prompts for the token, which keeps it out of your shell history:
+
+    ```bash
+    export BAO_ADDR=http://localhost:8200
+    bao login
+    ```
+  </Step>
+  <Step title="Set up real authentication and retire the root token">
+    Enable an auth method for people and workloads (for example `userpass`, `oidc` or `approle`), write policies, and then revoke the initial root token as upstream recommends. A new root token can be generated later with the recovery keys if it is ever needed. Only after this is in place consider `publicAccess.enabled: true`.
+  </Step>
+</Steps>
+
+<Warning>
+**Recovery keys do not unseal the server.** In every seal mode here the unseal happens through the static key secret or the KMS key; recovery keys only authorize privileged operations such as generating a new root token or migrating the seal. Keep the unseal-key secret (or the KMS key) and the recovery keys both backed up — losing either leaves you locked out in a different way.
+</Warning>
+
+## Operations
+
+### Backing Up
+
+The chart schedules no backups of its own. Two paths are available:
+
+**Volume set snapshot.** Snapshots the raft volume as a whole. Take one before upgrades or risky changes:
+
+```bash
+cpln volumeset snapshot create RELEASE_NAME-openbao-data --gvc GVC_NAME --snapshot-name openbao-before-upgrade
+```
+
+**Raft snapshot.** OpenBao's own point-in-time export, written as a local file by the `bao` CLI on your machine through the port-forward tunnel while logged in with a sufficiently privileged token. It needs no file transfer out of the container. This command follows the upstream [raft snapshot](https://openbao.org/docs/commands/operator/raft/) procedure and the chart's raft configuration but **has not been exercised against this template** — rehearse it on a throwaway release first:
+
+```bash
+export BAO_ADDR=http://localhost:8200
+bao operator raft snapshot save openbao.snap
+```
+
+Either backup is encrypted by the barrier, so it is only readable by a server unsealed with the **same** key. In `static` mode, keep the unseal-key secret backed up alongside it (see [Static Seal](#static-seal)); in the KMS modes, keep the KMS key.
+
+### Restoring a Backup
+
+<Warning>
+**No restore path has been exercised end to end against this template.** The steps are built from the chart's configuration and upstream documentation. Verify on a throwaway release before relying on them.
+</Warning>
+
+- **Raft snapshot.** Restore into a release that is initialized, unsealed and running under the **same** seal key the snapshot was taken under — the same static secret value, or the same KMS key. Through the tunnel, logged in: `bao operator raft snapshot restore openbao.snap`. Restoring across a different seal key is outside what is documented here.
+- **Volume set snapshot.** `cpln volumeset snapshot restore` restores a volume from a snapshot taken above; check `cpln volumeset snapshot restore --help` for its required `--snapshot-name`, `--location` and `--volume-index` flags. This command has not been exercised against this template.
+- **Accidental uninstall.** Uninstalling deletes the volume set, and the final snapshot it takes is retained for 7 days. That snapshot, plus the unseal-key secret (which uninstall does not touch), is the only way back.
+
+### Scaling and Availability
+
+- The template deploys a single replica with no `replicas` knob; raft runs with one member, so there is no failover.
+- A node failure reschedules the server and reattaches the same volume, and the server unseals itself on the way back up. The exposure is a short restart gap, not data loss or a manual unseal.
+- The volume set is snapshotted only when it is deleted (final snapshot, kept 7 days); use [Backing Up](#backing-up) for point-in-time copies.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Workload never becomes ready and cpln logs returns nothing">
+    **Symptom:** the install succeeds, `RELEASE_NAME-openbao` stays not ready indefinitely, and `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-openbao"}' --limit 50 --since 10m` returns zero lines.
+
+    **Cause:** `seal.static.secretName` names a secret that does not exist, so the container is never started. The reason is visible only in `status.versions[].message`:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-openbao --gvc GVC_NAME -o yaml
+    ```
+
+    ```text
+    The secret SECRET_NAME no longer exists. Workload updates are paused until the
+    secret is added or the reference to the secret removed.
+    ```
+
+    **Fix:** create the secret as in [Static Seal](#static-seal). The deployment recovers on its own within several minutes, or run `cpln workload force-redeployment RELEASE_NAME-openbao --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Health endpoint returns 501 and bao status says Initialized false">
+    **Symptom:** the workload is ready, but `GET /v1/sys/health` returns `501` and `bao status` reports `Initialized false`, `Sealed true`.
+
+    **Cause:** this is a fresh server that has not been initialized yet. The readiness probe deliberately treats the uninitialized and sealed states as healthy so the API and UI stay reachable for the one-time initialization — restarting the workload will not change it.
+
+    **Fix:** run `bao operator init` once as described in [First Run](#first-run).
+  </Accordion>
+  <Accordion title="gcpckms workload crash-loops with PermissionDenied cloudkms.cryptoKeys.get">
+    **Symptom:** `cpln helm install` reported success, but `RELEASE_NAME-openbao` restarts repeatedly and `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-openbao"} |= "PermissionDenied"' --limit 50 --since 10m` shows `PermissionDenied … cloudkms.cryptoKeys.get`.
+
+    **Cause:** the identity's service account has not been granted access on the crypto key, or was granted only `cryptoKeyEncrypterDecrypter`. OpenBao also calls `cloudkms.cryptoKeys.get` at startup and exits without it. The chart attaches no IAM binding of its own, so this grant is always a post-install step.
+
+    **Fix:** grant both `roles/cloudkms.cryptoKeyEncrypterDecrypter` and `roles/cloudkms.viewer` on the key to the service account named by the identity's `status.objectName` — see [KMS Auto-unseal Setup](#kms-auto-unseal-setup). The workload recovers on its own. Confirm the identity is healthy with `cpln identity get RELEASE_NAME-openbao-identity --gvc GVC_NAME -o yaml` (`status.gcp.usable`).
+  </Accordion>
+  <Accordion title="awskms server is ready but bao operator init fails with a KMS error">
+    **Symptom:** in `awskms` mode the workload is ready and uninitialized, and `bao operator init` fails with an AWS KMS access or key error instead of printing recovery keys.
+
+    **Cause:** `seal.aws.kmsKeyId` or `seal.aws.region` does not match the key, or the IAM policy named in `seal.aws.policyName` does not grant `kms:Encrypt`, `kms:Decrypt` and `kms:DescribeKey` on it. A wrong key does not stop the server from booting; it surfaces at the first seal operation.
+
+    **Fix:** check the identity with `cpln identity get RELEASE_NAME-openbao-identity --gvc GVC_NAME -o yaml`, correct the policy or the values, and upgrade the release. The server has not been initialized, so nothing is lost.
+  </Accordion>
+  <Accordion title="Logs warn that the Auto Unseal mechanism has moved into an external plugin">
+    **Symptom:** every boot in `awskms` or `gcpckms` mode logs `Support for this Auto Unseal mechanism has been moved into an external plugin`.
+
+    **Cause:** an upstream deprecation notice. On the pinned `2.6.1` image the built-in KMS seals still work; the notice is why the image is pinned to the 2.6.x line.
+
+    **Fix:** none needed. Do not bump `openbao.image` to 2.7 or later without arranging the external seal plugin — the KMS seal modes would stop working.
+  </Accordion>
+  <Accordion title="Logs mention raft FSM db file has wider permissions than needed">
+    **Symptom:** `raft FSM db file has wider permissions than needed` appears in the logs on startup.
+
+    **Cause:** cosmetic. The data directory is made group-writable so the non-root `openbao` user can use the volume.
+
+    **Fix:** none needed.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Static mode: the unseal-key secret must exist before install, and it is write-once.** A missing secret wedges the deployment; a lost or changed key makes all stored data unrecoverable.
-- **Run `bao operator init` once after install and save the output** — the recovery keys and root token are printed a single time, to your terminal only.
+- **Static mode: the unseal-key secret must exist before install, and it is write-once.** A missing secret wedges the deployment silently; a lost or changed key makes all stored data unrecoverable. Back the key up outside Control Plane.
+- **Run `bao operator init` once after install and store the output** — the recovery keys and root token are printed a single time, to your terminal only, and recovery keys cannot unseal the server.
 - **Do not switch `seal.type` after initialization** — changing modes requires an OpenBao seal migration, not a values change.
 - **`gcpckms` needs its key grant applied after install** — the workload crash-loops on `cloudkms.cryptoKeys.get` until both roles are granted on the key, then recovers on its own.
-- **Private by default** — set `publicAccess.enabled: true` to expose the API and web UI on the canonical endpoint.
-- **Data survives restarts and upgrades; uninstall deletes the volume set** (a final snapshot is kept for 7 days), and a reinstall starts uninitialized.
-- **Uninstall does not delete your unseal-key secret** — it is your resource, created outside the release, and it stays until you remove it.
-- **The template deploys a single node** — raft runs with one member, so plan maintenance windows around the short restart gap rather than expecting failover.
+- **Keep `openbao.image` on the 2.6.x line** — 2.7 moves the KMS seals into external plugins and would break `awskms` and `gcpckms`.
+- **Private by default** — initialize and configure authentication through `cpln port-forward`, then set `publicAccess.enabled: true` to expose the API and web UI on the canonical endpoint.
+- **Data survives restarts and upgrades; uninstall deletes the volume set** (a final snapshot is kept for 7 days) and leaves your unseal-key secret in place. A reinstall starts uninitialized.
+- **No backups are scheduled** — take volume set or raft snapshots yourself, and remember a snapshot is only readable under the same seal key.
 
 ## External References
 
@@ -279,7 +461,7 @@ Because the API is Vault-compatible, existing Vault clients, SDKs, and the `vaul
     Official OpenBao documentation
   </Card>
   <Card title="Seal / Auto-unseal Configuration" icon="lock" href="https://openbao.org/docs/configuration/seal/">
-    Reference for the static, awskms, and gcpckms seal stanzas
+    Reference for the static, awskms and gcpckms seal stanzas
   </Card>
   <Card title="Raft Storage" icon="database" href="https://openbao.org/docs/configuration/storage/raft/">
     The integrated storage backend this template uses
@@ -288,9 +470,6 @@ Because the API is Vault-compatible, existing Vault clients, SDKs, and the `vaul
     The one-time initialization command and its options
   </Card>
   <Card title="OpenBao on GitHub" icon="github" href="https://github.com/openbao/openbao">
-    Source, releases, and issue tracker
-  </Card>
-  <Card title="OpenBao Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/openbao">
-    View the source files, default values, and chart definition
+    Source, releases and issue tracker
   </Card>
 </CardGroup>

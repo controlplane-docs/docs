@@ -1,132 +1,89 @@
 ---
 title: MongoDB
 icon: /template-catalog/templates/icons/mongodb.png
-description: Deploy MongoDB on Control Plane using the Template Catalog. Covers the prerequisite credentials secret, volumes, internal and external access, scheduled S3 and GCS backups, and upgrading from template version 1.3.2.
-keywords: ['mongo', 'nosql', 'json db', 'replica set', 'mongosh', 'aggregation', 'documentdb alternative', 'mongo template', 'database template', 'schema-free', 'dictionary secret', 'mongodump', 'db.updateUser']
+description: Deploy a single-replica MongoDB document database on Control Plane with persistent storage, optional external access and scheduled mongodump backups to S3 or GCS. A dictionary secret holding the database credentials must exist before you install.
+keywords: ['mongo', 'nosql', 'json db', 'document store', 'mongosh', 'mongorestore', 'aggregation', 'documentdb alternative', 'atlas alternative', 'schema-free', 'dictionary secret', 'db.changeUserPassword', 'authSource', 'database template']
 ---
 
 ## Overview
 
-MongoDB is a document-oriented NoSQL database designed for flexible, schema-free data storage at scale. This template deploys a single-replica MongoDB instance with persistent storage and optional external access via a direct load balancer.
+MongoDB is a document-oriented NoSQL database for flexible, schema-free data. This template deploys one MongoDB 8 instance (`mongo:8.2.3`) on a persistent volume, reachable from other workloads in your [GVC](/reference/gvc) and optionally from the internet through a direct load balancer, with optional scheduled `mongodump` backups to AWS S3 or GCS.
 
 Database credentials are **not** template values. MongoDB reads its username, password and database name from a dictionary secret you create before installing, so no password passes through Helm or lands in the release.
 
-<Warning>
-**Template version 1.4.0 is a breaking security change.** `config.username` and `config.password` were removed, and an install or upgrade that still sets either one now fails at render instead of silently falling back to a published default password. If you are running 1.3.2 or earlier, read [Upgrading From 1.3.2 or Earlier](#upgrading-from-1-3-2-or-earlier) before you touch the release.
-</Warning>
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have.
+</Note>
 
 <Note>
-MongoDB on Control Plane operates as a single-replica deployment. Do not scale up the replica count, as this would result in multiple isolated instances rather than a replicated cluster.
+This template runs exactly one MongoDB replica. Do not scale it up: additional replicas would be isolated instances, not a replica set. For a highly available replica set, use the [MongoDB Cluster](/template-catalog/templates/mongodb-cluster) template instead.
 </Note>
 
 ### What Gets Created
 
-- **Stateful MongoDB Workload** — A single-replica MongoDB container with configurable resources.
-- **Volume Set** — Persistent storage for MongoDB data, with optional autoscaling.
-- **Backup Config Secret** *(optional)* — A dictionary secret holding the backup bucket and region. Non-sensitive, and created only when `backup.enabled: true`.
-- **Identity & Policy** — An identity bound to the workload, and a policy granting it `reveal` on exactly the credentials secret you created — plus the backup config secret and Cloud Account binding when backup is enabled.
-- **Backup Cron Workload** *(optional)* — A scheduled `mongodump` backup job that writes compressed archives to AWS S3 or GCS.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-mongo` | MongoDB server (stateful, 1 replica, port `27017`) | — |
+| Volume set | `RELEASE_NAME-mongo-vs` | Data directory mounted at `/data/db`, with optional autoscaling | — |
+| Identity | `RELEASE_NAME-mongo-identity` | Identity the workloads run as; carries the Cloud Account binding when backups are on | — |
+| Policy | `RELEASE_NAME-mongo-policy` | Grants the identity `reveal` on your credentials secret (and the backup config secret) | — |
+| Secret | `RELEASE_NAME-mongo-config` | Dictionary holding only the backup bucket and region — no credentials | `backup.enabled: true` |
+| Workload | `RELEASE_NAME-mongo-backup` | Cron job running `mongodump` on a schedule | `backup.enabled: true` |
 
-The template creates **no credential secret of its own.** The username, password and database name live only in the prerequisite secret described below.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
-
-## Upgrading From 1.3.2 or Earlier
-
-Template versions up to 1.3.2 took the database credentials as plain Helm values, shipped working defaults for them, and wrote those credentials into a chart-owned secret named after the release. Version 1.4.0 removes all of that.
-
-| | 1.3.2 and earlier | 1.4.0 |
-|---|---|---|
-| Database credentials | `config.username`, `config.password`, `config.database` values | `config.credentialsSecretName` → a dictionary secret you create |
-| Where the password lives | Chart-created secret `RELEASE_NAME-mongo-config`, and the Helm release | Only the secret you create |
-
-<Warning>
-**Carrying the old values forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running, rather than quietly restarting against a different password:
-
-```text
-Error: execution error at (mongodb/templates/identity.yaml:1:4): mongodb: config.username and
-config.password were REMOVED — they are now a `dictionary` secret you create, named by
-config.credentialsSecretName, holding the keys `username`, `password` and `database`. Delete
-them from your values. See Prerequisites in the README.
-```
-</Warning>
-
-<Steps>
-  <Step title="Read the credentials the database already uses">
-    Credentials are written into the data directory the first time the volume is initialized, so an existing database keeps whatever it was created with. Recover them from your current values file, or from the secret the old version created — do this **before** upgrading:
-
-    ```bash
-    cpln secret reveal RELEASE_NAME-mongo-config -o yaml
-    ```
-
-    Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values.
-  </Step>
-  <Step title="Create the prerequisite secret with those same values">
-    Follow [Prerequisites](#prerequisites), using the existing username, password and database name. Different values here do not change the database — they just leave the workload unable to authenticate.
-  </Step>
-  <Step title="Remove the old keys from your values">
-    Delete `config.username`, `config.password` and `config.database`, and set `config.credentialsSecretName` to your secret's name.
-  </Step>
-  <Step title="Upgrade, then rotate the password">
-    After the upgrade succeeds, change any password that came from a 1.3.2 default — those defaults were published in the public template repository, so treat them as compromised. Rotate inside MongoDB, then update the secret to match:
-
-    ```javascript
-    db.changeUserPassword("myuser", "NEW-STRONG-PASSWORD")
-    ```
-  </Step>
-</Steps>
-
-<Warning>
-**`RELEASE_NAME-mongo-config` no longer holds credentials.** It is now created only when `backup.enabled: true`, and holds nothing but the bucket and region. Anything outside this release that read the username or password from it by name — another workload's environment, a policy, or a parent chart bundling MongoDB as a subchart — must be pointed at the secret you create instead. A reference to a key that no longer exists does not fail loudly; it wedges the referring workload silently.
-</Warning>
+The template creates no credential secret of its own. The username, password and database name live only in the secret you create.
 
 ## Prerequisites
 
-**One secret must exist before you install.** It holds the credentials your applications put in their connection strings. The values never pass through Helm, so they do not land in the release. Secrets are org-level, so no GVC flag is involved.
+**One secret must exist before you install.** It holds the credentials your applications put in their connection strings. Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
   <Step title="Create the database credentials secret">
-    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. MongoDB creates that user and that database on first boot:
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. On first boot MongoDB creates the user in the `admin` database with the `root` role; the `database` entry is the name your applications use in their connection strings (MongoDB creates it on first write):
 
     ```bash
-    cpln secret create-dictionary --name my-mongodb-credentials \
+    cpln secret create-dictionary --name SECRET_NAME \
       --entry username=myuser \
       --entry password='YOUR-STRONG-PASSWORD' \
       --entry database=mydb
     ```
 
-    Set `config.credentialsSecretName` to the name you used. Secret names are org-wide, so give each release its own.
+    Set `config.credentialsSecretName` to this name. Secret names are org-wide, so give each release its own.
   </Step>
   <Step title="Read the secret back later">
     Pass `-o yaml`. A bare `cpln secret reveal` prints only a summary table, not the values:
 
     ```bash
-    cpln secret reveal my-mongodb-credentials -o yaml
+    cpln secret reveal SECRET_NAME -o yaml
     ```
   </Step>
 </Steps>
 
 <Warning>
-**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `config.credentialsSecretName` is blank, but a name pointing at a secret that does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines** — there is nothing to log, and every summary surface just looks like a slow deploy. The one place the reason appears is `status.versions[].message`:
+**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `config.credentialsSecretName` is blank, but a name that points at a secret which does not exist installs successfully and then never starts. The container never runs, so `cpln logs` returns **zero lines**. The one place the reason appears is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-mongo --gvc GVC_NAME -o yaml
 ```
 
 ```text
-The secret my-mongodb-credentials no longer exists. Workload updates are paused until the
+The secret SECRET_NAME no longer exists. Workload updates are paused until the
 secret is added or the reference to the secret removed.
 ```
 
-Use `get-deployments` — plain `cpln workload get` has no `versions` key and will show you nothing. Creating the missing secret repairs it on its own with no further action, in roughly **5.5 to 10.5 minutes** measured across five templates, or run `cpln workload force-redeployment RELEASE_NAME-mongo --gvc GVC_NAME` to clear it in about 90 seconds.
+Use `get-deployments` — plain `cpln workload get` has no `versions` key. Once the secret exists the deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-mongo --gvc GVC_NAME` to skip the wait.
 </Warning>
 
-Backups need a bucket, and a Control Plane Cloud Account, before they can be enabled — see [AWS S3](#aws-s3) or [GCS](#gcs). Nothing else is required.
+Backups need a bucket and a Control Plane Cloud Account before they can be enabled — see [Backing Up](#backing-up). Nothing else is required.
+
 ## Installation
 
-Create the [prerequisite secret](#prerequisites) first, then install by whichever method you prefer:
+Create the [prerequisite secret](#prerequisites), then install with the name of that secret:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/mongodb \
+  --version 1.4.1 --gvc GVC_NAME \
+  --set config.credentialsSecretName=SECRET_NAME
+```
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -152,7 +109,9 @@ Create the [prerequisite secret](#prerequisites) first, then install by whicheve
 
 ## Configuration
 
-The default `values.yaml` for this template:
+Each block below is the shipped default for that part of `values.yaml`.
+
+### Image and Resources
 
 ```yaml
 image: mongo:8.2.3
@@ -162,15 +121,29 @@ resources:
   minMemory: 256Mi
   maxCpu: 500m
   maxMemory: 512Mi
+```
 
+### Credentials
+
+```yaml
 config:
   # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
   # A `dictionary` secret holding exactly three keys: `username`, `password`
   # and `database`. If it does not exist at install time the deployment
   # WEDGES silently — `cpln logs` returns nothing at all. See Prerequisites
-  # for the exact `cpln secret create-dictionary` command.
+  # in the README for the exact `cpln secret create-dictionary` command.
   credentialsSecretName: my-mongodb-credentials
+```
 
+The workload reads the secret through `cpln://secret/...` references, so the values appear in neither the Helm release nor the stored workload spec.
+
+<Note>
+The credentials are applied only on first startup, when the data directory is empty. Changing the secret afterwards does **not** change the running database — it only changes what the workload presents when it authenticates, which then fails. To rotate on an existing instance, follow [Rotating the Password](#rotating-the-password).
+</Note>
+
+### Storage
+
+```yaml
 volumeset:
   capacity: 10 # initial capacity in GiB (minimum is 10)
   autoscaling:
@@ -178,15 +151,39 @@ volumeset:
     maxCapacity: 100 # Maximum capacity in GiB when autoscaling is enabled
     minFreePercentage: 10 # Minimum free percentage to trigger scaling when autoscaling is enabled
     scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
+```
 
-internalAccess: # Sets the internal firewall scope
+### Internal Access
+
+```yaml
+internalAccess: # Sets the internal firewall scope - if set to none, replicas will not be able to reach each other
   type: same-gvc # options: none, same-gvc, same-org, workload-list
   workloads:  # Note: can only be used if type is same-gvc or workload-list
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
+| Type | Who can connect on port `27017` |
+|------|-------------|
+| `none` | No workload |
+| `same-gvc` | Every workload in the same GVC |
+| `same-org` | Every workload in the organization |
+| `workload-list` | Only the workloads listed under `workloads` |
+
+A change to `internalAccess` can take a few minutes to take effect; re-test rather than trusting the first response.
+
+### Direct Load Balancer
+
+```yaml
 directLoadBalancer:
   enabled: false
+```
 
+When `true`, MongoDB is exposed on the internet on TCP port `27017` through a [direct load balancer](/reference/workload/load-balancing) with a public IP per location. Only enable it with a strong password in place, and prefer `internalAccess` for applications running in the same GVC.
+
+### Backup
+
+```yaml
 backup:
   enabled: false
   image: ghcr.io/controlplane-com/backup-images/mongo-backup:8.0
@@ -203,141 +200,276 @@ backup:
     region: us-east-1
     cloudAccountName: my-backup-cloudaccount
     policyName: my-backup-policy
-    prefix: mongodb/backups
+    prefix: mongodb/backups # folder name where your backups will be stored
 
   gcp:
     bucket: my-backup-bucket
     cloudAccountName: my-backup-cloudaccount
-    prefix: mongodb/backups
+    prefix: mongodb/backups # folder name where your backups will be stored
 ```
 
-### Credentials
+The bucket and Cloud Account must exist first — see [Backing Up](#backing-up) for the per-provider steps and the IAM policy.
 
-- `config.credentialsSecretName` — Name of the dictionary secret holding `username`, `password` and `database`. MongoDB creates that root user and that initial database on first boot, and these are the credentials your applications put in their connection strings.
+## Connecting
 
-The secret must exist before installing — see [Prerequisites](#prerequisites). The workload reads it through `cpln://secret/...` references, so the values appear in neither the Helm release nor the stored workload spec.
+| What | Address | Notes |
+|---|---|---|
+| Internal (same GVC) | `RELEASE_NAME-mongo.GVC_NAME.cpln.local:27017` | Allowed by the default `internalAccess.type: same-gvc`. Always use the fully qualified name. |
+| External | Public IP per location, TCP `27017` | Only when `directLoadBalancer.enabled: true`. Read the address from `status` in `cpln workload get RELEASE_NAME-mongo --gvc GVC_NAME -o yaml`. |
+| Credentials | `cpln secret reveal SECRET_NAME -o yaml` | The `username`, `password` and `database` entries of your prerequisite secret. |
 
-<Note>
-The credentials are applied only on first startup, when the data directory is empty. Changing the secret afterwards does **not** change the running database — it only changes what the workload presents when it authenticates, which will then fail. To rotate on an existing instance, change it inside MongoDB with `db.changeUserPassword()` first, then update the secret to match.
-</Note>
-
-### Resources
-
-- `resources.minCpu` / `resources.minMemory` — Minimum CPU and memory guaranteed to the workload.
-- `resources.maxCpu` / `resources.maxMemory` — Maximum CPU and memory the workload can use.
-
-### Storage
-
-- `volumeset.capacity` — Initial volume size in GiB (minimum 10).
-- `volumeset.autoscaling.enabled` — Automatically expand the volume as it fills. When enabled:
-  - `maxCapacity` — Maximum volume size in GiB.
-  - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
-  - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
-
-### Internal Access
-
-- `internalAccess.type` — Controls which workloads can connect to MongoDB on port `27017`:
-
-| Type | Description |
-|------|-------------|
-| `none` | No internal access allowed |
-| `same-gvc` | Allow access from all workloads in the same GVC |
-| `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from specific workloads listed in `workloads` |
-
-### Direct Load Balancer
-
-- `directLoadBalancer.enabled` — When `true`, exposes MongoDB externally on port `27017` via a dedicated load balancer IP.
-
-### Connecting to MongoDB
-
-Once deployed, connect to MongoDB from within the same GVC using:
+The user lives in the `admin` database, so connection strings must carry `authSource=admin`:
 
 ```text
-RELEASE_NAME-mongo.GVC_NAME.cpln.local:27017
+mongodb://USERNAME:PASSWORD@RELEASE_NAME-mongo.GVC_NAME.cpln.local:27017/DATABASE?authSource=admin
 ```
 
-## Backup
+Verify the server from inside the container. The credentials are already in its environment, so nothing is typed on the command line:
 
-Backup is disabled by default. When enabled, a cron workload runs `mongodump` on the configured schedule and uploads compressed archives to AWS S3 or GCS. The backup image is compatible with all MongoDB versions.
+```bash
+cpln workload exec RELEASE_NAME-mongo --gvc GVC_NAME -- sh -c \
+  'mongosh --quiet --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.runCommand({ ping: 1 })"'
+```
 
-- `backup.enabled` — Enable scheduled backups.
-- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
-- `backup.provider` — `aws` or `gcp`.
-- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
+To use `mongosh` from your own machine without opening the firewall, forward the port and connect to `127.0.0.1`:
 
-### AWS S3
+```bash
+cpln port-forward RELEASE_NAME-mongo 27017:27017 --gvc GVC_NAME
+```
 
-Before enabling backup with `provider: aws`, complete the following in your AWS account:
+```bash
+mongosh "mongodb://USERNAME:PASSWORD@127.0.0.1:27017/?authSource=admin"
+```
 
-1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.aws.cloudAccountName` to its name.
-3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`:
+## Operations
+
+### Backing Up
+
+When `backup.enabled` is `true`, the `RELEASE_NAME-mongo-backup` cron workload runs `mongodump` on `backup.schedule`, authenticating with the username and password from your credentials secret. Each run writes one gzip-compressed archive of **every database on the instance** — not only the one named in your secret — to `PREFIX/mongo-YYYY-MM-DDTHH-MM-SSZ.archive.gz` in your bucket. Backups do not delete older archives; manage retention with a bucket lifecycle rule.
+
+<Steps>
+  <Step title="AWS S3">
+    1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+    2. If you do not have a Control Plane Cloud Account for AWS, follow the [Create a Cloud Account](/guides/create-cloud-account) guide. Set `backup.aws.cloudAccountName` to its name.
+    3. Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`, and set `backup.aws.policyName` to its name. The template attaches this policy to the backup identity and nothing else, so the bucket in it is the only storage the job can reach:
+
+    ```json
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:DeleteObject",
+                    "s3:ListBucket",
+                    "s3:GetObjectVersion",
+                    "s3:DeleteObjectVersion",
+                    "s3:GetBucketLocation",
+                    "s3:AbortMultipartUpload",
+                    "s3:ListBucketMultipartUploads",
+                    "s3:ListMultipartUploadParts"
+                ],
+                "Resource": [
+                    "arn:aws:s3:::YOUR_BUCKET_NAME",
+                    "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+                ]
+            }
+        ]
+    }
+    ```
+
+    4. Set `backup.aws.prefix` to the folder path for the archives, then set `backup.enabled: true` and `backup.provider: aws`.
+  </Step>
+  <Step title="GCS">
+    1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
+    2. If you do not have a Control Plane Cloud Account for GCP, follow the [Create a Cloud Account](/guides/create-cloud-account) guide. Set `backup.gcp.cloudAccountName` to its name.
+    3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account. The template additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket in `backup.gcp.bucket`.
+    4. Set `backup.gcp.prefix` to the folder path for the archives, then set `backup.enabled: true` and `backup.provider: gcp`.
+  </Step>
+</Steps>
+
+Check a run with the container logs of the cron workload; a successful run ends with `[INFO] Backup completed: mongo-....archive.gz`:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-mongo-backup"}' --limit 50 --since 24h
+```
+
+### Restoring a Backup
+
+The archive is a `mongodump --archive --gzip` file, so it is restored with `mongorestore --gzip --archive`. The `mongo:8.2.3` image already contains `mongorestore`, and the container already holds the credentials in its environment, so the restore runs inside the database container. Raw binary cannot pass through `cpln workload exec` intact, so the archive is base64-encoded on the way in.
+
+<Note>
+This procedure matches how the backup job writes its archives and the tools present in the shipped images, but it has not been rehearsed against a live install of this template. Rehearse it on a throwaway release before you depend on it.
+</Note>
+
+<Steps>
+  <Step title="Download the archive">
+    From a machine with access to the bucket. For GCS use `gsutil cp gs://...` instead:
+
+    ```bash
+    aws s3 cp s3://BUCKET_NAME/PREFIX/mongo-TIMESTAMP.archive.gz ./restore.archive.gz
+    ```
+  </Step>
+  <Step title="Copy it into the MongoDB container">
+    `--stdin` is required; without it the piped data is discarded and the file lands empty:
+
+    ```bash
+    base64 < ./restore.archive.gz | cpln workload exec RELEASE_NAME-mongo --gvc GVC_NAME --stdin -- \
+      sh -c 'base64 -d > /tmp/restore.archive.gz'
+    ```
+
+    The file sits on the container's ephemeral disk, not on the data volume; check that `ls -l /tmp/restore.archive.gz` reports the same size as your download before continuing.
+  </Step>
+  <Step title="Restore">
+    By default `mongorestore` adds the archive's documents to the existing collections and keeps any document whose `_id` already exists. Add `--drop` to replace each collection with the backup's contents, or `--nsInclude` to restore a single database or collection; see the [mongorestore reference](https://www.mongodb.com/docs/database-tools/mongorestore/) for both.
+
+    ```bash
+    cpln workload exec RELEASE_NAME-mongo --gvc GVC_NAME -- sh -c \
+      'mongorestore --gzip --archive=/tmp/restore.archive.gz --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin && rm /tmp/restore.archive.gz'
+    ```
+  </Step>
+  <Step title="Verify">
+    List the databases with the verification command from [Connecting](#connecting), replacing the `--eval` expression with `db.adminCommand({ listDatabases: 1 })`, then spot-check a collection count.
+  </Step>
+</Steps>
+
+### Rotating the Password
+
+The password in the secret is only read on first boot, so a rotation happens inside MongoDB first and the secret is updated to match:
+
+<Steps>
+  <Step title="Change it inside MongoDB">
+    ```bash
+    cpln workload exec RELEASE_NAME-mongo --gvc GVC_NAME -- sh -c \
+      'mongosh --quiet --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.getSiblingDB(\"admin\").changeUserPassword(\"$MONGO_INITDB_ROOT_USERNAME\", \"NEW-STRONG-PASSWORD\")"'
+    ```
+  </Step>
+  <Step title="Update the secret">
+    Set the `password` entry of your [dictionary secret](/guides/create-secret/dictionary) to the new value, so that applications reading the secret and the backup job authenticate with it.
+  </Step>
+  <Step title="Redeploy the workload">
+    A running replica keeps the environment it started with; updating the secret does not restart it. Force a redeployment so the container's environment — which the commands on this page rely on — matches the secret:
+
+    ```bash
+    cpln workload force-redeployment RELEASE_NAME-mongo --gvc GVC_NAME
+    ```
+  </Step>
+</Steps>
+
+### Upgrading from Earlier Versions
+
+Template version 1.4.0 removed `config.username` and `config.password` as values: credentials became the prerequisite secret described above. Version 1.4.1 narrows the AWS backup permissions. Both upgrade in place; neither changes the data on the volume.
+
+#### From 1.3.2 or earlier
+
+| | 1.3.2 and earlier | 1.4.0 and later |
+|---|---|---|
+| Database credentials | `config.username`, `config.password`, `config.database` values | `config.credentialsSecretName` → a dictionary secret you create |
+| Where the password lives | Chart-created secret `RELEASE_NAME-mongo-config`, and the Helm release | Only the secret you create |
 
 <Warning>
-**Version 1.4.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
+**Carrying the old values forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing release is left untouched and running, rather than restarting against a different password:
 
-**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
+```text
+Error: execution error at (mongodb/templates/identity.yaml:1:4): mongodb: config.username and
+config.password were REMOVED — they are now a `dictionary` secret you create, named by
+config.credentialsSecretName, holding the keys `username`, `password` and `database`. Delete
+them from your values. See Prerequisites in the README.
+```
 </Warning>
 
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject",
-                "s3:PutObject",
-                "s3:DeleteObject",
-                "s3:ListBucket",
-                "s3:GetObjectVersion",
-                "s3:DeleteObjectVersion",
-                "s3:GetBucketLocation",
-                "s3:AbortMultipartUpload",
-                "s3:ListBucketMultipartUploads",
-                "s3:ListMultipartUploadParts"
-            ],
-            "Resource": [
-                "arn:aws:s3:::YOUR_BUCKET_NAME",
-                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
-            ]
-        }
-    ]
-}
-```
+<Steps>
+  <Step title="Read the credentials the database already uses">
+    Credentials are written into the data directory the first time the volume is initialized, so an existing database keeps whatever it was created with. Recover them from your current values file, or from the secret the old version created — **before** upgrading:
 
-4. Set `backup.aws.policyName` to the name of the policy created in step 3.
-5. Set `backup.aws.prefix` to the folder path where backups will be stored.
+    ```bash
+    cpln secret reveal RELEASE_NAME-mongo-config -o yaml
+    ```
+  </Step>
+  <Step title="Create the prerequisite secret with those same values">
+    Follow [Prerequisites](#prerequisites), using the existing username, password and database name. Different values here do not change the database — they just leave the workload unable to authenticate.
+  </Step>
+  <Step title="Remove the old keys from your values">
+    Delete `config.username`, `config.password` and `config.database`, and set `config.credentialsSecretName` to your secret's name.
+  </Step>
+  <Step title="Upgrade, then rotate the password">
+    After the upgrade succeeds, change any password that came from a 1.3.2 default — those defaults were published in the public template repository, so treat them as compromised. Follow [Rotating the Password](#rotating-the-password).
+  </Step>
+</Steps>
 
-### GCS
+<Warning>
+**`RELEASE_NAME-mongo-config` no longer holds credentials.** From 1.4.0 it is created only when `backup.enabled: true`, and holds nothing but the bucket and region. Anything outside this release that read the username or password from it by name — another workload's environment, a policy, or a parent chart bundling MongoDB as a subchart — must be pointed at the secret you create instead. A reference to a key that no longer exists does not fail loudly; it wedges the referring workload silently.
+</Warning>
 
-Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+#### From 1.4.0 with AWS backups
 
-1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
-2. If you do not have a Cloud Account set up, refer to the docs to [Create a Cloud Account](/guides/create-cloud-account). Set `backup.gcp.cloudAccountName` to its name.
-3. Add the **Storage Admin** role to the GCP service account associated with the Cloud Account.
-4. Set `backup.gcp.prefix` to the folder path where backups will be stored.
+Version 1.4.1 removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contained no write actions, so it never carried the backup itself — but it was silently supplying any read action your bucket-scoped policy happened to omit. Before upgrading, make sure your IAM policy contains the full action list under [Backing Up](#backing-up); if it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only.
 
-## Restoring a Backup
+### Scaling and Availability
 
-Run the following from a client with access to the backup bucket. For GCS, replace `aws s3 cp s3://...` with `gsutil cp gs://...`. `USERNAME` is the `username` entry from your credentials secret.
+The workload is pinned to one replica; raising the replica count is not supported and would produce isolated instances. Scale vertically with `resources`, and let the volume grow with `volumeset.autoscaling`. The data volume survives upgrades and restarts, and the template takes a final snapshot (retained 7 days) when the volume set is deleted. For failover and read scaling, use the [MongoDB Cluster](/template-catalog/templates/mongodb-cluster) template.
 
-```sh
-aws s3 cp s3://BUCKET_NAME/PREFIX/BACKUP_FILE.gz - \
-  | gunzip \
-  | mongorestore \
-      --host=RELEASE_NAME-mongo.GVC_NAME.cpln.local \
-      --port=27017 \
-      --username=USERNAME \
-      --archive
-```
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The workload never becomes ready and cpln logs is empty">
+    **Symptom:** `cpln helm install` reported success, the deployment never reaches ready, and `cpln logs` returns no lines. `cpln workload get-deployments RELEASE_NAME-mongo --gvc GVC_NAME -o yaml` shows under `status.versions[].message`:
+
+    ```text
+    The secret SECRET_NAME no longer exists. Workload updates are paused until the
+    secret is added or the reference to the secret removed.
+    ```
+
+    **Cause:** `config.credentialsSecretName` names a secret that does not exist (or was created in a different org).
+
+    **Fix:** Create the secret as shown in [Prerequisites](#prerequisites), then run `cpln workload force-redeployment RELEASE_NAME-mongo --gvc GVC_NAME` or wait several minutes for the deployment to recover on its own.
+  </Accordion>
+  <Accordion title="MongoServerError: Authentication failed after changing the secret">
+    **Symptom:** Clients using the values currently in the secret are rejected with `MongoServerError: Authentication failed.`
+
+    **Cause:** The secret is applied only when the data directory is first initialized. Editing it later changes what clients present, not the user stored in the database.
+
+    **Fix:** Authenticate with the credentials the database was created with, then follow [Rotating the Password](#rotating-the-password) to bring the database and the secret back in line. Also check that the connection string carries `authSource=admin`.
+  </Accordion>
+  <Accordion title="helm upgrade fails with config.username and config.password were REMOVED">
+    **Symptom:** `cpln helm upgrade` exits with the render error quoted under [Upgrading from Earlier Versions](#upgrading-from-earlier-versions) and nothing is changed.
+
+    **Cause:** Your values file still sets `config.username` or `config.password`, which 1.4.0 rejects.
+
+    **Fix:** Create the prerequisite secret with the existing credentials, delete the two keys, set `config.credentialsSecretName`, and upgrade again.
+  </Accordion>
+  <Accordion title="Backup run fails with AccessDenied on the S3 upload">
+    **Symptom:** The cron workload's logs show `mongodump` finishing, then `An error occurred (AccessDenied) when calling the PutObject operation`.
+
+    **Cause:** The IAM policy named in `backup.aws.policyName` is missing an action, or its `Resource` does not match `backup.aws.bucket`. From 1.4.1 nothing else on the identity fills the gap.
+
+    **Fix:** Update the policy to the full action list under [Backing Up](#backing-up) with both the bucket ARN and `BUCKET/*`, then wait for the next scheduled run and check its logs.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- **Create the credentials secret before installing.** A missing secret wedges the deployment with no log output; the only diagnostic is `status.versions[].message` from `cpln workload get-deployments`.
+- **Do not scale above one replica.** More replicas are isolated instances, not a replica set — use [MongoDB Cluster](/template-catalog/templates/mongodb-cluster) for that.
+- **Credentials apply only on first boot.** Changing the secret later does not change the database; rotate inside MongoDB first, then update the secret and redeploy.
+- **Connection strings need `authSource=admin`.** The user is created in the `admin` database, not in the database named in your secret.
+- **Backups are full-instance dumps** written on a schedule with no retention policy of their own; use a bucket lifecycle rule to expire old archives.
+- **Uninstalling deletes the volume set.** A final snapshot is taken and retained for 7 days; the release's data is otherwise gone with it.
+- **Firewall changes are not instant.** Allow a few minutes after changing `internalAccess` or `directLoadBalancer` before concluding a knob is broken.
 
 ## External References
 
 <CardGroup cols={2}>
     <Card title="MongoDB Documentation" icon="book" href="https://www.mongodb.com/docs/">
-    Official MongoDB documentation
+    Official MongoDB manual
+    </Card>
+    <Card title="mongorestore Reference" icon="book" href="https://www.mongodb.com/docs/database-tools/mongorestore/">
+    Options for restoring archives, including --drop and --nsInclude
+    </Card>
+    <Card title="MongoDB Docker Image" icon="docker" href="https://hub.docker.com/_/mongo">
+    Behavior of the MONGO_INITDB_* variables used by this template
     </Card>
     <Card title="Backup Image Source" icon="github" href="https://github.com/controlplane-com/backup-images/tree/main/mongo-backup">
     Source code for the MongoDB backup container image

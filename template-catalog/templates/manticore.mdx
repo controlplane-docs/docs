@@ -1,103 +1,104 @@
 ---
 title: Manticore Search
 icon: /template-catalog/templates/icons/manticore.png
-description: Deploy Manticore Search on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and distributed Galera clustering with orchestrator API and S3 imports.
-keywords: ['full text search', 'sphinx fork', 'elasticsearch alternative', 'meilisearch alternative', 'typesense alternative', 'inverted index', 'search index', 'sql full text', 'opensearch alternative']
+description: Galera-replicated Manticore Search cluster (3 replicas by default) with an orchestrator for coordinated CSV imports from S3, optional S3 backups and an internal web dashboard. Deploys into an existing GVC; an agent-token secret, an S3 bucket and a cloud account must exist before install.
+keywords: ['full text search', 'sphinx fork', 'elasticsearch alternative', 'meilisearch alternative', 'typesense alternative', 'opensearch alternative', 'inverted index', 'sql full text', 'distributed table', 'bulk index', 'k6 load test']
 ---
 
 ## Overview
 
-<Warning>
-**Upgrading from 2.0.1 or earlier?** Two values keys were removed and one default changed — see [Upgrading From 2.0.1 or Earlier](#upgrading-from-2-0-1-or-earlier). Anyone on an earlier version should also treat their agent token as compromised: it shipped as a working default in this repository and was shared by every install that did not override it.
-</Warning>
+Manticore Search is an open-source full-text search engine. This template deploys a replicated Manticore cluster using Galera replication, together with an orchestrator that performs coordinated, zero-downtime CSV imports from an S3 bucket into every replica, optional scheduled backups to S3, and a web dashboard for cluster operations. It is built for datasets that are regenerated upstream and republished as CSV: data arrives in a bucket, and the orchestrator turns it into a distributed table that keeps serving searches while it is reloaded.
 
-Manticore Search is a high-performance, open-source search engine built for fast full-text search at scale. This template deploys a distributed Manticore Search cluster using Galera replication for high availability, with an orchestrator API for cluster management, a web UI for monitoring and operations, and support for zero-downtime data imports from AWS S3.
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create or manage a GVC.
+</Note>
 
 ### What Gets Created
 
-- **Manticore Search Workload** — A stateful Galera cluster with configurable replicas. Each replica runs a sidecar agent that handles cluster coordination, data imports, and recovery operations.
-- **Orchestrator API Workload** — A REST API service for triggering imports, monitoring cluster health, initiating repairs, and managing backup and restore operations.
-- **Orchestrator Cron Job** — A scheduled workload that runs import, health check, or repair operations on a configured schedule.
-- **UI Workload** — A web dashboard for managing the cluster, monitoring replication, triggering operations, and visualizing queries.
-- **Volume Set** — Persistent storage allocated per replica for Manticore data directories.
-- **Shared Volume Set** — A shared volume accessible by all replicas and the orchestrator, used for slot-based import coordination.
-- **Secrets** — Four opaque secrets: the Manticore `searchd` base configuration, the startup/shutdown handler script, the table schema registry used by the agent, and the agent bearer token. A K6 load test script secret is also created when load testing is enabled.
-- **Identities & Policies** — Identities for the main cluster, orchestrator, and backup workloads. Policies grant `reveal` access to the configuration secrets, `exec` permissions on the orchestrator cron job, and `view` access to the Manticore workload for orchestration.
-- **Backup Cron Job** (optional) — Scheduled logical backups of delta and full tables to an S3 bucket. Enabled when `orchestrator.backup.enabled: true`.
-- **Domain** (optional) — Routes `/api/*` to the orchestrator API and all other traffic to the UI. Enabled when `domain.enabled: true`.
-- **Load Test Workload** (optional) — A k6-based load test runner with a controller for automated scheduling. Enabled when `loadTest.enabled: true`.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-manticore` | Manticore `searchd` cluster (stateful, 3 replicas by default); each replica also runs an `agent` sidecar for local table operations | — |
+| Workload | `RELEASE_NAME-orchestrator-api` | REST API coordinating cluster-wide init, import, repair, backup and restore (standard, 2 replicas by default) | — |
+| Workload | `RELEASE_NAME-orchestrator-job` | Cron job that runs the configured `init`, `import`, `health` or `repair` action; ships suspended and is triggered on demand | — |
+| Workload | `RELEASE_NAME-ui` | Management dashboard (standard, 1 replica, internal-only by default) | — |
+| Volume set | `RELEASE_NAME-manticore-vs` | Per-replica data volume for indexes and cluster state (200 GB by default) | — |
+| Volume set | `RELEASE_NAME-manticore-vs-shared` | Shared volume used to hand import artifacts from the job to the replicas (100 GB by default) | — |
+| Secrets | `RELEASE_NAME-manticore-config`, `RELEASE_NAME-manticore-schema`, `RELEASE_NAME-manticore-startup` | `searchd` base configuration, table schema registry, startup script | — |
+| Identities | `RELEASE_NAME-manticore-identity`, `RELEASE_NAME-manticore-orchestrator-identity`, `RELEASE_NAME-manticore-orchestrator-job-identity` | S3 access through your cloud account and secret access for each tier | — |
+| Policies | `RELEASE_NAME-manticore-config-policy`, `RELEASE_NAME-manticore-exec-policy`, `RELEASE_NAME-manticore-orchestrator-policy` | `reveal` on the three config secrets and your agent-token secret; the right to start the cron job and read the cluster workload | — |
+| Workload | `RELEASE_NAME-manticore-backup` | Cron job performing logical backups to a separate S3 bucket, with its own identity and policy | `orchestrator.backup.enabled: true` |
+| Workloads | `RELEASE_NAME-load-test`, `RELEASE_NAME-load-test-controller` | k6 load-test runner and the cron controller that scales it up and back to zero | `loadTest.enabled: true` |
+| Secret | `RELEASE_NAME-manticore-k6-script` | Generated k6 test script | `loadTest.enabled: true` |
+| Domain | your `domain.name` | Routes `/api/*` to the orchestrator API and everything else to the UI | `domain.enabled: true` |
 
 ## Prerequisites
 
-This template requires an AWS S3 bucket for CSV source data and a Control Plane Cloud Account before installation.
+Two things must exist before you install: the agent-token secret and the S3 source bucket with a cloud account that can read it. Only AWS S3 is supported.
 
-### AWS S3 (Source Data)
+<Steps>
+  <Step title="Create the agent-token secret">
+    The orchestrator, the agent sidecars and the UI authenticate to each other with one bearer token, stored in an opaque secret you create:
 
-1. Create an S3 bucket and upload your CSV source files. Set `buckets.sourceBucket` to the bucket name and `buckets.awsRegion` to its region.
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name SECRET_NAME --encoding plain -f -
+    ```
 
-2. If you do not have a Control Plane Cloud Account set up, follow the [Create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) guide. Set `buckets.cloudAccountName` to the name of your Cloud Account.
+    Set `orchestrator.agent.tokenSecretName` to this name.
 
-3. Set `buckets.awsPolicyRefs` to the IAM policies granting S3 access. **Read-only is sufficient** — use the AWS managed policy `aws::AmazonS3ReadOnlyAccess`, or a custom policy with `s3:GetObject` and `s3:ListBucket` on the bucket (omit the `aws::` prefix for custom policies).
+    <Warning>
+    If the secret does not exist at install time, the deployment wedges silently: the containers never start, `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
 
-<Note>
-Versions before 2.1.0 documented `s3:PutObject` and `s3:DeleteObject` on this bucket. That was never required: imports read from S3 and write only to the shared volume. If you granted write access on your source data bucket, you can narrow it to read-only. Backups use a **separate** bucket, which does need write access.
-</Note>
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-manticore --gvc GVC_NAME -o yaml
+    ```
 
-### Agent Token
+    Create the secret and the deployment recovers on its own; to skip the wait, run `cpln workload force-redeployment RELEASE_NAME-manticore --gvc GVC_NAME`.
+    </Warning>
+  </Step>
+  <Step title="Create the source bucket and a read-only IAM policy">
+    Create an S3 bucket and upload your CSV files (for example to `imports/addresses.csv`). Imports only ever read from this bucket — every scratch artifact is written to the shared volume — so a read-only policy is sufficient. Create an IAM policy with the following JSON, replacing `my-manticore-bucket`:
 
-The orchestrator, the agent sidecars and the UI authenticate to each other with a single bearer token. It is a **prerequisite opaque secret that must exist before you install** — the deployment otherwise hangs waiting on a secret that is not there, which looks like a platform fault rather than a missing step.
-
-```bash
-printf '%s' "$(openssl rand -base64 32)" | \
-  cpln secret create-opaque --name my-manticore-agent-token --encoding plain -f -
-```
-
-Set `orchestrator.agent.tokenSecretName` to that name.
-
-<Warning>
-**The management UI has no authentication of its own.** It holds the bearer token server-side and injects it on behalf of whoever connects, so the token protects the orchestrator API but not the UI itself. Anyone who can reach the UI has full cluster admin — imports, repairs and cluster operations.
-
-This is why `orchestrator.ui.publicAccess.enabled` defaults to `false`. Turning it on publishes cluster admin to the internet. If you need browser access from outside the GVC, put your own authenticating proxy in front of it.
-</Warning>
-
-### AWS S3 (Backup, Optional)
-
-Only required if `orchestrator.backup.enabled: true`:
-
-1. Create a separate S3 bucket for backups. Set `orchestrator.backup.s3Bucket` and `orchestrator.backup.s3Region`.
-
-2. Create an IAM policy with the following permissions, replacing `YOUR_BUCKET_NAME`:
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
         {
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject",
-                "s3:PutObject",
-                "s3:DeleteObject",
-                "s3:ListBucket"
-            ],
-            "Resource": [
-                "arn:aws:s3:::YOUR_BUCKET_NAME",
-                "arn:aws:s3:::YOUR_BUCKET_NAME/*"
-            ]
+          "Effect": "Allow",
+          "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+          "Resource": "arn:aws:s3:::my-manticore-bucket"
+        },
+        {
+          "Effect": "Allow",
+          "Action": ["s3:GetObject"],
+          "Resource": "arn:aws:s3:::my-manticore-bucket/*"
         }
-    ]
-}
-```
+      ]
+    }
+    ```
 
-3. Set `orchestrator.backup.cloudAccountName` and `orchestrator.backup.s3Policy` to the name of your Cloud Account and the custom policy created above.
+    Set `buckets.sourceBucket` to the bucket name and `buckets.awsRegion` to its region.
+  </Step>
+  <Step title="Create a cloud account and reference the policy">
+    Create a Control Plane cloud account for your AWS account by following the [Create a Cloud Account](/guides/create-cloud-account) guide, and attach the policy above to the role it uses. Set `buckets.cloudAccountName` to the cloud account name and `buckets.awsPolicyRefs` to the policy name. Custom policies are named without a prefix; only AWS-managed policies take the `aws::` prefix (for example `aws::AmazonS3ReadOnlyAccess`).
+  </Step>
+</Steps>
+
+Scheduled backups need a second, writable bucket with its own policy and cloud account. That setup is optional and described under [Backing Up](#backing-up).
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+Install from the marketplace registry into your existing GVC, naming the agent-token secret and the source-bucket resources you created above:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/manticore \
+  --version 2.2.0 --gvc GVC_NAME \
+  --set orchestrator.agent.tokenSecretName=SECRET_NAME \
+  --set buckets.cloudAccountName=CLOUD_ACCOUNT_NAME \
+  --set buckets.awsPolicyRefs[0]=POLICY_NAME \
+  --set buckets.sourceBucket=BUCKET_NAME
+```
+
+The default `tables` value defines one example table, `addresses`, read from `imports/addresses.csv`. Define your own tables in a values file (see [Tables](#tables)) and pass it with `-f` as described in the [CLI installation guide](/template-catalog/install-manage/cli).
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -123,37 +124,37 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+### Buckets
 
 ```yaml
-# =============================================================================
-# AWS Cloud Account and S3 Configuration
-# =============================================================================
 buckets:
   cloudAccountName: my-manticore-cloudaccount    # Name of your configured Cloud Account
   awsPolicyRefs:                        # IAM policies for S3 access
-    - aws::AmazonS3ReadOnlyAccess       # Note: if using a custom policy, omit the aws:: prefix
+    - my-manticore-policy       # Note: if using a custom policy, omit the aws:: prefix as this is only for AWS managed policies
   awsRegion: us-east-1                  # Region of your S3 bucket
   sourceBucket: my-manticore-bucket               # S3 bucket containing files to import
+```
 
-# =============================================================================
-# Tables Configuration
-# =============================================================================
+### Tables
+
+One entry per searchable table. `csvPath` is a path within `buckets.sourceBucket`, or a list of paths for a multi-segment table.
+
+```yaml
 tables:
   - name: addresses
     csvPath:
-      - manticore-imports/addresses/data.csv
+      - imports/addresses.csv
     config:
-      haStrategy: noerrors
-      agentRetryCount: 3
-      clusterMain: false
-      segmentCount: 1
-      charsetTable: non_cont
-      memLimit: 2G
-      hasHeader: true
-      secondaryIndexes: false
+      haStrategy: noerrors        # Distributed-query HA strategy; noerrors skips agents returning errors
+      agentRetryCount: 3          # Retries for a failed agent connection
+      clusterMain: false          # true replicates the main table across all nodes
+      segmentCount: 1             # Must equal the number of csvPath entries
+      charsetTable: non_cont      # Manticore charset_table preset; omit for the engine default
+      memLimit: 2G                # Indexer memory limit during import
+      hasHeader: true             # true if the CSV has a header row
+      secondaryIndexes: false     # Build secondary indexes on attributes
     schema:
-      columns:
+      columns:                    # See the column types table below
         - name: address_id
           type: attr_uint
         - name: street_number
@@ -174,10 +175,49 @@ tables:
           type: attr_float
         - name: longitude
           type: attr_float
+```
 
-# =============================================================================
-# Manticore Search Configuration
-# =============================================================================
+If the first CSV column is numeric it becomes the document ID and must not be declared in `schema.columns`; otherwise an ID is generated.
+
+| Column type | Description |
+|---|---|
+| `field` | Full-text searchable field |
+| `field_string` | Full-text field (string variant) |
+| `attr_uint` | Unsigned integer attribute |
+| `attr_bigint` | Big integer attribute |
+| `attr_float` | Float attribute |
+| `attr_bool` | Boolean attribute |
+| `attr_string` | String attribute (not full-text indexed) |
+| `attr_timestamp` | Timestamp attribute |
+| `attr_multi` | Multi-value integer attribute |
+| `attr_multi_64` | Multi-value 64-bit integer attribute |
+| `attr_json` | JSON attribute |
+
+**Multi-segment tables.** To split a large dataset across several CSV files and query them as one distributed table, set `csvPath` to a list and `segmentCount` to its length. The chart refuses to render if they disagree. A backup of a multi-segment table covers all segments as one archive, and a restore replaces all of them.
+
+```yaml
+tables:
+  - name: addresses
+    csvPath:
+      - large-file/part1.csv
+      - large-file/part2.csv
+    config:
+      segmentCount: 2
+      memLimit: 2G
+      hasHeader: true
+    schema:
+      columns:
+        - name: street_name
+          type: field
+```
+
+<Note>
+Multi-segment imports and `clusterMain: true` have not been verified at the shipped resource sizes. Treat them as untested rather than known-good, and validate per-replica row counts after an import if you rely on either.
+</Note>
+
+### Manticore
+
+```yaml
 manticore:
   image: manticoresearch/manticore:25.0.0
   clusterName: manticore          # Galera cluster name
@@ -188,30 +228,28 @@ manticore:
     capacity: 200                 # GB per replica
   sharedVolumeset:
     capacity: 100                 # GB shared across replicas and orchestrator
-
-  # minScale = replica count used by orchestrator for coordination
   autoscaling:
-    minScale: 3
+    minScale: 3                   # Replica count the orchestrator coordinates across
     maxScale: 4
     metric: rps                   # rps for stateful, cpu for standard
     target: 100
     scaleToZeroDelay: 300
-
   rolloutOptions:
     maxSurgeReplicas: 25%
     minReadySeconds: 10
     scalingPolicy: OrderedReady
     terminationGracePeriodSeconds: 60
-
-  # IMPORTANT: same-gvc required for Galera replication
   firewall:
     internalAccess:
-      type: same-gvc
+      type: same-gvc              # Required for Galera replication — do not narrow
       workloads: []
+```
 
-# =============================================================================
-# Orchestrator Configuration
-# =============================================================================
+### Orchestrator
+
+The orchestrator block configures the cron job, the REST API, the agent sidecar, the web UI and the optional backup job.
+
+```yaml
 orchestrator:
   version: v6.0.5
   image: ghcr.io/controlplane-com/manticore-orchestrator/manticore-cpln-api
@@ -219,17 +257,14 @@ orchestrator:
   resources:
     cpu: 1
     memory: 2Gi
-
-  # Cron job settings
   schedule: "0 * * * *"           # Cron schedule (default = every hour)
   action: import                  # init, import, health, repair
   tableName: addresses            # Must match a name in tables[]
   suspend: true                   # Start suspended (trigger via UI/API)
-  timeoutSeconds: 900             # Container timeout (default 15 minutes)
+  timeoutSeconds: 900             # Container timeout (seconds, default 15 minutes)
   importMemLimit: 2G              # Memory limit for import jobs
-  activeDeadlineSeconds: 14400    # Max job runtime (default 4 hours)
+  activeDeadlineSeconds: 14400    # Max job runtime (seconds, default 4 hours)
 
-  # Orchestrator API
   api:
     version: v6.0.5
     image: ghcr.io/controlplane-com/manticore-orchestrator/manticore-cpln-api
@@ -245,18 +280,14 @@ orchestrator:
       metric: cpu
       target: 80
 
-  # Agent sidecar
   agent:
     version: v6.0.5
     image: ghcr.io/controlplane-com/manticore-orchestrator/manticore-cpln-agent
-    # REQUIRED prerequisite: name of an opaque secret holding the bearer token.
-    # THE SECRET MUST EXIST BEFORE INSTALL — without it the deploy hangs waiting on a missing secret.
-    # printf '%s' "$(openssl rand -base64 32)" | cpln secret create-opaque --name my-manticore-agent-token --encoding plain -f -
-    tokenSecretName: my-manticore-agent-token
+    tokenSecretName: my-manticore-agent-token   # REQUIRED prerequisite opaque secret — must exist BEFORE install
     resources:
-      cpu: 250m
+      maxCpu: 250m
       minCpu: 100m
-      memory: 512Mi
+      maxMemory: 512Mi
       minMemory: 128Mi
     import:
       batchSize: 20000            # Rows per INSERT statement
@@ -265,17 +296,14 @@ orchestrator:
       initialBackoffSec: 5        # Initial delay between retries
       maxBackoffSec: 60           # Max backoff delay (exponential)
 
-  # Web UI
   ui:
     version: v6.0.5
     image: ghcr.io/controlplane-com/manticore-orchestrator/manticore-cpln-ui
     resources:
       cpu: 0.25
       memory: 0.25Gi
-    # DANGER: the UI has NO login of its own and injects the admin token for every caller.
-    # Enabling this publishes full cluster admin to the internet. Put an authenticating proxy in front.
     publicAccess:
-      enabled: false
+      enabled: false              # DANGER: the UI has no login of its own — see the warning below
     internalAccess:
       type: same-gvc              # same-gvc, same-org, workload-list, none
       workloads: []               # //gvc/{gvc}/workload/{name} links, used when type is workload-list
@@ -285,37 +313,45 @@ orchestrator:
       metric: cpu
       target: 80
 
-  # Backup Configuration (Optional)
   backup:
     enabled: false
     version: v6.0.5
     image: ghcr.io/controlplane-com/manticore-orchestrator/manticore-cpln-backup
     cloudAccountName: my-manticore-backup-cloudaccount
-    s3Bucket: my-manticore-backup-bucket
-    s3Policy:
-      - my-backup-policy
+    s3Bucket: my-manticore-backup-bucket    # S3 bucket for backups
+    s3Policy:                               # IAM policies for S3 access
+      - my-manticore-backup-policy          # Custom policy created in S3 setup instructions
     s3Region: us-east-1
     dataSet: addresses            # Data set to back up
     prefix: manticore-backups     # S3 prefix/folder for backups
-    schedules:
-      - {"table":"addresses","type":"delta","schedule":"0 2 * * *"}   # Daily at 2am UTC
-      - {"table":"addresses","type":"main","schedule":"0 2 1 * *"}    # Monthly on 1st at 2am UTC
-    activeDeadlineSeconds: 14400
+    schedules: [
+      {"table":"addresses","type":"delta","schedule":"0 2 * * *"},     # Daily at 2am UTC
+      {"table":"addresses","type":"main","schedule":"0 2 1 * *"}       # Monthly full backup on 1st at 2am UTC
+      ]
+    activeDeadlineSeconds: 14400  # Max job runtime (seconds, default 4 hours)
     resources:
       cpu: 1
       memory: 1Gi
+```
 
-# =============================================================================
-# Domain Configuration (Optional)
-# =============================================================================
+<Warning>
+**The management UI has no authentication of its own.** It holds the bearer token server-side and attaches it to every request it makes on a visitor's behalf, so anyone who can reach the UI holds full cluster admin — imports, restores and repairs included. The token protects the orchestrator API, not the UI. Keep `orchestrator.ui.publicAccess.enabled: false` and reach the UI from inside the GVC, or place your own authenticating proxy in front of it before exposing it by any route, including a custom domain.
+</Warning>
+
+### Domain
+
+```yaml
 domain:
   enabled: false
   name: ""                        # FQDN, e.g., manticore.example.com
   dnsMode: cname                  # cname (subdomains) or ns (zone delegation)
+```
 
-# =============================================================================
-# Load Testing Configuration (Optional)
-# =============================================================================
+When enabled, the domain routes `/api/*` to the orchestrator API (bearer token required) and everything else to the UI (no authentication — see the warning above).
+
+### Load Test
+
+```yaml
 loadTest:
   enabled: false
   image: grafana/k6:0.47.0
@@ -325,15 +361,15 @@ loadTest:
   vus: 10                         # Virtual users
   duration: "5m"                  # Test duration (e.g., 30s, 5m, 1h)
   rps: null                       # Target RPS (null = unlimited)
-  replicas: 1
+  replicas: 1                     # Number of k6 pods to spawn
   controller:
-    image: alpine/curl
+    image: alpine/curl            # Alpine image with curl pre-installed
     schedule: ""                  # Cron expression (empty = manual only)
     testDurationBuffer: 60        # Seconds added to duration before scale-down
   target:
     port: 9308                    # Manticore HTTP API port
     endpoint: search              # "search" or "sql"
-  query:
+  query:                          # Full JSON body for the /search endpoint
     index: addresses
     query:
       match:
@@ -344,127 +380,137 @@ loadTest:
     errorRate: 0.01               # 1%
 ```
 
-### S3 and Cloud Account
+How to run a test and read its results is described under [Load Testing](#load-testing).
 
-- `buckets.cloudAccountName` — Name of the Control Plane Cloud Account with AWS trust configured.
-- `buckets.awsPolicyRefs` — IAM policies granting read access to the source S3 bucket. Use `aws::AmazonS3ReadOnlyAccess` for the AWS managed policy, or omit the `aws::` prefix for custom policies.
-- `buckets.awsRegion` — AWS region of the source S3 bucket.
-- `buckets.sourceBucket` — Name of the S3 bucket containing CSV files to import.
+## Connecting
 
-### Tables
+| Target | Address | Notes |
+|---|---|---|
+| Manticore SQL | `RELEASE_NAME-manticore.GVC_NAME.cpln.local:9306` | MySQL protocol, no authentication — reachable only from inside the GVC |
+| Manticore HTTP | `RELEASE_NAME-manticore.GVC_NAME.cpln.local:9308` | JSON search API, no authentication — reachable only from inside the GVC |
+| Orchestrator API | `RELEASE_NAME-orchestrator-api.GVC_NAME.cpln.local:8080` | Requires `Authorization: Bearer TOKEN`; GVC-internal only |
+| Web UI | `RELEASE_NAME-ui.GVC_NAME.cpln.local:3000` | Internal-only by default. With `orchestrator.ui.publicAccess.enabled: true` it also gets a `*.cpln.app` endpoint, shown under `status.canonicalEndpoint` in `cpln workload get RELEASE_NAME-ui --gvc GVC_NAME -o yaml` |
+| Custom domain | `https://DOMAIN_NAME` | `/api/*` to the orchestrator API, everything else to the UI; only with `domain.enabled: true` |
 
-Each entry in `tables` defines a searchable index imported from a CSV file.
+The bearer token is the value you stored in the secret named by `orchestrator.agent.tokenSecretName`:
 
-- `name` — Table name used by Manticore and referenced by the orchestrator.
-- `csvPath` — List of S3 paths (relative to `sourceBucket`) for the CSV source files. Multiple paths create a distributed multi-segment table.
-- `config.haStrategy` — High-availability behavior when agents are unreachable (`noerrors` ignores unreachable agents).
-- `config.agentRetryCount` — Number of retry attempts when an agent doesn't respond.
-- `config.segmentCount` — Number of distributed segments for this table. Use more than 1 for very large datasets split across multiple CSVs.
-- `config.memLimit` — Memory limit for the Manticore index (e.g., `2G`).
-- `config.hasHeader` — Set to `true` if the CSV file includes a header row.
-- `config.secondaryIndexes` — When `true`, enables secondary indexes on both the main and delta tables for this entry. Defaults to `false`.
-- `schema.columns` — Column definitions. Each column has a `name` and a `type`.
+```bash
+cpln secret reveal SECRET_NAME -o yaml
+```
 
-**Supported column types:**
+Verify the cluster from inside a Manticore replica. The `manticore` container ships the `mysql` client, and `searchd` listens on loopback, so this works from any replica (substitute your `manticore.clusterName` for `manticore` in the status key if you changed it):
 
-| Type | Description |
-|------|-------------|
-| `field` | Full-text searchable string field |
-| `attr_uint` | Unsigned integer attribute |
-| `attr_float` | Float attribute |
-| `attr_bigint` | 64-bit integer attribute |
-| `attr_bool` | Boolean attribute |
-| `attr_string` | Non-indexed string attribute |
-| `attr_json` | JSON attribute |
-| `attr_multi` | Multi-value unsigned integer attribute |
-| `attr_multi_64` | Multi-value 64-bit integer attribute |
-| `attr_timestamp` | Unix timestamp attribute |
+```bash
+cpln workload exec RELEASE_NAME-manticore --gvc GVC_NAME --container manticore -- \
+  mysql --protocol=tcp -h 127.0.0.1 -P 9306 -e "SHOW STATUS LIKE 'cluster_manticore_status'"
+```
 
-### Manticore Cluster
+A healthy cluster reports `primary`. To use a MySQL client on your own machine instead, forward the SQL port and connect to `127.0.0.1:9306`:
 
-- `manticore.clusterName` — Galera cluster name used for replication coordination.
-- `manticore.resources` — CPU and memory for each Manticore replica.
-- `manticore.volumeset.capacity` — Persistent storage per replica in GB.
-- `manticore.sharedVolumeset.capacity` — Shared storage in GB, accessible by all replicas and the orchestrator for import slot coordination.
-- `manticore.autoscaling.minScale` — Minimum replica count. This value is also used by the orchestrator to determine cluster quorum. It should match your intended fixed replica count.
-- `manticore.autoscaling.maxScale` — Maximum replica count for autoscaling.
+```bash
+cpln port-forward RELEASE_NAME-manticore 9306:9306 --gvc GVC_NAME
+```
 
-<Note>
-`manticore.firewall.internalAccess.type` must be set to `same-gvc`. Galera replication requires direct peer-to-peer communication between all replicas within the GVC.
-</Note>
+### First Run
 
-### Orchestrator
+An install indexes nothing: the tables you defined exist but are empty until the cluster has been initialized once and an import has run. Both are orchestrator actions. Run them from the UI (reachable from inside the GVC on port 3000), or from the CLI by pointing the cron job at the action and starting it — see [Running Cluster Actions](#running-cluster-actions). Run `init` once, then `import`; repeat `import` whenever the CSVs in your source bucket change.
 
-The orchestrator manages all cluster lifecycle operations including data imports, health checks, and repairs.
+## Operations
 
-**Cron Job**
-- `orchestrator.schedule` — Cron schedule for automated operations (default: every hour).
-- `orchestrator.action` — Operation to run: `init` (initial cluster setup), `import` (load CSV data), `health` (check cluster state), or `repair` (fix split-brain issues).
-- `orchestrator.tableName` — The table to target for the cron job. Must match a name in `tables`.
-- `orchestrator.suspend` — When `true`, the cron job is created in a suspended state and must be triggered manually via the UI or CLI. Recommended for production.
-- `orchestrator.timeoutSeconds` — Timeout for each cron container execution.
-- `orchestrator.activeDeadlineSeconds` — Maximum total runtime for an import job before it is terminated.
+### Running Cluster Actions
 
-**API**
-- `orchestrator.api.importPollInterval` — How often the API checks import progress.
-- `orchestrator.api.importPollTimeout` — Maximum time the API waits for an import to complete.
-- `orchestrator.api.autoscaling` — Min/max replicas and CPU target for the orchestrator API.
+The `RELEASE_NAME-orchestrator-job` cron workload ships suspended. `orchestrator.action` selects what a run does — `init` bootstraps the Galera cluster, `import` loads the CSVs for `orchestrator.tableName` into a fresh slot and swaps it in without interrupting searches, `health` reports cluster state, and `repair` recovers from a split brain. Trigger a run on demand:
 
-**Agent Sidecar**
-- `orchestrator.agent.tokenSecretName` — Names the prerequisite opaque secret holding the bearer token that secures all internal communication between the orchestrator, the agents and the UI. **The secret must exist before you install** (see [Prerequisites](#prerequisites)).
-- `orchestrator.agent.import.batchSize` — Number of rows per INSERT statement during imports (default: 20000).
-- `orchestrator.agent.recovery` — Retry settings for Galera cluster recovery after a split-brain event.
+```bash
+cpln workload cron start RELEASE_NAME-orchestrator-job --gvc GVC_NAME
+```
 
-**UI**
-- `orchestrator.ui.publicAccess.enabled` — Defaults to `false`. The UI has no authentication of its own and injects the admin token for any caller, so turning this on publishes full cluster admin to the internet.
-- `orchestrator.ui.internalAccess.type` — Inbound scope for in-GVC callers: `same-gvc` (default), `same-org`, `workload-list` or `none`. With `workload-list`, name the permitted workloads in `orchestrator.ui.internalAccess.workloads`.
+The UI exposes the same actions plus backup and restore. Follow a run in the job's logs:
 
-### Backup (Optional)
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-orchestrator-job"}' --limit 50 --since 10m
+```
 
-Set `orchestrator.backup.enabled: true` to enable scheduled backups to S3.
+To run on a schedule instead, set `orchestrator.suspend: false`; `orchestrator.schedule` then applies.
+
+### Backing Up
+
+Backups are logical `delta` (incremental) and `main` (full) archives written to a **separate** S3 bucket by the `RELEASE_NAME-manticore-backup` cron workload, under its own identity. Do not widen the source-bucket policy; give backups their own bucket and policy.
+
+<Steps>
+  <Step title="Create the backup bucket and a writable policy">
+    Create a second bucket and an IAM policy with the following JSON, replacing `my-manticore-backup-bucket`. `GetObject` and `DeleteObject` let restores read an archive back and lifecycle cleanup remove one; a backup-only install can drop them.
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+          "Resource": "arn:aws:s3:::my-manticore-backup-bucket"
+        },
+        {
+          "Effect": "Allow",
+          "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+          "Resource": "arn:aws:s3:::my-manticore-backup-bucket/*"
+        }
+      ]
+    }
+    ```
+  </Step>
+  <Step title="Attach it to a cloud account and enable backups">
+    Attach the policy to the role your [cloud account](/guides/create-cloud-account) uses, then set `orchestrator.backup.enabled: true` together with `orchestrator.backup.cloudAccountName`, `s3Bucket`, `s3Region` and `s3Policy`.
+  </Step>
+</Steps>
+
+`orchestrator.backup.schedules` drives the automated runs (daily delta and monthly main by default). You can also run a backup on demand from the UI, or from any workload inside the GVC against the orchestrator API:
+
+```bash
+curl -X POST "http://RELEASE_NAME-orchestrator-api.GVC_NAME.cpln.local:8080/api/backup" \
+  -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"tableName": "addresses", "type": "delta"}'
+```
+
+After enabling backups, confirm that objects appear in the bucket after the first scheduled run.
+
+### Restoring a Backup
+
+Restore is driven through the UI or the orchestrator API; there is no `orchestrator.action: restore`. List the available archives (`type` defaults to `delta`, so pass `type=main` to see full backups), then restore one by filename:
+
+```bash
+curl "http://RELEASE_NAME-orchestrator-api.GVC_NAME.cpln.local:8080/api/backups/files?tableName=addresses&type=main" \
+  -H "Authorization: Bearer TOKEN"
+
+curl -X POST "http://RELEASE_NAME-orchestrator-api.GVC_NAME.cpln.local:8080/api/restore" \
+  -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"tableName": "addresses", "type": "main", "filename": "ARCHIVE_FILENAME.tar.gz"}'
+```
+
+A restore scales the cluster up by one replica while it runs and puts it back afterwards. After restoring a `main` backup, use the UI's **Rotate Main** control to swap the active slot.
 
 <Warning>
-**Scheduled backups did not work before 2.1.0.** On every earlier version the backup job failed on every run and nothing ever reached the bucket, so an install with backups enabled had none. If you are upgrading, verify that objects appear in your bucket after the first scheduled run.
+A restore can land on some replicas and not others while every node still reports `synced`, so cluster status alone does not confirm it. Count rows on each replica (the stateful replicas are named `RELEASE_NAME-manticore-0`, `-1`, `-2`, ...):
+
+```bash
+cpln workload exec RELEASE_NAME-manticore --gvc GVC_NAME --replica RELEASE_NAME-manticore-0 --container manticore -- \
+  mysql --protocol=tcp -h 127.0.0.1 -P 9306 -e "SELECT COUNT(*) FROM addresses"
+```
+
+If the counts disagree, run a fresh `import` of the table from your source CSVs, which rebuilds every replica.
 </Warning>
 
-Restore is driven through the orchestrator API or UI — there is no `orchestrator.action: restore`.
+### Upgrading from 2.0.1 or Earlier
 
-- `orchestrator.backup.cloudAccountName` — Cloud Account with write access to the backup S3 bucket.
-- `orchestrator.backup.s3Bucket` / `s3Region` — Backup bucket name and region.
-- `orchestrator.backup.s3Policy` — Custom IAM policy name(s) granting write access to the backup bucket (see [Prerequisites](#prerequisites)).
-- `orchestrator.backup.dataSet` — The table dataset to back up.
-- `orchestrator.backup.prefix` — S3 folder prefix for backup archives.
-- `orchestrator.backup.schedules` — List of backup schedules. Each entry specifies a `table`, a backup `type` (`delta` for incremental, `main` for full), and a `schedule` in cron format.
+2.0.1 and earlier shipped a **live working bearer token** as a values default, published in the template repository, so every install that did not override it shared one publicly-known credential. The management UI was also public by default while having no login of its own, and the chart's secret policy granted `reveal` on **every secret in the organization** rather than the four it needed. Treat the token on any earlier install as compromised: rotate it rather than simply upgrading.
 
-### Domain (Optional)
-
-- `domain.enabled` — Enable or disable the domain resource.
-- `domain.name` — Fully qualified domain name (e.g., `manticore.example.com`). Requires DNS configuration pointing to the GVC's load balancer.
-- `domain.dnsMode` — DNS routing mode: `cname` for subdomain-based routing or `ns` for zone delegation.
-
-When enabled, the domain routes `/api/*` to the orchestrator API and all other traffic to the UI.
-
-### Load Testing (Optional)
-
-- `loadTest.enabled` — Enable or disable the k6 load test workload.
-- `loadTest.vus` — Number of virtual users.
-- `loadTest.duration` — Total test duration (e.g., `30s`, `5m`, `1h`).
-- `loadTest.rps` — Target requests per second (`null` = unlimited).
-- `loadTest.target.endpoint` — Search endpoint to target: `search` (JSON body) or `sql`.
-- `loadTest.thresholds.p95ResponseTime` — P95 response time threshold in milliseconds.
-- `loadTest.thresholds.errorRate` — Maximum acceptable error rate (e.g., `0.01` = 1%).
-
-## Upgrading From 2.0.1 or Earlier
-
-2.0.1 and earlier shipped a **live working bearer token** as a values default, published in this repository, so every install that did not override it shared one publicly-known credential. The management UI was also public by default while having no login of its own, and the chart's secret policy granted `reveal` on **every secret in the organization** rather than the four it needed. Treat the token on any earlier install as compromised: rotate it rather than simply upgrading.
-
-| 2.0.1 and earlier | 2.1.0 |
+| 2.0.1 and earlier | 2.1.0 and later |
 |---|---|
-| `orchestrator.agent.token` (a working value) | `orchestrator.agent.tokenSecretName` → prerequisite opaque secret |
+| `orchestrator.agent.token` (a working value) | `orchestrator.agent.tokenSecretName` names a prerequisite opaque secret |
 | `orchestrator.ui.allowExternalAccess: true` | `orchestrator.ui.publicAccess.enabled: false` |
 | UI internal scope hardcoded | `orchestrator.ui.internalAccess.type` (`same-gvc`) |
 | Policy granted `reveal` org-wide | Scoped to exactly four secrets |
-| Scheduled backup failed on every run | Backup works; restore via API/UI |
+| Scheduled backup failed on every run | Backup works; restore via UI or API |
 | Source-bucket IAM asked for write | Read-only is sufficient |
 
 Both removed keys stop the render with a message naming their replacement, so an upgrade cannot silently fall back to a default:
@@ -472,7 +518,7 @@ Both removed keys stop the render with a message naming their replacement, so an
 ```text
 orchestrator.agent.token was REMOVED in manticore 2.1.0. The bearer token is now a
 prerequisite opaque secret you create before install; set
-orchestrator.agent.tokenSecretName to its name.
+orchestrator.agent.tokenSecretName to its name instead.
 ```
 
 <Steps>
@@ -483,31 +529,115 @@ orchestrator.agent.tokenSecretName to its name.
     Delete `orchestrator.agent.token` and `orchestrator.ui.allowExternalAccess` from your values, then set `orchestrator.agent.tokenSecretName`. If you were relying on external UI access, decide deliberately whether to set `orchestrator.ui.publicAccess.enabled: true` — it publishes cluster admin.
   </Step>
   <Step title="Narrow the source-bucket policy">
-    If you granted `s3:PutObject` or `s3:DeleteObject` on your source data bucket, you can reduce it to read-only.
+    If you granted `s3:PutObject` or `s3:DeleteObject` on your source data bucket, reduce it to the read-only policy shown in [Prerequisites](#prerequisites).
   </Step>
-  <Step title="Expect a long rollout">
-    A `helm upgrade` restarts the cluster serially and takes around nine minutes even when nothing has changed. Data survives it.
+  <Step title="Verify backups if you use them">
+    Scheduled backups did not work on any earlier version, so an install with backups enabled had none. After upgrading, confirm that objects appear in the backup bucket after the first scheduled run.
   </Step>
 </Steps>
 
-## Operational Notes
+### Upgrading from 2.1.0
 
-- **A no-op `helm upgrade` takes roughly 542 seconds.** The stateful tier restarts serially, so an upgrade that changes nothing still takes about nine minutes. This is expected, not a hang.
-- **Verify per-replica row counts after a restore.** A restore followed by a rolling restart has been observed to land on some replicas and not others **while every node reported `synced`** — so cluster status alone is not sufficient confirmation. Check counts on each replica.
-- **Multi-segment imports and `clusterMain: true` are unverified at the shipped resource sizes.** Testing at reduced CPU and memory saw Galera replication timeouts, but that is not a finding about the feature itself; it has not been exercised at the default 4 CPU / 8 Gi. Treat these as untested rather than known-good or known-broken.
-- **k6 load-test thresholds now appear in `cpln logs`.** Earlier versions exited before the summary was emitted, so results were unreadable.
+The agent sidecar's resource block exposes both a reservation and a limit, so 2.2.0 names the limit `maxCpu` / `maxMemory` instead of `cpu` / `memory`. Rename the two keys under `orchestrator.agent.resources` in your values:
+
+| 2.1.0 | 2.2.0 |
+|---|---|
+| `orchestrator.agent.resources.cpu` | `orchestrator.agent.resources.maxCpu` |
+| `orchestrator.agent.resources.memory` | `orchestrator.agent.resources.maxMemory` |
+
+`minCpu` and `minMemory` are unchanged, and blocks that expose only a limit (`manticore.resources`, `orchestrator.resources`, `orchestrator.api.resources`, `orchestrator.ui.resources`, `orchestrator.backup.resources`, `loadTest.resources`) keep the bare `cpu` / `memory` names. An upgrade that still carries the old names is refused at render:
+
+```text
+manticore: orchestrator.agent.resources.cpu was RENAMED to orchestrator.agent.resources.maxCpu.
+```
+
+### Scaling and Availability
+
+- `manticore.autoscaling.minScale` is both the minimum replica count and the replica count the orchestrator coordinates imports across. Changing it after the cluster is initialized requires a `repair` run.
+- Every `helm upgrade` — including one that changes nothing — restarts the Manticore replicas one at a time (`scalingPolicy: OrderedReady`). Indexed data survives, and searches keep serving from the replicas that are still up, but budget for the full serial rollout. Editing `tables` changes a mounted secret and therefore triggers the same rollout.
+- `manticore.firewall.internalAccess.type` must stay `same-gvc`: Galera replication between replicas depends on it, and Manticore's SQL and HTTP ports have no authentication of their own, so they rely on that firewall. Allow a few minutes for any access change to take effect.
+
+### Load Testing
+
+With `loadTest.enabled: true`, trigger a run by starting the controller; it scales the k6 workload up to `loadTest.replicas`, waits `duration` plus `testDurationBuffer`, then scales it back to zero:
+
+```bash
+cpln workload cron start RELEASE_NAME-load-test-controller --gvc GVC_NAME
+```
+
+Read the results — including whether each threshold passed — from the runner's logs:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-load-test"}' --limit 50 --since 10m
+```
+
+The last lines are k6's end-of-test summary (`http_req_duration`, `http_req_failed`, a pass/fail mark per threshold) followed by `k6 exited with status N` — non-zero means a threshold was breached. Set `loadTest.controller.schedule` to a cron expression to run tests automatically.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Deployment never becomes ready after install and cpln logs returns nothing">
+    **Cause:** the agent-token secret named by `orchestrator.agent.tokenSecretName` did not exist at install time. The containers never start, so there is no log output; the only place the missing secret is named is `status.versions[].message`.
+
+    **Fix:** read the message, create the secret, and the deployment recovers on its own (or force a redeployment to skip the wait):
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-manticore --gvc GVC_NAME -o yaml
+    cpln workload force-redeployment RELEASE_NAME-manticore --gvc GVC_NAME
+    ```
+  </Accordion>
+  <Accordion title="orchestrator.agent.token was REMOVED in manticore 2.1.0">
+    **Cause:** your values still carry a key from 2.0.1 or earlier. The same guard reports `orchestrator.ui.allowExternalAccess was REMOVED in manticore 2.1.0`.
+
+    **Fix:** follow [Upgrading from 2.0.1 or Earlier](#upgrading-from-2-0-1-or-earlier).
+  </Accordion>
+  <Accordion title="orchestrator.agent.resources.cpu was RENAMED to orchestrator.agent.resources.maxCpu">
+    **Cause:** your values still use the 2.1.0 names for the agent sidecar's limits. The same guard reports `orchestrator.agent.resources.memory was RENAMED to orchestrator.agent.resources.maxMemory`.
+
+    **Fix:** rename the two keys as shown in [Upgrading from 2.1.0](#upgrading-from-2-1-0).
+  </Accordion>
+  <Accordion title="csvPath has N entries but segmentCount is M — they must match">
+    **Cause:** a table's `config.segmentCount` does not equal the number of `csvPath` entries (or `csvPath` is a single string while `segmentCount` is not 1).
+
+    **Fix:** set `segmentCount` to the number of CSV paths for that table.
+  </Accordion>
+  <Accordion title="Searches return no results">
+    **Cause:** an install alone indexes nothing. The tables exist but are empty until the cluster has been initialized and an import has run.
+
+    **Fix:** run `init` once and then `import` as described in [Running Cluster Actions](#running-cluster-actions), then confirm with `SELECT COUNT(*)` on the table.
+  </Accordion>
+  <Accordion title="Row counts differ between replicas after a restore">
+    **Cause:** a restore can land on some replicas and not others while every node still reports `synced`.
+
+    **Fix:** count rows on each replica as shown in [Restoring a Backup](#restoring-a-backup); if they disagree, run a fresh `import` of the table, which rebuilds every replica from the source CSVs.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- Create the agent-token secret **before** installing; without it the deployment wedges silently and `status.versions[].message` is the only diagnostic.
+- Enabling `orchestrator.ui.publicAccess` or routing a domain to the UI puts an unauthenticated admin console on the public internet. Only do it behind your own authenticating proxy.
+- Keep `manticore.firewall.internalAccess.type` at `same-gvc`; Galera replication requires it and Manticore's 9306/9308 ports have no authentication.
+- Tables are empty until you run `init` followed by `import`; the install alone does not load data.
+- The source bucket only ever needs read access. Only the optional backup bucket needs write, and it has its own identity and policy.
+- Every `helm upgrade` restarts all Manticore replicas one at a time; data survives, but plan the rollout window.
+- Verify per-replica row counts after a restore rather than trusting cluster status.
+- Uninstalling deletes both volume sets and all indexed data. Take a backup first if you need it.
 
 ## External References
 
 <CardGroup cols={2}>
     <Card title="Manticore Search Documentation" icon="book" href="https://manual.manticoresearch.com/">
-    Official Manticore Search documentation
+    Official Manticore Search manual
+    </Card>
+    <Card title="Replication Setup" icon="book" href="https://manual.manticoresearch.com/Creating_a_cluster/Setting_up_replication/Setting_up_replication">
+    How Manticore's Galera-based replication works
     </Card>
     <Card title="Manticore Search GitHub" icon="github" href="https://github.com/manticoresoftware/manticoresearch">
     Manticore Search open-source repository
     </Card>
-    <Card title="Cloud Accounts" icon="cloud" href="https://docs.controlplane.com/guides/create-cloud-account">
-    Create a Control Plane Cloud Account for S3 access
+    <Card title="Orchestrator Source" icon="github" href="https://github.com/controlplane-com/manticore-orchestrator">
+    Orchestrator, agent, UI and backup images used by this template
     </Card>
     <Card title="Manticore Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/manticore">
     View the source files, default values, and chart definition

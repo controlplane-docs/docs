@@ -1,115 +1,90 @@
 ---
 title: TimescaleDB Highly Available
 icon: /template-catalog/templates/icons/timescaledb-highly-available.png
-description: Deploy a highly available TimescaleDB cluster on Control Plane. A Patroni-managed PostgreSQL 18 + TimescaleDB time-series cluster with etcd consensus, HAProxy leader routing, automatic failover, and optional PgBouncer pooling and scheduled backups.
-keywords: ['timescale ha', 'tsdb ha', 'timescaledb cluster', 'time-series database', 'hypertables', 'patroni', 'etcd', 'haproxy', 'automatic failover', 'streaming replication', 'postgres extension', 'pg ha', 'pgbouncer', 'timescale cloud alternative', 'metrics store']
+description: Patroni-managed TimescaleDB (PostgreSQL 18) cluster with etcd consensus, automatic failover and an HAProxy leader endpoint in one location, plus optional PgBouncer pooling and pg_dumpall backups to S3, GCS or MinIO. Deploys into an existing GVC; needs a dictionary credentials secret created first.
+keywords: ['timescale ha', 'tsdb ha', 'time-series database', 'hypertables', 'continuous aggregates', 'streaming replication', 'leader election', 'postgres extension', 'pg ha', 'timescale cloud alternative', 'metrics store', 'iot database', 'patronictl', 'connection pooler']
 ---
-
-<Warning>
-**Two things to check when upgrading an existing cluster.**
-
-**Confirm a recent backup actually completed.** This template takes scheduled *logical* backups as a cron workload. A dump that is killed part-way through logs nothing, so a schedule that looks healthy is not on its own evidence of a usable backup. Check the recent runs, and confirm the object landed in your bucket:
-
-```bash
-cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-timescaledb-ha-backup"}' --since 48h
-```
-
-**Upgrading does not retune a running cluster.** Patroni's consensus timeouts are written to etcd when the cluster is first created, and the chart is never read again afterwards. A new install picks up the current values; an existing cluster keeps the ones it was created with. To move a running cluster, use the `patronictl edit-config` command in the template README.
-</Warning>
 
 ## Overview
 
-TimescaleDB Highly Available deploys the TimescaleDB time-series database (a PostgreSQL 18 extension) as a Patroni-managed cluster with automatic failover. Three replicas — one leader plus two hot standbys — form the cluster over an etcd consensus store, and an HAProxy leader endpoint routes all writes to the current primary. When the leader fails, Patroni promotes a standby and HAProxy re-selects the new primary automatically, giving applications a single stable endpoint. Optional PgBouncer connection pooling and scheduled logical backups to AWS S3, GCS, or MinIO are included.
+TimescaleDB Highly Available deploys [TimescaleDB](https://www.tigerdata.com/docs) — the time-series database built as a PostgreSQL extension — as a multi-member PostgreSQL 18 cluster in one location. [Patroni](https://patroni.readthedocs.io/) manages the members, elects a leader and fails over automatically when the leader is lost; a dedicated [etcd](/template-catalog/templates/etcd) cluster holds the consensus state. An HAProxy workload gives applications one stable address that always routes to the current leader, and an optional PgBouncer in front of it pools connections. The TimescaleDB extension is preloaded on every member and created automatically in your database, so hypertables, compression, continuous aggregates and retention policies work from the first connection. Scheduled `pg_dumpall` backups to S3, GCS or MinIO are optional.
 
-Database credentials are **not** template values. The cluster reads its username, password and database name from a dictionary secret you create before installing, so no password passes through Helm or lands in the release.
-
-<Warning>
-**Template version 1.1.0 is a breaking security change.** `postgres.username`, `postgres.password` and `postgres.database` were removed, along with `backup.minio.accessKey` and `backup.minio.secretKey`. An install or upgrade that still sets any of them now fails at render instead of silently falling back to a published default password. If you are running 1.0.1 or earlier, read [Upgrading From 1.0.x](#upgrading-from-1-0-x) before you touch the release.
-</Warning>
-
-<Info>
-TimescaleDB is licensed under the Timescale License (TSL) plus the PostgreSQL License. It is free to self-host at any scale, including all Community features (compression, continuous aggregates, retention); the license only forbids reselling TimescaleDB itself as a managed database service.
-</Info>
+Database credentials are **not** template values. The cluster reads its username, password and database name from a [dictionary secret](/guides/create-secret/dictionary) you create before installing, so no password passes through Helm or lands in the release. The template creates no credential secret of its own.
 
 <Note>
-For high availability, keep at least 3 TimescaleDB replicas and 3 etcd replicas. etcd requires an odd number of replicas (3, 5, 7) for quorum. `replicas: 1` renders a single-member cluster with no failover.
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create or manage a GVC. Every workload runs in each location the GVC has, so use a GVC with a single location for this template.
 </Note>
+
+<Info>
+TimescaleDB Community is licensed under the Timescale License (TSL) plus the PostgreSQL License. It is free to self-host at any scale, including compression, continuous aggregates and retention; the license only forbids reselling TimescaleDB itself as a managed database service.
+</Info>
 
 ### What Gets Created
 
-- **Stateful TimescaleDB Workload** — A Patroni-managed PostgreSQL 18 + TimescaleDB 2.28.3 cluster on port `5432` (`replicas: 3` by default: 1 leader + 2 hot standbys). Each replica has per-replica DNS and its own volume; the extension is preloaded and created automatically in your database. Leadership is handed off before any replica is shut down, keeping writes available during deployments and restarts.
-- **etcd Workload** — A dedicated etcd cluster providing the distributed consensus store (DCS) for Patroni leader election, from the `etcd` subchart dependency.
-- **HAProxy Leader-Routing Workload** *(enabled by default)* — Routes write traffic to the current primary via Patroni's REST health check, providing a stable connection endpoint across failover.
-- **PgBouncer Workload** *(optional)* — A connection pooler deployed in front of HAProxy, multiplexing application connections into a smaller pool of real database connections.
-- **Backup Cron Workload** *(optional)* — A scheduled `pg_dumpall` logical backup that dumps the leader through HAProxy and writes a compressed SQL dump to AWS S3, GCS, or MinIO.
-- **Volume Sets** — Per-replica persistent storage for the TimescaleDB and etcd data directories, with optional autoscaling.
-- **Secrets** — A dictionary secret with database credentials, plus opaque secrets for the Patroni and HAProxy start scripts.
-- **Identity & Policy** — An identity bound to the workload with least-privilege `reveal` access to exactly those secrets, and scoped cloud storage access when backup is enabled.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-timescaledb-ha` | Patroni-managed PostgreSQL 18 + TimescaleDB 2.28.3 members (stateful, `replicas` replicas, TCP `5432`, Patroni REST API `8008`); container `patroni-timescaledb` | — |
+| Workload | `RELEASE_NAME-etcd` | Consensus store for leader election (stateful, `etcd.replicas` replicas, TCP `2379`/`2380`); container `etcd` | — |
+| Workload | `RELEASE_NAME-timescaledb-ha-proxy` | HAProxy routing TCP `5432` to the current leader; health on `8404`, stats on `8405`; container `haproxy` | `proxy.enabled: true` (default), forced on by `pgbouncer.enabled: true` |
+| Workload | `RELEASE_NAME-pgbouncer` | PgBouncer connection pooler in front of HAProxy (TCP `5432`); container `pgbouncer` | `pgbouncer.enabled: true` |
+| Workload | `RELEASE_NAME-timescaledb-ha-backup` | Cron job running `pg_dumpall` through HAProxy to S3, GCS or MinIO; container `backup` | `backup.enabled: true` |
+| Volume Set | `RELEASE_NAME-timescaledb-ha-vs` | One `ext4` general-purpose SSD volume per member holding the data directory; a final snapshot is taken when the volume set is deleted and kept 7 days | — |
+| Volume Set | `RELEASE_NAME-etcd-vs` | One volume per etcd member | — |
+| Identity | `RELEASE_NAME-timescaledb-ha-identity` | Shared by the members, proxy, pooler and backup workloads; carries the cloud account binding when backups use AWS or GCP | — |
+| Policy | `RELEASE_NAME-timescaledb-ha-policy` | Grants the identity `reveal` on the chart's startup-script secrets and on exactly the credential secrets you created | — |
+| Identity, Policy | `RELEASE_NAME-etcd-identity`, `RELEASE_NAME-etcd-policy` | The etcd cluster's own identity and `reveal` grant on its startup script | — |
+| Secret | `RELEASE_NAME-timescaledb-ha-patroni-startup` | Patroni startup script, mounted into every member | — |
+| Secret | `RELEASE_NAME-timescaledb-ha-proxy-startup` | HAProxy startup script | `proxy.enabled: true` or `pgbouncer.enabled: true` |
+| Secret | `RELEASE_NAME-etcd-startup` | etcd startup script | — |
+| Secret | `RELEASE_NAME-tsdb-ha-config` | Non-sensitive backup settings (bucket, region, MinIO endpoint) | `backup.enabled: true` |
 
 ## Prerequisites
 
-**One `dictionary` secret must exist before you install.** These are the credentials you type into every connection string, so they are not values — a value would leave them in the Helm release.
+One secret must exist before you install. It holds the credentials your applications put in their connection strings. Secrets are org-level, so no GVC flag is involved.
 
-```bash
-cpln secret create-dictionary --name my-timescaledb-ha-credentials \
-  --entry username=myuser \
-  --entry password='YOUR-STRONG-PASSWORD' \
-  --entry database=mydb
-```
+<Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding exactly three keys — `username`, `password` and `database`. Patroni creates that user as the cluster superuser and that database the first time the cluster is initialized, runs `CREATE EXTENSION timescaledb` in it, and uses the same password for its internal replication role:
 
-Set `postgres.credentialsSecretName` to the name you used. The TimescaleDB extension is created automatically in the database that secret names. Secret names are org-wide, so give each release its own.
+    ```bash
+    cpln secret create-dictionary --name CREDENTIALS_SECRET_NAME \
+      --entry username=postgres \
+      --entry password='YOUR-STRONG-PASSWORD' \
+      --entry database=mydb
+    ```
 
-Backing up to MinIO needs a second dictionary secret holding `accessKey` and `secretKey` — see [Backup Prerequisites](#backup-prerequisites).
+    Set `postgres.credentialsSecretName` to this name. Read it back later with `cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml` — a bare `cpln secret reveal` prints only a summary table, not the values. Secret names are org-wide, so give each release its own.
+  </Step>
+</Steps>
 
 <Warning>
-**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `postgres.credentialsSecretName` is blank, but a name pointing at a secret that does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines** — there is nothing to log. The one place the reason appears is `status.versions[].message`:
+**Create the secret before installing, or the deployment wedges silently.** The chart refuses to render when `postgres.credentialsSecretName` is blank, but a name pointing at a secret that does not exist installs successfully and then never starts. The container never runs, so `cpln logs` returns zero lines. The one place the reason appears is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-timescaledb-ha --gvc GVC_NAME -o yaml
 ```
 
-Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the missing secret repairs it on its own in roughly **5.5 to 10.5 minutes**, or run `cpln workload force-redeployment RELEASE_NAME-timescaledb-ha --gvc GVC_NAME` to clear it in about 90 seconds.
-</Warning>
-
-
-## Upgrading From 1.0.x
-
-Version 1.1.0 removes `postgres.username`, `postgres.password` and `postgres.database`, plus `backup.minio.accessKey` and `backup.minio.secretKey`.
-
-<Warning>
-**Carrying the old values forward stops the upgrade.** The removed keys are rejected at render, so `cpln helm upgrade` fails and your existing cluster is left untouched and running:
-
 ```text
-Error: execution error at (timescaledb-highly-available/templates/identity.yaml:2:4):
-timescaledb-highly-available: postgres.username, postgres.password and postgres.database were
-REMOVED — they are now a `dictionary` secret you create, named by postgres.credentialsSecretName,
-holding the keys `username`, `password` and `database`. Delete them from your values.
+The secret CREDENTIALS_SECRET_NAME no longer exists. Workload updates are paused until the
+secret is added or the reference to the secret removed.
 ```
+
+Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the missing secret repairs the deployment on its own within several minutes, or run `cpln workload force-redeployment RELEASE_NAME-timescaledb-ha --gvc GVC_NAME` to skip the wait.
 </Warning>
 
-<Steps>
-  <Step title="Create the secrets with the credentials the cluster already has">
-    Credentials were baked into the data directory at bootstrap, so a new value does not change the cluster. Use your existing values.
-  </Step>
-  <Step title="Remove the old keys and upgrade">
-    Delete the five removed keys and set the two `credentialsSecretName` values.
-  </Step>
-  <Step title="Rotate a default password">
-    `password` was published in the public template repository. Rotate with `ALTER ROLE` through the HAProxy leader endpoint, then update the secret to match.
-  </Step>
-</Steps>
-
-<Note>
-**Patroni now reads the credentials at container start**, rather than having them rendered into its configuration. The Patroni config is generated by the startup script from environment variables the platform resolves from your secret — a `cpln://` reference written into a config file would never be resolved. No configuration knobs changed.
-</Note>
+Backups are optional and need a bucket plus, for AWS or GCP, a Control Plane [cloud account](/guides/create-cloud-account); MinIO backups need a second dictionary secret holding `accessKey` and `secretKey` — see [Backing Up](#backing-up). Nothing else is required for a default install.
 
 ## Installation
 
-This template has no external prerequisites unless backup is enabled. To install, follow the instructions for your preferred method:
+Install the chart from the marketplace registry, pointing it at the secret you created:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/timescaledb-highly-available \
+  --version 1.2.0 --gvc GVC_NAME \
+  --set postgres.credentialsSecretName=CREDENTIALS_SECRET_NAME
+```
+
+Or follow the instructions for your preferred method:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -135,39 +110,89 @@ This template has no external prerequisites unless backup is enabled. To install
 
 ## Configuration
 
-The default `values.yaml` for this template:
+Each block below is the shipped default for that part of `values.yaml`.
+
+### Cluster and Resources
 
 ```yaml
-replicas: 3 # 1 leader + 2 hot standbys; Patroni forms the cluster and handles failover
+replicas: 3   # 1 leader + 2 hot standbys; Patroni forms the cluster and handles failover
 
 resources:
   minCpu: 500m
-  minMemory: 1Gi # time-series ingest is memory-sensitive
+  minMemory: 1Gi        # time-series ingest is memory-sensitive; 2Gi ceiling is the small-prod floor
   maxCpu: 1
   maxMemory: 2Gi
 
-image: timescale/timescaledb-ha:pg18.4-ts2.28.3 # PostgreSQL 18 + TimescaleDB 2.28.3 Community, Patroni bundled
+image: timescale/timescaledb-ha:pg18.4-ts2.28.3  # PostgreSQL 18 + TimescaleDB 2.28.3 Community, Patroni bundled
 
+multiZone: false        # spread replicas across zones in the location
+```
+
+- `replicas` — Number of TimescaleDB members. Keep at least 3 for a cluster that survives the loss of one member; one member is the leader and accepts writes, the others stream from it. `replicas: 1` renders a single-member cluster with no failover.
+- `image` — The `timescale/timescaledb-ha` image bundles PostgreSQL, the TimescaleDB extension and Patroni. Keep the PostgreSQL major at 18 unless you also change `backup.image` to match.
+- `multiZone` — Spread the members across availability zones within the location, when the location supports it.
+
+<Note>
+On a stateful workload the ratio of `maxCpu` to `minCpu` may not exceed 4:1. Raising `maxCpu` without raising `minCpu` can cross that limit and is rejected when the workload is applied.
+</Note>
+
+### Credentials
+
+```yaml
 postgres:
-  credentialsSecretName: my-timescaledb-ha-credentials # see Prerequisites — must exist before install
+  # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
+  # A `dictionary` secret holding exactly three keys: `username`, `password`
+  # and `database`. The TimescaleDB extension is created automatically in the
+  # database that secret names. If it does not exist at install time the
+  # deployment WEDGES silently — `cpln logs` returns nothing at all. See
+  # Prerequisites in the README for the create-dictionary command.
+  credentialsSecretName: my-timescaledb-ha-credentials
+```
 
-multiZone: false # spread replicas across zones in the location
+The three keys are applied when the cluster is first initialized. Changing the secret afterwards does not change the stored passwords — see [Rotating the Password](#rotating-the-password). The TimescaleDB extension is created only in the database the secret names; any other database you create needs its own `CREATE EXTENSION IF NOT EXISTS timescaledb`.
 
+### Storage
+
+```yaml
 volumeset:
-  capacity: 10 # initial capacity in GiB per replica (minimum 10)
+  capacity: 10          # initial capacity in GiB per replica (minimum 10)
   autoscaling:
-    enabled: false # set to true to grow each volume automatically
-    maxCapacity: 100 # maximum capacity in GiB when autoscaling is enabled
+    enabled: false      # set to true to grow each volume automatically
+    maxCapacity: 100    # maximum capacity in GiB when autoscaling is enabled
     minFreePercentage: 10 # free-space threshold that triggers scaling
-    scalingFactor: 1.2 # how much to scale up by
+    scalingFactor: 1.2  # how much to scale up by
+```
 
+Each member has its own volume of this size. The cluster caps the WAL retained for a member that is offline at a quarter of `volumeset.capacity`, so a member that stays down does not fill the leader's disk; a member that exceeds the cap is re-cloned from the leader when it returns.
+
+### Internal Access
+
+```yaml
 internal_access:
-  type: same-gvc # options: same-gvc, same-org, workload-list
-  workloads: # only when type is same-gvc or workload-list
+  type: same-gvc        # options: same-gvc, same-org, workload-list
+  workloads:            # only when type is same-gvc or workload-list
     #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
+| Type | Who can reach port `5432` |
+|------|-------------|
+| `same-gvc` | Every workload in the same GVC |
+| `same-org` | Every workload in the same org |
+| `workload-list` | Only the workloads listed in `internal_access.workloads` |
+
+The cluster has no public endpoint. The same setting is applied to the members, the HAProxy workload and the PgBouncer workload. A change can take several minutes to take effect — re-test before concluding it did not apply.
+
+<Warning>
+With `workload-list`, the list must also contain the release's own workloads, because the members replicate from each other and HAProxy, PgBouncer and the backup job all connect to them: `//gvc/GVC_NAME/workload/RELEASE_NAME-timescaledb-ha`, `//gvc/GVC_NAME/workload/RELEASE_NAME-timescaledb-ha-proxy`, and `RELEASE_NAME-pgbouncer` and `RELEASE_NAME-timescaledb-ha-backup` when they are enabled — plus your applications. A list without them leaves HAProxy waiting for members it cannot reach.
+</Warning>
+
+### etcd Cluster
+
+The bundled [etcd](/template-catalog/templates/etcd) template provides the consensus store. Its own values are passed through under `etcd`:
+
+```yaml
 etcd:
-  replicas: 3 # use an odd number (3, 5, 7) for quorum
+  replicas: 3
   resources:
     cpu: 500m
     memory: 512Mi
@@ -183,21 +208,25 @@ etcd:
     capacity: 10
   internal_access:
     type: same-gvc
+    workloads:
+      #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
-pgbouncer:
-  enabled: false
-  image: edoburu/pgbouncer:v1.25.1-p0
-  poolMode: transaction # options: session, transaction, statement
-  defaultPoolSize: 25 # real Postgres connections PgBouncer maintains per pod
-  maxClientConn: 1000 # maximum client connections PgBouncer accepts per pod
-  maxDbConnections: 100 # hard cap on total Postgres connections across all pods
-  minReplicas: 2
-  maxReplicas: 4
-  resources:
-    cpu: 200m
-    memory: 128Mi
+- `etcd.replicas` — Must be an **odd** number of at least 3 (3, 5, 7); the chart refuses other values at render. Choose it at install time — the etcd template does not support changing the member count on a running release.
+- `etcd.internal_access` — Must allow the TimescaleDB members to reach etcd on port `2379`. With `workload-list`, include `//gvc/GVC_NAME/workload/RELEASE_NAME-timescaledb-ha` and `//gvc/GVC_NAME/workload/RELEASE_NAME-etcd`.
 
-proxy: # HAProxy leader endpoint; auto-enabled when pgbouncer is enabled, required for logical backups
+#### etcd History Compaction
+
+Patroni renews its leader lease every few seconds and every renewal is a new etcd revision, so the etcd backend grows with time alone unless old revisions are compacted. Uncompacted, an otherwise idle cluster reaches etcd's 2 GiB backend quota in a matter of months, etcd raises a `NOSPACE` alarm and goes read-only, and the TimescaleDB members can no longer renew their leases. The `etcd.tuning` defaults — `periodic`, `1h` and `0` (etcd's own 2 GiB limit) — keep the backend flat and should be left alone. The [etcd template](/template-catalog/templates/etcd#compaction-and-backend-growth) documents the mechanism, the accepted value formats and the read-only inspection commands.
+
+Template version `1.0.0` did not compact — see [Upgrading From 1.0.0](#upgrading-from-1-0-0).
+
+### HAProxy Leader Endpoint
+
+Only the leader accepts writes; the other members are read-only. HAProxy checks every member's Patroni REST API and sends port `5432` traffic only to the one that reports itself primary, so applications keep one address through a failover.
+
+```yaml
+proxy:
   enabled: true
   image: haproxy:2.9
   resources:
@@ -205,16 +234,63 @@ proxy: # HAProxy leader endpoint; auto-enabled when pgbouncer is enabled, requir
     memory: 128Mi
   minReplicas: 2
   maxReplicas: 2
+```
 
+| Endpoint on `RELEASE_NAME-timescaledb-ha-proxy` | Purpose |
+|---|---|
+| `:5432` | PostgreSQL, routed to the current leader |
+| `:8404/healthz` | Returns healthy while at least one member reports itself primary |
+| `:8405/stats` | HAProxy stats page showing each member's health-check state |
+
+<Note>
+HAProxy must be enabled for backups, which connect through it. It is forced on when `pgbouncer.enabled: true`. HAProxy reads the member list from `replicas` when it starts, so after changing `replicas` force a redeployment of `RELEASE_NAME-timescaledb-ha-proxy`.
+</Note>
+
+### PgBouncer Connection Pooling
+
+PgBouncer multiplexes many application connections into a smaller pool of real database connections. It connects to HAProxy, so leader routing and failover are handled for it, and it reads the same credentials secret — nothing extra to configure. When enabled it becomes the endpoint your applications connect to.
+
+```yaml
+pgbouncer:
+  enabled: false
+  image: edoburu/pgbouncer:v1.25.1-p0
+  poolMode: transaction   # options: session, transaction, statement
+  defaultPoolSize: 25      # real Postgres connections PgBouncer maintains per pod
+  maxClientConn: 1000      # maximum client connections PgBouncer accepts per pod
+  maxDbConnections: 100    # hard cap on total Postgres connections across all pods
+  minReplicas: 2
+  maxReplicas: 4
+  resources:
+    cpu: 200m
+    memory: 128Mi
+```
+
+| `poolMode` | Behaviour |
+|------|-------------|
+| `transaction` | The server connection is held for one transaction. Best for most web and API workloads; not compatible with `SET` variables, temporary tables or advisory locks. |
+| `session` | Held for the whole client session. Compatible with everything, less reuse — raise `defaultPoolSize` to your expected concurrency. |
+| `statement` | Returned after every statement. Transactions are not supported. |
+
+<Warning>
+**`maxDbConnections` is enforced per PgBouncer replica, not across the deployment.** PgBouncer replicas do not coordinate, so the real ceiling on server connections is `maxReplicas × maxDbConnections` — 4 × 100 = 400 with the shipped values, against a cluster `max_connections` of 100, of which 3 are reserved for superuser maintenance. Size `maxReplicas × maxDbConnections` to stay under 97, and treat `defaultPoolSize` the same way, or clients get `remaining connection slots are reserved` under load instead of being queued.
+</Warning>
+
+PgBouncer autoscales on requests per second between `minReplicas` and `maxReplicas`.
+
+### Backup
+
+A cron workload dumps every database and role with `pg_dumpall` through HAProxy on the schedule and uploads the compressed script to your bucket. Each provider's bucket, cloud account and policy steps are under [Backing Up](#backing-up).
+
+```yaml
 backup:
   enabled: false
-  image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0 # PG18 client, matches server major
-  schedule: "0 2 * * *" # daily at 2am UTC
+  image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0  # PG18 client, matches server major
+  schedule: "0 2 * * *"   # daily at 2am UTC
   resources:
     cpu: 100m
-    memory: 128Mi
+    memory: 512Mi # 128Mi OOMKills the dump mid-backup (exitCode 137) and silently produces no backup
 
-  provider: aws # options: aws, gcp, minio
+  provider: aws           # options: aws, gcp, minio
 
   aws:
     bucket: my-backup-bucket
@@ -228,137 +304,54 @@ backup:
     cloudAccountName: my-backup-cloudaccount
     prefix: timescaledb/backups
 
-  minio: # self-hosted MinIO or any S3-compatible endpoint
+  minio:  # self-hosted MinIO or any S3-compatible endpoint
     endpoint: http://my-minio-workload:9000 # e.g. http://WORKLOAD_NAME:9000 for an internal MinIO deployment
     bucket: my-backup-bucket
-    credentialsSecretName: my-timescaledb-ha-minio-credentials # dictionary secret with accessKey and secretKey
+    # REQUIRED PREREQUISITE SECRET when provider is `minio` — a `dictionary`
+    # secret holding exactly two keys: `accessKey` and `secretKey`. For the
+    # minio template these are its admin.username and admin.password.
+    credentialsSecretName: my-timescaledb-ha-minio-credentials
     prefix: timescaledb/backups
 ```
 
-### Credentials
-
-- `postgres.username` — Database superuser username. **Change before deploying to production.**
-- `postgres.password` — Database superuser password. **Change before deploying to production.**
-- `postgres.database` — Name of the database created on first startup. The TimescaleDB extension is created automatically inside it.
-
-<Note>
-These values are only applied on first startup when the data directory is empty. Updating them after the initial deployment has no effect on the running database. To change credentials or the database name on an existing cluster, use PostgreSQL's native commands (e.g. `ALTER USER`, `ALTER DATABASE`).
-</Note>
-
-### Cluster and Resources
-
-- `replicas` — Number of TimescaleDB replicas (default `3`: 1 leader + 2 hot standbys). Use at least 3 for high availability.
-- `image` — The TimescaleDB HA image tag (PostgreSQL 18 + TimescaleDB 2.28.3 Community, with Patroni bundled).
-- `resources.minCpu` / `resources.minMemory` — Minimum CPU and memory guaranteed per replica.
-- `resources.maxCpu` / `resources.maxMemory` — Maximum CPU and memory per replica.
-- `multiZone` — Spread replicas across availability zones within the location.
-
-### Storage
-
-- `volumeset.capacity` — Initial volume size in GiB (minimum 10). Each replica gets its own volume.
-- `volumeset.autoscaling.enabled` — Automatically expand the volume as it fills. When enabled:
-  - `maxCapacity` — Maximum volume size in GiB.
-  - `minFreePercentage` — Trigger a scale-up when free space drops below this percentage.
-  - `scalingFactor` — Multiply the current capacity by this factor when scaling up.
-
-### etcd Cluster
-
-- `etcd.replicas` — Number of etcd replicas. Must be an **odd number** (3, 5, 7) for quorum.
-- `etcd.resources.cpu` / `etcd.resources.memory` — CPU and memory per etcd replica.
-- `etcd.multiZone` — Spread etcd replicas across availability zones.
-- `etcd.volumeset.capacity` — Initial volume size for etcd data in GiB.
-- `etcd.internal_access.type` — Controls which workloads can reach the etcd cluster.
-
-<Note>
-etcd is a hard dependency. If the etcd members are unhealthy, Patroni loses its consensus store and the cluster goes read-only. If writes start failing, check the `RELEASE_NAME-etcd` workload first.
-</Note>
-
-#### etcd History Compaction
-
-`etcd.tuning.autoCompactionMode`, `etcd.tuning.autoCompactionRetention` and `etcd.tuning.quotaBackendBytes` control how much revision history the bundled etcd cluster keeps and how large its backend may grow. The defaults — `periodic`, `1h` and `0` (etcd's own 2 GiB limit) — are the right settings for a Patroni consensus store and should be left alone. The [etcd template](/template-catalog/templates/etcd#compaction-and-backend-growth) documents the mechanism, the accepted value formats, and the read-only commands for inspecting a cluster.
-
-<Warning>
-**Template version `1.0.0` did not compact the bundled etcd cluster.** Patroni renews its leader lease about every 10 seconds and every renewal creates a revision, so etcd grows with time alone — roughly 19 MB per day on an idle cluster — and reaches its 2 GiB backend quota in about 110 days. etcd then goes read-only across the whole cluster, and the TimescaleDB replicas restart-loop with `exitCode: 0` and `reason: Completed`, which reads as healthy and is easily mistaken for a database fault. Upgrade to `1.0.1` or later to turn compaction on.
-
-Upgrading prevents further growth but cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade — see [If the Backend Quota Is Already Full](/template-catalog/templates/etcd#if-the-backend-quota-is-already-full).
-</Warning>
-
-### HAProxy Leader Endpoint
-
-In a Patroni cluster, only the leader replica accepts writes — the standbys are read-only. HAProxy automatically routes writes to the current leader by health-checking each replica's Patroni REST endpoint, giving applications a stable connection endpoint even during failover. It is enabled by default.
-
-- `proxy.enabled` — Deploy the HAProxy leader-routing workload (default: `true`).
-- `proxy.resources.cpu` / `proxy.resources.memory` — CPU and memory per HAProxy replica.
-- `proxy.minReplicas` / `proxy.maxReplicas` — Replica count for the proxy workload.
-
-<Note>
-`proxy.enabled` must stay `true` for logical backups — the backup job dumps the leader through the proxy endpoint.
-</Note>
-
-### Internal Access
-
-The cluster is internal-only; there is no public endpoint. Reach it from other workloads through the proxy (or PgBouncer).
-
-- `internal_access.type` — Controls which workloads can connect to the cluster on port `5432`:
-
-| Type | Description |
-|------|-------------|
-| `same-gvc` | Allow access from all workloads in the same GVC |
-| `same-org` | Allow access from all workloads in the same organization |
-| `workload-list` | Allow access only from specific workloads listed in `workloads` |
-
-- `internal_access.workloads` — When `type` is `workload-list`, the list of workload links (e.g. `//gvc/GVC_NAME/workload/WORKLOAD_NAME`) allowed to connect.
-
-### PgBouncer Connection Pooling
-
-PgBouncer is an optional connection pooler that sits in front of HAProxy, multiplexing application connections into a smaller pool of real database connections. HAProxy handles leader routing and failover transparently — PgBouncer is unaware of which replica is the primary.
-
-Enabling PgBouncer **automatically enables HAProxy**, as it is required for leader-aware routing. When enabled, PgBouncer becomes the primary connection endpoint:
-
-```text
-RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432
-```
-
-- `pgbouncer.poolMode` — Controls how connections are reused:
-
-| Mode | Description |
-|------|-------------|
-| `transaction` | Connection held only for the duration of a transaction, then returned to the pool. Best for most web and API workloads. Not compatible with session-level features (`SET` variables, temporary tables, advisory locks). |
-| `session` | Connection held for the entire client session. Compatible with all PostgreSQL features but provides less reuse. |
-| `statement` | Connection returned after every statement. Transactions are not supported. Rarely used. |
-
-- `pgbouncer.defaultPoolSize` — Number of real database connections PgBouncer maintains per pod (default: `25`).
-- `pgbouncer.maxClientConn` — Maximum number of client connections PgBouncer accepts per pod (default: `1000`).
-- `pgbouncer.maxDbConnections` — Hard cap on total PostgreSQL connections across **all** PgBouncer pods (default: `100`). Prevents connection blowout when PgBouncer scales out.
-- `pgbouncer.minReplicas` / `pgbouncer.maxReplicas` — PgBouncer autoscales between these bounds.
-- `pgbouncer.resources.cpu` / `pgbouncer.resources.memory` — Resources allocated to each PgBouncer pod.
-
-### Backup
-
-Backup is disabled by default. When enabled, a cron workload runs `pg_dumpall` against the leader (through HAProxy) on the configured schedule and uploads a compressed SQL dump to AWS S3, GCS, or a MinIO-compatible endpoint.
-
-- `backup.enabled` — Enable scheduled logical backups.
-- `backup.image` — The backup container image. Match its tag to the server major version — `18.1.0` for the default PostgreSQL 18 image.
-- `backup.schedule` — Cron expression for backup frequency (default: daily at 2am UTC).
-- `backup.provider` — `aws`, `gcp`, or `minio`.
-- `backup.resources.cpu` / `backup.resources.memory` — Resources for the backup cron container.
-
-Complete the [backup prerequisites](#backup-prerequisites) for your provider before enabling backup.
+- `backup.image` — The backup container's `pg_dumpall` must match the server major: tag `18.1.0` for the default PostgreSQL 18 image.
+- `backup.schedule` — Standard five-field cron expression, evaluated in UTC.
 
 ## Connecting
 
-Always connect through the proxy (or PgBouncer) — never a raw replica address, since the leader moves on failover.
+This template exposes no public endpoint. Everything below is reachable from inside the GVC, subject to `internal_access.type`.
 
-| What | Value |
-|------|-------|
-| Via HAProxy (default) | `RELEASE_NAME-timescaledb-ha-proxy.GVC_NAME.cpln.local:5432` |
-| Via PgBouncer *(when enabled)* | `RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432` — use this as your application endpoint |
-| Credentials | `postgres.username` / `postgres.password` |
-| Database | `postgres.database` (TimescaleDB extension created here) |
+| What | Address | Notes |
+|---|---|---|
+| TimescaleDB, writes and reads | `RELEASE_NAME-timescaledb-ha-proxy.GVC_NAME.cpln.local:5432` | HAProxy routes to the current leader. Use this unless PgBouncer is enabled. |
+| TimescaleDB, pooled | `RELEASE_NAME-pgbouncer.GVC_NAME.cpln.local:5432` | Only when `pgbouncer.enabled: true`. Prefer it when the pooler is on. |
+| Any member, unrouted | `RELEASE_NAME-timescaledb-ha.GVC_NAME.cpln.local:5432` | Reaches whichever member answers, which may be a read-only replica. For diagnostics only. |
+| HAProxy health and stats | `RELEASE_NAME-timescaledb-ha-proxy.GVC_NAME.cpln.local:8404/healthz`, `:8405/stats` | HTTP. |
+| Credentials | `cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml` | The `username`, `password` and `database` keys. Never stored in the Helm release. |
 
-## Using TimescaleDB
+To verify from your own machine, tunnel to HAProxy and connect with `psql`:
 
-Any PostgreSQL client or ORM works unchanged. Turn a regular table into a hypertable (automatically partitioned by time) and query it with time buckets:
+```bash
+cpln port-forward RELEASE_NAME-timescaledb-ha-proxy 5432:5432 --gvc GVC_NAME
+```
+
+```bash
+psql "postgresql://USERNAME:PASSWORD@127.0.0.1:5432/DATABASE" -c "select pg_is_in_recovery(), extversion from pg_extension where extname = 'timescaledb'"
+```
+
+`pg_is_in_recovery()` returns `f` through HAProxy, because it always reaches the leader, and `extversion` confirms the TimescaleDB extension is installed in your database. The same query on a member directly returns `t` on a replica:
+
+```bash
+cpln workload exec RELEASE_NAME-timescaledb-ha --gvc GVC_NAME --replica RELEASE_NAME-timescaledb-ha-0 --container patroni-timescaledb -- psql -h 127.0.0.1 -U USERNAME -d DATABASE -c 'select pg_is_in_recovery()'
+```
+
+Use `--replica` to pick a member (`RELEASE_NAME-timescaledb-ha-0` through `RELEASE_NAME-timescaledb-ha-N`); without it the CLI picks one for you. The superuser credentials are already present in the container's environment, so `psql` does not prompt.
+
+Applications should retry on connection errors with backoff. A failover, a rolling restart or a scale-down moves the leader, and connections open at that moment are reset while HAProxy re-routes to the new leader.
+
+### Using Hypertables
+
+Any PostgreSQL client or ORM works unchanged. Turn a regular table into a hypertable, partitioned by time, and query it with time buckets:
 
 ```sql
 CREATE TABLE metrics (time timestamptz NOT NULL, device text, value double precision);
@@ -372,38 +365,59 @@ GROUP BY bucket, device
 ORDER BY bucket;
 ```
 
-From here you can add columnar compression, continuous aggregates, and retention policies — all Community features included in the default image.
+From here you can add columnar compression, continuous aggregates and retention policies — all Community features included in the default image. See the [hypertables guide](https://www.tigerdata.com/docs/learn/hypertables/understand-hypertables).
 
-### Availability During Failover and Upgrades
+## Operations
 
-The cluster keeps writes available across leader changes, but applications should implement connection retry with exponential backoff — a few seconds of write interruption is expected at each leader restart:
+### Checking Cluster State
 
-- **Automatic failover** — When the leader fails, Patroni promotes a standby (a manual/orchestrated promotion completes in roughly 5 seconds in testing, with no committed rows lost) and HAProxy re-selects the new primary automatically, with no client change.
-- **Rolling restarts and upgrades** — Each replica is restarted in turn; leadership is handed off before the leader shuts down. Expect a brief write gap (a few seconds) at each leader switchover during the roll.
+Patroni's own tool shows every member, its role, its state and its replication lag:
 
-## Backup Prerequisites
+```bash
+cpln workload exec RELEASE_NAME-timescaledb-ha --gvc GVC_NAME --replica RELEASE_NAME-timescaledb-ha-0 --container patroni-timescaledb -- patronictl -c /tmp/patroni_config.yml list
+```
 
-### AWS S3
+`/tmp/patroni_config.yml` is the configuration the startup script writes in each member; `patronictl` needs it to find etcd. The same tool shows the cluster-wide settings Patroni keeps in etcd:
 
-Before enabling backup with `provider: aws`, complete the following in your AWS account:
+```bash
+cpln workload exec RELEASE_NAME-timescaledb-ha --gvc GVC_NAME --replica RELEASE_NAME-timescaledb-ha-0 --container patroni-timescaledb -- patronictl -c /tmp/patroni_config.yml show-config
+```
 
-<Steps>
-  <Step title="Create a bucket">
-    Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
-  </Step>
-  <Step title="Set up a Cloud Account">
-    If you do not have one, [create a Cloud Account](/guides/create-cloud-account) for your AWS account. Set `backup.aws.cloudAccountName` to its name.
-  </Step>
-  <Step title="Create an IAM policy">
-    Create an IAM policy with the JSON below, replacing `YOUR_BUCKET_NAME`, then set `backup.aws.policyName` to the policy's name and `backup.aws.prefix` to the folder path for backups.
-  </Step>
-</Steps>
+For HAProxy's view of the members — which one passes the primary health check — tunnel to the stats page and open `http://127.0.0.1:8405/stats` in a browser:
+
+```bash
+cpln port-forward RELEASE_NAME-timescaledb-ha-proxy 8405:8405 --gvc GVC_NAME
+```
+
+### Backing Up
+
+Backups are off by default. Enable them with `backup.enabled: true`, pick a `backup.provider`, and complete that provider's setup below first. `RELEASE_NAME-timescaledb-ha-backup` runs on `backup.schedule`, connects through HAProxy with the `username` and `password` from your credentials secret, and uploads one `postgres-TIMESTAMP.sql.gz` object per run under `backup.PROVIDER.prefix`. The object is a gzip-compressed `pg_dumpall` script: every role and every database in the cluster, as plain SQL. HAProxy must be enabled.
+
+Check the recent runs after enabling, and confirm the object actually landed in your bucket:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-timescaledb-ha-backup"}' --limit 50 --since 48h
+```
 
 <Warning>
-**Version 1.1.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
-
-**Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
+**A zero-length backup object is a failed run, not a backup.** If `pg_dumpall` cannot reach the cluster, the upload still writes a tiny empty gzip under a normal-looking timestamped name and the job exits non-zero. Check the object size before restoring from it — a real dump is kilobytes at minimum. Keep `backup.resources.memory` at the shipped `512Mi` or above: at `128Mi` the dump is OOM-killed part-way through (`exitCode 137`), logs nothing, and produces no backup.
 </Warning>
+
+<Note>
+This is a logical backup only. The image has no WAL archiver, so there is no continuous archiving or point-in-time recovery; what you can restore is the state at the last successful run. The volume set also keeps a final snapshot for 7 days when it is deleted.
+</Note>
+
+#### Backup Prerequisites
+
+Complete the steps for your provider before enabling backups.
+
+#### AWS S3
+
+1. Create an S3 bucket. Set `backup.aws.bucket` to its name and `backup.aws.region` to its region.
+
+2. If you do not have one yet, create a Control Plane [cloud account](/guides/create-cloud-account) for the AWS account holding the bucket. Set `backup.aws.cloudAccountName` to its name.
+
+3. Create an IAM policy scoped to exactly that bucket, replacing `YOUR_BUCKET_NAME`:
 
 ```json
 {
@@ -432,100 +446,305 @@ Before enabling backup with `provider: aws`, complete the following in your AWS 
 }
 ```
 
-### GCS
+4. Set `backup.aws.policyName` to that policy's name. The template attaches it to the workload identity together with `cpln-connector` and nothing else — the bucket in your policy is the only storage the backup container can reach. Upgrading from `1.1.0` or earlier narrows this; see [Upgrading From 1.1.0](#upgrading-from-1-1-0).
 
-Before enabling backup with `provider: gcp`, complete the following in your GCP account:
+#### GCS
 
-<Steps>
-  <Step title="Create a bucket">
-    Create a GCS bucket. Set `backup.gcp.bucket` to its name.
-  </Step>
-  <Step title="Set up a Cloud Account">
-    If you do not have one, [create a Cloud Account](/guides/create-cloud-account) for your GCP project. Set `backup.gcp.cloudAccountName` to its name — access is keyless, with no stored credentials.
-  </Step>
-</Steps>
+1. Create a GCS bucket. Set `backup.gcp.bucket` to its name.
 
-<Warning>
-Grant the **Storage Admin** role (`roles/storage.objectAdmin` scoped to the bucket also works) to the GCP service account created for the Cloud Account. Set `backup.gcp.prefix` to the folder path for backups.
-</Warning>
+2. Create a Control Plane [cloud account](/guides/create-cloud-account) for the GCP project holding the bucket, and set `backup.gcp.cloudAccountName` to its name. Access is keyless — no credentials are stored.
 
-### MinIO
+3. Grant the cloud account's service account the **Storage Admin** role. The template additionally binds the identity to `roles/storage.objectAdmin` on exactly the bucket in `backup.gcp.bucket`.
 
-Before enabling backup with `provider: minio`, ensure your MinIO instance (or any S3-compatible endpoint) is accessible:
+#### MinIO
 
-<Steps>
-  <Step title="Create a bucket">
-    Create a bucket on the server. Set `backup.minio.bucket` to its name.
-  </Step>
-  <Step title="Set the endpoint">
-    Set `backup.minio.endpoint` to the S3 API address including the port. For the `minio` marketplace template deployed in the same GVC, use `http://WORKLOAD_NAME:9000`.
-  </Step>
-  <Step title="Set credentials">
-    Create a second [dictionary secret](/guides/create-secret/dictionary) holding exactly `accessKey` and `secretKey`, and set `backup.minio.credentialsSecretName` to its name. For the MinIO template these are its `admin.username` and `admin.password`. Set `backup.minio.prefix` to the folder path for backups.
-  </Step>
-</Steps>
+No cloud account is needed — the backup container authenticates with a second prerequisite secret and uses path-style addressing, so any S3-compatible endpoint works.
 
-<Note>
-MinIO backup requires no Control Plane Cloud Account — credentials are passed directly to the backup job.
-</Note>
+1. Create the bucket in MinIO. Set `backup.minio.bucket` to its name.
 
-## Restoring a Backup
+2. Set `backup.minio.endpoint` to the S3 API address including the port. For the [minio](/template-catalog/templates/minio) template deployed in the same GVC that is `http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000`.
 
-Restoring a TimescaleDB dump is **not** the vanilla PostgreSQL procedure. The target server must run the **same TimescaleDB extension version** as the dump, and the replay must be wrapped in `timescaledb_pre_restore()` and `timescaledb_post_restore()`. Connect through the proxy so the restore targets the current leader.
+3. Create a [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `accessKey` and `secretKey`, and set `backup.minio.credentialsSecretName` to its name. For the `minio` template these are its admin username and password:
+
+```bash
+cpln secret create-dictionary --name MINIO_CREDENTIALS_SECRET_NAME \
+  --entry accessKey=MINIO_ACCESS_KEY \
+  --entry secretKey=MINIO_SECRET_KEY
+```
+
+The policy this template creates grants the identity `reveal` on this secret as well as the database credentials secret. If the secret does not exist at install time the deployment wedges exactly as described in [Prerequisites](#prerequisites).
+
+### Restoring a Backup
 
 <Warning>
-Restore replays a full-cluster dump. Run it against a fresh cluster, not a database that already holds data you want to keep.
+**Neither procedure below has been rehearsed against this template.** Both follow TimescaleDB's own documentation and the chart's configuration, but a restore that has not been practised is not a recovery plan. Rehearse the one you depend on against a scratch release before you need it.
 </Warning>
 
-**AWS S3:**
+Restoring hypertables is **not** the vanilla PostgreSQL procedure. The target must run the **same TimescaleDB extension version** as the source (`2.28.3` for the default image — upgrade the extension after restoring, never before), and the data must be loaded with TimescaleDB's background workers stopped and its `timescaledb.restoring` setting on, which is what `timescaledb_pre_restore()` and `timescaledb_post_restore()` do. Loading hypertable rows without that fails with `invalid INSERT on the root table of hypertable`.
 
-```sh
+#### Restoring the Scheduled pg_dumpall Backup
+
+The scheduled backup is a whole-cluster plain SQL script. TimescaleDB's documented restore wraps a single-database `pg_dump -Fc` archive in `timescaledb_pre_restore()` / `timescaledb_post_restore()`; a `pg_dumpall` script does not fit that shape directly, because it reconnects to each database as it goes, so there is no single point at which to call `timescaledb_pre_restore()` for the database being loaded. **Replaying the scheduled dump into a TimescaleDB database is therefore unverified on this template.** Use it to recover roles, non-hypertable databases, and as the source for a per-database restore: extract the `\connect DATABASE` section of the script and load it as in [Restoring a Single Database](#restoring-a-single-database) with the restoring setting on. Downloading the object is the same for every provider:
+
+<Tabs>
+  <Tab title="AWS S3">
+    ```bash
+    aws s3 cp "s3://BUCKET_NAME/PREFIX/postgres-TIMESTAMP.sql.gz" - | gunzip > postgres-TIMESTAMP.sql
+    ```
+  </Tab>
+  <Tab title="GCS">
+    ```bash
+    gsutil cp "gs://BUCKET_NAME/PREFIX/postgres-TIMESTAMP.sql.gz" - | gunzip > postgres-TIMESTAMP.sql
+    ```
+  </Tab>
+  <Tab title="MinIO">
+    ```bash
+    export AWS_ACCESS_KEY_ID="MINIO_ACCESS_KEY"
+    export AWS_SECRET_ACCESS_KEY="MINIO_SECRET_KEY"
+    aws configure set default.s3.addressing_style path
+
+    aws s3 cp "s3://BUCKET_NAME/PREFIX/postgres-TIMESTAMP.sql.gz" - --endpoint-url "http://MINIO_ENDPOINT:9000" | gunzip > postgres-TIMESTAMP.sql
+
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    ```
+  </Tab>
+</Tabs>
+
+#### Restoring a Single Database
+
+This is the procedure TimescaleDB documents, and the one to rehearse. It needs a `pg_dump` custom-format archive of one database, taken with a PostgreSQL 18 client; the scheduled job does not produce one, so take it yourself through HAProxy with `cpln port-forward RELEASE_NAME-timescaledb-ha-proxy 5432:5432 --gvc GVC_NAME` open:
+
+```bash
 export PGPASSWORD="PASSWORD"
+pg_dump -h 127.0.0.1 -p 5432 -U USERNAME -d DATABASE -Fc -f DATABASE.bak
+```
 
-psql -h RELEASE_NAME-timescaledb-ha-proxy.GVC_NAME.cpln.local -U USERNAME -d DATABASE \
-  -c "SELECT timescaledb_pre_restore();"
+Restore it into a database on the target cluster that already has the extension — on a fresh install of this template, the database named in your credentials secret qualifies. Connect through HAProxy so every statement lands on the leader; the replicas receive the data through normal streaming replication:
 
-aws s3 cp "s3://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" - \
-  | gunzip \
-  | psql -h RELEASE_NAME-timescaledb-ha-proxy.GVC_NAME.cpln.local -p 5432 -U USERNAME -d postgres
-
-psql -h RELEASE_NAME-timescaledb-ha-proxy.GVC_NAME.cpln.local -U USERNAME -d DATABASE \
-  -c "SELECT timescaledb_post_restore();"
-
+```bash
+psql -h 127.0.0.1 -p 5432 -U USERNAME -d DATABASE -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+psql -h 127.0.0.1 -p 5432 -U USERNAME -d DATABASE -c "SELECT timescaledb_pre_restore();"
+pg_restore -h 127.0.0.1 -p 5432 -U USERNAME -d DATABASE -Fc --no-owner DATABASE.bak
+psql -h 127.0.0.1 -p 5432 -U USERNAME -d DATABASE -c "SELECT timescaledb_post_restore();"
 unset PGPASSWORD
 ```
 
-For **GCS**, replace the download with `gsutil cp "gs://BUCKET_NAME/PREFIX/BACKUP_FILE.sql.gz" -`. For **MinIO**, add `--endpoint-url "http://MINIO_ENDPOINT:9000"` to the `aws s3 cp` command and export the MinIO access and secret keys as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+Do not add `-j` to `pg_restore` — parallel restore does not restore the TimescaleDB catalogs correctly. A `must be owner of extension timescaledb` error from `pg_restore` can be ignored when the extension already exists. Until `timescaledb_post_restore()` has run, background jobs (compression, retention, continuous aggregate refresh) stay stopped on that database.
+
+### Rotating the Password
+
+Patroni writes its configuration from the secret each time a member starts and applies the password to the database only when the cluster is first initialized. After that the stored passwords live in PostgreSQL, so a rotation touches three places, and the order matters. **This procedure has not been rehearsed on this template — practise it on a scratch release first.**
+
+1. Update the `password` key in your credentials secret to the new value — for example with `cpln apply -f` of the full secret manifest — so any member that restarts from now on reads the new one. Nothing running changes yet: workloads resolve a secret only when a replica starts.
+
+2. On the leader (through HAProxy), change **both** roles that share the password. The replication role `repl` was created with the same password as the superuser, and every member's Patroni configuration will expect the new one after its next restart:
+
+   ```sql
+   ALTER ROLE USERNAME WITH PASSWORD 'NEW-STRONG-PASSWORD';
+   ALTER ROLE repl WITH PASSWORD 'NEW-STRONG-PASSWORD';
+   ```
+
+3. Force a redeployment of the members, then of PgBouncer if it is enabled, so every process holds the new password. Expect a brief write outage while the members restart:
+
+   ```bash
+   cpln workload force-redeployment RELEASE_NAME-timescaledb-ha --gvc GVC_NAME
+   cpln workload force-redeployment RELEASE_NAME-pgbouncer --gvc GVC_NAME
+   ```
+
+The backup job reads the secret fresh on its next scheduled run and needs nothing else.
+
+### Upgrading From 1.0.0
+
+Template version `1.0.0` did not compact the bundled etcd cluster, so its backend grows with time alone and goes read-only once it reaches the 2 GiB quota — after which the TimescaleDB members restart-loop with `exitCode: 0` and `reason: Completed`, which reads as healthy and is easily mistaken for a database fault. Upgrading to `1.0.1` or later turns compaction on and stops further growth, but it cannot shrink a backend that has already grown, and a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade. Check first, with the read-only commands in [If the Backend Quota Is Already Full](/template-catalog/templates/etcd#if-the-backend-quota-is-already-full), run against `RELEASE_NAME-etcd`.
+
+### Upgrading From 1.0.x
+
+Template version `1.1.0` removed `postgres.username`, `postgres.password` and `postgres.database`. They are now the prerequisite dictionary secret named by `postgres.credentialsSecretName`, and `backup.minio.accessKey` / `backup.minio.secretKey` moved the same way to `backup.minio.credentialsSecretName`. An upgrade that still carries any of the old keys is refused at render, before anything is applied, so your running cluster is left untouched:
+
+```text
+timescaledb-highly-available: postgres.username, postgres.password and postgres.database were
+REMOVED — they are now a `dictionary` secret you create, named by postgres.credentialsSecretName,
+holding the keys `username`, `password` and `database`. Delete them from your values. See
+Prerequisites in the README.
+```
+
+| | 1.0.x | 1.1.0 and later |
+|---|---|---|
+| Database credentials | `postgres.username`, `postgres.password`, `postgres.database` values | `postgres.credentialsSecretName` → a dictionary secret you create |
+| Where they were stored | `RELEASE_NAME-tsdb-ha-config`, created by the chart | Only in your secret; `RELEASE_NAME-tsdb-ha-config` now holds backup settings and is created only when backups are enabled |
+| MinIO backup credentials | `backup.minio.accessKey`, `backup.minio.secretKey` values | `backup.minio.credentialsSecretName` → a dictionary secret you create |
+
+<Steps>
+  <Step title="Read the credentials the cluster already uses">
+    An existing cluster keeps the credentials it was initialized with. Recover them **before** upgrading, from your values file or from the secret the old version created:
+
+    ```bash
+    cpln secret reveal RELEASE_NAME-tsdb-ha-config -o yaml
+    ```
+  </Step>
+  <Step title="Create the prerequisite secret with those same values">
+    Follow [Prerequisites](#prerequisites) using the existing `username`, `password` and `database`. Different values here do not change the database — they leave every member unable to authenticate after its next restart.
+  </Step>
+  <Step title="Remove the old keys from your values">
+    Delete `postgres.username`, `postgres.password` and `postgres.database` and set `postgres.credentialsSecretName`. If you back up to MinIO, replace `backup.minio.accessKey` and `backup.minio.secretKey` with `backup.minio.credentialsSecretName`.
+  </Step>
+  <Step title="Upgrade, then rotate any default password">
+    Versions `1.0.x` shipped `username: username` and `password: password` as defaults, published in the public template repository. If your cluster still runs it, treat it as compromised and follow [Rotating the Password](#rotating-the-password) after the upgrade.
+  </Step>
+</Steps>
+
+<Warning>
+**The chart no longer writes credentials into `RELEASE_NAME-tsdb-ha-config`.** Anything outside this release that read that secret by name — another workload's environment, a policy, a parent chart bundling this template — must be pointed at the secret you created instead. A reference to a key that no longer exists wedges the referring workload silently.
+</Warning>
+
+### Upgrading From 1.1.0
+
+Template version `1.1.1` removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to every bucket in your AWS account and contains no write actions, so it never carried the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit. **Update your IAM policy to the full action list in [AWS S3](#aws-s3) before upgrading**; if it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only.
+
+### Upgrading From a Version Before 1.2.0
+
+Template version `1.2.0` changes how new clusters are initialized, and an upgrade does not apply those changes to a cluster that already exists:
+
+- **Patroni's consensus timeouts.** The chart now initializes new clusters with `ttl: 45`, `loop_wait: 10` and `retry_timeout: 15`. Earlier versions asked for `ttl: 30` with `retry_timeout: 30`, a combination Patroni silently clamps rather than rejecting, so those clusters tolerated a shorter etcd outage than configured before demoting a healthy leader. Patroni reads these values only while the data directory is empty; afterwards they live in etcd, and an existing cluster keeps the ones it was created with. Move it with `patronictl` — all three together, because Patroni requires `loop_wait + 2 × retry_timeout ≤ ttl` and quietly rewrites the others when one is changed alone:
+
+  ```bash
+  cpln workload exec RELEASE_NAME-timescaledb-ha --gvc GVC_NAME --replica RELEASE_NAME-timescaledb-ha-0 --container patroni-timescaledb -- patronictl -c /tmp/patroni_config.yml edit-config --force -s ttl=45 -s loop_wait=10 -s retry_timeout=15
+  ```
+
+  Confirm with the `show-config` command in [Checking Cluster State](#checking-cluster-state).
+
+- **Riding out an etcd outage.** Clusters created from `1.2.0` have Patroni's `failsafe_mode` on: when the leader loses etcd but every member still answers its REST API, it keeps serving instead of demoting. A cluster created earlier gains it only through `edit-config -s failsafe_mode=true`.
+
+Also in `1.2.0`: `backup.resources.memory` rose from `128Mi` to `512Mi` because the smaller value OOM-killed the dump; passwords containing quotes or backslashes now work on both Patroni and PgBouncer. Before upgrading, confirm a recent backup actually completed — see [Backing Up](#backing-up).
+
+### Scaling and Availability
+
+- **Leader loss fails over automatically.** When the leader stops answering, Patroni promotes the most up-to-date replica and HAProxy's health checks move port `5432` to it. Writes are refused in between and connections open at that moment are reset — build retry with backoff into your applications.
+- **Planned restarts hand leadership off first.** Before a leader is stopped, the chart asks Patroni to switch over to a replica, so a rolling restart costs a few seconds of refused writes rather than a full failover. A `cpln helm upgrade` that changes the member workload can restart members together; expect a brief write outage and plan upgrades as maintenance.
+- **Losing etcd does not fail the cluster over.** With `failsafe_mode` on (clusters created from `1.2.0`), a leader that cannot reach etcd keeps serving as long as every other member still answers its REST API, and only a member Patroni recorded as eligible can win the next leader race. An etcd outage that also hides a replica still demotes the leader.
+- **A member that stays down is re-cloned, not fatal.** WAL retained for an absent member is capped at a quarter of `volumeset.capacity`; past that, its slot is dropped and it re-clones from the leader when it returns.
+- **Keep `replicas` at 3 or more and `etcd.replicas` odd.** Two members cannot fail over safely, and an even etcd count adds nothing to its fault tolerance. Choose `etcd.replicas` at install time.
+- **Changing `replicas` on a running release** adds or removes members; a removed member that held the leader role triggers a failover. Afterwards force a redeployment of `RELEASE_NAME-timescaledb-ha-proxy` so HAProxy picks up the new member list.
+- **The first `cpln helm upgrade` after an install** can re-apply resources that did not change and restart them. Plan it as a short outage.
+- **`multiZone: true`** on the members and on etcd spreads each across zones within the location, when the location supports it.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Workload never becomes ready and cpln logs returns nothing">
+    **Symptom:** the install succeeds, `RELEASE_NAME-timescaledb-ha` stays not ready indefinitely, and `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-timescaledb-ha"}' --limit 50 --since 10m` returns zero lines.
+
+    **Cause:** `postgres.credentialsSecretName` (or, with MinIO backups, `backup.minio.credentialsSecretName`) names a secret that does not exist, so the container is never started. The message is only visible in `status.versions[].message`:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-timescaledb-ha --gvc GVC_NAME -o yaml
+    ```
+
+    ```text
+    The secret CREDENTIALS_SECRET_NAME no longer exists. Workload updates are paused until the
+    secret is added or the reference to the secret removed.
+    ```
+
+    **Fix:** create the secret as in [Prerequisites](#prerequisites). The deployment recovers on its own within several minutes, or run `cpln workload force-redeployment RELEASE_NAME-timescaledb-ha --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Upgrade fails with 'postgres.username, postgres.password and postgres.database were REMOVED'">
+    **Symptom:** `cpln helm upgrade` stops before touching any resource:
+
+    ```text
+    Error: ... timescaledb-highly-available: postgres.username, postgres.password and postgres.database were
+    REMOVED — they are now a `dictionary` secret you create, named by postgres.credentialsSecretName ...
+    ```
+
+    `backup.minio.accessKey` / `backup.minio.secretKey` produce the same kind of message under their own names.
+
+    **Cause:** your values still carry keys that were removed in `1.1.0`.
+
+    **Fix:** follow [Upgrading From 1.0.x](#upgrading-from-1-0-x). Your running cluster is unaffected until the upgrade succeeds.
+  </Accordion>
+  <Accordion title="HAProxy logs 'waiting for patroni endpoints to answer before starting haproxy'">
+    **Symptom:** `RELEASE_NAME-timescaledb-ha-proxy` never becomes ready and `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-timescaledb-ha-proxy"}' --limit 50 --since 10m` repeats `tsdb-ha proxy: waiting for patroni endpoints to answer before starting haproxy — pgN (...) not responding yet`.
+
+    **Cause:** HAProxy will not start until every member's Patroni REST API answers on port `8008`. Either the members are still starting (normal for the first minutes of an install), or `internal_access.type: workload-list` does not include the proxy workload, so it cannot reach them.
+
+    **Fix:** wait for `RELEASE_NAME-timescaledb-ha` to become ready. If it is ready and HAProxy still waits, add `//gvc/GVC_NAME/workload/RELEASE_NAME-timescaledb-ha-proxy` to `internal_access.workloads` as described in [Internal Access](#internal-access). The container gives up and restarts after ten minutes, so it recovers on its own once the members are reachable.
+  </Accordion>
+  <Accordion title="Members restart-loop with exitCode 0 and reason Completed">
+    **Symptom:** the TimescaleDB members restart repeatedly with a climbing restart count in `cpln workload get-deployments RELEASE_NAME-timescaledb-ha --gvc GVC_NAME -o yaml`, each exit reading `exitCode: 0` and `reason: Completed`, while nothing in the database logs looks wrong.
+
+    **Cause:** etcd has gone read-only. A Patroni member that cannot renew its lease exits cleanly, so the failure reads as healthy. The usual reason is an uncompacted etcd backend that has reached its 2 GiB quota and raised a `NOSPACE` alarm (template version `1.0.0`).
+
+    **Fix:** check etcd first, with two read-only commands:
+
+    ```bash
+    cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl endpoint status --cluster -w table
+    cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl alarm list
+    ```
+
+    A healthy cluster prints nothing for `alarm list`. `NOSPACE` confirms it; recovery is the operator procedure in [If the Backend Quota Is Already Full](/template-catalog/templates/etcd#if-the-backend-quota-is-already-full), followed by an upgrade to `1.0.1` or later so it does not recur.
+  </Accordion>
+  <Accordion title="Clients get 'remaining connection slots are reserved' through PgBouncer">
+    **Symptom:** under load, connections through `RELEASE_NAME-pgbouncer` fail with `FATAL: remaining connection slots are reserved for roles with the SUPERUSER attribute` (or `... for non-replication superuser connections`) instead of waiting in the pool.
+
+    **Cause:** `pgbouncer.maxDbConnections` is enforced per PgBouncer replica, so `maxReplicas × maxDbConnections` server connections can be opened against a cluster `max_connections` of 100 (97 usable).
+
+    **Fix:** lower `pgbouncer.maxDbConnections` or `pgbouncer.maxReplicas` so their product stays under 97, and keep `pgbouncer.defaultPoolSize` within the same budget — see [PgBouncer Connection Pooling](#pgbouncer-connection-pooling).
+  </Accordion>
+  <Accordion title="Queries fail with 'function create_hypertable does not exist'">
+    **Symptom:** `SELECT create_hypertable(...)` or `time_bucket(...)` fails with `ERROR: function create_hypertable(unknown, ...) does not exist`, usually in a database other than the one in your credentials secret.
+
+    **Cause:** the TimescaleDB extension is preloaded on every member but *created* only in the database named by the `database` key of your credentials secret, at first initialization. A database you created afterwards does not have it.
+
+    **Fix:** connect to that database through HAProxy as the superuser and run `CREATE EXTENSION IF NOT EXISTS timescaledb;`. The replicas pick it up through streaming replication.
+  </Accordion>
+  <Accordion title="Backup job exits with exitCode 137 and no object appears in the bucket">
+    **Symptom:** `cpln workload get-deployments RELEASE_NAME-timescaledb-ha-backup --gvc GVC_NAME -o yaml` shows the `backup` container ending with `exitCode: 137`, `cpln logs` for it stops after `Running pg_dumpall against ...`, and no new `postgres-TIMESTAMP.sql.gz` lands under the prefix.
+
+    **Cause:** the dump is being OOM-killed mid-run. Nothing is logged from inside the container when that happens; `backup.resources.memory` is below what `pg_dumpall` plus the upload needs (template versions before `1.2.0` shipped `128Mi`).
+
+    **Fix:** set `backup.resources.memory` to at least the shipped `512Mi` and upgrade. The next scheduled run produces a backup.
+  </Accordion>
+  <Accordion title="Apply rejected with 'The ratio between cpu and minCpu must be less than 4:1'">
+    **Symptom:** an install or upgrade fails and the member workload is not created or updated.
+
+    **Cause:** `resources.maxCpu` is more than four times `resources.minCpu`, which the platform rejects on a stateful workload.
+
+    **Fix:** raise `resources.minCpu` or lower `resources.maxCpu` so the ratio is at most 4:1.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
-- **Change `postgres.password` before installing.** Credentials are baked into the data directory at first boot; changing the value later does not change the database password. To reset, uninstall (which deletes the volumes) and reinstall.
-- **Always connect via the proxy, never a replica.** The leader moves on failover; a pinned replica address will break. PgBouncer and backups already route through the proxy.
-- **`replicas: 1` has no HA.** It renders a single-member Patroni cluster with no failover. Use at least 3, and an odd `etcd.replicas` (3, 5, 7) for quorum.
-- **etcd is a hard dependency.** If the etcd members are unhealthy, Patroni loses its consensus store and the cluster goes read-only — check `RELEASE_NAME-etcd` first if writes fail.
-- **`proxy.enabled` must stay `true` for backups.** The logical backup dumps the leader through the proxy endpoint.
-- **Backups are logical-only.** A scheduled `pg_dumpall`; continuous WAL archiving / point-in-time restore is a planned follow-up.
-- **Expect a brief write interruption per leader restart.** During failover or a rolling upgrade, applications should retry with exponential backoff.
+- **Create the credentials secret before installing.** A reference to a secret that does not exist wedges the members with no log output; see [Prerequisites](#prerequisites) for the one command that shows the reason.
+- **Connect through HAProxy** (`RELEASE_NAME-timescaledb-ha-proxy`), or PgBouncer when enabled. A member reached directly may be a read-only replica.
+- **Credentials are applied only when the cluster is first initialized**, and the `repl` replication role shares the superuser password. Rotate in the order given in [Rotating the Password](#rotating-the-password).
+- **The TimescaleDB extension is created only in the database your secret names.** Run `CREATE EXTENSION IF NOT EXISTS timescaledb` in any other database before creating hypertables there.
+- **Keep `replicas` at 3 or more and `etcd.replicas` odd**, and choose `etcd.replicas` at install time.
+- **Do not change `etcd.tuning` to disable compaction** — an uncompacted etcd takes the whole cluster read-only months later.
+- **With `workload-list` access, list the release's own workloads** as well as your applications, or HAProxy cannot reach the members.
+- **Backups are logical only** — a scheduled `pg_dumpall` with no WAL archiving or point-in-time recovery. Keep `backup.resources.memory` at `512Mi` or more.
+- **Restore procedures are unverified on this template**, and the scheduled whole-cluster dump does not fit TimescaleDB's documented single-database restore directly — rehearse against a scratch release, and take a per-database `pg_dump -Fc` for anything you must be able to restore.
+- **`cpln helm uninstall` deletes both volume sets** and the data with them; the TimescaleDB volume set leaves a final snapshot for 7 days. Your credentials secrets are yours and are left alone.
+- **Upgrading from 1.0.x is a breaking change** — the removed keys stop the upgrade rather than resetting a password. See [Upgrading From 1.0.x](#upgrading-from-1-0-x).
 
 ## External References
 
 <CardGroup cols={2}>
-    <Card title="TimescaleDB Documentation" icon="database" href="https://docs.timescale.com/">
+    <Card title="TimescaleDB Documentation" icon="database" href="https://www.tigerdata.com/docs">
     Official TimescaleDB documentation
     </Card>
-    <Card title="Hypertables" icon="table" href="https://docs.timescale.com/use-timescale/latest/hypertables/">
-    Hypertables, compression, continuous aggregates, and retention
+    <Card title="Hypertables" icon="table" href="https://www.tigerdata.com/docs/learn/hypertables/understand-hypertables">
+    How hypertables partition time-series data
+    </Card>
+    <Card title="Logical Backup and Restore" icon="rotate-left" href="https://www.tigerdata.com/docs/deploy/self-hosted/backup-and-restore/logical-backup">
+    pg_dump, pg_restore, timescaledb_pre_restore and timescaledb_post_restore
     </Card>
     <Card title="Patroni Documentation" icon="book" href="https://patroni.readthedocs.io/">
-    Patroni automatic failover documentation
+    Patroni configuration, REST API and `patronictl` reference
     </Card>
-    <Card title="etcd Documentation" icon="server" href="https://etcd.io/docs/v3.6/">
-    Official etcd documentation
-    </Card>
-    <Card title="Restoring a TimescaleDB Backup" icon="rotate-left" href="https://www.tigerdata.com/docs/reference/timescaledb/administration/timescaledb_pre_restore">
-    Using timescaledb_pre_restore and timescaledb_post_restore
+    <Card title="PgBouncer Documentation" icon="database" href="https://www.pgbouncer.org/config.html">
+    PgBouncer configuration reference
     </Card>
     <Card title="TimescaleDB HA Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/timescaledb-highly-available">
-    View the source files, default values, and chart definition
+    Source files, default values, and chart definition
     </Card>
 </CardGroup>

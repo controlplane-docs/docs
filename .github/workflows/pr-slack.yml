@@ -19,11 +19,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── Parent message: posted once, when the PR becomes reviewable ──
-  root:
+  # ── Skip the parent if the PR already has a thread, e.g. one the reply job made for a draft ──
+  thread:
     if: >-
       github.event.action == 'ready_for_review' ||
       (github.event.action == 'opened' && github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      exists: ${{ steps.find.outputs.exists }}
+    steps:
+      - name: Look for an existing thread
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          ts=$(gh api "repos/$REPO/issues/$NUM/comments" --paginate \
+            --jq '.[].body | try capture("slack-thread-ts:(?<ts>[0-9.]+)") catch empty | .ts' \
+            | head -n1 || true)
+
+          if [ -n "$ts" ]; then
+            echo "::notice::This PR already has a Slack thread (${ts}); not posting another parent message."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Parent message: posted once, when the PR becomes reviewable ──
+  root:
+    needs: thread
+    if: needs.thread.outputs.exists != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -46,8 +73,8 @@ jobs:
               ;;
           esac
 
-          if [ -n "${SLACK_USER_MAP}" ] && ! jq -e 'type == "object"' >/dev/null <<< "$SLACK_USER_MAP"; then
-            echo "::error::SLACK_USER_MAP must be a valid JSON object."
+          if [ -n "${SLACK_USER_MAP}" ] && ! jq -e 'type == "object" and all(.[]; type == "string" or type == "object")' >/dev/null <<< "$SLACK_USER_MAP"; then
+            echo "::error::SLACK_USER_MAP must be a JSON object of GitHub login to Slack ID, or to {\"slack\": ID, \"name\": NAME}."
             exit 1
           fi
 
@@ -62,13 +89,21 @@ jobs:
             sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/\\/\\\\/g; s/"/\\"/g'
           }
 
+          # Bold display name from SLACK_USER_MAP, else the GitHub login; never pings
+          slack_name() {
+            login="$1"
+            name=$(jq -r --arg login "$login" '.[$login] | (if type == "object" then .name else null end) // empty' <<< "${SLACK_USER_MAP:-"{}"}")
+            printf '*%s*\n' "$(printf '%s\n' "${name:-$login}" | slack_escape)"
+          }
+
+          # Slack mention that pings; only for the PR opener's thread reply
           slack_user() {
             login="$1"
-            slack_id=$(jq -r --arg login "$login" '.[$login] // empty' <<< "${SLACK_USER_MAP:-{}}")
+            slack_id=$(jq -r --arg login "$login" '.[$login] | (if type == "object" then .slack else . end) // empty' <<< "${SLACK_USER_MAP:-"{}"}")
             if [ -n "$slack_id" ]; then
               printf '<@%s>\n' "$slack_id"
             else
-              printf '*%s*\n' "$(printf '%s\n' "$login" | slack_escape)"
+              slack_name "$login"
             fi
           }
 
@@ -78,7 +113,8 @@ jobs:
           echo "title=$title" >> "$GITHUB_OUTPUT"
 
           author=$(jq -r '.pull_request.user.login' "$GITHUB_EVENT_PATH")
-          echo "author=$(slack_user "$author")" >> "$GITHUB_OUTPUT"
+          echo "author=$(slack_name "$author")" >> "$GITHUB_OUTPUT"
+          echo "author_mention=$(slack_user "$author")" >> "$GITHUB_OUTPUT"
 
           # Label fork PRs — Mintlify doesn't build previews from forks
           if [ "$(jq -r '.pull_request.head.repo.fork' "$GITHUB_EVENT_PATH")" = "true" ]; then
@@ -125,7 +161,7 @@ jobs:
           payload: |
             channel: "${{ vars.SLACK_CHANNEL_ID }}"
             thread_ts: "${{ steps.post.outputs.ts }}"
-            text: ":memo: PR opened by ${{ steps.meta.outputs.author }}"
+            text: ":memo: PR opened by ${{ steps.meta.outputs.author_mention }}"
             reply_broadcast: false
 
       - name: Wait for the Mintlify preview
@@ -269,8 +305,8 @@ jobs:
               ;;
           esac
 
-          if [ -n "${SLACK_USER_MAP}" ] && ! jq -e 'type == "object"' >/dev/null <<< "$SLACK_USER_MAP"; then
-            echo "::error::SLACK_USER_MAP must be a valid JSON object."
+          if [ -n "${SLACK_USER_MAP}" ] && ! jq -e 'type == "object" and all(.[]; type == "string" or type == "object")' >/dev/null <<< "$SLACK_USER_MAP"; then
+            echo "::error::SLACK_USER_MAP must be a JSON object of GitHub login to Slack ID, or to {\"slack\": ID, \"name\": NAME}."
             exit 1
           fi
 
@@ -288,13 +324,21 @@ jobs:
             sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/\\/\\\\/g; s/"/\\"/g'
           }
 
+          # Bold display name from SLACK_USER_MAP, else the GitHub login; never pings
+          slack_name() {
+            login="$1"
+            name=$(jq -r --arg login "$login" '.[$login] | (if type == "object" then .name else null end) // empty' <<< "${SLACK_USER_MAP:-"{}"}")
+            printf '*%s*\n' "$(printf '%s\n' "${name:-$login}" | slack_escape)"
+          }
+
+          # Slack mention that pings; only for review requests and the PR opener's thread reply
           slack_user() {
             login="$1"
-            slack_id=$(jq -r --arg login "$login" '.[$login] // empty' <<< "${SLACK_USER_MAP:-{}}")
+            slack_id=$(jq -r --arg login "$login" '.[$login] | (if type == "object" then .slack else . end) // empty' <<< "${SLACK_USER_MAP:-"{}"}")
             if [ -n "$slack_id" ]; then
               printf '<@%s>\n' "$slack_id"
             else
-              printf '*%s*\n' "$(printf '%s\n' "$login" | slack_escape)"
+              slack_name "$login"
             fi
           }
 
@@ -333,8 +377,8 @@ jobs:
               review_id=$(jq -r '.review.id' "$GITHUB_EVENT_PATH")
               review_state=$(jq -r '.review.state' "$GITHUB_EVENT_PATH")
               case "$review_state" in
-                approved)          text=":white_check_mark: $(slack_user "$who") approved" ;;
-                changes_requested) text=":warning: $(slack_user "$who") requested changes" ;;
+                approved)          text=":white_check_mark: $(slack_name "$who") approved" ;;
+                changes_requested) text=":warning: $(slack_name "$who") requested changes" ;;
                 *)                 echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
               esac
               event_key="review-${review_id}-${review_state}"
@@ -347,7 +391,7 @@ jobs:
               while IFS=$'\t' read -r review_id approver; do
                 [ -n "$review_id" ] || continue
                 if ! grep -qx "$review_id" <<< "$posted_approval_ids"; then
-                  line=":white_check_mark: $(slack_user "$approver") approved"
+                  line=":white_check_mark: $(slack_name "$approver") approved"
                   if [ -z "$missing_approvals" ]; then
                     missing_approvals="$line"
                   else
@@ -359,7 +403,7 @@ jobs:
 
               if [ "$(jq -r '.pull_request.merged' "$GITHUB_EVENT_PATH")" = "true" ]; then
                 by=$(jq -r '.pull_request.merged_by.login' "$GITHUB_EVENT_PATH")
-                text=":large_green_circle: *Merged* by $(slack_user "$by")"
+                text=":large_green_circle: *Merged* by $(slack_name "$by")"
               else
                 text=":red_circle: *Closed without merging*"
               fi
@@ -372,7 +416,8 @@ jobs:
           {
             echo "ts=$ts"
             echo "title=$title"
-            echo "author=$(slack_user "$author")"
+            echo "author=$(slack_name "$author")"
+            echo "author_mention=$(slack_user "$author")"
             echo "text=$text"
             echo "event_key=$event_key"
           } >> "$GITHUB_OUTPUT"
@@ -417,7 +462,7 @@ jobs:
           payload: |
             channel: "${{ vars.SLACK_CHANNEL_ID }}"
             thread_ts: "${{ steps.post_missing_parent.outputs.ts }}"
-            text: ":memo: PR opened by ${{ steps.msg.outputs.author }}"
+            text: ":memo: PR opened by ${{ steps.msg.outputs.author_mention }}"
             reply_broadcast: false
 
       - name: Build changed files message

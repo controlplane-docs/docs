@@ -1,81 +1,94 @@
 ---
 title: Weaviate
 icon: /template-catalog/templates/icons/weaviate.png
-description: Deploy a Weaviate vector database cluster on Control Plane. Covers the prerequisite API key secret, Raft clustering and its restart limitation, AI provider modules, internal-only access, and scheduled backups to S3 or GCS.
-keywords: ['weaviate', 'vector search', 'hybrid search', 'embeddings', 'rag', 'semantic search', 'pinecone alternative', 'qdrant alternative', 'milvus alternative', 'text2vec', 'openai', 'anthropic', 'cohere', 'huggingface', 'nearvector']
+description: Deploy Weaviate, an AI-native vector database, as a Raft cluster on Control Plane. Covers the prerequisite API key secret, AI provider modules, internal-only access, scheduled S3 or GCS backups, and upgrading from template versions 1.0.1 and 1.1.0.
+keywords: ['weaviate', 'vector search', 'hybrid search', 'embeddings', 'rag', 'semantic search', 'pinecone alternative', 'qdrant alternative', 'milvus alternative', 'text2vec', 'openai', 'anthropic', 'cohere', 'huggingface', 'graphql']
 ---
 
 ## Overview
 
-<Warning>
-**Upgrading from 1.0.1 or earlier?** The Weaviate API key and every AI provider key are now prerequisite secrets you create, and the old values keys stop the render — see [Upgrading From 1.0.1 or Earlier](#upgrading-from-1-0-1-or-earlier).
-
-1.0.1 and earlier shipped a **working 64-character API key** as a values default, published in this repository and shared by every install that did not override it. It is the only authentication Weaviate has, so anyone holding it can read and write every collection. Treat the key on any earlier install as **compromised**: rotate it rather than simply upgrading.
-</Warning>
-
 Weaviate is an AI-native vector database for storing, indexing, and querying vector embeddings alongside structured object data. This template deploys a Weaviate 1.38 cluster of `replicas` nodes in a single location, using Raft consensus for schema and cluster state, with one persistent volume per node, optional AI provider modules, and optional scheduled backups to AWS S3 or GCS.
 
-The cluster has **no public endpoint by design** — it is reachable only from inside Control Plane, scoped by `internalAccess.type`.
+The cluster has **no public endpoint by design** — it is reachable only from inside Control Plane, scoped by `internalAccess.type`. The Weaviate API key and every AI provider key are secrets you create before installing; none of them pass through Helm or land in the release.
+
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have.
+</Note>
 
 ### What Gets Created
 
-- **Weaviate Workload** — A `stateful` workload of `replicas` nodes forming a Raft cluster, serving REST and GraphQL on port `8080` and gRPC on `50051`.
-- **Volume Set** — One volume per replica holding that node's objects and vector indexes, with autoscaling.
-- **Credentials Secret** — Template-managed `dictionary` secret holding the non-sensitive `api-user` value, plus the backup bucket coordinates when backups are enabled. No credential passes through it.
-- **Start Script Secret** — The boot script mounted into each container.
-- **Identity & Policy** — An identity bound to the workloads, and a policy granting it `reveal` on exactly four things at most: the two template secrets, your API key secret, and each AI provider secret you name. Cloud storage access is added to the identity only when backups are enabled.
-- **Backup Cron Workload** *(optional)* — Calls Weaviate's backup API on a schedule to write a full snapshot to cloud storage.
-
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-weaviate` | Weaviate cluster (stateful, `replicas` nodes): REST and GraphQL on port `8080`, gRPC on `50051` | — |
+| Volume Set | `RELEASE_NAME-weaviate-data` | One `ext4` volume per replica holding that node's objects and vector indexes, with autoscaling | — |
+| Secret | `RELEASE_NAME-weaviate-credentials` | Dictionary secret holding the non-sensitive `api-user` value, plus bucket coordinates when backups are enabled. No credential passes through it | — |
+| Secret | `RELEASE_NAME-weaviate-start-script` | The boot script mounted into each replica | — |
+| Identity | `RELEASE_NAME-weaviate-identity` | Bound to the Weaviate and backup workloads; carries the Cloud Account binding only when backups are enabled | — |
+| Policy | `RELEASE_NAME-weaviate-policy` | Grants the identity `reveal` on exactly: the two template secrets, your API key secret, and each AI provider secret you name | — |
+| Workload | `RELEASE_NAME-weaviate-backup` | Cron job that calls Weaviate's backup API on a schedule and writes a full snapshot to your bucket | `backup.enabled: true` |
 
 ## Prerequisites
 
-### API Key
+**One secret must exist before you install.** It holds the API key every client authenticates with. Secrets are org-level, so no GVC flag is involved.
 
-Weaviate has no anonymous access in this template. The API key is a **required prerequisite `opaque` secret that must exist before you install** — the key never enters the Helm release, and the template only ever refers to it by name.
+<Steps>
+  <Step title="Create the API key secret">
+    An [opaque secret](/guides/create-secret/opaque) whose entire payload is the API key. `--encoding plain` is required:
 
-```bash
-printf '%s' "$(openssl rand -hex 32)" | \
-  cpln secret create-opaque --name my-weaviate-api-key --encoding plain -f -
-```
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name SECRET_NAME --encoding plain -f -
+    ```
 
-Set `apiKeySecretName` to that name, and set `apiUser` to the username the key maps to. Keep your own copy of the key: the platform is the only place it is stored, and every client authenticates with it.
+    Set `apiKeySecretName` to the name you used, and set `apiUser` to the username the key maps to. Weaviate has no anonymous access in this template.
+  </Step>
+  <Step title="Read the key back later">
+    Keep your own copy of the key — the platform is the only place it is stored. Pass `-o yaml`; a bare `cpln secret reveal` prints only a summary table:
+
+    ```bash
+    cpln secret reveal SECRET_NAME -o yaml
+    ```
+  </Step>
+  <Step title="Create AI provider secrets (optional)">
+    Only needed if you want Weaviate to call a provider for embeddings or generative search. Create one opaque secret per provider, holding just that provider's key:
+
+    ```bash
+    printf '%s' "sk-..." | cpln secret create-opaque --name my-weaviate-openai-key --encoding plain -f -
+    ```
+
+    Set `modules.openai.apiKeySecretName` (or the `anthropic`, `cohere`, `huggingface` equivalent) to that name. Leaving a provider's `apiKeySecretName` empty means the provider is genuinely off: no environment variable, no `reveal` grant, and no outbound internet access on the workload.
+  </Step>
+</Steps>
 
 <Warning>
-**Installing without the secret looks like a platform fault, not a missing step.** `cpln helm install` reports complete success and creates every resource, then the workload simply never becomes ready. `cpln logs` returns **zero lines** — there is no container to produce output — and the only diagnostic is in `status.versions[].message`:
+**Create the API key secret before installing, or the deployment wedges silently.** A name that points at a secret which does not exist installs "successfully" and then never starts. The container never runs, so `cpln logs` returns **zero lines**, and every summary surface just looks like a slow deploy. The one place the reason appears is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-weaviate --gvc GVC_NAME -o yaml
+```
 
 ```text
 The secret my-weaviate-api-key no longer exists. Workload updates are paused until
 the secret is added or the reference to the secret removed.
 ```
 
-Read it with `cpln workload get-deployments {release}-weaviate --gvc {gvc} -o yaml`. Creating the secret afterwards **does** release it, without further action, but slowly — measured between 5.5 and 10.5 minutes across five templates, so poll rather than time-box it. To skip the wait, run `cpln workload force-redeployment {release}-weaviate --gvc {gvc}`, which cleared it in about 90 seconds.
+Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the missing secret repairs the deployment on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-weaviate --gvc GVC_NAME` to skip the wait.
 </Warning>
-
-### AI Provider Keys
-
-Only needed if you want Weaviate to call a provider for embeddings or generative search. Create one `opaque` secret per provider, holding just that provider's key:
-
-```bash
-printf '%s' "sk-..." | \
-  cpln secret create-opaque --name my-weaviate-openai-key --encoding plain -f -
-```
-
-Set `modules.openai.apiKeySecretName` (or the `anthropic`, `cohere`, `huggingface` equivalent) to that name. Leaving a provider's `apiKeySecretName` empty means the provider is genuinely off: no environment variable, no `reveal` grant, and no outbound internet access on the workload. All three were confirmed against the live resources on a default install, where the container could not reach `api.openai.com` at all.
 
 <Warning>
-**Naming a provider secret gives you a live, billable integration.** It is not inert configuration held in reserve — see [Provider Modules Load Regardless of the Module List](#provider-modules-load-regardless-of-the-module-list). Only supply a provider key when you intend that provider to be used.
+**Naming a provider secret gives you a live, billable integration.** It is not inert configuration held in reserve, and `modules.enabled` does not gate it — see [AI Modules](#ai-modules). Only supply a provider key when you intend that provider to be used.
 </Warning>
 
-### Cloud Storage
-
-Only needed if you set `backup.enabled: true`. See [Backing Up](#backing-up) for the bucket, Cloud Account, and IAM steps.
+Backups need a bucket and a Control Plane Cloud Account before they can be enabled — see [Backing Up](#backing-up). Nothing else is required.
 
 ## Installation
 
-To install, follow the instructions for your preferred method:
+Install from the marketplace registry into an existing GVC, pointing `apiKeySecretName` at the secret you created:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/weaviate \
+  --version 1.1.1 --gvc GVC_NAME \
+  --set apiKeySecretName=SECRET_NAME
+```
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -101,38 +114,50 @@ To install, follow the instructions for your preferred method:
 
 ## Configuration
 
-The default `values.yaml` for this template:
+Each subsection shows the shipped defaults for one area of `values.yaml`.
+
+### Cluster
 
 ```yaml
-# ─── Cluster ──────────────────────────────────────────────────────────────────
 replicas: 3
 
 image: semitechnologies/weaviate:1.38.0
+```
 
-# ─── Authentication ───────────────────────────────────────────────────────────
+Three replicas is the practical minimum for Raft, which needs a quorum (2 of 3) to elect a leader and accept schema changes. A single-replica install (`replicas: 1`) has no cluster membership to maintain. Read [Scaling and Availability](#scaling-and-availability) before running a multi-replica cluster in production.
+
+### Authentication
+
+```yaml
 # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL.
 # An `opaque` secret (encoding: plain) whose entire payload is the API key:
 #   printf '%s' "$(openssl rand -hex 32)" | \
 #     cpln secret create-opaque --name my-weaviate-api-key --encoding plain -f -
-# If it does not exist at install time the deployment WEDGES waiting on it and
-# looks broken. See Prerequisites in the README.
 apiKeySecretName: my-weaviate-api-key
 
 # Username the API key maps to. Not a secret — it is the admin-list identity.
 apiUser: admin@example.com
+```
 
-# ─── Query Behavior ───────────────────────────────────────────────────────────
+The key is read straight from your secret into Weaviate's allowed-keys setting and never appears in the Helm release or the rendered manifest. Anonymous access is disabled unconditionally; a request without the exact key returns `401 Unauthorized`.
+
+### Query Behavior
+
+```yaml
 # Default result limit for queries
 queryDefaultsLimit: 25
 
 # Default vectorizer module applied to new collections
 # Options: none, text2vec-openai, text2vec-cohere, text2vec-huggingface, text2vec-aws
 defaultVectorizerModule: none
+```
 
-# ─── AI Modules ───────────────────────────────────────────────────────────────
+Leave `defaultVectorizerModule: none` when your application supplies its own vectors. Set it to a provider module to have Weaviate call that provider's embedding API on insert and query.
+
+### AI Modules
+
+```yaml
 modules:
-  # Every module you intend to use must be listed here — supplying a key alone
-  # does not activate it.
   # Common options: text2vec-openai, text2vec-cohere, text2vec-huggingface,
   #                 generative-openai, generative-cohere, generative-anthropic,
   #                 qna-openai, ref2vec-centroid
@@ -141,8 +166,6 @@ modules:
   # OPTIONAL PREREQUISITE SECRETS — one `opaque` secret (encoding: plain) per
   # provider, holding only that provider's key. Empty = provider off: no env
   # var, no reveal grant, no outbound egress opened.
-  #   printf '%s' "sk-..." | \
-  #     cpln secret create-opaque --name my-weaviate-openai-key --encoding plain -f -
   openai:
     apiKeySecretName: "" # e.g. my-weaviate-openai-key
   anthropic:
@@ -151,14 +174,35 @@ modules:
     apiKeySecretName: "" # e.g. my-weaviate-cohere-key
   huggingface:
     apiKeySecretName: "" # e.g. my-weaviate-huggingface-key
+```
 
-# ─── Resources ────────────────────────────────────────────────────────────────
+| Module | Type | Provider | Secret knob |
+|--------|------|----------|-------------|
+| `text2vec-openai`, `generative-openai`, `qna-openai` | Vectorizer / Generative | OpenAI | `modules.openai.apiKeySecretName` |
+| `generative-anthropic` | Generative | Anthropic | `modules.anthropic.apiKeySecretName` |
+| `text2vec-cohere`, `generative-cohere` | Vectorizer / Generative | Cohere | `modules.cohere.apiKeySecretName` |
+| `text2vec-huggingface` | Vectorizer | Hugging Face | `modules.huggingface.apiKeySecretName` |
+
+<Warning>
+**Supplying a provider key is what activates a provider, not `modules.enabled`.** On Weaviate 1.38 the API-based vectorizer and generative modules load whether or not they are listed, so a collection that names a vectorizer such as `text2vec-openai` will call that provider as soon as its key is present — and bill you for it. Only name a provider secret when you intend that provider to be used, and clear the name when you stop using it.
+</Warning>
+
+`modules.enabled` is written to Weaviate's `ENABLE_MODULES` setting. When backups are enabled the template appends `backup-s3` or `backup-gcs` to it for you. Naming any provider secret, or enabling backups, opens outbound internet access on the Weaviate workload so it can reach that API; with neither, the workload has no egress at all.
+
+### Resources
+
+```yaml
 # HNSW vector indexes are RAM-resident. Rough sizing:
 #   memory ≈ vectors × dimensions × 4 bytes × 1.5
 cpu: 2
 memory: 4Gi
+```
 
-# ─── Storage ──────────────────────────────────────────────────────────────────
+Memory is the sizing constraint, not CPU. An undersized cluster fails with out-of-memory restarts rather than slow queries.
+
+### Storage
+
+```yaml
 volumes:
   data:
     initialCapacity: 20 # GiB per replica (platform minimum 10)
@@ -166,21 +210,32 @@ volumes:
       maxCapacity: 200
       minFreePercentage: 20
       scalingFactor: 1.5
+```
 
-# ─── Placement ────────────────────────────────────────────────────────────────
+Volume data survives a redeploy and an upgrade. Uninstalling the release deletes the volume set.
+
+### Placement
+
+```yaml
 multiZone:
   enabled: false # true = spread replicas across AZs (location must support it)
+```
 
-# ─── Access ───────────────────────────────────────────────────────────────────
-# Weaviate is reachable only from inside Control Plane — there is no public
-# endpoint, by design. See Important Notes in the README.
+### Access
+
+```yaml
 internalAccess:
   type: same-gvc # none | same-gvc | same-org | workload-list
   workloads: [] # used only with workload-list
   # workloads:
   #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
 
-# ─── Backup ───────────────────────────────────────────────────────────────────
+Weaviate is reachable only from inside Control Plane — this template opens no public endpoint, and that is not configurable. A change to `internalAccess` takes up to a couple of minutes to take effect.
+
+### Backup
+
+```yaml
 backup:
   enabled: false
   provider: aws # aws | gcp
@@ -203,198 +258,66 @@ backup:
     path: weaviate/backups
 ```
 
-### Cluster
-
-- `replicas` — Number of Weaviate nodes. Three is the default and the practical minimum for Raft, which needs a quorum (2 of 3) to elect a leader and accept schema changes. Read [Rolling Restarts Can Split a Replica Out of the Cluster](#rolling-restarts-can-split-a-replica-out-of-the-cluster) before running a multi-replica cluster in production.
-- `image` — The Weaviate image and tag. The template is tested on `semitechnologies/weaviate:1.38.0`.
-
-A first install of three replicas took about **165 seconds** to reach all-ready in testing: the first replica is ready at roughly 60 seconds and the ordered rollout paces the remaining two.
-
-### Authentication
-
-- `apiKeySecretName` — Name of the pre-created `opaque` secret whose entire payload is the API key. Required; see [Prerequisites](#prerequisites). The key is read straight from the secret into `AUTHENTICATION_APIKEY_ALLOWED_KEYS` and never appears in the Helm release, the rendered manifest, or the stored workload spec.
-- `apiUser` — The username the API key maps to, and the entry in Weaviate's admin list. This is an identity, not a credential, so it is an ordinary value and is stored in the template's own dictionary secret.
-
-Anonymous access is disabled unconditionally. In testing, an unauthenticated request and a request with a wrong key both returned `401 Unauthorized`, and only the exact key from the secret returned `200`.
-
-### Query Behavior
-
-- `queryDefaultsLimit` — Default result limit applied to queries that do not specify one.
-- `defaultVectorizerModule` — The vectorizer applied to new collections. Leave it at `none` when your application supplies its own vectors; set it to a provider module to have Weaviate call that provider's embedding API on insert and query.
-
-### AI Modules
-
-- `modules.enabled` — List of modules written to Weaviate's `ENABLE_MODULES` variable. When backups are enabled the template appends `backup-s3` or `backup-gcs` to this list for you.
-- `modules.openai.apiKeySecretName`, `modules.anthropic.apiKeySecretName`, `modules.cohere.apiKeySecretName`, `modules.huggingface.apiKeySecretName` — Name of the `opaque` secret holding that provider's key. Empty means the provider is off.
-
-| Module | Type | Provider | Secret knob |
-|--------|------|----------|-------------|
-| `text2vec-openai`, `generative-openai`, `qna-openai` | Vectorizer / Generative | OpenAI | `modules.openai.apiKeySecretName` |
-| `generative-anthropic` | Generative | Anthropic | `modules.anthropic.apiKeySecretName` |
-| `text2vec-cohere`, `generative-cohere` | Vectorizer / Generative | Cohere | `modules.cohere.apiKeySecretName` |
-| `text2vec-huggingface` | Vectorizer | Hugging Face | `modules.huggingface.apiKeySecretName` |
-
-Naming any provider secret, or enabling backups, opens outbound internet access on the Weaviate workload so it can reach that API. With neither, the workload has no egress at all.
-
-<Warning>
-The comment in `values.yaml` — "supplying a key alone does not activate it" — **overstates what `modules.enabled` does** on Weaviate 1.38. See [Provider Modules Load Regardless of the Module List](#provider-modules-load-regardless-of-the-module-list).
-</Warning>
-
-### Resources
-
-- `cpu` / `memory` — Limits applied to each Weaviate replica.
-
-Memory is the sizing constraint, not CPU: HNSW vector indexes are held in RAM. Size roughly as `vectors × dimensions × 4 bytes × 1.5`. Under-provisioning surfaces as an out-of-memory restart rather than slow queries.
-
-### Storage
-
-- `volumes.data.initialCapacity` — Initial volume size in GiB per replica. The platform minimum is 10.
-- `volumes.data.autoscaling.maxCapacity` — Maximum volume size in GiB.
-- `volumes.data.autoscaling.minFreePercentage` — Free-space percentage that triggers a scale-up.
-- `volumes.data.autoscaling.scalingFactor` — Multiplier applied to current capacity when scaling up.
-
-Volume data survives a redeploy. After a full restart in testing, all objects written beforehand were still present and byte-identical, including their original write timestamps.
-
-### Placement
-
-Set `multiZone.enabled: true` to spread replicas across availability zones within the location. Verify the location supports multi-zone before enabling.
-
-### Access
-
-- `internalAccess.type` — Which workloads may reach Weaviate: `none`, `same-gvc` (default), `same-org`, or `workload-list`.
-- `internalAccess.workloads` — Used only with `workload-list`. Full workload links, for example `//gvc/GVC_NAME/workload/WORKLOAD_NAME`.
-
-All four settings were exercised against a live cluster, including the negative case: a workload absent from `workload-list` was refused, and adding it to the list let it through.
-
-<Note>
-**A firewall change takes up to a couple of minutes to take effect.** Measured propagation was 45–95 seconds. A denial surfaces to the caller as `HTTP 503 upstream connect error`, which is indistinguishable from an unhealthy upstream — re-test after a couple of minutes before concluding a knob did not work.
-</Note>
-
-## Upgrading From 1.0.1 or Earlier
-
-`1.1.0` is a security release. Every credential the chart used to accept as a value is now a secret you create and reference by name, and carrying a `1.0.1` values file forward **fails at render** with a message naming its replacement — nothing silently falls back to a default.
-
-| `1.0.1` and earlier | `1.1.0` | Why |
-|---|---|---|
-| `apiKey` (a working 64-character key) | `apiKeySecretName` → required prerequisite `opaque` secret | The default key was published in this repository and shared by every install that did not override it. It is the only authentication Weaviate has |
-| `modules.openai.apiKey` and the `anthropic`, `cohere`, `huggingface` equivalents | `modules.{provider}.apiKeySecretName` → optional prerequisite `opaque` secrets | Your own provider billing keys were landing in the Helm release in plaintext |
-| `internal_access` | `internalAccess` | Renamed only; the fields (`type`, `workloads`) are unchanged |
-| `clusterName` | Removed | It was never rendered into any resource. Nothing replaces it |
-
-The render guard for the API key reads:
-
-```text
-weaviate: `apiKey` was removed in 1.1.0 — the API key is now a REQUIRED prerequisite
-`opaque` secret (encoding: plain). Create it, then set `apiKeySecretName` to its name.
-```
-
-<Steps>
-  <Step title="Rotate the key, do not carry it forward">
-    Generate a **new** key and create the secret as shown in [Prerequisites](#prerequisites). The old default was public, so an install that used it should be treated as having had its data readable and writable by anyone who found it. If you overrode the default with your own value, that value still travelled in the Helm release and is worth rotating too.
-  </Step>
-  <Step title="Replace the removed keys">
-    Delete `apiKey`, `clusterName`, and any `modules.{provider}.apiKey` entries from your values. Set `apiKeySecretName`, rename `internal_access` to `internalAccess`, and create a provider secret for each provider you actually use.
-  </Step>
-  <Step title="Update every client">
-    The API key changes, so every application, notebook, and client library holding the old bearer token must be updated.
-  </Step>
-  <Step title="Plan the restart">
-    A `helm upgrade` restarts the cluster one replica at a time. Read [Rolling Restarts Can Split a Replica Out of the Cluster](#rolling-restarts-can-split-a-replica-out-of-the-cluster) first and verify cluster health afterwards — the platform's ready status will not tell you if a node failed to rejoin.
-  </Step>
-</Steps>
-
-## Cluster Behavior and Known Limits
-
-Both limitations below are **pre-existing** — `1.1.0` changed no clustering configuration — and both were confirmed on a live three-replica cluster.
-
-### Rolling Restarts Can Split a Replica Out of the Cluster
-
-A single redeployment of a three-replica cluster left one node **permanently split out of the Raft cluster**. The restarted node came up as a leaderless `Candidate` — it had Raft log entries on disk but had applied none of them, so its schema state was empty. The other two replicas elected a leader without it, and it **never rejoined**: it was still in that state 31 minutes later, and it did not recover on its own.
-
-The part that makes this dangerous is what the platform reports:
-
-- **All three replicas report `ready`.** The readiness probe checks `/v1/.well-known/live`, which only proves the HTTP server is up, so the split node stays in the service-DNS rotation.
-- **Roughly a third of client requests fail silently.** A 60-sample probe against the load-balanced service DNS measured `200: 42 (70%)` and `404: 18 (30%)` — exactly one node in three. The failures are `404 Not Found`, an answered, routed response rather than a connection error, so a client sees "no such collection", not "cluster unhealthy".
-
-This is a **rejoin** defect, not a rollout-pacing one: the restart of the other two replicas was seamless, with 270 of 270 probe samples returning `200` while they cycled one at a time.
-
-<Warning>
-**`replicas: 3` is not safe across an upgrade**, and `helm upgrade` is how you will meet this. A restart is routine — an upgrade, an image bump, a platform reschedule — so **verify cluster health after any restart instead of trusting the platform's ready status.**
-</Warning>
-
-Check membership from inside any replica. A healthy cluster reports one `Leader` and two `Follower` nodes on the same term, and `/v1/nodes` lists every replica as `HEALTHY`:
-
-```bash
-cpln workload exec {release}-weaviate --gvc {gvc} --container weaviate -- \
-  /bin/sh -c "wget -qO- --header='Authorization: Bearer YOUR_API_KEY' \
-  http://localhost:8080/v1/cluster/statistics"
-```
-
-A split node reports `"state":"Candidate"` with an empty `leaderId` and `"lastContact":"never"`, and `/v1/nodes` queried from a healthy replica lists fewer nodes than you deployed. A single-replica install (`replicas: 1`) has no Raft membership to lose and is not exposed to this.
-
-### Provider Modules Load Regardless of the Module List
-
-`modules.enabled` does not gate the API-based vectorizer and generative modules. With `modules.enabled: []` and only a provider secret named, `text2vec-openai` was still loaded, a collection could be created with `"vectorizer":"text2vec-openai"`, and inserting an object with **no vector** made Weaviate call the provider and store the embedding it returned. `/v1/meta` reports the same 41 modules loaded whether `ENABLE_MODULES` is set or not — on 1.38 these modules are compiled in and always available.
-
-<Warning>
-The risk is the **inverse** of what the values comment suggests. Supplying a provider key "just to have it configured" gives you a **live, billable** provider integration that will be used the moment any collection specifies that vectorizer. Only name a provider secret when you intend that provider to be used, and remove the secret name when you stop using it.
-</Warning>
-
-`modules.enabled` still has a job — it is the documented upstream knob and it is how the backup modules are turned on, which the template does for you when `backup.enabled: true`. It is simply not a safety gate on provider access.
+The bucket, Cloud Account and IAM steps are under [Backing Up](#backing-up).
 
 ## Connecting
 
-Weaviate is reachable from workloads inside Control Plane, subject to `internalAccess.type`. There is no public endpoint.
+Weaviate is reachable from workloads inside Control Plane, subject to `internalAccess.type`. Authenticate every request with the API key as a bearer token.
 
-| What | Where |
-|---|---|
-| Cluster (load balanced) | `{release}-weaviate.{gvc}.cpln.local` |
-| A specific replica | `{release}-weaviate-{n}.{gvc}.cpln.local` |
-| REST and GraphQL port | `8080` |
-| gRPC port | `50051` |
-| Credentials | The key in the secret named by `apiKeySecretName`; username `apiUser` |
-| Public endpoint | None |
+| What | Address | Notes |
+|---|---|---|
+| REST and GraphQL (load balanced) | `RELEASE_NAME-weaviate.GVC_NAME.cpln.local:8080` | Use this from other workloads |
+| gRPC (load balanced) | `RELEASE_NAME-weaviate.GVC_NAME.cpln.local:50051` | For client libraries that use the gRPC transport |
+| A specific replica | `replica-0.RELEASE_NAME-weaviate.LOCATION_NAME.GVC_NAME.cpln.local:8080` | Replica indexes start at `0`; see [replica-direct endpoints](/reference/workload/general#internal-endpoint-formatting) |
+| Public endpoint | None | Inbound internet access is closed unconditionally |
+| Credentials | `cpln secret reveal SECRET_NAME -o yaml` | The payload is the bearer token; the username is `apiUser` |
 
-Authenticate with the key as a bearer token:
+From another workload in the GVC:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_API_KEY" \
-     http://{release}-weaviate.{gvc}.cpln.local:8080/v1/meta
+     http://RELEASE_NAME-weaviate.GVC_NAME.cpln.local:8080/v1/meta
+```
+
+From your own machine, open a tunnel and call the same endpoint on localhost:
+
+```bash
+cpln port-forward RELEASE_NAME-weaviate 8080:8080 --gvc GVC_NAME
+```
+
+```bash
+curl -H "Authorization: Bearer YOUR_API_KEY" http://localhost:8080/v1/meta
 ```
 
 <Note>
-The workload is assigned a canonical `*.cpln.app` hostname like any other, but `inboundAllowCIDR` is empty unconditionally, so every request from the internet is refused at the platform edge with `403 RBAC: access denied` — **a valid API key does not help**, because the request never reaches Weaviate. If you need browser or off-platform access, put your own authenticating proxy in front of it inside the GVC.
+The workload is assigned a canonical `*.cpln.app` hostname like any other, but every request from the internet is refused at the platform edge with `403 RBAC: access denied` — **a valid API key does not help**, because the request never reaches Weaviate. If you need browser or off-platform access, put your own authenticating proxy in front of it inside the GVC, or use `cpln port-forward`.
 </Note>
 
-## Backing Up
+## Operations
 
-With `backup.enabled: true`, a cron workload calls Weaviate's backup API on `backup.schedule` and writes a full snapshot of every collection to `{path}/{backup-id}/` in your bucket.
+### Backing Up
+
+With `backup.enabled: true`, the `RELEASE_NAME-weaviate-backup` cron workload calls Weaviate's backup API on `backup.schedule` and writes a full snapshot of every collection to `{path}/{backup-id}/` in your bucket. Backup IDs are written as `weaviate-backup-YYYYMMDD-HHMMSS`.
 
 <Warning>
-**The backup path has not been exercised end to end.** Rendering, the chart's validation of the backup settings, and the backup job's discovery of the cluster endpoint were all checked live, but no snapshot has been written to S3 or GCS from this template — a real run needs cloud resources outside the test environment. Treat backups as unverified: run one on your own bucket and confirm the objects land before you rely on it. A misconfigured cloud binding can report a successful install while the identity is unusable, so check the objects, not the install.
+**The backup path has not been exercised end to end from this template.** Rendering and the chart's validation of the backup settings are checked, but no snapshot has been written to S3 or GCS by this template. Run one on your own bucket and confirm the objects land before you rely on the schedule. A misconfigured cloud binding can report a successful install while the identity is unusable, so check the objects, not the install.
 </Warning>
 
 <Warning>
-**With `internalAccess.type: workload-list`, the backup job is denied.** The cron job is a separate workload and the template does not add it to the allow-list, so its calls to Weaviate are refused like any other unlisted workload. Add `//gvc/{gvc}/workload/{release}-weaviate-backup` to `internalAccess.workloads` yourself, or use `same-gvc` or `same-org`.
+**With `internalAccess.type: workload-list`, the backup job is denied.** The cron job is a separate workload and the template does not add it to the allow-list, so its calls to Weaviate are refused like any other unlisted workload. Add `//gvc/GVC_NAME/workload/RELEASE_NAME-weaviate-backup` to `internalAccess.workloads` yourself, or use `same-gvc` or `same-org`.
 </Warning>
 
-### AWS S3
+#### AWS S3
 
 <Steps>
   <Step title="Create a bucket">
     Create an S3 bucket. Set `backup.aws.bucket` and `backup.aws.region` to match, and `backup.aws.path` to the prefix you want snapshots written under.
   </Step>
   <Step title="Set up a Cloud Account">
-    If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for the AWS account holding the bucket. Set `backup.aws.cloudAccountName` to its name.
+    If you do not have one, [create a Cloud Account](/guides/create-cloud-account) for the AWS account holding the bucket. Set `backup.aws.cloudAccountName` to its name.
   </Step>
   <Step title="Create an IAM policy">
-    Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`, and set `backup.aws.policyName` to its name:
-
-    <Warning>
-    **Version 1.1.1 narrows AWS backup permissions.** This version removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to **every bucket in your AWS account** and contains no write actions at all, so it was never carrying the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit.
-
-    **Update your IAM policy to the full action list below before upgrading.** If it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only, which is strictly narrower than before. Nothing else changes.
-    </Warning>
+    Create an IAM policy with the following JSON, replacing `YOUR_BUCKET_NAME`, and set `backup.aws.policyName` to its name. The identity carries `cpln-connector` and this bucket-scoped policy only:
 
     ```json
     {
@@ -425,51 +348,195 @@ With `backup.enabled: true`, a cron workload calls Weaviate's backup API on `bac
   </Step>
 </Steps>
 
-### GCS
+#### GCS
 
 <Steps>
   <Step title="Create a bucket">
     Create a GCS bucket. Set `backup.gcp.bucket` to its name and `backup.gcp.path` to the prefix.
   </Step>
   <Step title="Set up a Cloud Account">
-    If you do not have one, [create a Cloud Account](https://docs.controlplane.com/guides/create-cloud-account) for the GCP project. Set `backup.gcp.cloudAccountName` to its name.
+    If you do not have one, [create a Cloud Account](/guides/create-cloud-account) for the GCP project. Set `backup.gcp.cloudAccountName` to its name.
   </Step>
   <Step title="Grant the bucket role">
     Grant the Cloud Account's service account `roles/storage.objectAdmin` on that bucket. The template requests exactly that role on exactly that bucket, and nothing more.
   </Step>
 </Steps>
 
-## Restoring a Backup
-
-Run the restore from inside any Weaviate replica. Use `gcs` in place of `s3` for GCP backups, and replace `BACKUP_ID` with the backup name from your bucket (they are written as `weaviate-backup-YYYYMMDD-HHMMSS`):
+To check the outcome of a scheduled run, read the backup job's logs:
 
 ```bash
-# Trigger the restore
-wget -qO- \
-  --header='Authorization: Bearer YOUR_API_KEY' \
-  --header='Content-Type: application/json' \
-  --post-data='{}' \
-  'http://localhost:8080/v1/backups/s3/BACKUP_ID/restore'
-
-# Poll for completion
-wget -qO- \
-  --header='Authorization: Bearer YOUR_API_KEY' \
-  'http://localhost:8080/v1/backups/s3/BACKUP_ID/restore'
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-weaviate-backup"}' --limit 50 --since 24h
 ```
 
+### Restoring a Backup
+
 <Warning>
-A restore is not a merge. It fails if a collection from the backup already exists on the cluster — drop the collection first, or restore into a fresh deployment.
+**This restore procedure is unverified for this template.** It follows the upstream Weaviate backup API and the backup module configuration this chart ships, and the pinned image provides `wget`, but it has not been run against a snapshot written by this template. Test it against a backup you do not need before you depend on it.
 </Warning>
+
+Run the restore from inside any Weaviate replica. Use `gcs` in place of `s3` for GCP backups, and replace `BACKUP_ID` with the backup name from your bucket:
+
+```bash
+cpln workload exec RELEASE_NAME-weaviate --gvc GVC_NAME --container weaviate -- \
+  sh -c "wget -qO- --header='Authorization: Bearer YOUR_API_KEY' \
+  --header='Content-Type: application/json' --post-data='{}' \
+  http://localhost:8080/v1/backups/s3/BACKUP_ID/restore"
+```
+
+Poll the same URL without `--post-data` until the status reads `SUCCESS`:
+
+```bash
+cpln workload exec RELEASE_NAME-weaviate --gvc GVC_NAME --container weaviate -- \
+  sh -c "wget -qO- --header='Authorization: Bearer YOUR_API_KEY' \
+  http://localhost:8080/v1/backups/s3/BACKUP_ID/restore"
+```
+
+A restore is not a merge: it fails if a collection from the backup already exists on the cluster. Drop the collection first, or restore into a fresh release.
+
+### Upgrading From 1.0.1 or Earlier
+
+Template version 1.1.0 is a security release. Every credential the chart used to accept as a value is now a secret you create and reference by name, and carrying a 1.0.1 values file forward **fails at render** with a message naming its replacement — nothing silently falls back to a default.
+
+<Warning>
+**Treat the key on any 1.0.1 or earlier install as compromised.** Those versions shipped a working API key as a values default, published in the public template repository and shared by every install that did not override it. It is the only authentication Weaviate has, so anyone holding it can read and write every collection. Rotate it rather than simply upgrading.
+</Warning>
+
+| 1.0.1 and earlier | 1.1.0 and later | Why |
+|---|---|---|
+| `apiKey` (a working key) | `apiKeySecretName` → required prerequisite opaque secret | The default key was public and shared by every install that did not override it |
+| `modules.openai.apiKey` and the `anthropic`, `cohere`, `huggingface` equivalents | `modules.{provider}.apiKeySecretName` → optional prerequisite opaque secrets | Your own provider billing keys were landing in the Helm release in plaintext |
+| `internal_access` | `internalAccess` | Renamed only; the fields (`type`, `workloads`) are unchanged |
+| `clusterName` | Removed | It was never rendered into any resource. Nothing replaces it |
+
+The render guard for the API key reads:
+
+```text
+weaviate: `apiKey` was removed in 1.1.0 — the API key is now a REQUIRED prerequisite
+`opaque` secret (encoding: plain). Create it, then set `apiKeySecretName` to its name.
+```
+
+<Steps>
+  <Step title="Rotate the key, do not carry it forward">
+    Generate a **new** key and create the secret as shown in [Prerequisites](#prerequisites). If you overrode the old default with your own value, that value still travelled in the Helm release and is worth rotating too.
+  </Step>
+  <Step title="Replace the removed keys">
+    Delete `apiKey`, `clusterName`, and any `modules.{provider}.apiKey` entries from your values. Set `apiKeySecretName`, rename `internal_access` to `internalAccess`, and create a provider secret for each provider you actually use.
+  </Step>
+  <Step title="Update every client">
+    The API key changes, so every application, notebook, and client library holding the old bearer token must be updated.
+  </Step>
+  <Step title="Plan the restart">
+    A `cpln helm upgrade` restarts the cluster one replica at a time. Read [Scaling and Availability](#scaling-and-availability) first and verify cluster health afterwards — the platform's ready status will not tell you if a node failed to rejoin.
+  </Step>
+</Steps>
+
+### Upgrading From 1.1.0
+
+Template version 1.1.1 removes the `aws::ReadOnlyAccess` managed policy from the backup identity. That policy granted read access to **every bucket in your AWS account** and contains no write actions, so it was never carrying the backup itself — but it was silently supplying any read action your own bucket-scoped policy happened to omit.
+
+**If you back up to S3, update your IAM policy to the full action list under [AWS S3](#aws-s3) before upgrading.** If it already matches, no action is needed. GCS backups and installs without backups are unaffected. Nothing else changes.
+
+### Scaling and Availability
+
+`replicas` sets the number of Weaviate nodes, each with its own volume. Raft needs a quorum to elect a leader and accept schema changes, so a three-node cluster tolerates the loss of one node and a two-node cluster tolerates none. Upgrades restart replicas one at a time.
+
+<Warning>
+**A replica can fail to rejoin the cluster after a rolling restart, and the platform will not tell you.** The readiness probe only checks that the HTTP server is up, so a node that came back without rejoining the Raft cluster still reports `ready` and still receives traffic. Clients then see intermittent `404 Not Found` for collections that exist on the other nodes. **Verify cluster health after any restart** — an upgrade, an image bump, or a platform reschedule — instead of trusting the ready status.
+</Warning>
+
+Check membership from inside a replica. A healthy cluster reports one `Leader` and the remaining nodes as `Follower`, and `/v1/nodes` lists every replica as `HEALTHY`:
+
+```bash
+cpln workload exec RELEASE_NAME-weaviate --gvc GVC_NAME --container weaviate -- \
+  sh -c "wget -qO- --header='Authorization: Bearer YOUR_API_KEY' \
+  http://localhost:8080/v1/cluster/statistics"
+```
+
+```bash
+cpln workload exec RELEASE_NAME-weaviate --gvc GVC_NAME --container weaviate -- \
+  sh -c "wget -qO- --header='Authorization: Bearer YOUR_API_KEY' \
+  http://localhost:8080/v1/nodes"
+```
+
+A split node reports `"state":"Candidate"` with an empty `leaderId`, and `/v1/nodes` queried from a healthy replica lists fewer nodes than you deployed. No in-place repair for a split node has been verified for this template. A single-replica install (`replicas: 1`) has no Raft membership to lose and is not exposed to this.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Workload never becomes ready and cpln logs returns nothing">
+    **Symptom:** `cpln helm install` succeeds, every resource exists, but `RELEASE_NAME-weaviate` never reaches ready and `cpln logs` prints zero lines.
+
+    **Cause:** The secret named by `apiKeySecretName` (or a provider's `apiKeySecretName`) does not exist. The container is never started, so there is nothing to log. The only diagnostic is `status.versions[].message`:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-weaviate --gvc GVC_NAME -o yaml
+    ```
+
+    ```text
+    The secret my-weaviate-api-key no longer exists. Workload updates are paused until
+    the secret is added or the reference to the secret removed.
+    ```
+
+    **Fix:** Create the missing secret as shown in [Prerequisites](#prerequisites). The deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-weaviate --gvc GVC_NAME` to skip the wait.
+  </Accordion>
+  <Accordion title="401 Unauthorized on every request">
+    **Symptom:** Requests return `401 Unauthorized` even with the `Authorization: Bearer` header set.
+
+    **Cause:** The key you are sending is not the current payload of the secret named by `apiKeySecretName`, or you rotated the secret without restarting the cluster — a secret is read when a replica starts, and nothing re-reads it while the replica lives.
+
+    **Fix:** Read the key the cluster trusts with `cpln secret reveal SECRET_NAME -o yaml`. After changing the secret's payload, force a redeployment so every replica picks up the new key:
+
+    ```bash
+    cpln workload force-redeployment RELEASE_NAME-weaviate --gvc GVC_NAME
+    ```
+  </Accordion>
+  <Accordion title="Some requests return 404 Not Found for a collection that exists">
+    **Symptom:** After an upgrade or restart, roughly one request in `replicas` fails with `404 Not Found` for a collection other requests find, while every replica reports ready.
+
+    **Cause:** One replica did not rejoin the Raft cluster after its restart and is serving an empty schema. It still passes the readiness probe, so it stays in rotation.
+
+    **Fix:** Identify the node with the `/v1/cluster/statistics` and `/v1/nodes` checks under [Scaling and Availability](#scaling-and-availability). No in-place repair has been verified for this template; keep a current backup so you can restore into a fresh release.
+  </Accordion>
+  <Accordion title="A provider is being called and billed although modules.enabled is empty">
+    **Symptom:** Inserts into a collection whose vectorizer is a provider module (for example `text2vec-openai`) produce embeddings and provider charges, even though `modules.enabled: []`.
+
+    **Cause:** On Weaviate 1.38 the API-based modules load regardless of `modules.enabled`. Naming a provider's `apiKeySecretName` is what makes that provider live.
+
+    **Fix:** Set the provider's `apiKeySecretName` back to `""` and run `cpln helm upgrade`. That removes the environment variable, the `reveal` grant and the outbound internet access together.
+  </Accordion>
+  <Accordion title="Backup job fails to reach Weaviate with internalAccess.type workload-list">
+    **Symptom:** With `internalAccess.type: workload-list`, the `RELEASE_NAME-weaviate-backup` job's calls to the cluster are refused and no snapshot is written.
+
+    **Cause:** The backup job is a separate workload and is not on the allow-list.
+
+    **Fix:** Add `//gvc/GVC_NAME/workload/RELEASE_NAME-weaviate-backup` to `internalAccess.workloads`, or use `same-gvc` or `same-org`.
+  </Accordion>
+  <Accordion title="A workload is still refused after changing internalAccess">
+    **Symptom:** You changed `internalAccess.type` or `internalAccess.workloads`, upgraded, and a caller still gets `503 upstream connect error` or a connection refusal.
+
+    **Cause:** An access change takes up to a couple of minutes to take effect, and a denial is indistinguishable from an unhealthy upstream.
+
+    **Fix:** Wait a couple of minutes and retry before concluding the setting did not apply.
+  </Accordion>
+  <Accordion title="403 RBAC access denied on the canonical cpln.app endpoint">
+    **Symptom:** A request to the workload's `*.cpln.app` hostname returns `403 RBAC: access denied` even with a valid API key.
+
+    **Cause:** This template closes inbound internet access unconditionally; the request is refused at the platform edge before it reaches Weaviate.
+
+    **Fix:** Reach Weaviate from inside the GVC, through `cpln port-forward`, or through your own authenticating proxy deployed in the GVC. There is no values key to open the public endpoint.
+  </Accordion>
+</AccordionGroup>
 
 ## Important Notes
 
 - **Create the API key secret before you install.** Without it the install reports success and the deployment silently wedges, with no container and no logs. See [Prerequisites](#prerequisites).
-- **Verify cluster health after every restart.** A replica that fails to rejoin the Raft cluster still reports `ready` and still receives traffic. See [Rolling Restarts Can Split a Replica Out of the Cluster](#rolling-restarts-can-split-a-replica-out-of-the-cluster).
-- **A named provider secret is a live billable integration**, whether or not the module is listed in `modules.enabled`.
-- **Keep your own copy of the API key.** Rotating it means updating the secret and restarting the cluster; losing it locks you out of every collection.
+- **Verify cluster health after every restart.** A replica that fails to rejoin the Raft cluster still reports ready and still receives traffic. See [Scaling and Availability](#scaling-and-availability).
+- **A named provider secret is a live, billable integration**, whether or not the module is listed in `modules.enabled`.
+- **Rotating the API key requires a forced redeployment.** Update the secret's payload, then run `cpln workload force-redeployment RELEASE_NAME-weaviate --gvc GVC_NAME`; until then the old key keeps working and the new one does not.
+- **Keep your own copy of the API key.** Losing it locks you out of every collection.
 - **There is no public endpoint**, and that is not configurable in this template. Reachability is `internalAccess` only, and an access change takes up to a couple of minutes to settle.
 - **Size memory, not CPU.** Vector indexes are RAM-resident; an undersized cluster fails with out-of-memory restarts.
-- **Backups are unverified.** Confirm a snapshot lands in your bucket before depending on the schedule.
+- **Backups and restores are unverified from this template.** Confirm a snapshot lands in your bucket, and test a restore, before depending on either.
 
 ## External References
 

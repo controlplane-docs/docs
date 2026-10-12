@@ -1,28 +1,44 @@
 ---
 title: etcd
 icon: /template-catalog/templates/icons/etcd.png
-description: Deploy etcd on Control Plane using the Template Catalog. Covers configuration, volumes, scaling, and distributed key-value store cluster setup with peer discovery.
-keywords: ['kv store', 'service discovery', 'config store', 'consul alternative', 'zookeeper alternative', 'k8s backend', 'distributed lock', 'raft consensus', 'leader election', 'coordination service', 'auto-compaction', 'nospace alarm', 'backend quota', 'etcdctl']
+description: Deploy etcd on Control Plane using the Template Catalog. A single-location quorum cluster of three or more stateful replicas with persistent volumes and auto-compaction on by default. No prerequisites; installs into an existing GVC.
+keywords: ['kv store', 'service discovery', 'config store', 'consul alternative', 'zookeeper alternative', 'k8s backend', 'distributed lock', 'raft consensus', 'leader election', 'coordination service', 'patroni dcs', 'nospace alarm', 'backend quota', 'etcdctl', 'snapshot save']
 ---
 
 ## Overview
 
-etcd is a distributed, reliable key-value store designed for the most critical data of a distributed system. It provides consistent coordination, service discovery, and configuration management across distributed systems, making it a common foundation for cluster health and orchestration. This template deploys an etcd cluster as a stateful workload with configurable replica count, persistent storage, and auto-compaction configured so the backend does not grow without bound.
+etcd is a distributed, strongly consistent key-value store for the most critical data of a distributed system: leader election, distributed locks, service discovery and shared configuration. This template deploys an etcd cluster as one stateful workload whose replicas form a single Raft quorum in one location, each member on its own persistent volume, with auto-compaction configured so the backend does not grow without bound. It is also the consensus store that [Postgres Highly Available](/template-catalog/templates/postgres-highly-available) and [TimescaleDB Highly Available](/template-catalog/templates/timescaledb-highly-available) bundle for Patroni.
+
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) you already have; it does not create one. Each member builds its peer list from its own location, so the cluster is meant for a GVC with a single location — for a cluster that spans locations use the [etcd Multi-Location](/template-catalog/templates/etcd-multi-location) template instead.
+</Note>
 
 ### What Gets Created
 
-- **Stateful Workload** — An etcd cluster with a configurable number of replicas (default: 3).
-- **Volume Set** — Persistent storage for etcd data.
-- **Secret** — An opaque startup script secret that handles cluster initialization, peer URL configuration, and replica setup.
-- **Identity & Policy** — An identity bound to the workload with `reveal` access to the startup script secret.
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-etcd` | The etcd members: a stateful workload of `replicas` replicas, client API on port `2379`, peer traffic on port `2380` | — |
+| Volume Set | `RELEASE_NAME-etcd-vs` | `/var/lib/etcd` on every member — `ext4` on general-purpose SSD, snapshots retained 7 days, final snapshot on uninstall | — |
+| Secret | `RELEASE_NAME-etcd-startup` | The startup script that derives each member's name and peer list at boot | — |
+| Identity | `RELEASE_NAME-etcd-identity` | Bound to the workload so it can read the startup script | — |
+| Policy | `RELEASE_NAME-etcd-policy` | Grants the identity `reveal` on the startup secret and nothing else | — |
 
-<Note>
-This template does not create a GVC. You must deploy it into an existing GVC.
-</Note>
+The template creates no credential secret: etcd here runs without TLS or authentication, and access is governed by the internal firewall (see [Internal Access](#internal-access)).
+
+## Prerequisites
+
+None for a default install. There are no secrets to create and no cloud account to connect.
 
 ## Installation
 
-This template has no external prerequisites. To install, follow the instructions for your preferred method:
+A default install needs only a release name and the GVC to deploy into:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/etcd \
+  --version 1.4.2 --gvc GVC_NAME
+```
+
+To install with another method, follow the instructions for your preferred tool:
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -48,56 +64,55 @@ This template has no external prerequisites. To install, follow the instructions
 
 ## Configuration
 
-The default `values.yaml` for this template:
-
-```yaml
-replicas: 3 # minimum 3, must be odd
-
-resources:
-  cpu: 1
-  memory: 2Gi
-
-multiZone: false
-
-# etcd keeps every superseded revision until told otherwise, so compaction is
-# required rather than optional and cannot be switched off here.
-tuning:
-  autoCompactionMode: periodic # periodic (retention is a duration) or revision (a revision count)
-  autoCompactionRetention: 1h # periodic needs an explicit unit (1h, 30m, 24h); revision takes a count
-  quotaBackendBytes: 0 # backend size limit in bytes; 0 = etcd's own default of 2 GiB
-
-volumeset:
-  capacity: 10 # initial capacity in GiB (minimum is 10)
-
-internal_access:
-  type: same-gvc # options: same-gvc, same-org, workload-list
-  workloads: # Note: can only be used if type is same-gvc or workload-list
-    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
-```
+Each subsection below shows the shipped default for one area of `values.yaml`. Override only what you need with `--set` or a values file.
 
 ### Replicas
 
-- `replicas` — Number of etcd instances in the cluster (minimum 3).
+```yaml
+replicas: 3 # minimum 3, must be odd
+```
 
-<Note>
-The replica count must always be an odd number. etcd uses the Raft consensus algorithm, which requires a majority quorum — an odd number of members ensures a quorum can always be reached and avoids split-brain scenarios.
-</Note>
+- `replicas` — Number of etcd members in the cluster. Must be at least 3 and odd; an even count adds no fault tolerance and risks split votes. Install-time validation rejects anything else. Choose the count when you install — see [Scaling and Availability](#scaling-and-availability).
+
+### Image
+
+```yaml
+image: controlplanecorporation/etcd:0.1
+```
+
+- `image` — The etcd container image. The shipped tag carries etcd `3.6.5` together with `etcdctl` and `etcdutl`.
 
 ### Resources
 
-- `resources.cpu` / `resources.memory` — CPU and memory allocated to each etcd instance (default: 1 CPU, 2Gi). These can be lowered for lighter workloads. See the [etcd hardware recommendations](https://etcd.io/docs/v3.6/op-guide/hardware/) for guidance.
+```yaml
+resources:
+  cpu: 1
+  memory: 2Gi
+```
 
-### Storage
+- `resources.cpu` / `resources.memory` — CPU and memory limit for each member. These can be lowered for lighter workloads; see the [etcd hardware recommendations](https://etcd.io/docs/v3.6/op-guide/hardware/) for sizing guidance.
 
-- `volumeset.capacity` — Persistent volume size in GiB for etcd data (minimum 10).
+### Multi-Zone
+
+```yaml
+multiZone: false
+```
+
+- `multiZone` — When `true`, distributes the members across the availability zones of the location.
+
+<Note>
+Not all locations support multi-zone deployments. Confirm that your target location supports multi-zone before enabling this option.
+</Note>
 
 ### Compaction and Backend Growth
 
-etcd never discards a superseded revision on its own. Every write creates a new revision and the old one is kept until a **compaction** removes it, so the backend grows with **time alone** whenever a client writes on a timer — Patroni, for example, renews its leader lease roughly every 10 seconds, which produces new revisions whether or not any application data changes. Measured on an otherwise idle cluster: about **151,000 revisions and 19 MB per day**, which reaches etcd's default 2 GiB backend quota in roughly **110 days**.
+etcd never discards a superseded revision on its own. Every write creates a new revision and the old one is kept until a **compaction** removes it, so the backend grows with time alone whenever a client writes on a timer — Patroni, for example, renews its leader lease every few seconds, producing new revisions whether or not any application data changes. Left uncompacted, an otherwise idle cluster reaches etcd's default 2 GiB backend quota in a matter of months.
 
-When the quota is reached, etcd raises a cluster-wide `NOSPACE` alarm and **every member goes read-only** until an operator intervenes. Auto-compaction is what prevents that, and this template configures it by default.
+When the quota is reached, etcd raises a cluster-wide `NOSPACE` alarm and **every member goes read-only** until an operator intervenes. Auto-compaction is what prevents that, and this template configures it by default:
 
 ```yaml
+# etcd keeps every superseded revision until told otherwise, so compaction is
+# required rather than optional and cannot be switched off here.
 tuning:
   autoCompactionMode: periodic # periodic (retention is a duration) or revision (a revision count)
   autoCompactionRetention: 1h # periodic needs an explicit unit (1h, 30m, 24h); revision takes a count
@@ -116,29 +131,32 @@ tuning:
 **`quotaBackendBytes` takes a plain byte count, not a size suffix.** etcd itself refuses `--quota-backend-bytes 2Gi` at boot and the cluster would crash-loop, so a `2Gi`-style value is rejected at render time instead. Write `2147483648`.
 </Warning>
 
-Compaction is deliberately not switchable off: a retention of `0`, an unrecognized mode and a negative quota (which etcd reads as "no quota at all") are each rejected at render time. Each one produces a chart that installs cleanly and fails weeks later.
+Compaction is deliberately not switchable off: a retention of `0`, an unrecognized mode and a negative quota (which etcd reads as "no quota at all") are each rejected at render time, because each one produces a chart that installs cleanly and fails weeks later.
 
 <Note>
-**Compaction frees pages for reuse inside the backend file; it does not shrink the file.** The reported `dbSize` therefore plateaus rather than dropping, while `dbSizeInUse` falls back to the size of the live keyspace. That is the expected behavior and is sufficient to stay under the quota, because reclaimed pages are reused for new writes. Only `etcdctl defrag` returns space to the filesystem, and this template does not automate it — defragmentation blocks the member it runs on.
-
-Testing measured the mechanism directly on a shortened retention window: the compacted revision advanced from 1 to 4001, `dbSizeInUse` collapsed from 5.76 MB to 20,480 bytes while `dbSize` stayed at about 5.8 MB, and reads of pre-compaction revisions then failed with `required revision has been compacted`. The multi-day `dbSize` plateau is **derived from that mechanism rather than observed** over days.
+**Compaction frees pages for reuse inside the backend file; it does not shrink the file.** The reported `DB SIZE` therefore plateaus rather than dropping, while `DB SIZE IN USE` falls back to the size of the live keyspace. That is expected and is sufficient to stay under the quota, because reclaimed pages are reused for new writes. Only `etcdctl defrag` returns space to the filesystem, and this template does not automate it — defragmentation blocks the member it runs on.
 </Note>
 
-<Note>
-`etcdctl endpoint status` reports `QUOTA | 0 B` when `quotaBackendBytes` is `0`, because that column reflects the flag rather than the effective limit. The effective quota in that case is still etcd's 2 GiB default, which etcd logs at startup as `enabled backend quota with default value`.
-</Note>
+### Storage
 
-### Multi-Zone
+```yaml
+volumeset:
+  capacity: 10 # initial capacity in GiB (minimum is 10)
+```
 
-- `multiZone` — When `true`, distributes replicas equally across available zones for higher availability.
-
-<Note>
-Not all locations support multi-zone deployments. Confirm that your target location supports multi-zone before enabling this option.
-</Note>
+- `volumeset.capacity` — Size in GiB of the persistent volume each member gets for `/var/lib/etcd` (minimum 10). The volume set keeps snapshots for 7 days and takes a final snapshot when the release is uninstalled.
 
 ### Internal Access
 
-The `internal_access` section controls which workloads can reach the etcd cluster:
+```yaml
+internal_access:
+  type: same-gvc # options: same-gvc, same-org, workload-list
+  workloads:  # Note: can only be used if type is same-gvc or workload-list
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+    #- //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
+
+- `internal_access.type` — Controls which workloads can reach the client API on port `2379`:
 
 | Type | Description |
 |------|-------------|
@@ -146,12 +164,96 @@ The `internal_access` section controls which workloads can reach the etcd cluste
 | `same-org` | Allow access from all workloads in the same organization |
 | `workload-list` | Allow access only from specific workloads listed in `workloads` |
 
-## If the Backend Quota Is Already Full
-
-Auto-compaction is configured from template version `1.4.2` onward. Earlier versions passed no compaction flags at all, so a cluster installed from one of them retains every revision it has ever written and grows until it hits the quota.
+- `internal_access.workloads` — The workload links allowed in when `type` is `workload-list`.
 
 <Warning>
-**Upgrading turns compaction on, but it cannot rescue a cluster that has already filled its backend.** Compaction stops further growth; it never shrinks an existing backend file. Once etcd has raised a `NOSPACE` alarm, writes stay rejected until an operator compacts, defragments each member and disarms the alarm — an upgrade does none of that.
+**etcd runs here without TLS or authentication.** Anything the internal firewall lets in has full read and write access to the keyspace. If the GVC holds workloads that should not have that, use `workload-list` and name the clients explicitly. A firewall change can take a few minutes to take effect; re-test rather than trusting the first response.
+</Warning>
+
+## Connecting
+
+The cluster has no public endpoint: external inbound traffic is closed and no load balancer is created. Clients connect from inside the GVC, or from your machine through a port-forward.
+
+| What | Address | Notes |
+|---|---|---|
+| Client API from the same GVC | `http://RELEASE_NAME-etcd.GVC_NAME.cpln.local:2379` | Resolves to any member; the one address to give to clients |
+| A specific member | `http://replica-N.RELEASE_NAME-etcd.LOCATION.GVC_NAME.cpln.local:2379` | `N` runs from `0` to `replicas - 1`; `LOCATION` is the GVC's location name |
+| Peer traffic | `RELEASE_NAME-etcd.GVC_NAME.cpln.local:2380` | Used by the members themselves; clients do not need it |
+| Credentials | none | No TLS and no authentication — access is decided by [Internal Access](#internal-access) |
+
+Always use the fully qualified hostname; the bare workload name is not reliably resolvable.
+
+Verify the cluster from inside one of its members. `etcdctl` is in the image and talks to the local member by default:
+
+```bash
+cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl endpoint status --cluster -w table
+```
+
+Every member should appear with the same `RAFT TERM` and exactly one `IS LEADER: true`. From another workload in the GVC, point `etcdctl` at the service address:
+
+```bash
+etcdctl --endpoints=http://RELEASE_NAME-etcd.GVC_NAME.cpln.local:2379 put hello world
+etcdctl --endpoints=http://RELEASE_NAME-etcd.GVC_NAME.cpln.local:2379 get hello
+```
+
+To reach the cluster from your own machine, forward the client port and use a local `etcdctl` against `http://127.0.0.1:2379`:
+
+```bash
+cpln port-forward RELEASE_NAME-etcd 2379:2379 --gvc GVC_NAME
+```
+
+<Tip>
+Give long-lived clients a short command timeout (`etcdctl --command-timeout=5s`, or the equivalent in your client library). When fewer than a majority of members are reachable, etcd makes writes wait for quorum rather than failing immediately, so a client without a timeout appears to hang.
+</Tip>
+
+## Operations
+
+### Backing Up
+
+Two independent layers protect the data:
+
+- **Volume set snapshots.** The volume set `RELEASE_NAME-etcd-vs` keeps snapshots for 7 days and takes a final snapshot when the release is uninstalled; this is configured by the template and needs no action. To take one on demand:
+
+  ```bash
+  cpln volumeset snapshot create RELEASE_NAME-etcd-vs --gvc GVC_NAME --snapshot-name NAME
+  ```
+
+- **An etcd snapshot file.** `etcdctl snapshot save` writes a consistent, hash-protected copy of the whole keyspace from one member. The image ships `etcdctl` and `base64`, so the file can be pulled out through `cpln workload exec`. Pass it through `base64` on both sides — the exec stream is text-only and corrupts raw binary:
+
+  ```bash
+  cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- \
+    sh -c 'etcdctl snapshot save /tmp/snapshot.db >/dev/null 2>&1 && base64 /tmp/snapshot.db' \
+    | base64 -d > etcd-snapshot.db
+  ```
+
+  Then confirm the file is intact on your machine with `etcdutl`, which is part of every [etcd release](https://github.com/etcd-io/etcd/releases):
+
+  ```bash
+  etcdutl snapshot status etcd-snapshot.db -w table
+  ```
+
+<Note>
+The snapshot command above was checked against the shipped image's contents and the upstream `etcdctl` documentation, but has not been exercised against a live install of this template. Run it once on a test release and confirm `etcdutl snapshot status` reports the hash before you rely on it.
+</Note>
+
+### Restoring a Backup
+
+**Restoring is not a procedure this template performs or has verified.** The upstream path — `etcdutl snapshot restore` — rebuilds a data directory for every member with a new cluster ID and requires each member to be stopped and started from the rebuilt directory. This template manages the data directory through the startup script and gives you no supported way to stop a member and replace `/var/lib/etcd` on its volume. Restoring a volume set snapshot in place is likewise unverified for this template.
+
+If you must recover a keyspace, follow the [etcd disaster recovery guide](https://etcd.io/docs/v3.6/op-guide/recovery/) against a **new** release and rehearse it on a throwaway release first. Where etcd came bundled with a database template as its Patroni consensus store, consult that parent template's page before attempting any etcd-level recovery.
+
+### Upgrading From a Version Before 1.4.2
+
+Auto-compaction is configured from template version `1.4.2` onward. Earlier versions passed no compaction flags at all, so a cluster installed from one of them retains every revision it has ever written and grows until it hits the backend quota.
+
+- Upgrading is a normal `cpln helm upgrade`; the `tuning` keys are new and their defaults apply if you set nothing.
+- Upgrading turns compaction on but **cannot rescue a cluster that has already filled its backend** — see [If the Backend Quota Is Already Full](#if-the-backend-quota-is-already-full) and check that first.
+- If etcd came bundled with [Postgres Highly Available](/template-catalog/templates/postgres-highly-available) or [TimescaleDB Highly Available](/template-catalog/templates/timescaledb-highly-available), the etcd version is pinned by that parent chart. Upgrade the parent; do not install this template alongside it.
+
+### If the Backend Quota Is Already Full
+
+<Warning>
+**Compaction stops further growth; it never shrinks an existing backend file.** Once etcd has raised a `NOSPACE` alarm, writes stay rejected until an operator compacts, defragments each member and disarms the alarm — an upgrade does none of that.
 </Warning>
 
 The symptom usually surfaces in the client rather than in etcd. A Patroni replica that cannot renew its lease exits *cleanly*, so it restart-loops with `exitCode: 0` and `reason: Completed` and a climbing restart count — which reads as healthy and gets misdiagnosed as a database fault. Check etcd first.
@@ -165,6 +267,63 @@ cpln workload exec RELEASE_NAME-etcd --gvc GVC_NAME --container etcd -- etcdctl 
 
 A `DB SIZE` close to 2.1 GB on every member, plus `NOSPACE` in the alarm list, confirms it. A healthy cluster prints nothing at all for `alarm list`. Recovery from there — compacting to a revision, defragmenting each member, then disarming the alarm — is an operator procedure this template deliberately does not perform, because each step is disruptive and the order matters. Follow etcd's [maintenance guide](https://etcd.io/docs/v3.6/op-guide/maintenance/) and plan it as a maintenance window.
 
+### Scaling and Availability
+
+- **Fault tolerance follows the member count.** A cluster of `N` members keeps serving while a majority is up: 3 members tolerate 1 failure, 5 tolerate 2. Even counts add nothing, which is why the template requires an odd number.
+- **Choose `replicas` at install time.** Each member derives its peer list from the replica count when it boots, and the template performs no `etcdctl member add` or `member remove`. Changing `replicas` on a running release is therefore not a supported operation; to change the size, install a new release and move clients over.
+- **Spread across zones with `multiZone: true`** when the location supports it, so a single-zone failure cannot take a majority down.
+- **A restart of the whole workload** (a `cpln helm upgrade` that changes the workload, or a forced redeployment) restarts the members; each rejoins from its own volume with `--initial-cluster-state existing`, so the keyspace is preserved. Expect writes to pause while a leader is re-elected.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Install fails: .Values.replicas must be an odd number / must be at least 3">
+    **Cause:** The template validates `replicas` at render time. An even number or anything below 3 is rejected before any resource is created.
+
+    **Fix:** Set `replicas` to `3`, `5` or `7`.
+  </Accordion>
+  <Accordion title="Install fails: tuning.autoCompactionRetention must carry an explicit unit">
+    **Cause:** In `periodic` mode etcd reads a bare number as hours, so the template refuses an unsuffixed retention rather than letting a `30` become thirty hours.
+
+    **Fix:** Add a unit — `30m`, `1h`, `24h`. In `revision` mode supply a plain revision count instead, such as `10000`.
+  </Accordion>
+  <Accordion title="Writes fail with etcdserver: mvcc: database space exceeded">
+    **Cause:** The backend quota is full and etcd has raised a cluster-wide `NOSPACE` alarm. Every member is read-only until the alarm is cleared. This is the expected end state of a cluster installed from a version before 1.4.2 that was never compacted.
+
+    **Fix:** Confirm with `etcdctl alarm list`, then follow [If the Backend Quota Is Already Full](#if-the-backend-quota-is-already-full). Upgrading the template alone does not clear it.
+  </Accordion>
+  <Accordion title="Reads fail with etcdserver: mvcc: required revision has been compacted">
+    **Cause:** A client asked for a revision older than the retention window — a `get --rev` or a watch resuming from a revision that auto-compaction has already discarded. With the default `autoCompactionRetention: 1h` only the last hour of history is readable.
+
+    **Fix:** Read the current revision instead, or restart the watch from the current revision. If your application genuinely needs a longer history, raise `tuning.autoCompactionRetention` (for example `24h`) and accept the larger backend.
+  </Accordion>
+  <Accordion title="etcdctl hangs, then reports context deadline exceeded">
+    **Cause:** Fewer than a majority of members are reachable, so the cluster cannot commit writes; etcd waits for quorum rather than failing fast. Linearizable reads wait as well.
+
+    **Fix:** Check which members are healthy and whether any replica is restarting:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-etcd --gvc GVC_NAME -o yaml
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-etcd"}' --limit 50 --since 10m
+    ```
+
+    Once a majority is back, pending operations complete on their own. Always give clients a `--command-timeout` so an outage surfaces as an error instead of a hang.
+  </Accordion>
+  <Accordion title="Patroni replicas restart-loop with exitCode 0 and reason Completed">
+    **Cause:** The Postgres cluster's consensus store cannot accept writes — most often because this etcd cluster's backend quota is full — so Patroni cannot renew its leader lease and exits cleanly. The restarts look healthy because the exit code is zero.
+
+    **Fix:** Run the two read-only commands in [If the Backend Quota Is Already Full](#if-the-backend-quota-is-already-full) before touching the database.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- **`replicas` must be odd and at least 3, and is chosen at install time.** The template does not resize a running cluster.
+- **Deploy into a single-location GVC.** Members only discover peers in their own location; use the [etcd Multi-Location](/template-catalog/templates/etcd-multi-location) template for a cluster that spans locations.
+- **No TLS, no authentication.** Scope `internal_access` with `workload-list` whenever the GVC holds workloads that should not read or write the keyspace.
+- **Compaction is required and cannot be switched off.** A full backend quota puts the cluster into a read-only `NOSPACE` alarm that survives restarts and must be cleared explicitly after compacting and defragmenting.
+- **Uninstalling deletes the volume sets, and with them the entire keyspace.** The volume set takes a final snapshot first.
+
 ## External References
 
 <CardGroup cols={2}>
@@ -173,6 +332,9 @@ A `DB SIZE` close to 2.1 GB on every member, plus `NOSPACE` in the alarm list, c
     </Card>
     <Card title="Maintenance and Compaction" icon="broom" href="https://etcd.io/docs/v3.6/op-guide/maintenance/">
     Compaction, defragmentation, and clearing a NOSPACE alarm
+    </Card>
+    <Card title="Disaster Recovery" icon="life-ring" href="https://etcd.io/docs/v3.6/op-guide/recovery/">
+    Snapshotting and restoring a cluster with etcdctl and etcdutl
     </Card>
     <Card title="Hardware Recommendations" icon="server" href="https://etcd.io/docs/v3.6/op-guide/hardware/">
     etcd hardware and resource sizing guidelines

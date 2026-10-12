@@ -49,7 +49,7 @@ These are the areas where answers go wrong most often. The facts are grouped by 
 ### Workloads — types, scaling, and immutability
 
 - **Scale to zero is ONLY available** for Serverless workloads using `rps` or `concurrency`. Standard and Stateful can scale to zero only via KEDA. Cron cannot scale to zero. Default `minScale` is 1.
-- **Capacity AI works on every workload type.** It is on by default for Standard, Serverless, and Cron. It does **NOT** work with CPU Utilization autoscaling, multi-metric autoscaling, or GPUs, and is mutually exclusive with all three.
+- **Capacity AI works on every workload type.** It is on by default for Standard, Serverless, and Cron. Stateful and VM default off through the API but on through Terraform and Pulumi. It does **NOT** work with CPU Utilization autoscaling, multi-metric autoscaling, or GPUs, and is mutually exclusive with all three.
 - **`replicaDirect` load balancing is Stateful-only.** It gives each replica its own routable endpoint. Serverless, Standard, and Cron do not support it.
 - **Cron workloads deploy to ALL locations** in their GVC with no per-location overrides, and cannot expose ports. `spec.job` (with `schedule`) is required; probes, autoscaling, and `timeoutSeconds` are ignored. `capacityAI` applies and is on by default, taking effect at the next scheduled run.
 - **Workload type is immutable.** Changing type (serverless ↔ standard ↔ stateful ↔ cron) requires deleting and recreating the workload. Capture state with `cpln workload get NAME --gvc GVC -o yaml-slim > NAME.bak.yaml` first.
@@ -124,7 +124,7 @@ These are the areas where answers go wrong most often. The facts are grouped by 
 |:---|:---:|:---:|:---:|:---:|
 | Scale to zero | `rps` / `concurrency` | KEDA only | KEDA only | No |
 | Ports | Exactly 1 HTTP (required) | 0 or more | 0 or more | Must NOT expose any |
-| Capacity AI | Yes (default) | Yes (default) | Supported | Yes (default), applied at the next run |
+| Capacity AI | Yes (default) | Yes (default) | Yes (API default off; Terraform and Pulumi default on) | Yes (default), applied at the next run |
 | Persistent volumes | No | No | Yes (volume sets) | No |
 | `replicaDirect` LB | No | No | **Yes (only type)** | No |
 | Multi-metric autoscaling | No | Yes | Yes | N/A |
