@@ -501,7 +501,7 @@ Dedicated LB on the GVC (`spec.loadBalancer.dedicated: true`) unlocks: domain po
 
 Bind principals to permissions on resources. Wrong target kind, link format, or permission name all silently fail.
 
-- **`targetKind`** is singular and lowercase. Valid: `account`, `agent`, `auditctx`, `cloudaccount`, `domain`, `group`, `gvc`, `identity`, `image`, `location`, `org`, `policy`, `quota`, `secret`, `serviceaccount`, `task`, `user`, `volumeset`, `workload`. **NOT** valid (controlled via parent): `ipset`, `mk8s`, `workloadreplica`.
+- **`targetKind`** is singular and lowercase. Valid: `account`, `agent`, `auditctx`, `certificategenerator`, `cloudaccount`, `domain`, `group`, `gvc`, `identity`, `image`, `location`, `org`, `policy`, `quota`, `secret`, `serviceaccount`, `task`, `user`, `volumeset`, `workload`. **NOT** valid (controlled via parent): `ipset`, `mk8s`, `workloadreplica`.
 - **Target scope** — pick exactly one: `target: all` | `targetLinks: [...]` | `targetQuery: {spec: {match, terms}}`.
 - **Target link by scope**: org-scoped `//KIND/NAME`, GVC `//gvc/NAME`, GVC-scoped `//gvc/GVC/KIND/NAME`, user `//user/EMAIL`.
 - **Principal links**: user `//user/EMAIL`, service account `//serviceaccount/NAME`, group `//group/NAME`, **identity `//gvc/GVC/identity/NAME`** (NEVER `//identity/NAME` — silent ignore).
@@ -521,12 +521,13 @@ Provider sections each have XOR rules (e.g. AWS `roleName` ⊻ `policyRefs`; GCP
 | --- | --- |
 | `dnsMode` | `cname` or `ns`. **Apex domains MUST use `cname`** — NS doesn't support apex. |
 | `certChallengeType` | `http01` or `dns01`. **NS mode requires `dns01`** (`http01` rejected). |
+| `certificateGeneratorLink` | Custom ACME CA via a [certificate generator](https://docs.controlplane.com/reference/certificategenerator). **Must not** be combined with `certChallengeType` or `tls.serverCertificate`; an `http01` generator is rejected with `dnsMode: ns`, `gvcLink`, or `workloadLink`. |
 | `gvcLink` ⊻ `workloadLink` ⊻ `ports.routes` | Mutually exclusive. `workloadLink` (replica-direct) is Stateful only. |
 | `acceptAllHosts` ⊻ `acceptAllSubdomains` | Mutually exclusive; both require dedicated LB. |
 | `ports[].protocol` | `http`, `http2` (default), `tcp` (`tcp` requires dedicated LB). |
 | Route scope | All routes in a domain must target workloads in the **same GVC**. |
 
-CNAME records → `cpln.app`. NS records → `ns1.cpln.cloud`, `ns2.cpln.cloud`, `ns1.cpln.live`, `ns2.cpln.live`. Auto-TLS = Let's Encrypt, valid 90 days, auto-renewed every 60. Custom certs use the `keypair` secret type with PEM content. For CORS, header wildcards, route limits, and full route schema, fetch [/reference/domain](https://docs.controlplane.com/reference/domain).
+CNAME records → `cpln.app`. NS records → `ns1.cpln.cloud`, `ns2.cpln.cloud`, `ns1.cpln.live`, `ns2.cpln.live`. Auto-TLS = Let's Encrypt (or a linked certificate generator's CA), valid 90 days, auto-renewed every 60. Custom certs use the `keypair` secret type with PEM content. For CORS, header wildcards, route limits, and full route schema, fetch [/reference/domain](https://docs.controlplane.com/reference/domain).
 
 ## Volume sets
 
