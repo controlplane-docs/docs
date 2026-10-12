@@ -1,0 +1,196 @@
+---
+title: 'Query Costs and Usage'
+description: 'Break down what your orgs cost and use per GVC, workload, or location through the billing and usage APIs, automate it with a billing service account token, and download invoices.'
+keywords: ['cost breakdown', 'cost per gvc', 'cost per workload', 'chargeback', 'showback', 'finops', 'cost export', 'billing-ng', 'metering', 'invoice pdf', 'cpln-bsat', 'usage report']
+---
+
+This guide reads last month's cost and usage per GVC through the API. Use it to report cost per team or environment, or to feed a FinOps tool. The same numbers are in the Console under `Cost & Usage`.
+
+Two APIs are involved:
+
+- The [billing API](/reference/billing-api) (`billing-ng.cpln.io`) prices usage and covers a whole [billing account](/concepts/billing).
+- The [usage API](/reference/usage-api) (`metering.cpln.io`) returns raw quantities, such as core-seconds and bytes, for one org.
+
+## Prerequisites
+
+- To query **cost for a billing account**: the `billing_admin` or `billing_viewer` role on the account.
+- To query **cost or usage for one org**: the `readMetrics` [permission](/reference/org#permissions) on the org. Members of `superusers` have it.
+- `curl` and `jq`.
+
+## Steps
+
+<Steps>
+  <Step title="Get a token">
+    Log in and print a token for your profile:
+
+    ```bash
+    cpln login
+    export TOKEN=$(cpln profile token default)
+    ```
+
+    For scheduled automation, use a token that does not belong to a person. Use an org [service account key](/guides/create-service-account) with `readMetrics` for one org, or a [billing service account token](#automate-with-a-billing-service-account-token) for a whole billing account.
+  </Step>
+
+  <Step title="Find your account ID">
+    List your billing accounts and note the `id` of the one to query:
+
+    ```bash
+    curl -s https://billing-ng.cpln.io/account \
+      -H "Authorization: Bearer $TOKEN" | jq '.items[] | {id, fullName}'
+    ```
+
+    ```bash
+    export ACCOUNT_ID=a1b2c3d4-0000-4000-8000-000000000001
+    ```
+  </Step>
+
+  <Step title="List the GVCs that had usage">
+    List the values of the `gvc` [usage tag](/reference/usage-api#usage-tags) across the account. Tag values are read by calendar month, and the month that begins at or after `endTime` is always included, so this returns GVCs with usage in September or October:
+
+    ```bash
+    curl -s -X POST "https://billing-ng.cpln.io/account/$ACCOUNT_ID/tags/values/query" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "startTime": "2026-09-01T00:00:00Z",
+        "endTime": "2026-09-30T00:00:00Z",
+        "tag": "gvc",
+        "filterBy": { "feature": "workloads" }
+      }' | jq '.tagValues | sort'
+    ```
+
+    The same query works for `workload`, `location`, or `metric`. For a single org, call `POST https://metering.cpln.io/org/ORG_NAME/tags/values/query` with the same body.
+  </Step>
+
+  <Step title="Get cost per GVC">
+    Query September's priced workload usage, grouped by GVC:
+
+    ```bash
+    curl -s -X POST "https://billing-ng.cpln.io/account/$ACCOUNT_ID/charges/-query" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "startTime": "2026-09-01T00:00:00Z",
+        "endTime": "2026-10-01T00:00:00Z",
+        "timeStep": "month",
+        "groupBy": ["gvc"],
+        "consumptionQueries": [
+          {
+            "filterBy": { "feature": "workloads" },
+            "aggregateBy": ["gvc", "metric", "locationType"]
+          }
+        ]
+      }' | jq '.results.periods[0].groups[] | {gvc: .key.gvc, total: ([.consumptions[].total] | add)}'
+    ```
+
+    ```json
+    { "gvc": "prod", "total": 487.12 }
+    { "gvc": "staging", "total": 20.35 }
+    ```
+
+    `total` is in whole units of your account's currency.
+
+    <Warning>
+    Keep `metric` and `locationType` in `aggregateBy`, plus any other tag your [chargeable items](/reference/billing-api#list-chargeable-items) price on, such as `performanceClass` for volume sets. A row is priced only when it carries every tag in its item's `consumptionTags`, and an unpriced row shows `"total": 0`.
+    </Warning>
+
+    To cost a single org, send the same body to `POST https://billing-ng.cpln.io/org/ORG_NAME/charges/-query`.
+  </Step>
+
+  <Step title="Break usage down per workload">
+    Query the raw quantities of one GVC's workloads per day, from the usage API:
+
+    ```bash
+    curl -s -X POST "https://metering.cpln.io/org/ORG_NAME/query" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "startTime": "2026-09-01T00:00:00Z",
+        "endTime": "2026-10-01T00:00:00Z",
+        "timeStep": "day",
+        "aggregateByTimeStep": true,
+        "groupBy": ["workload"],
+        "consumptionQueries": [
+          {
+            "filterBy": { "feature": "workloads", "gvc": "prod", "metric": "/^(cpu|memory)$/" },
+            "aggregateBy": ["workload", "metric"]
+          }
+        ]
+      }'
+    ```
+
+    CPU is returned in core-seconds and memory in byte-seconds. Divide CPU by `3600` for core-hours. See [metrics and units](/reference/usage-api#usage-metrics-and-units) for every metric.
+  </Step>
+</Steps>
+
+## Automate with a Billing Service Account Token
+
+A scheduled export should not run on a person's token. A `billing_admin` can create a token that holds only the `billing_viewer` role:
+
+```bash
+curl -s -X POST "https://billing-ng.cpln.io/account/$ACCOUNT_ID/service-account-token" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{ "name": "finops-export", "roles": ["billing_viewer"] }' | jq -r .token
+```
+
+Store the printed `cpln-bsat-...` value in your secret store; it is shown only once. Use it as the Bearer token for the account endpoints in the steps above, after the step that finds the account ID: `GET /account` lists only the accounts a person belongs to. A billing service account token does not work on the usage API or the `/org/{org}` billing endpoints, so use an org service account key with `readMetrics` for those. See [billing service account tokens](/reference/billing-api#billing-service-account-tokens) to list and revoke tokens.
+
+## Download Invoices
+
+List the account's invoices for a range, then download one as a PDF:
+
+```bash
+curl -s "https://billing-ng.cpln.io/account/$ACCOUNT_ID/charges/invoices?start=2026-01-01T00:00:00Z&end=2026-10-01T00:00:00Z" \
+  -H "Authorization: Bearer $TOKEN" | jq '.invoices[] | {id, number, startTime, totalCharge, status}'
+
+curl -s "https://billing-ng.cpln.io/account/$ACCOUNT_ID/charges/invoices/INVOICE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Accept: application/pdf' \
+  --output invoice.pdf
+```
+
+Invoice amounts such as `totalCharge` are in the smallest currency unit, so `51247` is $512.47. `totalCharge` is before credits; see [invoices](/reference/billing-api#invoices) for the amount due.
+
+## Get Alerted Before Spend Grows
+
+A `billing_admin` can email every `billing_admin` the first time the account's charges for a month reach an amount:
+
+```bash
+curl -s -X POST "https://billing-ng.cpln.io/account/$ACCOUNT_ID/alert" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{ "alert": { "amount": 500, "enabled": true } }'
+```
+
+See [spend alert](/reference/billing-api#spend-alert) to change or remove it.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title='401 {"code":401,"error":"Unauthorized"} from metering.cpln.io'>
+    **Cause:** the token's principal lacks `readMetrics` on the org in the path, the org is deactivated, or the token is a billing service account token, which the usage API does not accept.
+
+    **Fix:** grant `readMetrics` on the org with a [policy](/reference/policy), or use a member of `superusers`. A new grant can take up to 5 minutes to apply.
+  </Accordion>
+  <Accordion title="Every total in a charges query is 0">
+    **Cause:** `aggregateBy` drops a tag the chargeable item prices on, so no rate applies to the row.
+
+    **Fix:** add `metric` and `locationType` to `aggregateBy`. Call `GET https://billing-ng.cpln.io/chargeable_items` to see each item's `consumptionTags`.
+  </Accordion>
+  <Accordion title="startTime and endTime must be aligned with an hour boundary / decomposition failed. Unable to decompose time segment">
+    **Cause:** a tag-values query (first message) or a charges query (second message, a `500`) used a time with minutes or seconds, such as `2026-09-01T10:30:00Z`.
+
+    **Fix:** send UTC times on the hour, such as `2026-09-01T10:00:00Z`.
+  </Accordion>
+  <Accordion title="consumption data at timeStep=hour is retained for 12 months">
+    **Cause:** `hour`, `day`, and `week` usage is kept for 12 months, and the query starts earlier than that.
+
+    **Fix:** use a later `startTime`, or `"timeStep": "month"`, which is kept indefinitely.
+  </Accordion>
+  <Accordion title="the given metering query groups by X, but consumption query N does not aggregate by X">
+    **Cause:** a `groupBy` key is missing from a consumption query's `aggregateBy`.
+
+    **Fix:** add every `groupBy` key to the `aggregateBy` of every consumption query.
+  </Accordion>
+</AccordionGroup>
