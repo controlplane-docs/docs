@@ -1,13 +1,13 @@
 ---
 title: Temporal
 icon: /template-catalog/templates/icons/temporal.png
-description: Deploy Temporal on Control Plane using the Template Catalog. A durable-execution server of one to five replicas plus the Web UI, internal-only, on a bundled highly available PostgreSQL cluster or a single-instance database. Needs only an existing GVC.
+description: Deploy Temporal on Control Plane using the Template Catalog. An internal durable-execution server of one to five replicas, a Web UI you can open to listed IP ranges, optional S3 archival, and a bundled HA or single-instance PostgreSQL. Needs only an existing GVC.
 keywords: ['workflow orchestration', 'workflow engine', 'cadence', 'step functions alternative', 'conductor alternative', 'camunda alternative', 'background jobs', 'task queue', 'saga pattern', 'automatic retries', 'grpc', 'history shards', 'namespace retention', 'self-hosted']
 ---
 
 ## Overview
 
-Temporal is an open-source (MIT) durable-execution platform: applications write workflows as ordinary code, and the Temporal server guarantees they run to completion, surviving process crashes, restarts, and long waits. This template deploys the Temporal server (one replica by default, or a cluster of up to five) with its gRPC frontend and HTTP API, plus the Temporal Web UI, all internal-only. By default the server is backed by the [Postgres Highly Available](/template-catalog/templates/postgres-highly-available) template as a bundled subchart; a single-instance [Postgres](/template-catalog/templates/postgres) subchart is available for lighter installs. Database creation, schema migrations and the `default` namespace are handled automatically.
+Temporal is an open-source (MIT) durable-execution platform: applications write workflows as ordinary code, and the Temporal server guarantees they run to completion, surviving process crashes, restarts, and long waits. This template deploys the Temporal server (one replica by default, or a cluster of up to five) with its gRPC frontend and HTTP API, plus the Temporal Web UI. The server is internal-only; the UI is internal-only too unless you open it to IP ranges you list. Closed workflows can optionally be archived to S3. By default the server is backed by the [Postgres Highly Available](/template-catalog/templates/postgres-highly-available) template as a bundled subchart; a single-instance [Postgres](/template-catalog/templates/postgres) subchart is available for lighter installs. Database creation, schema migrations and the `default` namespace are handled automatically.
 
 <Note>
 This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create one.
@@ -19,7 +19,7 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 |---|---|---|---|
 | Workload | `RELEASE_NAME-temporal` | Temporal server (standard, `replicas` replicas, default 1, no volume). Each replica runs a `temporal` container (frontend, history, matching and worker services in one process; gRPC on `7233`, HTTP API on `7243`) and an `admin` sidecar that migrates the schema and serves the `temporal` CLI | — |
 | Workload | `RELEASE_NAME-temporal-ui` | Temporal Web UI on port `8080` (standard, 1 replica) | `ui.enabled: false` removes it |
-| Identity & Policy | `RELEASE_NAME-temporal-identity`, `RELEASE_NAME-temporal-policy` | Server identity with `reveal` on exactly the database credentials secret. The UI has no identity because it mounts no secrets | — |
+| Identity & Policy | `RELEASE_NAME-temporal-identity`, `RELEASE_NAME-temporal-policy` | Server identity with `reveal` on exactly the database credentials secret. With archival on, the identity is also bound to your AWS cloud account and bucket-scoped IAM policy. The UI has no identity because it mounts no secrets | — |
 | Secret | `my-temporal-db-credentials` | Dictionary secret **created by this chart** from `postgres.credentials.*`, holding `username`, `password` and `database`. Its name is the active database block's `config.credentialsSecretName` | — |
 | Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL cluster (stateful, 3 replicas) | HA mode (default) |
 | Workload | `RELEASE_NAME-etcd` | etcd consensus store for Patroni (stateful, 3 replicas) | HA mode |
@@ -41,6 +41,36 @@ In HA mode with `postgresHA.backup.mode: wal-g`, no cron workload is created; a 
 None for a default install. The database credentials are **not** a prerequisite: this chart creates the credentials secret for you from `postgres.credentials.*` and hands it to the bundled database by name. You only have to change the password before installing.
 
 Optional database backups need a bucket and, for AWS or GCP, a Control Plane Cloud Account. Backups to MinIO or another S3-compatible endpoint additionally need a dictionary secret holding `accessKey` and `secretKey`, which must exist before you enable them. See [Backing Up](#backing-up).
+
+Optional [archival](#archival) needs the S3 setup below, completed before you set `archival.enabled: true`.
+
+### Archival Storage Setup
+
+Archival reaches the bucket through the server's workload identity, so no access keys are stored.
+
+<Steps>
+  <Step title="Create an S3 bucket">
+    Create an S3 bucket. Set `archival.s3.bucket` to its bare name (no `s3://`) and `archival.s3.region` to its region.
+  </Step>
+  <Step title="Set up a Cloud Account">
+    If you do not have one, [create a Cloud Account](/guides/create-cloud-account) for your AWS account. Set `archival.s3.cloudAccountName` to its name.
+  </Step>
+  <Step title="Create a bucket-scoped IAM policy">
+    Create an AWS IAM policy with the JSON below. Replace `YOUR_BUCKET`, and `YOUR_PREFIX` with the value of `archival.s3.prefix`. The server lists the bucket and writes and reads archives under the prefix; it never deletes from it.
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::YOUR_BUCKET"] },
+        { "Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"], "Resource": ["arn:aws:s3:::YOUR_BUCKET/YOUR_PREFIX/*"] }
+      ]
+    }
+    ```
+
+    Set `archival.s3.policyName` to the policy's name.
+  </Step>
+</Steps>
 
 ## Installation
 
@@ -79,11 +109,11 @@ cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/temporal
 ### Temporal Server
 
 ```yaml
-image: temporalio/server:1.32.1 # 1.30.x, 1.31.x or 1.32.x; step one minor version per upgrade
+image: temporalio/server:1.32.1 # server binary; configured from env (archival adds a generated config file)
 
-replicas: 1 # 1-5; 3 survives a replica loss. See Scaling and Availability
+replicas: 1 # 1-5; 3 survives a replica loss. >1 rolling restarts are noisy — see README
 
-resources: # per replica
+resources:
   maxCpu: 1000m
   maxMemory: 2Gi
   minCpu: 500m
@@ -93,6 +123,7 @@ adminTools:
   image: temporalio/admin-tools:1.32.1 # schema migrations + `temporal` CLI sidecar; same tag as image
 
 historyShards: 512 # fixed at first install; a later change is ignored (the cluster keeps its original count)
+
 namespaceRetention: 72h # retention of the `default` namespace, applied when it is first created
 ```
 
@@ -104,9 +135,10 @@ namespaceRetention: 72h # retention of the `default` namespace, applied when it 
 ### Web UI
 
 ```yaml
-ui: # internal-only: the Temporal UI has no built-in authentication
-  enabled: true # set false to remove the UI workload
+ui:
+  enabled: true
   image: temporalio/ui:2.55.0
+  allowedCIDRs: [] # IP ranges that may open the UI in a browser (e.g. 203.0.113.10/32); empty = internal-only. The UI has no login
   resources:
     maxCpu: 500m
     maxMemory: 512Mi
@@ -114,21 +146,24 @@ ui: # internal-only: the Temporal UI has no built-in authentication
     minMemory: 128Mi
 ```
 
+- `ui.enabled` — Set `false` to remove the UI workload.
+- `ui.allowedCIDRs` — IP ranges that may open the UI in a browser on its canonical endpoint, such as your office or VPN egress address (`203.0.113.10/32`). Empty keeps the UI internal-only. IPv4 ranges must be `/8` or narrower and IPv6 ranges `/32` or narrower; the chart refuses broader ranges, including the whole internet. A change takes up to a few minutes to apply. Only the UI is opened; the server stays internal-only.
+
 <Warning>
-The Temporal Web UI has **no built-in authentication**, so this template keeps it internal-only and has no knob to expose it publicly. Reach it from your own machine with `cpln port-forward` (see [Connecting](#connecting)), or put your own authenticating proxy in front of it.
+The Temporal Web UI has **no login**: anyone who can reach it can view and act on every workflow. List only addresses you trust in `ui.allowedCIDRs`.
 </Warning>
 
 ### Access
 
 ```yaml
-internalAccess: # internal firewall scope for the server (gRPC :7233, HTTP API :7243) and the UI (:8080)
+internalAccess: # internal firewall scope for the server (gRPC :7233, HTTP API :7243, cluster ports) and the UI (:8080)
   type: same-gvc # options: none, same-gvc, same-org, workload-list
   workloads: [] # used with workload-list; the server and UI workloads are always added
   # workloads:
   #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
 ```
 
-Both workloads are internal-only; there is no public-access option in this template. `internalAccess.type` sets the internal firewall scope for the server and the UI:
+The server is never reachable from outside Control Plane: workers and clients run as workloads in your org. The UI is internal-only too unless you list IP ranges in `ui.allowedCIDRs`. `internalAccess.type` sets the internal firewall scope for the server and the UI:
 
 | Type | Description |
 |------|-------------|
@@ -138,6 +173,43 @@ Both workloads are internal-only; there is no public-access option in this templ
 | `workload-list` | Allow access only from the workloads listed in `internalAccess.workloads`. The Temporal server and Web UI workloads are added to the list automatically, so list only your own workers and clients. |
 
 Changing `internalAccess` restarts every server replica, and a change can take a few minutes to take effect. Re-test rather than trusting the first response.
+
+### Archival
+
+Archival copies closed workflow histories and visibility records to S3, so they stay readable after the namespace's retention deletes them. This template supports S3 only, reached through the server's workload identity with no stored keys, and archival needs Temporal server 1.31 or later. Complete the [Archival Storage Setup](#archival-storage-setup) before turning it on.
+
+```yaml
+archival:
+  enabled: false # declares the S3 archiver on the server and binds the identity to AWS
+  defaultNamespace: true # archive the `default` namespace (false = stop archiving it)
+  s3:
+    bucket: my-temporal-archival-bucket
+    region: us-east-1
+    prefix: temporal # folder in the bucket; history and visibility go below it
+    cloudAccountName: my-s3-cloud-account
+    policyName: my-temporal-archival-policy # AWS IAM policy scoped to the bucket
+```
+
+- `archival.enabled` — Declares the S3 archiver on the server and binds the server identity to your AWS cloud account and IAM policy. The chart refuses it on a 1.30 image; when upgrading from 1.x, turn it on after the step to 1.31.
+- `archival.defaultNamespace` — Whether the `default` namespace archives. With archival on, `default` archives to `s3://BUCKET/PREFIX/history` and `s3://BUCKET/PREFIX/visibility`, including on an existing install.
+- `archival.s3.*` — The bucket, its region, the folder in the bucket, the cloud account and the IAM policy from the setup steps.
+
+<Warning>
+**To stop archiving, set `archival.defaultNamespace: false` and keep `archival.enabled: true`.** Never set `archival.enabled: false` once archival has been used: the `default` namespace can then no longer be updated, archived workflows become unreadable, and the server keeps retrying to archive every closed workflow.
+</Warning>
+
+A workflow appears in the archive a few minutes after it closes. Read archived workflows back from the `admin` container:
+
+```bash
+cpln workload exec RELEASE_NAME-temporal --gvc GVC_NAME --container admin -- temporal workflow list -n default --archived
+cpln workload exec RELEASE_NAME-temporal --gvc GVC_NAME --container admin -- temporal workflow show -n default -w WORKFLOW_ID -r RUN_ID
+```
+
+While `archival.defaultNamespace` is `false`, `temporal workflow list --archived` returns `Namespace is not configured for visibility archival.`, but `temporal workflow show` with `-r RUN_ID` still reads archived histories.
+
+- Temporal never changes a namespace's archival target once it is set, so a later change to `bucket` or `prefix` applies only to namespaces that do not archive yet.
+- Other namespaces can archive to the same bucket: create them with `temporal operator namespace create -n NAMESPACE --history-archival-state enabled --history-uri s3://BUCKET/PREFIX/history --visibility-archival-state enabled --visibility-uri s3://BUCKET/PREFIX/visibility`.
+- The server identity keeps its AWS binding until the release is uninstalled.
 
 ### PostgreSQL
 
@@ -152,15 +224,17 @@ Exactly one of `postgresHA` and `postgres` must be enabled; the chart refuses to
 #### Highly Available PostgreSQL
 
 ```yaml
-postgresHA: # default: highly available PostgreSQL
+postgresHA:
   enabled: true
   config:
-    credentialsSecretName: my-temporal-db-credentials # name of the dictionary secret THIS CHART creates from postgres.credentials.*; give each release its own
+    # Name of the dictionary secret this chart creates (from postgres.credentials.*)
+    # and the bundled postgres-highly-available reads. Org-wide: unique per release.
+    credentialsSecretName: my-temporal-db-credentials
   replicas: 3
   volumeset:
     capacity: 10 # initial capacity in GiB per replica (minimum is 10)
 
-  backup: # optional database backups; see Backing Up
+  backup: # optional database backups — see README storage setup
     enabled: false
     mode: logical # logical or wal-g
     resources:
@@ -185,7 +259,9 @@ postgresHA: # default: highly available PostgreSQL
     minio:
       endpoint: http://my-minio-workload:9000
       bucket: temporal-pg-backup-bucket
-      credentialsSecretName: my-temporal-minio-credentials # REQUIRED prerequisite dictionary secret holding accessKey and secretKey, only when provider is minio
+      # REQUIRED PREREQUISITE SECRET when provider is `minio` — a `dictionary`
+      # secret holding exactly `accessKey` and `secretKey`. See README.
+      credentialsSecretName: my-temporal-minio-credentials
       prefix: postgres/backups
 ```
 
@@ -198,18 +274,24 @@ postgresHA: # default: highly available PostgreSQL
 Enable this block and disable `postgresHA` for a lighter non-HA deployment.
 
 ```yaml
-postgres: # dev/lightweight: single-instance PostgreSQL (disable postgresHA first)
+postgres:
   enabled: false
-  credentials: # the chart writes these into the credentials secret; used in BOTH database modes
+  # Credentials for the bundled database, used in BOTH database modes: this chart
+  # creates the secret from them, so there is nothing to create before installing.
+  # The password is set once, when the database volume is initialised.
+  # `database` MUST stay `temporal` (render-enforced in both modes).
+  credentials:
     username: temporal
     password: change-me-temporal-db-password # change before installing
-    database: temporal # MUST stay temporal (render-enforced in both modes)
+    database: temporal
   config:
-    credentialsSecretName: my-temporal-db-credentials # secret names are org-wide; give each release its own
+    # Name of the dictionary secret this chart creates and the bundled postgres reads.
+    # Org-wide: unique per release (a second release on this name is refused at install).
+    credentialsSecretName: my-temporal-db-credentials
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 
-  backup: # optional database backups; see Backing Up
+  backup: # optional database backups (Postgres 17+) — see README storage setup
     enabled: false
     image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0
     schedule: "0 2 * * *"
@@ -230,7 +312,9 @@ postgres: # dev/lightweight: single-instance PostgreSQL (disable postgresHA firs
     minio:
       endpoint: http://my-minio-workload:9000
       bucket: temporal-pg-backup-bucket
-      credentialsSecretName: my-temporal-minio-credentials # REQUIRED prerequisite dictionary secret holding accessKey and secretKey, only when provider is minio
+      # REQUIRED prerequisite dictionary secret holding `accessKey` and `secretKey`,
+      # only when this backup is enabled with provider: minio. See README.
+      credentialsSecretName: my-temporal-minio-credentials
       prefix: postgres/backups
 ```
 
@@ -244,17 +328,18 @@ The credentials are applied once, when the database volume is first initialized.
 
 ## Connecting
 
-This template exposes no public endpoint. Everything below is reachable from workloads inside the `internalAccess` scope, or from your own machine through `cpln port-forward`.
+The server exposes no public endpoint: everything except the browser UI is reachable only from workloads inside the `internalAccess` scope. The Web UI is reachable in a browser from the IP ranges you list in `ui.allowedCIDRs`.
 
 | What | Address | Notes |
 |---|---|---|
 | gRPC frontend | `RELEASE_NAME-temporal.GVC_NAME.cpln.local:7233` | Workers and clients connect here, namespace `default`. Always use the full `.cpln.local` hostname; short workload names do not resolve. |
 | HTTP API | `http://RELEASE_NAME-temporal.GVC_NAME.cpln.local:7243` | For example `/api/v1/namespaces/default`. |
-| Web UI | `cpln port-forward RELEASE_NAME-temporal-ui 8080:8080 --gvc GVC_NAME`, then `http://localhost:8080` | Internal only, no authentication. |
+| Web UI in a browser | The UI workload's canonical endpoint, `status.canonicalEndpoint` in `cpln workload get RELEASE_NAME-temporal-ui --gvc GVC_NAME -o yaml` | Reachable only from the ranges in `ui.allowedCIDRs`. No login. |
+| Web UI, quick checks | `cpln port-forward RELEASE_NAME-temporal-ui 8080:8080 --gvc GVC_NAME`, then `http://localhost:8080` | Works with `ui.allowedCIDRs` empty. Suited to curl-level checks rather than browsing. |
 | `temporal` CLI | The `admin` container of `RELEASE_NAME-temporal` | Already pointed at the server; see the command below. |
 | PostgreSQL (HA mode) | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432` | The HAProxy leader endpoint Temporal itself uses. |
 | PostgreSQL (single mode) | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | Only when `postgres.enabled: true`. |
-| Database credentials | `cpln secret reveal SECRET_NAME -o yaml` | `SECRET_NAME` is the active database block's `config.credentialsSecretName` (default `my-temporal-db-credentials`). |
+| Database credentials | `cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml` | `DB_CREDENTIALS_SECRET_NAME` is the active database block's `config.credentialsSecretName` (default `my-temporal-db-credentials`). |
 
 Confirm the server is serving by listing workflows with the `temporal` CLI in the `admin` sidecar. On a fresh install the list is empty and the command exits without an error:
 
@@ -262,13 +347,19 @@ Confirm the server is serving by listing workflows with the `temporal` CLI in th
 cpln workload exec RELEASE_NAME-temporal --gvc GVC_NAME --container admin -- temporal workflow list
 ```
 
-To open the Web UI from your own machine, tunnel to the UI workload and browse to `http://localhost:8080`:
+To use the Web UI in a browser, list your address in `ui.allowedCIDRs`, upgrade the release, and open the UI's canonical endpoint:
+
+```bash
+cpln workload get RELEASE_NAME-temporal-ui --gvc GVC_NAME -o yaml
+```
+
+A change to `ui.allowedCIDRs` takes up to a few minutes to apply; until then the endpoint answers `403`. For a quick check without opening the UI, tunnel to it instead and request `http://localhost:8080/healthz`:
 
 ```bash
 cpln port-forward RELEASE_NAME-temporal-ui 8080:8080 --gvc GVC_NAME
 ```
 
-If the UI stops loading pages through `cpln port-forward` after some navigation, restart the port-forward and reload the page.
+A browser through `cpln port-forward` can stop loading pages after some navigation, so use `ui.allowedCIDRs` for browser use.
 
 ### First Run
 
@@ -276,15 +367,33 @@ Temporal has no setup wizard. A fresh install already has a `default` namespace,
 
 <Steps>
   <Step title="Check the namespace in the Web UI">
-    With the port-forward above running, open `http://localhost:8080`. The `default` namespace is already registered, with the retention you set in `namespaceRetention`.
+    Open the Web UI as described above. The `default` namespace is already registered, with the retention you set in `namespaceRetention`.
   </Step>
   <Step title="Run a worker">
-    Workers run as their own workloads inside the `internalAccess` scope and connect to the gRPC frontend by its full hostname. A minimal Python worker:
+    Workers run as their own workloads inside the `internalAccess` scope and connect to the gRPC frontend by its full hostname. A minimal Python worker with one workflow and one activity:
 
     ```python
     import asyncio
+    from datetime import timedelta
+
+    from temporalio import activity, workflow
     from temporalio.client import Client
     from temporalio.worker import Worker
+
+
+    @activity.defn
+    async def say_hello(name: str) -> str:
+        return f"Hello, {name}!"
+
+
+    @workflow.defn
+    class HelloWorkflow:
+        @workflow.run
+        async def run(self, name: str) -> str:
+            return await workflow.execute_activity(
+                say_hello, name, start_to_close_timeout=timedelta(seconds=10)
+            )
+
 
     async def main():
         client = await Client.connect(
@@ -294,10 +403,11 @@ Temporal has no setup wizard. A fresh install already has a `default` namespace,
         worker = Worker(
             client,
             task_queue="my-task-queue",
-            workflows=[MyWorkflow],
-            activities=[my_activity],
+            workflows=[HelloWorkflow],
+            activities=[say_hello],
         )
         await worker.run()
+
 
     if __name__ == "__main__":  # required, see note below
         asyncio.run(main())
@@ -313,12 +423,20 @@ Temporal has no setup wizard. A fresh install already has a `default` namespace,
     ```bash
     cpln workload exec RELEASE_NAME-temporal --gvc GVC_NAME --container admin \
       -- temporal workflow start --namespace default \
-      --task-queue my-task-queue --type MyWorkflow --workflow-id first-run
+      --task-queue my-task-queue --type HelloWorkflow --workflow-id first-run \
+      --input '"Temporal"'
     ```
 
     The run appears in the Web UI under Workflows.
   </Step>
 </Steps>
+
+### Nexus and Worker Deployments
+
+These need no template configuration:
+
+- **Nexus** works with endpoints that target a namespace and task queue in this Temporal cluster; create them with `temporal operator nexus endpoint create` or the UI's Nexus page. Endpoints that target an external URL are not supported.
+- **Worker Deployments** (worker versioning, pinned and auto-upgrade workflows) work. The UI's Workers **Instances** tab relies on worker heartbeats, which need Python SDK 1.20 or later.
 
 ## Operations
 
@@ -389,7 +507,7 @@ In HA mode, `postgresHA.backup.mode` selects `logical` (a scheduled `pg_dumpall`
         Create a [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `accessKey` and `secretKey`, with credentials that can read and write the bucket:
 
         ```bash
-        cpln secret create-dictionary --name SECRET_NAME \
+        cpln secret create-dictionary --name MINIO_CREDENTIALS_SECRET_NAME \
           --entry accessKey=ACCESS_KEY \
           --entry secretKey=SECRET_KEY
         ```
@@ -431,7 +549,7 @@ In single-instance mode the cron workload is `RELEASE_NAME-postgres-backup`. Wit
 
 A logical backup is a full-server dump (`pg_dumpall`), so one file holds both Temporal databases and the `temporal` role. Restore into a database Temporal is not writing to: the dump recreates `temporal` and `temporal_visibility`, so the cleanest target is a database from which both have been dropped, with the Temporal server not running against it.
 
-Then run the pipeline documented by the bundled database template from a client with access to the bucket, using the `username` and `password` from `cpln secret reveal SECRET_NAME -o yaml` and the matching host: `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local` in HA mode, `RELEASE_NAME-postgres.GVC_NAME.cpln.local` in single mode.
+Then run the pipeline documented by the bundled database template from a client with access to the bucket, using the `username` and `password` from `cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml` and the matching host: `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local` in HA mode, `RELEASE_NAME-postgres.GVC_NAME.cpln.local` in single mode.
 
 ```bash
 export PGPASSWORD="PASSWORD"
@@ -546,6 +664,7 @@ Also in this version:
 
 - **AWS backups:** the HA backup no longer attaches AWS's `ReadOnlyAccess` policy. Update your bucket-scoped IAM policy to the full action list under [Backing Up](#backing-up) before upgrading.
 - **Temporal 1.32 visibility queries are stricter:** a list filter that compares a search attribute with the wrong type, or an empty `Text` filter, now returns an error instead of results.
+- **New optional features:** [archival](#archival) to S3, which needs Temporal 1.31 or later, so turn it on after the step to 1.31; and browser access to the Web UI from listed IP ranges with `ui.allowedCIDRs` (see [Web UI](#web-ui)).
 
 ### Scaling and Availability
 
@@ -645,6 +764,27 @@ Also in this version:
 
     **Fix:** Give the new release its own `postgresHA.config.credentialsSecretName` (or `postgres.config.credentialsSecretName` in single mode). The first release is unaffected.
   </Accordion>
+  <Accordion title="Render fails with archival needs Temporal server 1.31 or later">
+    **Symptom:** Render fails with `temporal: archival needs Temporal server 1.31 or later, and this release runs 1.30.x`.
+
+    **Cause:** `archival.enabled` is `true` on a 1.30 image, typically during the first step of [Upgrading from 1.x](#upgrading-from-1-x).
+
+    **Fix:** Keep archival off until the release runs 1.31 or later, then turn it on.
+  </Accordion>
+  <Accordion title="Render fails with ui.allowedCIDRs entry is too broad">
+    **Symptom:** Render fails with `ui.allowedCIDRs entry "…" is too broad for a UI with no login`, `… opens the Web UI to the whole internet`, or `… is not an IP range`.
+
+    **Cause:** The UI has no login, so the chart accepts only IPv4 ranges of `/8` or narrower and IPv6 ranges of `/32` or narrower, written as an address with a prefix length.
+
+    **Fix:** List specific ranges, such as your office or VPN egress address with `/32`.
+  </Accordion>
+  <Accordion title="Namespace updates fail with unable to find archiver config">
+    **Symptom:** After an upgrade that set `archival.enabled: false`, updates of the `default` namespace fail with `unable to find archiver config for the given scheme`, and `temporal workflow list --archived` no longer returns archived workflows.
+
+    **Cause:** The namespace still points at its S3 archive, and the server no longer declares the S3 archiver.
+
+    **Fix:** Upgrade with `archival.enabled: true` again. To stop archiving, set `archival.defaultNamespace: false` instead.
+  </Accordion>
   <Accordion title="Changing historyShards has no effect">
     **Symptom:** After an upgrade that changed `historyShards`, the cluster still reports its original shard count.
 
@@ -680,7 +820,8 @@ Also in this version:
 - **Change `postgres.credentials.password` before installing.** The default `change-me-temporal-db-password` is published in the template repository, and it is the database password in both database modes. It is set once, when the database volume is first initialized.
 - **Upgrade Temporal one minor version at a time**, and back up through the database backup first. A skipped minor is refused; see [Upgrading from 1.x](#upgrading-from-1-x).
 - **`historyShards` is fixed at first install.** A later change is ignored, so size it before installing.
-- **Never expose the Web UI publicly.** It has no authentication, and this template deliberately has no knob to do so. Use `cpln port-forward` or your own authenticating proxy.
+- **The Web UI has no login.** List only addresses you trust in `ui.allowedCIDRs`; ranges broader than `/8` (IPv4) or `/32` (IPv6) are refused, and a change takes up to a few minutes to apply.
+- **To stop archiving, set `archival.defaultNamespace: false`.** Never set `archival.enabled: false` once archival has been used.
 - **Use the full `.cpln.local` hostname** in every worker and client; short workload names do not resolve.
 - **Give each release its own `config.credentialsSecretName`.** Secret names are organization-wide; a second release on the default name is refused at install.
 - **Keep the GVC to one location.** Each location would run its own servers against its own database.
