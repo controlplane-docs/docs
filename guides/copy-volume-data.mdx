@@ -1,0 +1,209 @@
+---
+title: 'Copy volume data between locations'
+sidebarTitle: 'Copy Volume Data'
+description: 'Copy a stateful workload volume to another location or into another volume set using the copyVolume command, then run the workload on the copy.'
+keywords: ['copyVolume', 'migrate volume', 'move data', 'replicate disk', 'region migration', 'cross-cloud', 'seed replica', 'persistent volume', 'pv copy', 'rsync']
+---
+
+A [volume set](/reference/volumeset) keeps a separate volume in each location. When you add a location, the volume there starts empty. The `copyVolume` command copies an existing volume's data into another location, or into a volume in a different volume set, so a workload can start there with the data it needs.
+
+## When to copy a volume
+
+<CardGroup cols={2}>
+  <Card title="Expand to a new location" icon="globe">
+    Seed the volume in a location you just added to a GVC
+  </Card>
+  <Card title="Move to another cloud or region" icon="truck-moving">
+    Run a stateful workload somewhere else without re-creating its data
+  </Card>
+  <Card title="Copy into another volume set" icon="copy">
+    Give a workload in another GVC its own copy of the data
+  </Card>
+  <Card title="Refresh a replica" icon="rotate">
+    Replace a stale volume with a copy of a current one
+  </Card>
+</CardGroup>
+
+## Prerequisites
+
+<AccordionGroup>
+<Accordion title="CLI installed">
+  Install the Control Plane CLI. See [Installation](/cli-reference/installation).
+</Accordion>
+
+<Accordion title="A volume set with an ext4 or xfs filesystem">
+  `copyVolume` is not available for `shared` volume sets. See [file system type](/reference/volumeset#file-system-type).
+</Accordion>
+
+<Accordion title="The copy permission">
+  You need `exec.copyVolume` on the source volume set, and on the destination volume set when you copy into another one. The `exec` permission does not include it, because the copy replaces the destination volume. See [volume set permissions](/reference/volumeset#permissions).
+</Accordion>
+
+<Accordion title="The destination location in the GVC">
+  The GVC that owns the destination volume set must include the destination location. See [GVC locations](/reference/gvc).
+</Accordion>
+</AccordionGroup>
+
+<Warning>
+The copy **deletes** whatever the destination volume held and replaces it with the source's data. Copy only into a volume you intend to overwrite.
+</Warning>
+
+## Copy a volume to another location
+
+The examples use a volume set named `my-volume-set` in GVC `my-gvc`, mounted by the stateful workload `my-app`. They copy volume `0` from `aws-us-west-2` to `gcp-us-east1`.
+
+<Steps>
+<Step title="Find the volume to copy">
+  List the volumes and note the location and volume index of the source.
+
+  ```bash
+  cpln volumeset volume get my-volume-set --gvc my-gvc
+  ```
+
+  Each workload replica uses the volume with the same index as the replica. Replica `0` uses volume `0`.
+</Step>
+
+<Step title="Stop writes to the source (recommended)">
+  A copy taken from a running replica is not crash-consistent, because the application keeps writing during the copy. Suspend the workload so the copy captures a consistent state.
+
+  ```bash
+  cpln workload stop my-app --gvc my-gvc
+  ```
+
+  With no replica using the source volume, the copy runs through a dedicated pod. Skip this step only if your application tolerates an inconsistent copy.
+</Step>
+
+<Step title="Write the command">
+  Save the command to `copy-volume.json`. The copy lands at the same volume index in the destination location.
+
+  ```json copy-volume.json
+  {
+    "type": "copyVolume",
+    "spec": {
+      "location": "aws-us-west-2",
+      "targetLocation": "gcp-us-east1",
+      "volumeIndex": 0,
+      "acknowledgeDestinationVolumeDeletion": true
+    }
+  }
+  ```
+</Step>
+
+<Step title="Send the command to the source volume set">
+  ```bash
+  cpln rest post /org/my-org/gvc/my-gvc/volumeset/my-volume-set/-command --file copy-volume.json
+  ```
+</Step>
+
+<Step title="Watch the copy">
+  List the volume set's commands. While the copy runs, `status.bulkSyncProgressPercent`, `status.bulkSyncRate` and `status.bulkSyncEta` show its progress. The copy is done when `lifecycleStage` is `completed`.
+
+  ```bash
+  cpln rest get /org/my-org/gvc/my-gvc/volumeset/my-volume-set/-command -o json
+  ```
+
+  Copy time depends on the amount of data and the network path between the two locations.
+</Step>
+
+<Step title="Confirm the destination volume">
+  The destination location now has a new storage device. If it replaced an older one, the old device is listed in `oldStorageDeviceIds`.
+
+  ```bash
+  cpln volumeset get my-volume-set --gvc my-gvc -o json
+  ```
+</Step>
+
+<Step title="Resume the workload">
+  Start the workload again. Its replica in `gcp-us-east1` mounts the copied volume.
+
+  ```bash
+  cpln workload start my-app --gvc my-gvc
+  ```
+</Step>
+</Steps>
+
+## Copy a volume into another volume set
+
+Set `targetVolumeSet` to copy into a volume in a different volume set. The destination can be in the same GVC (`//volumeset/<name>`) or in another GVC of the same org (`//gvc/<gvc>/volumeset/<name>`). Send the command to the **source** volume set, as before.
+
+```json copy-volume.json
+{
+  "type": "copyVolume",
+  "spec": {
+    "location": "aws-us-west-2",
+    "targetLocation": "gcp-us-east1",
+    "volumeIndex": 0,
+    "targetVolumeSet": "//gvc/my-other-gvc/volumeset/my-other-volume-set",
+    "acknowledgeDestinationVolumeDeletion": true
+  }
+}
+```
+
+With a different destination volume set, `location` and `targetLocation` may be the same, which copies the data within one location. If a workload in the destination location uses the destination volume set, its replica restarts onto the copy when the command completes.
+
+## Troubleshooting copyVolume
+
+<AccordionGroup>
+<Accordion title="Set spec.acknowledgeDestinationVolumeDeletion to confirm">
+  **Symptom:** the command is rejected with `This command replaces the volume at index 0 in ... Set spec.acknowledgeDestinationVolumeDeletion to confirm.`
+
+  **Cause:** every copy replaces the destination volume, so the command requires explicit confirmation.
+
+  **Fix:** add `"acknowledgeDestinationVolumeDeletion": true` to the spec after confirming the destination volume can be overwritten.
+</Accordion>
+
+<Accordion title="GVC is not scheduled in the target location">
+  **Symptom:** the command is rejected with `GVC my-gvc is not scheduled in gcp-us-east1, so no actuator there can receive the volume. Add the location to the GVC and retry.`
+
+  **Cause:** the destination volume set's GVC does not include `targetLocation`.
+
+  **Fix:** add the location to that GVC, then send the command again.
+</Accordion>
+
+<Accordion title="Nothing to copy">
+  **Symptom:** the command is rejected with `The volume at index 0 in aws-us-west-2 has no underlying storage device, so there is nothing to copy.`
+
+  **Cause:** the source volume was never created in that location, or it was deleted.
+
+  **Fix:** check the location and volume index with `cpln volumeset volume get`, and copy from a volume that has data.
+</Accordion>
+
+<Accordion title="targetLocation must differ from location">
+  **Symptom:** the command is rejected with `targetLocation must differ from location when the copy stays within one volume set`.
+
+  **Cause:** a copy within one volume set cannot use the same location for both ends, because both ends would be the same volume.
+
+  **Fix:** choose a different `targetLocation`, or set `targetVolumeSet` to copy into another volume set.
+</Accordion>
+
+<Accordion title="Not granted exec.copyVolume">
+  **Symptom:** the command is rejected with `... is not granted [exec.copyVolume] on /org/my-org/gvc/my-other-gvc/volumeset/my-other-volume-set`.
+
+  **Cause:** you lack `exec.copyVolume` on the destination volume set. The general `exec` permission does not include it.
+
+  **Fix:** grant `exec.copyVolume` on that volume set through a [policy](/reference/policy).
+</Accordion>
+
+<Accordion title="GVCs run on different clusters">
+  **Symptom:** a copy into another GVC within one location is rejected with `GVC my-gvc and GVC my-other-gvc run on different clusters in aws-us-west-2 ...`.
+
+  **Cause:** a same-location copy between two GVCs requires both to be served by the same cluster in that location.
+
+  **Fix:** copy through a different location, or contact Control Plane support.
+</Accordion>
+
+<Accordion title="Another command is running on the volume">
+  **Symptom:** the command is rejected because a conflicting command is in progress.
+
+  **Cause:** `copyVolume` cannot start while a `restoreVolume`, `expandVolume`, `shrinkVolume`, `copyVolume` or `deleteVolume` command runs on the source or destination volume.
+
+  **Fix:** wait for the other command to finish, then send the copy again.
+</Accordion>
+</AccordionGroup>
+
+## Related pages
+
+- [Volume set reference](/reference/volumeset)
+- [Volume copy command](/reference/volumeset#volume-copy)
+- [Stateful workloads](/reference/workload/types#stateful)
+- [Workload suspend](/reference/workload/general#suspend)
