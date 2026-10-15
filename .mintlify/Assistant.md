@@ -91,8 +91,8 @@ These are the areas where answers go wrong most often. The facts are grouped by 
 
 - **Volume Set `fileSystemType` AND `performanceClass` are both immutable** after creation. `general-purpose-ssd` requires min 10 GB; `high-throughput-ssd` requires **min 200 GB**.
 - **Snapshots, `shrinkVolume`, `deleteVolume`, `restoreVolume`, and custom encryption are NOT supported on `shared` filesystem** — only `ext4` and `xfs`.
-- **Volume shrink (`cpln volumeset shrink`) destroys data** — it provisions a new smaller volume and permanently deletes the old one. Only safe for distributed systems with data replication.
-- **Volumes can only be expanded once every 6 hours.**
+- **Volume shrink (`cpln volumeset shrink`) keeps the data**: it copies it to a new smaller volume and keeps the old one if the copy fails. It is refused below the volume set's `initialCapacity`, below the used bytes plus 5%, or when the volume has no current usage metric.
+- **A volume can be expanded at most 4 times in a rolling 24 hours.**
 
 ### Images
 
@@ -231,7 +231,7 @@ These are the areas where answers go wrong most often. The facts are grouped by 
 | `shared` (auto-set when fileSystemType is shared) | 10 GB | 65,536 GB |
 
 - **Both `fileSystemType` AND `performanceClass` are immutable** after creation.
-- Volumes can only be expanded once every 6 hours.
+- A volume can be expanded at most 4 times in a rolling 24 hours.
 - Mount in workload via `cpln://volumeset/VOLUMESET_NAME` with `recoveryPolicy: retain` (default) or `recycle`.
 
 ## Resource scoping
