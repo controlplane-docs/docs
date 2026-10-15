@@ -5,7 +5,7 @@ alwaysApply: true
 
 # cpln CLI Conventions
 
-**Never write a cpln command from memory.** Verify with `cpln <command> --help` or `mcp__cpln__cpln_suggest`.
+**Never write a cpln command from memory.** Verify with `cpln <command> --help`.
 
 ## Command Structure
 
