@@ -234,6 +234,6 @@ These are the most common sources of documentation errors:
 10. **Images** must be `linux/amd64`
 11. **Orgs are immutable** — once created, an org cannot be deleted
 12. **`cpln workload log` does NOT exist** — use `cpln logs '{gvc="GVC", workload="WORKLOAD"}'` with LogQL syntax
-13. **Volume shrink destroys data** — `shrinkVolume` provisions a NEW smaller volume; existing data is NOT migrated. Only use for systems with data replication (Kafka, CockroachDB)
+13. **Volume shrink keeps the data**: `shrinkVolume` copies it to a NEW smaller volume and keeps the old one if the copy fails. It is refused below the volume set's `initialCapacity`, below the used bytes plus 5%, or when the volume has no current usage metric
 14. **Don't set `spec.identityLink` unless needed** — only assign an identity when the workload needs secret access, credential-free cloud access, or private network access (via agents)
 15. **Never use `docker.io/` prefix for external images** — use the exact image reference as-is (e.g., `nginx:latest`, not `docker.io/library/nginx:latest`). The registry hostname `<org>.registry.cpln.io` is only for `docker login`, never in workload specs
