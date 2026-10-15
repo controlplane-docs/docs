@@ -1,0 +1,370 @@
+---
+title: vLLM
+icon: /template-catalog/templates/icons/vllm.png
+description: Deploy vLLM on Control Plane. Serves one Hugging Face model through an OpenAI-compatible API on a built-in NVIDIA A10G or T4 or your own BYOK GPU cluster, with optional extra replicas. Needs an existing single-location GVC, GPU access and an API key secret.
+keywords: ['vllm', 'llm inference', 'inference server', 'model serving', 'openai-compatible api', 'openai api alternative', 'gpu inference', 'nvidia a10g', 'nvidia t4', 'byok gpu', 'hugging face', 'qwen', 'llama', 'mistral', 'self-hosted llm', 'private llm', 'text generation inference alternative', 'vllm template']
+---
+
+## Overview
+
+[vLLM](https://github.com/vllm-project/vllm) is a high-throughput inference server for open-weight large language models. This template serves one Hugging Face model through vLLM's OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`) on an NVIDIA GPU: either one of Control Plane's built-in A10G or T4 cards, or your own GPU cluster registered as a BYOK location. The API is protected by an API key you create before installing, and the downloaded model is cached on a persistent volume so restarts do not download it again.
+
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create, provision, or manage a GVC. Use a GVC with exactly one location: every location of the GVC runs its own copy of the server, each with its own GPUs.
+</Note>
+
+### What Gets Created
+
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-vllm` | Stateful vLLM server, container `vllm` on port `8000`, one GPU set per replica (`replicas: 1` by default); `/metrics` is scraped into the platform's built-in metrics | — |
+| Volume Set | `RELEASE_NAME-vllm-models` | One `ext4` volume per replica at `/models`, holding the downloaded weights and vLLM's compile cache; a re-downloadable cache, so no snapshots are kept | — |
+| Identity | `RELEASE_NAME-vllm-identity` | Identity the workload runs as | — |
+| Policy | `RELEASE_NAME-vllm-policy` | `reveal` on exactly your API key secret, plus your Hugging Face token secret when set | — |
+
+vLLM has no browser UI. For a chat UI, pair it with the [Open WebUI](/template-catalog/templates/open-webui) template (see [Pairing with Open WebUI](#pairing-with-open-webui)).
+
+## Prerequisites
+
+<Steps>
+  <Step title="Create the API key secret">
+    Clients send this key as a Bearer token. It is an opaque secret and **must exist before you install**:
+
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name API_KEY_SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `apiKey.secretName` to this name.
+  </Step>
+  <Step title="Make a GPU available">
+    **Built-in GPU (`gpu.type: builtin`, the default).** Your org needs GPU quota in a location that offers it — by default one NVIDIA A10G with 6 vCPU and 16 GiB of memory. Ask Control Plane support to enable it. A T4 is the other built-in choice (`gpu.model: t4`).
+
+    **Your own GPU cluster (`gpu.type: byok`).** Any Kubernetes cluster registered as a Control Plane [BYOK location](/byok/overview) works: an MK8s cluster with the [BYOK add-on](/mk8s/add-ons/byok) enabled, or a cluster you already run (EKS, GKE, AKS, on-premises). A cluster that is not registered as a location cannot run this template. The cluster needs NVIDIA GPU nodes with driver 580 or newer (the image is a CUDA 13 build), a device plugin that exposes `nvidia.com/gpu`, a `nvidia` runtime class, and no taint on the GPU nodes, because Control Plane workloads do not tolerate it.
+
+    Only MK8s has been tested. As an example, on an MK8s cluster on AWS that means:
+
+    - **NVIDIA add-on with `taintGPUNodes: false`** — with the taint on, nothing can use the GPU.
+    - **GPU node pool label `cpln.io/gpuUsageAutoDrain: ignore`** — otherwise BYOK drains a GPU node that has had no GPU pod for 5 minutes, including one where vLLM is still starting.
+    - **An x86 NVIDIA-driver node image plus the label `mk8s.cpln.io/accelerator: nvidia`** — the recommended `+nvidia` images currently resolve to arm64 and cannot boot GPU instances; with a custom image the device plugin only runs on nodes carrying that label.
+    - **A GPU node boot disk of at least 200 GB** — the driver image, the vLLM image and the model otherwise fill the disk and the node evicts vLLM.
+    - **One instance type per GPU node pool.**
+    - **`resources` sized to the node** — a 4-vCPU / 16 GiB GPU node (g5.xlarge, g6.xlarge) cannot fit the built-in default of 6 CPU; use about `cpu: 2000m` and `memory: 8Gi`.
+
+    Use a GVC whose only location is the BYOK location: on a Control Plane location the GPU request is ignored and vLLM cannot start.
+  </Step>
+  <Step title="Optional - create a Hugging Face token secret for gated models">
+    Gated models such as Llama or Gemma need a Hugging Face token. Accept the model's license on its huggingface.co page **with the account that owns the token**, and wait until the page shows access granted (some, like Llama, are reviewed by hand). Create a read token (a fine-grained token needs read access to public gated repos), then store it:
+
+    ```bash
+    printf '%s' "$HF_TOKEN" | cpln secret create-opaque --name HF_TOKEN_SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `huggingFace.tokenSecretName` to this name. Without license access the replica restarts with exit code 1 (see [Troubleshooting](#troubleshooting)).
+  </Step>
+</Steps>
+
+<Warning>
+If a secret named in `apiKey.secretName` or `huggingFace.tokenSecretName` does not exist, the deployment waits silently and `cpln logs` shows nothing. Read `status.versions[].message`, which names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-vllm --gvc GVC_NAME -o yaml
+```
+
+Once the secret exists the deployment recovers by itself, which can take up to about 10 minutes; keep polling.
+</Warning>
+
+## Installation
+
+Install with the name of your API key secret:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/vllm \
+  --version 1.0.0 --gvc GVC_NAME \
+  --set apiKey.secretName=API_KEY_SECRET_NAME
+```
+
+The first start pulls a large image and then downloads and loads the model, so allow several minutes before the API answers.
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+### Image
+
+```yaml
+image: vllm/vllm-openai:v0.31.0 # CUDA 13 build; needs NVIDIA driver 580 or newer (Control Plane GPUs run 580)
+```
+
+### Model
+
+The model is downloaded into the volume on first start. Any extra `vllm serve` flag goes in `extraArgs` (see the [engine arguments](https://docs.vllm.ai/en/latest/configuration/engine_args.html)).
+
+```yaml
+model:
+  name: Qwen/Qwen2.5-1.5B-Instruct # Hugging Face model id; downloaded into the volume on first start
+  servedModelName: "" # name clients send as "model"; empty = the model id
+  maxModelLen: 8192 # max tokens per request (prompt + output)
+  gpuMemoryUtilization: 0.90 # share of GPU memory vLLM may use for weights and KV cache
+  dtype: auto # options: auto, half, bfloat16, float32 (bfloat16 is not supported on t4)
+  toolCallParser: hermes # tool calling, which Open WebUI and agents need; must match the model: hermes (Qwen), llama3_json (Llama 3), mistral; "" = off
+  extraArgs: [] # extra `vllm serve` flags, e.g. ["--max-num-seqs", "32"]
+```
+
+### Credentials
+
+Both are names of opaque secrets you create first (see [Prerequisites](#prerequisites)); the key values never enter the Helm release.
+
+```yaml
+apiKey:
+  # REQUIRED opaque secret (encoding: plain) holding the API key clients send as a Bearer token.
+  # It must EXIST BEFORE INSTALL — the deployment waits silently (no logs) otherwise. Create it with:
+  # printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name my-vllm-api-key --encoding plain -f -
+  secretName: my-vllm-api-key
+huggingFace:
+  tokenSecretName: "" # opaque secret with a Hugging Face token, needed for gated models (e.g. my-vllm-hf-token); empty = anonymous
+```
+
+### GPU
+
+`builtin` uses Control Plane's GPU locations; `byok` runs on your own NVIDIA nodes on a BYOK location (see [Prerequisites](#prerequisites) for the cluster requirements). The built-in form cannot target BYOK nodes.
+
+```yaml
+gpu:
+  type: builtin # options: builtin (Control Plane GPU locations), byok (your own GPU cluster on a BYOK location)
+  model: a10g # builtin only. options: a10g (24 GB), t4 (16 GB)
+  quantity: 1 # GPUs per replica. a10g: 1, t4: 1-4, byok: 1-8; more than 1 enables tensor parallelism
+```
+
+### Resources and Scaling
+
+The chart refuses CPU and memory combinations the GPU type does not allow; the comments list the limits. Each replica is an independent server with its own GPUs and its own model cache.
+
+```yaml
+# builtin a10g: cpu 6000m-8000m, memory 8Gi-62Gi. t4: cpu 2000m-8000m and memory 7Gi-31Gi per GPU (4000m per GPU with 2+ GPUs or from 14Gi).
+# Any type: memory below 8 MiB per millicore of cpu (e.g. under 16Gi at 2000m).
+# byok: fit your GPU node, e.g. cpu 2000m / memory 8Gi on a 4-vCPU g5.xlarge or g6.xlarge.
+resources:
+  cpu: 6000m
+  memory: 16Gi
+
+replicas: 1 # each replica runs its own GPU(s) and model cache; 2+ keeps serving through restarts and upgrades
+startupTimeoutSeconds: 900 # seconds from container start to ready (download + load) before the platform restarts it; 300-1830
+```
+
+### Model Cache
+
+`capacity` sizes new volumes only; to grow a live one, see [Growing the Model Cache](#growing-the-model-cache).
+
+```yaml
+volumeset:
+  capacity: 50 # GiB per replica for new volumes; at least 2x the model's weights plus 5 (minimum 10)
+```
+
+### Access
+
+The API key guards `/v1` whether or not public access is on.
+
+```yaml
+publicAccess:
+  enabled: false # true = the API is reachable from the internet (the API key still applies to /v1)
+
+internalAccess:
+  type: same-gvc # options: none, same-gvc, same-org, workload-list
+  workloads: [] # used with workload-list
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
+
+## Connecting
+
+| What | Address | Notes |
+|---|---|---|
+| Internal API | `http://RELEASE_NAME-vllm.GVC_NAME.cpln.local:8000/v1` | From workloads that `internalAccess.type` allows |
+| Public API | `https://` + `status.canonicalEndpoint` + `/v1` | Only with `publicAccess.enabled: true`; read the endpoint with `cpln workload get RELEASE_NAME-vllm --gvc GVC_NAME -o yaml` |
+| From your machine | `cpln port-forward RELEASE_NAME-vllm 8000:8000 --gvc GVC_NAME`, then `http://localhost:8000/v1` | Works with public access off |
+| API key | The payload of your `apiKey.secretName` secret | Read it with `cpln secret reveal API_KEY_SECRET_NAME -o yaml` |
+| Model name | `model.servedModelName`, or the model id when it is empty | The value clients send as `"model"` |
+
+With the port-forward running and the key in `VLLM_API_KEY`, send a chat request with the default model:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $VLLM_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen2.5-1.5B-Instruct","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+Any OpenAI SDK works with `base_url` set to the `/v1` address and `api_key` set to the key. The [LiteLLM](/template-catalog/templates/litellm) template can also use vLLM as an OpenAI-compatible backend.
+
+### Pairing with Open WebUI
+
+For a chat UI, install the [Open WebUI](/template-catalog/templates/open-webui) template (1.3.0 or later) in the same GVC and point its OpenAI-compatible backend at `http://RELEASE_NAME-vllm.GVC_NAME.cpln.local:8000/v1`, reusing your vLLM API key secret. The exact values are on the Open WebUI page under [Pairing with vLLM](/template-catalog/templates/open-webui#pairing-with-vllm). On the vLLM side:
+
+- **Keep `model.toolCallParser` set and matched to your model.** Open WebUI offers tools on every chat, so without a parser each message fails with `"auto" tool choice requires --enable-auto-tool-choice`.
+- **The default model and its 8192-token context are fine for chat.**
+- **Open WebUI's Control Plane tools need a context of at least 64k tokens.** Qwen2.5-7B-Instruct reaches 64k with YaRN:
+
+```yaml
+model:
+  name: Qwen/Qwen2.5-7B-Instruct
+  maxModelLen: 65536
+  extraArgs:
+    - --hf-overrides
+    - '{"max_position_embeddings":65536,"rope_parameters":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":32768,"rope_theta":1000000.0}}'
+```
+
+vLLM must also allow Open WebUI as a caller; the default `internalAccess.type: same-gvc` does.
+
+## Operations
+
+### Backing Up
+
+There is nothing to back up. The volume holds only downloaded model weights and vLLM's compile cache, which a replica downloads or rebuilds on start, so the chart keeps no snapshots.
+
+### Rotating the API Key
+
+A running replica keeps the old key until it restarts. Replace the secret's value, then force a redeployment:
+
+```yaml
+kind: secret
+name: API_KEY_SECRET_NAME
+type: opaque
+data:
+  encoding: plain
+  payload: NEW-VALUE
+```
+
+```bash
+cpln apply -f rotate.yaml
+cpln secret reveal API_KEY_SECRET_NAME -o yaml
+cpln workload force-redeployment RELEASE_NAME-vllm --gvc GVC_NAME
+```
+
+With one replica the API is unavailable while the replica restarts; with two or more it keeps serving.
+
+### Growing the Model Cache
+
+Changing `volumeset.capacity` does not resize an existing volume; it only sizes new ones. Grow a live volume online, with no restart, once per replica (`--volume-index 0` for the first replica, `1` for the second, and so on):
+
+```bash
+cpln volumeset expand RELEASE_NAME-vllm-models --gvc GVC_NAME --location LOCATION --volume-index 0 --new-size 100
+```
+
+### Freeing Old Model Weights
+
+Switching `model.name` leaves the old model's weights on the volume. Remove them with the Hugging Face CLI in the image, replacing `ORG/NAME` with the old model id:
+
+```bash
+cpln workload exec RELEASE_NAME-vllm --gvc GVC_NAME --container vllm -- hf cache rm model/ORG/NAME -y
+```
+
+Deleting the model's folder by hand frees nothing, because the weights live in a shared blob store.
+
+### Scaling and Availability
+
+With `replicas: 1` (the default) the API is down whenever the replica restarts, which includes every upgrade and setting change. Set `replicas: 2` for zero-downtime restarts and upgrades; replicas are independent servers behind the workload's load-balanced endpoint and are replaced one at a time. Each replica needs its own GPU and its own model cache volume, so check your GPU quota first.
+
+`gpu.quantity` above 1 splits the model across several GPUs in one replica (tensor parallelism) rather than adding replicas; on built-in GPUs only the T4 allows it.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The deployment waits and cpln logs shows nothing">
+    **Symptom:** The workload never becomes ready and `cpln logs` returns no lines.
+
+    **Cause:** The secret named in `apiKey.secretName` (or `huggingFace.tokenSecretName`) does not exist, so the container never starts.
+
+    **Fix:** Read `status.versions[].message`, which names the missing secret, then create it as in [Prerequisites](#prerequisites). The deployment recovers by itself once it exists:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-vllm --gvc GVC_NAME -o yaml
+    ```
+  </Accordion>
+  <Accordion title="A gated model restarts with exit code 1">
+    **Symptom:** The replica restarts with exit code 1, and the logs show `GatedRepoError`.
+
+    **Cause:** A `401` means no token was supplied (`huggingFace.tokenSecretName` is empty). A `403` with "not in the authorized list" means the account that owns the token has not been granted access to the model.
+
+    **Fix:** Accept the model's license on huggingface.co with the token's account, wait for access to be granted, and set `huggingFace.tokenSecretName`. To find the error:
+
+    ```bash
+    cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-vllm"} |= "GatedRepoError"' --limit 50 --since 10m
+    ```
+  </Accordion>
+  <Accordion title="Chat requests fail with an auto tool choice error">
+    **Symptom:** Every message from Open WebUI or an agent client fails with `"auto" tool choice requires --enable-auto-tool-choice`.
+
+    **Cause:** `model.toolCallParser` is empty, or does not match the model family.
+
+    **Fix:** Set `model.toolCallParser` to the parser for your model: `hermes` (Qwen), `llama3_json` (Llama 3) or `mistral`.
+  </Accordion>
+  <Accordion title="The replica restarts before it becomes ready">
+    **Symptom:** A large model never finishes loading; the replica restarts and starts the download or load again.
+
+    **Cause:** The replica was not ready within `startupTimeoutSeconds`.
+
+    **Fix:** Raise `startupTimeoutSeconds` (up to `1830`) for large models.
+  </Accordion>
+  <Accordion title="A replica stays pending">
+    **Symptom:** The replica is never scheduled.
+
+    **Cause:** The requested CPU and memory do not fit the GPU node. On a BYOK 4-vCPU node the built-in default of 6 CPU cannot fit. On a built-in T4, larger requests the chart accepts (such as the 6000m / 16Gi default) did not schedule in testing.
+
+    **Fix:** On BYOK, size `resources` to the node (about `cpu: 2000m`, `memory: 8Gi` on a g5.xlarge or g6.xlarge). On a T4, use about `cpu: 3000m` and `memory: 12Gi`.
+  </Accordion>
+  <Accordion title="Port-forward returns 502 on a BYOK location">
+    **Symptom:** `cpln port-forward` returns `502 Unable to connect to upstream workload`.
+
+    **Cause:** On a BYOK location, port-forward needs `internalAccess.type` other than `none`.
+
+    **Fix:** Set `internalAccess.type` to `same-gvc` (the default) or another allowed type.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- **Create the API key secret before installing.** A missing secret stalls the install with no logs; `status.versions[].message` names it.
+- **The API key protects only `/v1`.** vLLM leaves `/health`, `/metrics`, `/tokenize` and `/detokenize` unauthenticated, so with public access on anyone can read metrics and use the tokenizer.
+- **Use a GVC with exactly one location.** Every location runs its own copy with its own GPUs, and on BYOK the only location must be the BYOK location.
+- **Rotating the API key needs a forced redeployment.** The running server keeps the old key until it restarts — see [Rotating the API Key](#rotating-the-api-key).
+- **With one replica the API is down during every restart and upgrade.** Set `replicas: 2` for zero downtime; each replica needs its own GPU.
+- **`volumeset.capacity` only sizes new volumes, and switching models keeps the old weights.** See [Growing the Model Cache](#growing-the-model-cache) and [Freeing Old Model Weights](#freeing-old-model-weights).
+
+## External References
+
+<CardGroup cols={2}>
+    <Card title="vLLM on GitHub" icon="github" href="https://github.com/vllm-project/vllm">
+    Source, releases, and issues for the vLLM project
+    </Card>
+    <Card title="OpenAI-Compatible Server" icon="code" href="https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html">
+    The API this template serves, including tool calling
+    </Card>
+    <Card title="Engine Arguments" icon="sliders" href="https://docs.vllm.ai/en/latest/configuration/engine_args.html">
+    Every `vllm serve` flag you can pass through `model.extraArgs`
+    </Card>
+    <Card title="Supported Models" icon="database" href="https://docs.vllm.ai/en/latest/models/supported_models.html">
+    Model architectures vLLM can serve
+    </Card>
+    <Card title="vLLM Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/vllm">
+    View the source files, default values, and chart definition
+    </Card>
+</CardGroup>
