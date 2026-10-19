@@ -490,29 +490,77 @@ If there is an attempt to disable the TLS settings on a domain, it will always r
 
 #### Client Certificate Forwarding
 
-The `clientCertificate` property configures client certificate forwarding for TLS connections. Client certificates included in a request to a domain can be configured to be forwarded to the destination [workload](/concepts/workload).
+The `clientCertificate` property configures client certificate forwarding for TLS connections. When it is set, the domain requests a client certificate during the TLS handshake, and any certificate the client presents is forwarded to the destination [workload](/concepts/workload) in the `x-forwarded-client-cert` (XFCC) HTTP header.
 
-The `x-forwarded-client-cert` (XFCC) HTTP header will contain the client certificate details.
+To associate a certificate authority (CA) with the domain, reference a [secret](/reference/secret) of type [`tls`](/guides/create-secret/tls) through the `clientCertificate.secretLink` property. The secret's certificate must be the CA certificate, in PEM format, that issues your client certificates. During the handshake, the domain lists this CA as an acceptable issuer so that clients can select the matching certificate.
 
-The certificate authority PEM, stored as a [secret](/reference/secret) of type `keypair`, can be associated with the domain through the `secretLink` property and used to verify the authority of the client certificate. The secret must contain a client certificate authority certificate in PEM format used to verify requests that include client certificates. The key subject must match the domain and the key usage properties must be configured for client certificate authorization.
+Only the secret's `cert` field is used. The `key` and `chain` fields are ignored, so the CA's private key does not need to be stored in Control Plane.
 
-If a certificate authority PEM is not associated with a domain, no verification is performed.
+The `cpln secret create-tls` command requires a private key, so create a certificate-only secret with `cpln apply` instead:
 
-By default, supplying a client certificate is optional — a request without one is still served, and any certificate presented is forwarded in the XFCC header. To **require** a valid client certificate, set the [`cpln/clientCertificateValidation`](#special-tags) tag to `enabled` on the domain. Control Plane then verifies each client certificate against the certificate authority configured in `clientCertificate.secretLink` and rejects any connection that does not present a valid, trusted certificate. A `clientCertificate.secretLink` must be configured for this to take effect.
+```yaml
+kind: secret
+name: client-ca-cert
+type: tls
+data:
+  cert: |
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----
+```
 
-CRL lists are not verified, but they can be checked by the [workload](/concepts/workload) by keeping a list of allowed or revoked client certificate hashes. When a request is received by the [workload](/concepts/workload), the hash field in the XFCC header can be checked against the allowed or revoked list and an allow or deny decision can be made.
+```bash
+cpln apply -f client-ca-cert.yaml
+```
+
+<Warning>
+
+The secret must be of type `tls`. A secret of any other type, such as `keypair`, is accepted by the domain without an error or warning, but it is ignored and the CA is never applied.
+
+</Warning>
+
+By default, supplying a client certificate is optional and **no verification is performed**, even when a CA is configured through `clientCertificate.secretLink`. A request without a client certificate is still served, and any certificate presented, including a self-signed or untrusted one, is forwarded in the XFCC header.
+
+To **require** a valid client certificate, set the [`cpln/clientCertificateValidation`](#special-tags) tag to `enabled` on the domain. Control Plane then verifies each client certificate against the CA configured in `clientCertificate.secretLink` and rejects, during the TLS handshake, any connection that does not present a valid, trusted certificate. A `clientCertificate.secretLink` must be configured for this to take effect.
+
+When validation is enabled:
+
+- The client certificate must chain to the configured CA.
+- If the client certificate includes an `extendedKeyUsage` extension, it must include `clientAuth`. A certificate with only `serverAuth` is rejected.
+- The certificate's subject and common name (CN) are not checked. Any certificate issued by the CA is accepted. To restrict access to specific certificates, check the XFCC header in the workload.
+
+The CA certificate must be a valid CA certificate, with `basicConstraints` set to `CA:TRUE` and a `keyUsage` that includes `keyCertSign`.
+
+##### The XFCC Header
+
+The XFCC header is always present on requests forwarded from the domain. It contains one or more comma-separated elements, each made up of semicolon-separated `key=value` fields:
+
+- When the client presents a certificate, the **first** element describes it: `Hash` (SHA-256 fingerprint of the client certificate), `Cert` (the URL-encoded PEM certificate), `Subject`, and `URI`.
+- The last element describes the internal hop from the Control Plane ingress to the workload and includes a `By` field. Its `Hash` is the ingress certificate, not the client's.
+- When the client does not present a certificate, only the internal hop element is present.
+
+Example with a client certificate (wrapped for readability):
+
+```text
+Hash=e3b9e80b...6b31;Cert="-----BEGIN%20CERTIFICATE-----%0A...";Subject="CN=client.example.com";URI=,
+By=spiffe://cluster.local/ns/.../sa/my-workload;Hash=2a83c7f6...5055;Subject="";URI=spiffe://cluster.local/ns/istio-system/sa/istio-ingressgateway-custom-domain
+```
+
+##### Allow and Revoke Lists
+
+CRL lists are not verified, but they can be checked by the [workload](/concepts/workload) by keeping a list of allowed or revoked client certificate hashes. When a request is received, the workload can compare the `Hash` field of the client element of the XFCC header (the first element, which has no `By` field) against the list and make an allow or deny decision.
+
+<Note>
+
+A revoked-hash list alone does not block requests that present no client certificate. Either enable the `cpln/clientCertificateValidation` tag or have the workload reject requests whose XFCC header has no client element.
+
+</Note>
 
 To generate the certificate hash, execute the following command:
 
 ```bash
-openssl x509 -noout -fingerprint -sha256 -inform pem -in MyClientCert.pem | awk -F= '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]'`
+openssl x509 -noout -fingerprint -sha256 -inform pem -in MyClientCert.pem | awk -F= '{print $2}' | tr -d ':' | tr '[:upper:]' '[:lower:]'
 ```
-
-<Tip>
-
-Verify that the CA certificate includes the correct x509 key usage fields (critical, digitalSignature, keyEncipherment) + extendedKeyUsage = serverAuth and that the CN of the client certificate matches the domain name selected.
-
-</Tip>
 
 #### Custom Server Certificate
 
@@ -778,7 +826,7 @@ Control Plane supports special tags prefixed with `cpln/` that modify domain beh
 | :-- | :---- | :---------- |
 | `cpln/skipDNSCheck` | `true` | Skip DNS validation checks during domain configuration. Useful when DNS propagation is delayed or when using external DNS management. |
 | `cpln/wildcard` | `true` | Enable wildcard certificate for custom ingress domains. Only applicable for domains with custom ingress enabled. |
-| `cpln/clientCertificateValidation` | `enabled` | Require a valid client certificate (mTLS) on the domain. Connections must present a certificate that is verified against the CA in `tls.clientCertificate.secretLink`; requests without a valid, trusted certificate are rejected. When unset, client certificates are optional and accepted without verification. |
+| `cpln/clientCertificateValidation` | `enabled` | Require a valid client certificate (mTLS) on the domain. Connections must present a certificate that is verified against the CA in `tls.clientCertificate.secretLink` (a secret of type `tls`); connections without a valid, trusted certificate are rejected during the TLS handshake. When unset, client certificates are optional and accepted without verification, even when a CA is configured. |
 
 ## CLI
 
