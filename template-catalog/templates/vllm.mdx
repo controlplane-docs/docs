@@ -39,18 +39,7 @@ vLLM has no browser UI. For a chat UI, pair it with the [Open WebUI](/template-c
   <Step title="Make a GPU available">
     **Built-in GPU (`gpu.type: builtin`, the default).** Your org needs GPU quota in a location that offers it — by default one NVIDIA A10G with 6 vCPU and 16 GiB of memory. Ask Control Plane support to enable it. A T4 is the other built-in choice (`gpu.model: t4`).
 
-    **Your own GPU cluster (`gpu.type: byok`).** Any Kubernetes cluster registered as a Control Plane [BYOK location](/byok/overview) works: an MK8s cluster with the [BYOK add-on](/mk8s/add-ons/byok) enabled, or a cluster you already run (EKS, GKE, AKS, on-premises). A cluster that is not registered as a location cannot run this template. The cluster needs NVIDIA GPU nodes with driver 580 or newer (the image is a CUDA 13 build), a device plugin that exposes `nvidia.com/gpu`, a `nvidia` runtime class, and no taint on the GPU nodes, because Control Plane workloads do not tolerate it.
-
-    Only MK8s has been tested. As an example, on an MK8s cluster on AWS that means:
-
-    - **NVIDIA add-on with `taintGPUNodes: false`** — with the taint on, nothing can use the GPU.
-    - **GPU node pool label `cpln.io/gpuUsageAutoDrain: ignore`** — otherwise BYOK drains a GPU node that has had no GPU pod for 5 minutes, including one where vLLM is still starting.
-    - **An x86 NVIDIA-driver node image plus the label `mk8s.cpln.io/accelerator: nvidia`** — the recommended `+nvidia` images currently resolve to arm64 and cannot boot GPU instances; with a custom image the device plugin only runs on nodes carrying that label.
-    - **A GPU node boot disk of at least 200 GB** — the driver image, the vLLM image and the model otherwise fill the disk and the node evicts vLLM.
-    - **One instance type per GPU node pool.**
-    - **`resources` sized to the node** — a 4-vCPU / 16 GiB GPU node (g5.xlarge, g6.xlarge) cannot fit the built-in default of 6 CPU; use about `cpu: 2000m` and `memory: 8Gi`.
-
-    Use a GVC whose only location is the BYOK location: on a Control Plane location the GPU request is ignored and vLLM cannot start.
+    **Your own GPU cluster (`gpu.type: byok`).** Any Kubernetes cluster registered as a Control Plane [BYOK location](/byok/overview) works: an MK8s cluster with the [BYOK add-on](/mk8s/add-ons/byok) enabled, or a cluster you already run (EKS, GKE, AKS, on-premises). A cluster that is not registered as a location cannot run this template. See [GPU Cluster Setup (BYOK)](#gpu-cluster-setup-byok) for what each cluster type needs.
   </Step>
   <Step title="Optional - create a Hugging Face token secret for gated models">
     Gated models such as Llama or Gemma need a Hugging Face token. Accept the model's license on its huggingface.co page **with the account that owns the token**, and wait until the page shows access granted (some, like Llama, are reviewed by hand). Create a read token (a fine-grained token needs read access to public gated repos), then store it:
@@ -72,6 +61,64 @@ cpln workload get-deployments RELEASE_NAME-vllm --gvc GVC_NAME -o yaml
 
 Once the secret exists the deployment recovers by itself, which can take up to about 10 minutes; keep polling.
 </Warning>
+
+### GPU Cluster Setup (BYOK)
+
+Every cluster used with `gpu.type: byok` needs:
+
+- **NVIDIA GPU nodes with driver 580 or newer** (the image is a CUDA 13 build) and a device plugin that exposes `nvidia.com/gpu`.
+- **A RuntimeClass named `nvidia`.** The template always requests it, and its handler differs per cluster type (see below). Without it the install fails with `The GPU runtime class nvidia is not supported in this cluster`. If you add it after installing BYOK, restart BYOK's actuator, which does not see new runtime classes until then: `kubectl rollout restart deploy/actuator -n controlplane`.
+- **No taint on the GPU nodes.** Control Plane workloads do not tolerate it.
+- **The GPU node label `cpln.io/gpuUsageAutoDrain: ignore`.** Otherwise BYOK drains a GPU node that has had no GPU pod for 5 minutes, including one where vLLM is still starting.
+- **A GPU node boot disk of at least 200 GB.** The vLLM image and the model otherwise fill the disk and the node evicts vLLM.
+- **`resources` sized to the node.** A 4-vCPU GPU node (g5.xlarge, g6.xlarge, g2-standard-4, Standard_NC4as_T4_v3) cannot fit the built-in default of 6 CPU and the replica stays pending; use about `cpu: 2000m` and `memory: 8Gi`.
+- **A GVC whose only location is the BYOK location.** On a Control Plane location the GPU request is ignored and vLLM cannot start.
+
+On EKS, GKE and AKS, create the RuntimeClass yourself (MK8s ships one):
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia # EKS: nvidia, GKE: runc, AKS: nvidia-container-runtime
+```
+
+Each of the following was tested with this template; the notes are what that cluster type needs beyond the list above.
+
+<AccordionGroup>
+  <Accordion title="MK8s on AWS">
+    - **NVIDIA add-on with `taintGPUNodes: false`.**
+    - **An x86 NVIDIA-driver node image (an AWS Deep Learning AMI) plus the label `mk8s.cpln.io/accelerator: nvidia`.** The recommended `+nvidia` images currently resolve to arm64 and cannot boot GPU instances, and with a custom image the device plugin only runs on nodes carrying that label.
+    - **One instance type per GPU node pool.**
+    - The `nvidia` RuntimeClass is built in.
+  </Accordion>
+  <Accordion title="MK8s on GCP">
+    - **NVIDIA add-on with `taintGPUNodes: false`.**
+    - **A driver image on the GPU pool**: `overrideImage.family` with project `deeplearning-platform-release` and family `common-cu129-ubuntu-2404-nvidia-580`, plus the label `mk8s.cpln.io/accelerator: nvidia`.
+    - **Only machine types with a built-in GPU work** (G2 with L4, A2, A3). GCP node pools have no accelerator field, so a T4 or V100 on an N1 machine is not possible.
+    - The `nvidia` RuntimeClass and the cloud load balancer work with no extra setup.
+  </Accordion>
+  <Accordion title="EKS">
+    - **The Amazon Linux 2023 NVIDIA AMI** for the GPU node group; `eksctl` selects it for GPU instance types and installs the device plugin.
+    - **RuntimeClass `nvidia` with handler `nvidia`.**
+    - **The [AWS Load Balancer Controller](https://kubernetes-sigs.github.io/aws-load-balancer-controller/).** BYOK's ingress requests an `external` network load balancer and gets no address without it. Installing its Helm chart after BYOK needs `--disable-openapi-validation`.
+  </Accordion>
+  <Accordion title="GKE">
+    - **A GPU node pool with `gpu-driver-version=latest`**, so GKE installs the driver.
+    - **RuntimeClass `nvidia` with handler `runc`.** GKE has no `nvidia` handler; it injects the driver itself.
+    - **On N1 machines (the only T4 family), replace BYOK's storage classes.** They create Hyperdisk volumes, which N1 machines cannot attach. Set `byok.noDefaultStorageClasses: true` in `cluster.json` of the ConfigMap `cpln-byok-current` in `kube-system`, restart `deploy/cpln-byok-agent -n kube-system`, and create your own `general-purpose-ssd-ext4` storage class on `pd-balanced`. Machines with a built-in GPU (G2) attach Hyperdisk without this.
+    - **If the BYOK install stalls with `istiod` never created**, restart `deploy/cpln-byok-agent -n kube-system`.
+  </Accordion>
+  <Accordion title="AKS">
+    - **A GPU node pool in an availability zone** (for example `--zones 1`). BYOK's storage classes use Premium SSD v2, which Azure attaches only to zonal VMs; on a non-zonal pool the volume fails with `can be used only with Virtual Machines in an Availability Zone`.
+    - **The default `--gpu-driver Install`**, which installs driver 580.
+    - **The [NVIDIA device plugin](https://github.com/NVIDIA/k8s-device-plugin).** AKS does not install it. Give the GPU pool the label `nvidia.com/gpu.present=true` so the plugin's Helm chart schedules there.
+    - **RuntimeClass `nvidia` with handler `nvidia-container-runtime`.**
+  </Accordion>
+</AccordionGroup>
+
+MK8s on Azure does not run this template yet: a GPU node pool with a custom NVIDIA-driver image is not created, and the default image has no driver.
 
 ## Installation
 
@@ -146,7 +193,7 @@ huggingFace:
 
 ### GPU
 
-`builtin` uses Control Plane's GPU locations; `byok` runs on your own NVIDIA nodes on a BYOK location (see [Prerequisites](#prerequisites) for the cluster requirements). The built-in form cannot target BYOK nodes.
+`builtin` uses Control Plane's GPU locations; `byok` runs on your own NVIDIA nodes on a BYOK location (see [GPU Cluster Setup (BYOK)](#gpu-cluster-setup-byok) for the cluster requirements). The built-in form cannot target BYOK nodes.
 
 ```yaml
 gpu:
@@ -330,6 +377,24 @@ With `replicas: 1` (the default) the API is down whenever the replica restarts, 
     **Cause:** The requested CPU and memory do not fit the GPU node. On a BYOK 4-vCPU node the built-in default of 6 CPU cannot fit. On a built-in T4, larger requests the chart accepts (such as the 6000m / 16Gi default) did not schedule in testing.
 
     **Fix:** On BYOK, size `resources` to the node (about `cpu: 2000m`, `memory: 8Gi` on a g5.xlarge or g6.xlarge). On a T4, use about `cpu: 3000m` and `memory: 12Gi`.
+  </Accordion>
+  <Accordion title="The install fails with a GPU runtime class error on BYOK">
+    **Symptom:** The deployment reports `The GPU runtime class nvidia is not supported in this cluster`.
+
+    **Cause:** The cluster has no RuntimeClass named `nvidia`, or BYOK's actuator has not seen it yet.
+
+    **Fix:** Create the RuntimeClass with your cluster's handler (see [GPU Cluster Setup (BYOK)](#gpu-cluster-setup-byok)), then restart the actuator:
+
+    ```bash
+    kubectl rollout restart deploy/actuator -n controlplane
+    ```
+  </Accordion>
+  <Accordion title="The model volume never attaches on a BYOK GPU node">
+    **Symptom:** The replica stays in `Init` and Kubernetes events show `FailedAttachVolume`.
+
+    **Cause:** The GPU node cannot attach BYOK's default disk type: Hyperdisk on a GKE N1 machine, or Premium SSD v2 on a non-zonal AKS node.
+
+    **Fix:** On AKS, put the GPU node pool in an availability zone. On GKE N1, replace BYOK's storage classes as described in [GPU Cluster Setup (BYOK)](#gpu-cluster-setup-byok).
   </Accordion>
   <Accordion title="Port-forward returns 502 on a BYOK location">
     **Symptom:** `cpln port-forward` returns `502 Unable to connect to upstream workload`.
