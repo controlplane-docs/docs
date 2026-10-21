@@ -1,7 +1,7 @@
 ---
 title: Volume Set
 description: "Persistent storage volumes for stateful workloads. Covers filesystem types (ext4, xfs, shared), autoscaling, snapshots, and capacity management."
-keywords: ['pv', 'pvc', 'block storage', 'shared filesystem', 'efs', 'nfs', 'volume set spec', 'wal', 'backup', 'snapshot policy', 'storageclass', 'replicated volume']
+keywords: ['pv', 'pvc', 'block storage', 'shared filesystem', 'efs', 'nfs', 'volume set spec', 'wal', 'backup', 'snapshot policy', 'storageclass', 'replicated volume', 'copyVolume', 'migrate volume', 'clone volume']
 ---
 
 ## Overview
@@ -28,6 +28,7 @@ The shared filesystem does not support:
   - `restoreVolume`
   - `deleteVolume`
   - `shrinkVolume`
+  - `copyVolume`
 
 ### Capacity and Billing
 
@@ -511,6 +512,169 @@ For example:
 }
 ```
 
+## Volume Copy
+
+A `copyVolume` command copies one volume into another location of the same volume set, or into a volume of another volume set in the same org, including one in another [GVC](/reference/gvc). The copy lands on the same volume index at the destination and replaces the volume there. The source volume is never modified.
+
+<Warning>
+
+**The destination volume is replaced, and its storage device is DELETED.**
+
+Whatever storage device occupies the volume at `volumeIndex` in the destination is deleted once the copy is committed, and its data is lost. Every `copyVolume` command must set `acknowledgeDestinationVolumeDeletion` to `true`, even when the volume set status shows no device at the destination: status can lag behind reality.
+
+</Warning>
+
+<Info>`copyVolume` is only available for `ext4` and `xfs` volume sets, on both ends. It is not supported for `shared` file systems.</Info>
+
+### copyVolume
+
+Spec:
+
+- `location`: the location the volume is copied **from**. Required.
+- `volumeIndex`: the index of the volume to copy. The copy replaces the volume at the same index at the destination. Required.
+- `targetLocation`: the location the volume is copied **to**. Required.
+- `acknowledgeDestinationVolumeDeletion`: must be `true`. Confirms that the destination volume is replaced and its storage device deleted.
+- `targetVolumeSet`: optional. A link to the volume set that receives the copy, in the same org. It defaults to the volume set the command is issued on. It accepts these forms:
+  - `//volumeset/VOLUME_SET`: a volume set in the same GVC
+  - `//gvc/GVC/volumeset/VOLUME_SET`
+  - `/org/ORG/gvc/GVC/volumeset/VOLUME_SET`
+
+To copy a volume into another location of the same volume set:
+
+```json copyVolume Command
+{
+  "type": "copyVolume",
+  "spec": {
+    "location": "aws-us-east-2",
+    "volumeIndex": 0,
+    "targetLocation": "aws-us-west-2",
+    "acknowledgeDestinationVolumeDeletion": true
+  }
+}
+```
+
+To copy a volume into a volume set in another GVC:
+
+```json copyVolume Command (another volume set)
+{
+  "type": "copyVolume",
+  "spec": {
+    "location": "aws-us-east-2",
+    "volumeIndex": 0,
+    "targetLocation": "aws-us-west-2",
+    "targetVolumeSet": "//gvc/my-other-gvc/volumeset/my-volume-set",
+    "acknowledgeDestinationVolumeDeletion": true
+  }
+}
+```
+
+### Copy Volume Rules
+
+- **Source:** the volume must have a storage device. A replica using the source volume keeps running during the copy, so the copy isn't crash-consistent. Stop the workload first if you need a consistent copy.
+- **Destination:** the destination location doesn't need a volume at that index yet; the copy creates it. The destination GVC must include `targetLocation`. The destination volume ends up the same size as the source.
+- **Same location:** within one volume set, `targetLocation` must differ from `location`. A same-location copy is allowed into another volume set, but only when both GVCs run on the same cluster in that location.
+- **Destination workload:** if a workload replica uses the destination volume, it keeps running on its old volume until the copy is committed. Control Plane then waits for all of the workload's replicas to be ready, restarts that replica onto the copied volume, and deletes the old storage device.
+- **Permissions:** the caller needs `exec.copyVolume` on both the source and target volume sets.
+- **Conflicts:** a copy conflicts with `restoreVolume`, `expandVolume`, `shrinkVolume`, `deleteVolume`, and other `copyVolume` commands on the same volume, at either end. A snapshot of the source can run alongside it. A `deleteVolume` issued on either end while a copy runs isn't refused: it marks the copy `failed`.
+
+### Run a Volume Copy
+
+<Tabs>
+  <Tab title="Console">
+    1. Open the source volume set and go to its **Volumes** page.
+    2. In the **Actions** menu of the volume to copy, select **Copy Volume**. It is disabled when the volume has no storage device.
+    3. Under **Destination Volume Set**, leave the field empty to copy into another location of this volume set, or pick any volume set in the org.
+    4. Choose the **Destination Location**.
+    5. Tick the acknowledgement that the destination volume will be replaced and its storage device deleted. If the destination is known to hold a storage device, also type the confirmation text shown.
+    6. Select **Copy**. The copy's progress shows in the **Copy operations** panel on the source volume set's **Volumes** page. A destination in another volume set doesn't list the copy.
+  </Tab>
+  <Tab title="CLI">
+    Use [`cpln volumeset copy`](/cli-reference/commands/volumeset):
+
+    ```bash
+    cpln volumeset copy my-volume-set --gvc my-gvc --location aws-us-east-2 --target-location aws-us-west-2 --volume-index 0 --acknowledge-destination-deletion
+    ```
+
+    To copy into another volume set, add `--target-volumeset` with its name or link, such as `--target-volumeset //gvc/my-other-gvc/volumeset/my-volume-set`. Without `--volume-index`, every volume in `--location` that has a storage device is copied, each to its own index.
+  </Tab>
+  <Tab title="API">
+    ```bash
+    curl -X POST "https://api.cpln.io/org/my-org/gvc/my-gvc/volumeset/my-volume-set/-command" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d @copy.json
+    ```
+
+    `$TOKEN` is a user or [service account](/reference/serviceaccount) token; `cpln profile token` prints one for the current profile.
+  </Tab>
+</Tabs>
+
+### Follow a Volume Copy
+
+A copy is an asynchronous [command](/concepts/command). The API `POST` returns the created command, including its `id`. `cpln volumeset copy` doesn't print the ID, so list the source volume set's running commands to find it:
+
+```bash
+cpln rest get "/org/my-org/gvc/my-gvc/volumeset/my-volume-set/-command?lifecycleStage=running"
+```
+
+Get the command by ID from the source volume set until its `lifecycleStage` is `completed`, `cancelled`, or `failed`:
+
+```bash
+cpln rest get /org/my-org/gvc/my-gvc/volumeset/my-volume-set/-command/COMMAND_ID
+```
+
+Each end of the copy reports its own progress in `status`:
+
+- `status.source.stage`: `capture-source`, `await-receiver`, `apply-source-egress`, `run-bulk-sync`, then `cleanup-k8s`.
+- `status.target.stage`: `prepare-destination`, `apply-receiver`, `await-bulk-sync`, `commit-and-prepare-swap`, `shutdown-target-replica`, `await-target-replica-termination`, then `cleanup-k8s`. `shutdown-target-replica` and `await-target-replica-termination` are skipped when no workload replica uses the destination volume.
+- Either end's stage is `fail` when that end has failed; the command is then cancelled (see [Cancel a Volume Copy](#cancel-a-volume-copy)).
+- `status.source.messages` and `status.target.messages` explain what each end is doing or why it failed.
+- `status.bulkSyncProgressPercent`, `status.bulkSyncTransferredBytes`, `status.bulkSyncRate` and `status.bulkSyncEta` report the transfer's progress. They refresh about every 10 seconds.
+
+The command is `completed` once both ends have finished and cleaned up.
+
+### Cancel a Volume Copy
+
+A copy has no time limit. To stop one that is in progress or taking too long, request its cancellation. This needs `exec.copyVolume` on the source volume set:
+
+```bash
+echo '{"lifecycleStage": "cancellation-requested"}' > cancel.json
+cpln rest patch /org/my-org/gvc/my-gvc/volumeset/my-volume-set/-command/COMMAND_ID --file cancel.json
+```
+
+What a cancellation does depends on how far the copy got:
+
+The copy is committed at the destination's `commit-and-prepare-swap` stage, when the volume set is pointed at the copied volume.
+
+- **Before the copy is committed:** the new volume is deleted, and the destination keeps its original storage device.
+- **After the copy is committed:** the volume set already points at the copied volume, so the copy is rolled forward. The destination replica is moved onto the copied volume, and the old storage device is deleted.
+
+Either way, the command ends in `cancelled` only after both ends have removed the temporary resources they created.
+
+<Note>A copy that fails on its own also ends in `cancelled`, not `failed`: a failing end cancels the command so that both ends clean up, with the same before- and after-commit outcomes. Read `status.source.messages` and `status.target.messages` for the reason. The source makes up to 3 bulk-sync attempts before it fails. A copy ends in `failed` only when a `deleteVolume` on either end overrides it.</Note>
+
+The console has no cancel action for a copy; use the CLI or API.
+
+### Copy Volume Errors
+
+The `POST` is refused with `400`, `403` or `409` when the copy can't run. The messages include:
+
+| Message | Fix |
+| :------ | :-- |
+| `This command replaces the volume at index N in LOCATION with a copy from LOCATION. ... Set spec.acknowledgeDestinationVolumeDeletion to confirm.` | Set `acknowledgeDestinationVolumeDeletion` to `true` after confirming that the destination volume can be deleted. |
+| `targetLocation must differ from location unless targetVolumeSet names another volume set` | Pick another `targetLocation`, or set `targetVolumeSet` to copy into another volume set. |
+| `targetLocation must differ from location when the copy stays within one volume set` | `targetVolumeSet` names the source volume set itself. Pick another `targetLocation`. |
+| `spec.targetVolumeSet must be //volumeset/<name>, //gvc/<gvc>/volumeset/<name> or /org/ORG/gvc/<gvc>/volumeset/<name>, got ...` | Use one of the three link forms. |
+| `The volume at index N in LOCATION has no underlying storage device, so there is nothing to copy.` | The source volume has no data yet. Pick a volume that has a storage device. |
+| `GVC GVC is not scheduled in LOCATION, so no actuator there can receive the volume. Add the location to the GVC and retry.` | Add `targetLocation` to the destination GVC's locations. |
+| `spec.targetVolumeSet must be in org ORG; a volume cannot be copied across orgs` | Copy into a volume set in the same org. |
+| `spec.targetVolumeSet ... does not exist` | Check the link, and that the volume set exists and is ready. |
+| `GVC A and GVC B run on different clusters in LOCATION ..., so a same-location copy cannot reach both volumes.` | Copy into another location of the destination GVC. |
+| `Cannot copy into VolumeSet ... because it has a fileSystemType of shared` | Copy into an `ext4` or `xfs` volume set. |
+| `Cannot create a copyVolume command on VolumeSet ... because it has a fileSystemType of shared` | The source is a `shared` volume set, which can't be copied. |
+| `PRINCIPAL is not granted [exec.copyVolume] on VOLUME_SET` (`403`) | Grant `exec.copyVolume` on that volume set. |
+| `There is a conflicting TYPE command for volume: ... (conflicting command id = ID).` (`409`) | Wait for that command to finish, then retry. |
+
 ## Volume Deletion
 
 To delete a volume, issue a `deleteVolume` command.
@@ -654,15 +818,19 @@ The permissions below are used to define [policies](/reference/policy) together 
 | create                    | Create new volumesets                     |                                                                                                                                                          |
 | delete                    | Delete existing volumesets                |                                                                                                                                                          |
 | edit                      | Modify existing volumesets                | view                                                                                                                                                     |
-| exec                      | Execute commands                          | exec.restoreVolume, exec.createVolumeSnapshot, exec.expandVolume, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.shrinkVolume                        |
+| exec                      | Execute commands                          | exec.restoreVolume, exec.createVolumeSnapshot, exec.expandVolume, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.deleteOrphanedVolume                |
+| exec.copyVolume           | Copy a volume into another location       |                                                                                                                      |
 | exec.createVolumeSnapshot | Create a snapshot of a volume             |                                                                                                                                                          |
+| exec.deleteOrphanedVolume | Delete a volume which is no longer in the cluster |                                                                                                                                                  |
 | exec.deleteVolume         | Delete a volume                           |                                                                                                                                                          |
 | exec.deleteVolumeSnapshot | Delete a volume snapshot                  |                                                                                                                                                          |
 | exec.expandVolume         | Increase the storage capacity of a volume |                                                                                                                                                          |
 | exec.restoreVolume        | Restore a volume to a snapshot            |                                                                                                                                                          |
 | exec.shrinkVolume         | Shrink a volume (causes data loss)        |                                                                                                                                                          |
-| manage                    | Full access                               | create, delete, edit, exec, exec.createVolumeSnapshot, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.expandVolume, exec.restoreVolume, exec.shrinkVolume, manage, view |
+| manage                    | Full access                               | create, delete, edit, exec, exec.copyVolume, exec.createVolumeSnapshot, exec.deleteOrphanedVolume, exec.deleteVolume, exec.deleteVolumeSnapshot, exec.expandVolume, exec.restoreVolume, exec.shrinkVolume, view |
 | view                      | Read-only access                          |                                                                                                                                                          |
+
+<Info>`exec` doesn't include `exec.copyVolume` or `exec.shrinkVolume`. Both destroy a storage device, so they must be granted explicitly or through `manage`.</Info>
 
 ## Access Report
 

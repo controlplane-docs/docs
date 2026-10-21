@@ -134,7 +134,7 @@ A workload without firewall config cannot reach its database, be reached by user
 
 Before any destructive operation, present a structured summary AND wait for explicit confirmation — **even when permissions auto-approve.** Permission mode is tool-prompt UX; this is conversation-level safety, independent.
 
-- **Always destructive**: any `cpln <resource> delete`, `gvc delete-all-workloads`, `volumeset shrink`, `volumeset snapshot delete`, `volumeset volume delete`.
+- **Always destructive**: any `cpln <resource> delete`, `gvc delete-all-workloads`, `volumeset shrink`, `volumeset snapshot delete`, `volumeset volume delete`, and `volumeset copy` (it deletes the destination volume's storage device).
 - **Service-disrupting**: `policy remove-binding` (breaks runtime access), `serviceaccount remove-key` (breaks CI/CD), `group remove-member` (locks users out), `gvc remove-location` (forces redeployment).
 - **Implicit destructive (immutability traps)**: org delete impossible; workload type/name immutable (rename via `cpln workload clone OLD --name NEW --gvc GVC`); volume set `fileSystemType` and `performanceClass` immutable; `cpln apply` of a renamed resource creates a new one (old must be deleted with `cpln delete --file ...`).
 
@@ -543,6 +543,7 @@ Performance classes: `general-purpose-ssd` (min 10 GB), `high-throughput-ssd` (*
 
 - **Both `fileSystemType` AND `performanceClass` are immutable.** Changing either = delete + recreate (data loss — guardrail #6).
 - `shrinkVolume` destroys data; volumes can be expanded only once every 6 hours.
+- `copyVolume` replaces the destination volume and deletes its storage device; it needs `acknowledgeDestinationVolumeDeletion: true` and `exec.copyVolume` (not in `exec`).
 - `createFinalSnapshot: true` (default) auto-snapshots before any volume deletion — leave on.
 
 For autoscaling, predictive scaling, mount options on `shared`, and AWS KMS custom encryption, fetch [/reference/volumeset](https://docs.controlplane.com/reference/volumeset).
