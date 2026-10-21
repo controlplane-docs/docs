@@ -74,7 +74,7 @@ A default install needs no values:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/redis \
-  --version 3.8.0 --gvc GVC_NAME
+  --version 3.9.0 --gvc GVC_NAME
 ```
 
 <CardGroup cols={2}>
@@ -114,7 +114,7 @@ To install in dev mode:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/redis \
-  --version 3.8.0 --gvc GVC_NAME \
+  --version 3.9.0 --gvc GVC_NAME \
   --set mode=dev
 ```
 
@@ -122,7 +122,7 @@ In dev mode:
 
 - `redis.replicas` and every other `sentinel` setting are ignored; the Redis workload always runs one node.
 - Sentinel public access, persistence and authentication are refused at render. Keep `sentinel.publicAccess.enabled`, `sentinel.persistence.enabled`, `sentinel.auth.password.enabled` and `sentinel.auth.fromSecret.enabled` set to `false`; the Redis password is `redis.auth`.
-- Turn on `redis.persistence.enabled` **at install** if your data must survive restarts and upgrades. Without it the data lives in memory only, and persistence cannot be added to a running release later.
+- Turn on `redis.persistence.enabled` if your data must survive restarts and upgrades. Without it the data lives in memory only. Set it at install when you can; to add it to a running release, see [Persistence](#persistence).
 - Everything else works the same as in production mode: authentication, persistence, the metrics exporter, backups, the Valkey engine, the firewall settings and Redis public access (one public port, `6380`). With `workload-list` and backups on, add `RELEASE_NAME-redis-backup` to `inboundAllowWorkload`, or the backup job cannot reach Redis.
 - Clients connect directly to `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379`. There is no Sentinel to query, so a client configured for Sentinel discovery cannot connect. See [Connecting](#connecting).
 
@@ -131,18 +131,37 @@ To move a dev release to production later, see [Moving from Dev to Production](#
 ### Engine
 
 ```yaml
-engine: redis                     # redis | valkey — chosen at INSTALL time; an existing data directory cannot move between engines
+engine: redis                     # redis | valkey
 # Used for BOTH tiers when engine is valkey; redis.image / sentinel.image are
 # then ignored. Only the Debian-based tags are supported (the -alpine tags have
 # no bash and this chart's probes require it).
 valkeyImage: valkey/valkey:8.1.9
 ```
 
-`engine: valkey` moves the Redis *and* Sentinel workloads onto `valkeyImage` together; a Redis-Sentinel / Valkey-server hybrid cannot be produced. Nothing else changes: the Valkey image ships `redis-server`, `redis-cli` and `redis-sentinel` compatibility symlinks, so every command and config directive on this page applies to both engines. Valkey reports `redis_version:7.2.4` in `INFO` for client compatibility and carries its real version in `server_name` and `valkey_version`; check that before switching if your client library gates features on `redis_version`.
+`engine` is chosen at install. `engine: valkey` moves the Redis *and* Sentinel workloads onto `valkeyImage` together; running different engines on the two tiers is not supported. Nothing else changes: the Valkey image ships `redis-server`, `redis-cli` and `redis-sentinel` compatibility symlinks, so every command and config directive on this page applies to both engines. Valkey reports `redis_version:7.2.4` in `INFO` for client compatibility and carries its real version in `server_name` and `valkey_version`; check that before switching if your client library gates features on `redis_version`.
 
 <Warning>
-**The engine cannot be switched on a running deployment.** Valkey does not read the data format Redis 8 writes: with persistence enabled the replaced replica crash-loops with `Can't handle RDB format version 15`, and with persistence disabled it silently starts empty. Migrate between engines with dump/restore or replication, never by changing `engine`. Setting `engine` back recovers the release.
+**The engine cannot be switched on a running deployment.** Valkey cannot read the data files Redis 8 writes, so switching `engine` on a running release crash-loops the nodes (persistence on) or starts them empty (persistence off). Move data between engines with dump/restore or replication, never by changing `engine`. Setting `engine` back recovers the release.
 </Warning>
+
+### Suspend
+
+```yaml
+# true stops every workload in the release: Redis, Sentinel and the backup job.
+# Volume sets and secrets are kept; set back to false to start it again.
+suspend: false
+```
+
+`suspend: true` stops every workload the release runs: the Redis nodes, the Sentinel tier (production mode) and the backup job. Nothing is deleted: volume sets and secrets are kept, and Redis is unreachable until you set `suspend` back to `false`. With persistence on, each node reloads its data from its volume set when it starts again; without persistence, the data held in memory is lost.
+
+To suspend a release, set `suspend: true` in the values file you installed with and upgrade; set it back to `false` and upgrade again to resume:
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/redis \
+  --version 3.9.0 --gvc GVC_NAME -f values.yaml
+```
+
+Suspending is also how persistence is added to a running release; see [Persistence](#persistence).
 
 ### Redis
 
@@ -185,8 +204,10 @@ redis:
 ```
 
 <Warning>
-**Do not change the password on a running cluster.** Changing `redis.auth.password.value` (or the contents of the referenced secret) stalls the rolling update: the first restarted node cannot replicate from the not-yet-restarted master, logging `Unable to AUTH to MASTER: -WRONGPASS invalid username-password pair or user is disabled.`, and its readiness probe never passes. Re-apply the previous password to recover. To change the password, uninstall and reinstall, or accept a planned outage.
+**Do not change the password on a running release.** Changing `redis.auth.password.value` (or the contents of the referenced secret) stops the rolling update: a restarted replica can no longer authenticate to the master, so it never becomes ready and the rollout stops advancing. Setting the previous password back recovers it. To change the password, uninstall and reinstall.
 </Warning>
+
+A password may contain spaces, quotes, backslashes and any other printable character. Line breaks, tabs and other control characters are not supported, because each password is written on a single configuration line.
 
 #### Public Access and Firewall
 
@@ -269,7 +290,7 @@ redis:
       timeoutSeconds: 5
 ```
 
-The readiness probe holds a replica out of rotation until it has finished syncing from the master; the liveness probe only checks that the process is up, so a replica mid-resync is never killed. The startup window is `initialDelaySeconds + 30 × periodSeconds` (160 seconds by default). With persistence enabled and a large dataset, a replica must load its AOF before it can sync, so raise `periodSeconds` to widen the window — for example `initialDelaySeconds: 35` and `periodSeconds: 20` gives 635 seconds.
+The readiness probe holds a replica out of rotation until it has finished syncing from the master, and a node or Sentinel that answers with an authentication error is not reported ready. The liveness probe only checks that the process is up, so a replica mid-resync is never killed. The startup window is `initialDelaySeconds + 30 × periodSeconds` (160 seconds by default). With persistence enabled and a large dataset, a replica must load its AOF before it can sync, so raise `periodSeconds` to widen the window — for example `initialDelaySeconds: 35` and `periodSeconds: 20` gives 635 seconds.
 
 #### Metrics Exporter
 
@@ -293,13 +314,13 @@ When enabled, Control Plane scrapes `:9121/metrics` on each Redis replica and th
 ```yaml
 redis:
   persistence:
-    # Set at INSTALL time. Enabling this on an already-running release stalls
-    # the rollout indefinitely (volumes stay unbound) — see the README.
+    # Best set at install. To add it to a running release, set suspend: true in
+    # the same upgrade, then false; data held only in memory is lost.
     enabled: false
     volumes:
       data:
         initialCapacity: 10 # In GB
-        performanceClass: general-purpose-ssd # general-purpose-ssd / high-throughput-ssd (Min 1000GB)
+        performanceClass: general-purpose-ssd # general-purpose-ssd / high-throughput-ssd (min 200 GB)
         fileSystemType: ext4 # ext4 / xfs
         snapshots:
           retentionDuration: 7d
@@ -314,10 +335,15 @@ redis:
         #   keyId: arn:aws:kms:us-east-1:1234567890:key/d411f35a-1d31-4515-9934-4f193e042d80 # Replace with your AWS KMS key ARN
 ```
 
-With persistence enabled each Redis replica keeps its data in `redis.dataDir` on a [volume set](/reference/volumeset) with both AOF and RDB persistence on, so data survives restarts and redeployments. Lifecycle hooks remove orphaned temporary RDB and AOF-rewrite files on every container start and stop. Without persistence the data lives in memory and on the container's ephemeral filesystem only.
+With persistence enabled each Redis replica keeps its data in `redis.dataDir` on a [volume set](/reference/volumeset) with both AOF and RDB persistence on, so data survives restarts and redeployments. Each node removes leftover temporary RDB and AOF-rewrite files from the volume before Redis starts, so files from an interrupted sync never accumulate. Without persistence the data lives in memory and on the container's ephemeral filesystem only.
 
 <Warning>
-**Enable persistence at install time, not on a running release.** Turning `redis.persistence.enabled` or `sentinel.persistence.enabled` on for a deployment that is already running stalls the rollout indefinitely: every replica sits on `Replica N will be restarted shortly`, the volume set's volumes stay `unbound`, and a forced redeployment does not clear it. Uninstall and reinstall with persistence enabled instead. A fresh install with persistence comes up normally, and upgrading a release that already owns its volume rolls fine.
+**Turn persistence on at install when you can.** Adding `redis.persistence` or `sentinel.persistence` to a running release takes effect only once every node stops, so an upgrade that turns it on by itself stalls the rollout. Add it in two upgrades instead, using the values file you installed with:
+
+1. Set `redis.persistence.enabled: true` (or `sentinel.persistence.enabled: true`) and `suspend: true`, then upgrade.
+2. Set `suspend: false`, then upgrade again.
+
+Every node stops in between, so Redis data that is held only in memory is lost. Take a backup first if it matters.
 </Warning>
 
 ### Sentinel
@@ -358,13 +384,13 @@ sentinel:                         # production mode only; ignored in dev mode
   # CONFIG REWRITE. Replicas query sentinel at startup, so persisted state lets
   # them rejoin the real master rather than redis-0. Recommended ON in prod.
   persistence:
-    # Set at INSTALL time. Enabling this on an already-running release stalls
-    # the rollout indefinitely (volumes stay unbound) — see the README.
+    # Best set at install. To add it to a running release, set suspend: true in
+    # the same upgrade, then false; data held only in memory is lost.
     enabled: false
     volumes:
       data:
         initialCapacity: 10 # In GB
-        performanceClass: general-purpose-ssd # general-purpose-ssd / high-throughput-ssd (Min 1000GB)
+        performanceClass: general-purpose-ssd # general-purpose-ssd / high-throughput-ssd (min 200 GB)
         fileSystemType: ext4 # ext4 / xfs
         snapshots:
           retentionDuration: 7d
@@ -509,19 +535,22 @@ Switching `backup.provider` between `aws` and `gcp` on an existing release leave
 
 ### Restoring a Backup
 
+Each backup is a standard gzipped RDB file (`redis-TIMESTAMP.rdb.gz`). This template does not provide an in-place restore into a running release.
+
+To use a backup, decompress it and start a standalone Redis or Valkey server with AOF disabled and the file in place as its `dump.rdb` (or, on Redis 8.10 and later, with the startup-only `preload-file rdb:/path/to/file.rdb` setting described under [Restoring a backup in the Redis persistence documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/#restoring-a-backup)), for example on a local machine with Docker. From there, inspect the data or replay it into your cluster with your own tooling.
+
 <Warning>
-**There is no verified procedure for restoring one of these snapshots into a running release of this template.** Two things that look like they should work do not:
+Two shortcuts do not restore anything:
 
-- Copying the file into the data directory as `dump.rdb` and restarting does nothing. The chart runs with `appendonly yes`, and when both AOF and RDB persistence are enabled Redis rebuilds the dataset from the AOF at startup and ignores `dump.rdb`.
-- `redis-cli --rdb FILE` *downloads* an RDB from a server; it does not load one. Running it against the cluster overwrites your downloaded backup with the live dataset.
+- Placing a `dump.rdb` in the cluster's data directory has no effect: the cluster runs with AOF enabled, and Redis loads the AOF at startup.
+- `redis-cli --rdb FILE` downloads a dump from a server; it does not load one, and pointing it at your backup file overwrites it.
 </Warning>
-
-What the backup is: a standard, gzipped RDB file, and RDB files are portable. The upstream-documented way to read one is to start a standalone Redis or Valkey server with AOF disabled and the decompressed file in place as its `dump.rdb` (or, on Redis 8.10 and later, with the startup-only `preload-file rdb:/path/to/file.rdb` setting described under [Restoring a backup in the Redis persistence documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/#restoring-a-backup)), for example on a local machine with Docker. From there you can inspect the data or replay it into your cluster with your own tooling. Loading the file into this template's cluster in place has not been tested; if you need that path, test it against a throwaway release before relying on it.
 
 If you enabled `redis.persistence`, the volume set also takes its own scheduled snapshots on `redis.persistence.volumes.data.snapshots.schedule`; those are managed through the volume set, independently of the bucket backups.
 
 ### Upgrading from an Earlier Version
 
+- **From 3.8.0 — no values changes needed.** `suspend` defaults to `false`, so the release keeps running. The Redis and Sentinel start scripts and readiness probes change, so every node restarts once during the rolling upgrade. If you changed a password at runtime with `CONFIG SET requirepass`, set the configured password (`redis.auth` or the referenced secret) to match the running one before upgrading; a node whose running password differs from the configured one is not ready and stops serving. Passwords may now contain spaces, quotes and backslashes.
 - **From 3.7.x — no values changes needed.** `mode` defaults to `production`, which deploys the same topology as 3.7.x. Every Redis and Sentinel replica restarts once during the rolling upgrade, which moves the master through one Sentinel failover. With `redis.persistence.enabled`, data is kept.
 - **From 3.5.1 or earlier — resource keys were renamed.** Blocks that expose both a reservation and a limit now name the limit `maxCpu` / `maxMemory` instead of `cpu` / `memory`: `redis.resources`, `sentinel.resources` and `redis.exporter.resources`. Rename them in your values before upgrading; an upgrade that still carries the old names is refused at render with `redis.resources.cpu was RENAMED to redis.resources.maxCpu`. `backup.resources`, which exposes only a limit, keeps bare `cpu` / `memory`.
 - **From 3.5.0 or earlier with AWS backups — permissions narrowed.** Version 3.5.1 removed the AWS managed policy `ReadOnlyAccess` from the backup identity. It granted read access to every bucket in your account and had been silently supplying any read action your own policy omitted. Update your IAM policy to the full action list under [Backing Up](#backing-up) before upgrading; if it already matches, nothing changes.
@@ -535,14 +564,14 @@ Run a `helm upgrade` on the same release with `mode` set to `production` and eve
 
 ```bash
 cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/redis \
-  --version 3.8.0 --gvc GVC_NAME -f values.yaml
+  --version 3.9.0 --gvc GVC_NAME -f values.yaml
 ```
 
 If you installed with `--set` flags, repeat every one of them and replace `mode=dev`:
 
 ```bash
 cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/redis \
-  --version 3.8.0 --gvc GVC_NAME --set mode=production
+  --version 3.9.0 --gvc GVC_NAME --set mode=production
 ```
 
 Do not rebuild a values file from `cpln helm get values`: it returns `--set` values as flat dotted keys, which `-f` ignores, so persistence and authentication would fall back to their defaults.
@@ -560,7 +589,7 @@ Afterwards, point your clients at Sentinel (`RELEASE_NAME-sentinel.GVC_NAME.cpln
 - The default shape is already highly available: three data nodes (one master, two replicas) and three Sentinels with a quorum of two. Change `redis.replicas` and `sentinel.replicas` to resize either tier; keep the Sentinel count odd. For a single node with no Sentinel and no failover, use `mode: dev` instead (see [Mode](#mode)).
 - When the master stops responding, Sentinel marks it down after 5 seconds, elects a replica and repoints the remaining replicas at it. The old master rejoins as a replica when it comes back. Writes pause for the duration of the failover; reads from replicas continue.
 - Write capacity is that of a single node: replicas take reads only. For more memory or throughput, raise `redis.resources` and `redis.persistence.volumes.data` rather than adding replicas.
-- Enable `sentinel.persistence` so the elected master survives Sentinel restarts, and `redis.persistence` so data survives Redis restarts. Both are install-time choices.
+- Enable `sentinel.persistence` so the elected master survives Sentinel restarts, and `redis.persistence` so data survives Redis restarts. Set both at install when you can; to add one later, see [Persistence](#persistence).
 
 ### Troubleshooting
 
@@ -568,16 +597,16 @@ Afterwards, point your clients at Sentinel (`RELEASE_NAME-sentinel.GVC_NAME.cpln
   <Accordion title="Rollout stalls on `Replica N will be restarted shortly` after enabling persistence">
     **Symptom:** after a `cpln helm upgrade` that turned `redis.persistence.enabled` or `sentinel.persistence.enabled` on, every replica reports `Replica N will be restarted shortly` indefinitely and the volume set's volumes stay `unbound`.
 
-    **Cause:** a volume set cannot be attached to a release that is already running.
+    **Cause:** persistence added to a running release takes effect only once every node stops.
 
-    **Fix:** uninstall the release and reinstall it with persistence enabled from the start. Data in a release without persistence lives in memory only, so take a backup first if it matters.
+    **Fix:** run the upgrade again with `suspend: true` added, then a second upgrade with `suspend: false`, as described under [Persistence](#persistence). Data held only in memory is lost, so take a backup first if it matters.
   </Accordion>
   <Accordion title="`Unable to AUTH to MASTER: -WRONGPASS invalid username-password pair or user is disabled.`">
     **Symptom:** after changing the Redis password, the rollout stops at the first restarted node, which logs this line and never becomes ready.
 
     **Cause:** the restarted node uses the new password; the master it must replicate from still runs with the old one.
 
-    **Fix:** run `cpln helm upgrade` again with the previous password to recover. To change the password, uninstall and reinstall, or accept a planned outage.
+    **Fix:** run `cpln helm upgrade` again with the previous password to recover. To change the password, uninstall and reinstall.
   </Accordion>
   <Accordion title="`READONLY You can't write against a read only replica.`">
     **Symptom:** writes that used to succeed are refused after a failover or a rolling upgrade.
@@ -632,7 +661,7 @@ Afterwards, point your clients at Sentinel (`RELEASE_NAME-sentinel.GVC_NAME.cpln
     **Fix:** set the named Sentinel setting to `false`, or keep `mode: production`.
   </Accordion>
   <Accordion title="Clients can still connect after tightening the firewall">
-    **Symptom:** after changing `internal_inboundAllowType` or `inboundAllowWorkload`, previously allowed clients keep connecting.
+    **Symptom:** after changing `internal_inboundAllowType` or `inboundAllowWorkload`, clients the new rule excludes keep connecting.
 
     **Cause:** firewall changes take a few minutes to propagate.
 
@@ -642,15 +671,16 @@ Afterwards, point your clients at Sentinel (`RELEASE_NAME-sentinel.GVC_NAME.cpln
 
 ## Important Notes
 
-- **`mode: dev` has no failover and is not for production.** Turn on `redis.persistence.enabled` at install if dev data must survive restarts and upgrades.
+- **`mode: dev` has no failover and is not for production.** Turn on `redis.persistence.enabled` if dev data must survive restarts and upgrades.
 - **Choose `engine` at install time.** Switching it on a running release does not migrate anything; Valkey cannot read data written by Redis 8.
-- **Choose persistence at install time.** Enabling `redis.persistence` or `sentinel.persistence` on a running release stalls the rollout indefinitely; uninstall and reinstall instead.
-- **Never change the password in place.** It deadlocks the rolling update; re-apply the previous password to recover and reinstall to change it.
+- **Choose persistence at install time when you can.** To add it to a running release, set `suspend: true` in the same upgrade, then `suspend: false`; data held only in memory is lost.
+- **`suspend: true` stops every node.** Without persistence, the data in memory is lost.
+- **Never change the password in place.** The rolling update stops advancing; set the previous password back to recover, and reinstall to change it.
 - **In production mode, always discover the master through Sentinel** (`mymaster` at `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379`). A client pinned to replica 0 gets `READONLY` errors after any failover or upgrade. In dev mode, connect to `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` directly.
 - **Enable `sentinel.persistence` in production** so the elected master survives Sentinel restarts.
 - **The Redis 7.4 to 8 upgrade is one-way.** Snapshot the volume set before upgrading if you need a rollback path.
 - **Public access needs the DNS records in place before the first deploy and `external_inboundAllowCIDR` uncommented**, or the domain is rejected or routes nowhere.
-- **Bucket backups have no verified in-place restore.** Treat them as portable RDB files; see [Restoring a Backup](#restoring-a-backup).
+- **Bucket backups are not restored in place.** Load them into a standalone server; see [Restoring a Backup](#restoring-a-backup).
 
 ## External References
 
