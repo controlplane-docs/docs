@@ -1,7 +1,7 @@
 ---
 title: Umami
 icon: /template-catalog/templates/icons/umami.png
-description: Umami privacy-first, cookieless web analytics as a stateless app tier over a bundled PostgreSQL store (single-instance by default, highly available with one flag), deployed into an existing GVC. An app secret must exist first. Starts private until you change the admin password.
+description: Umami privacy-first, cookieless web analytics as a stateless app tier over a bundled PostgreSQL store (single-instance by default, highly available with one flag), deployed into an existing GVC. App and database secrets must exist first. Starts private until you change the admin password.
 keywords: ['web analytics', 'product analytics', 'cookieless analytics', 'google analytics alternative', 'plausible alternative', 'matomo alternative', 'fathom alternative', 'self-hosted analytics', 'website tracking', 'tracking script', 'app secret', 'port forward', 'patroni']
 ---
 
@@ -28,18 +28,17 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Workload | `RELEASE_NAME-postgres-ha-backup` | Scheduled logical backup of the highly available store (cron) | `postgresHA.backup.enabled: true` with `mode: logical` |
 | Volume set | `RELEASE_NAME-pg-vs` | Single-instance database data (10 GiB by default; takes no scheduled snapshots; a final snapshot is taken when the volume set is deleted and kept 7 days) | Default; `postgres.enabled: true` |
 | Volume set | `RELEASE_NAME-postgres-ha-vs`, `RELEASE_NAME-etcd-vs` | Highly available database and consensus-store data (10 GiB per replica by default) | `postgresHA.enabled: true` |
-| Secret | The name in `postgres.config.credentialsSecretName` (HA mode: `postgresHA.config.credentialsSecretName`), default `my-umami-db-credentials` | Database credentials (`username`, `password`, `database`), **created by this chart** from `postgres.credentials.*` and read by Umami and the active database | — |
 | Secret | `RELEASE_NAME-etcd-startup`, `RELEASE_NAME-patroni-startup`, `RELEASE_NAME-postgres-proxy-startup`, `RELEASE_NAME-wal-g-backup-script` | Startup scripts of the highly available database tier | `postgresHA.enabled: true` |
 | Secret | `RELEASE_NAME-postgres-config` | Non-sensitive backup settings of the highly available database | `postgresHA.backup.enabled: true` |
 | Identity / Policy | `RELEASE_NAME-umami-identity`, `RELEASE_NAME-umami-policy` | `reveal` on exactly two secrets: your app secret and the database credentials secret | — |
 | Identity / Policy | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-pg-policy` | The single-instance database's own identity and policy | Default; `postgres.enabled: true` |
 | Identity / Policy | `RELEASE_NAME-postgres-ha-identity`, `RELEASE_NAME-postgres-ha-policy`, `RELEASE_NAME-etcd-identity`, `RELEASE_NAME-etcd-policy` | The highly available database tier's own identities and policies | `postgresHA.enabled: true` |
 
-Umami itself has no volume set — every user, website, session and event lives in PostgreSQL. The app secret is a **prerequisite secret you create yourself**; the chart references it by name and never creates, modifies or deletes it.
+Umami itself has no volume set — every user, website, session and event lives in PostgreSQL. The app secret and the database credentials secret are **prerequisite secrets you create yourself**; the chart references them by name and never creates, modifies or deletes them.
 
 ## Prerequisites
 
-One [opaque secret](/guides/create-secret/opaque) must exist before you install. Secrets are org-level, so no `--gvc` flag is involved.
+Two secrets must exist before you install: an [opaque secret](/guides/create-secret/opaque) for the app secret and a [dictionary secret](/guides/create-secret/dictionary) for the database credentials. They hold credentials, so they are prerequisite secrets rather than values — a value would sit in plaintext in the Helm release for the life of the install. Secrets are org-level, so no `--gvc` flag is involved.
 
 <Steps>
   <Step title="Create the app secret">
@@ -51,13 +50,22 @@ One [opaque secret](/guides/create-secret/opaque) must exist before you install.
 
     Keep it for the life of the install: changing it logs every user out. Set `app.appSecretName` to this name.
   </Step>
-  <Step title="Choose the database password">
-    The bundled database's credentials are internal plumbing: this chart writes `postgres.credentials.username`, `postgres.credentials.password` and `postgres.credentials.database` into a dictionary secret it creates, and both Umami and the database read it. Nothing to create — but the password ships as the placeholder `change-me-umami-db`, so set `postgres.credentials.password` to a value of your own before installing. This applies in **both** database modes.
+  <Step title="Create the database credentials secret">
+    The bundled PostgreSQL initializes with these values and Umami connects with them, in **both** database modes:
+
+    ```bash
+    cpln secret create-dictionary --name my-umami-db-credentials \
+      --entry username=umami \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=umami
+    ```
+
+    Set its name in the key of the store you use: `postgres.config.credentialsSecretName` (single-instance, the default) or `postgresHA.config.credentialsSecretName` (HA). Umami builds its connection URL from the three keys, so keep them URL-safe (letters, digits, `-`, `_`). PostgreSQL reads the secret only when its data is first initialized — see [Rotating the Database Password](#rotating-the-database-password).
   </Step>
 </Steps>
 
 <Warning>
-**A missing app secret wedges the install rather than failing it.** `cpln helm install` reports success and every resource is created, but the Umami container never starts — so `cpln logs` returns **zero lines**. The only place the missing secret is named is `status.versions[].message`:
+**A missing app secret or database credentials secret wedges the install rather than failing it.** `cpln helm install` reports success and every resource is created, but the Umami container never starts — so `cpln logs` returns **zero lines**. The only place the missing secret is named is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-umami --gvc GVC_NAME -o yaml
@@ -70,16 +78,16 @@ Optional database backups need a bucket and access setup on AWS S3, Google Cloud
 
 ## Installation
 
-Once the app secret exists, install the template into your GVC, naming the secret and replacing the database password placeholder:
+Once both secrets exist, install the template into your GVC, naming them:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/umami \
-  --version 1.3.1 --gvc GVC_NAME \
+  --version 1.4.0 --gvc GVC_NAME \
   --set app.appSecretName=APP_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-STRONG-DB-PASSWORD'
+  --set postgres.config.credentialsSecretName=my-umami-db-credentials
 ```
 
-Keep these settings in a values file (`--values`) rather than `--set` if you do not want the database password in your shell history — and because every later upgrade must pass them again. If you run more than one release of this template in the same org, also give each its own `postgres.config.credentialsSecretName` — see [Backing Store](#backing-store).
+Keep these settings in a values file (`--values`) rather than `--set`, because every later upgrade must pass them again. If you run more than one release of this template in the same org, create a separate database credentials secret for each — see [Backing Store](#backing-store).
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -145,12 +153,12 @@ Enable exactly one of the two stores — the chart refuses to render with both o
 postgres: # default: single-instance PostgreSQL — set postgresHA.enabled: true (and this false) for failover
   enabled: true
   image: postgres:18
-  credentials: # this chart builds the database credentials secret from these
-    username: umami
-    password: change-me-umami-db # change before installing
-    database: umami
   config:
-    # name of the dictionary secret this chart CREATES; org-wide, so unique per release
+    # REQUIRED PREREQUISITE SECRET (single-instance mode) — CREATE IT BEFORE YOU
+    # INSTALL. If it does not exist the deployment WEDGES silently and looks like a
+    # platform fault. A `dictionary` secret holding exactly three keys: username,
+    # password, database. PostgreSQL reads it once, when its data is first
+    # initialized, and Umami connects with the same keys. See README Prerequisites.
     credentialsSecretName: my-umami-db-credentials
   resources:
     minCpu: 250m
@@ -163,7 +171,9 @@ postgres: # default: single-instance PostgreSQL — set postgresHA.enabled: true
 postgresHA: # durable HA: 3-replica Patroni store with an HAProxy leader endpoint
   enabled: false
   config:
-    # the secret name used in HA mode; still built from postgres.credentials.* above
+    # REQUIRED PREREQUISITE SECRET (HA mode) — the same kind of `dictionary`
+    # secret as postgres.config.credentialsSecretName above (keys: username,
+    # password, database). Create it BEFORE you install.
     credentialsSecretName: my-umami-db-credentials
   replicas: 3
   volumeset:
@@ -178,9 +188,9 @@ postgresHA: # durable HA: 3-replica Patroni store with an HAProxy leader endpoin
 | Database failover | None — a failed node is rescheduled onto the same volume | Automatic leader election |
 | Best for | Most installs — analytics can tolerate a few minutes of downtime | Installs where the dashboard and collection must stay up through a database failure |
 
-To use HA mode on a **new** install, set `postgres.enabled: false` and `postgresHA.enabled: true`. The credentials still come from `postgres.credentials.*` in both modes. Switching an existing release between modes does not move data — the other store starts empty.
+To use HA mode on a **new** install, set `postgres.enabled: false` and `postgresHA.enabled: true`. The credentials come from your prerequisite database credentials secret in both modes, named by `postgresHA.config.credentialsSecretName` in HA mode. Switching an existing release between modes does not move data — the other store starts empty.
 
-Secret names are org-wide, so if you run more than one release of this template in the same org, give each its own credentials secret name — `postgres.config.credentialsSecretName`, or `postgresHA.config.credentialsSecretName` in HA mode. A second release left on the default name is **refused at install** and creates nothing; the first release is unaffected.
+Secret names are org-wide, so if you run more than one release of this template in the same org, create a separate database credentials secret for each and point each release's `postgres.config.credentialsSecretName` (or `postgresHA.config.credentialsSecretName` in HA mode) at its own.
 
 Database backups are configured under `postgres.backup` / `postgresHA.backup` — see [Backing Up](#backing-up).
 
@@ -216,7 +226,7 @@ internalAccess:
 | Dashboard (private) | `http://localhost:3000` through `cpln port-forward` | Works with public access off — see the command below |
 | Internal | `http://RELEASE_NAME-umami.GVC_NAME.cpln.local:3000` | Reachable per `internalAccess.type`; for server-side event tracking from your own workloads |
 | Admin login | `admin` / `umami` until you change it | Hardcoded by Umami — change it before publishing, see [First Run](#first-run) |
-| Database credentials | The secret named by `postgres.config.credentialsSecretName` (HA mode: `postgresHA.config.credentialsSecretName`) | `cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml`; keys `username`, `password`, `database` |
+| Database credentials | Your prerequisite secret, named by `postgres.config.credentialsSecretName` (HA mode: `postgresHA.config.credentialsSecretName`) | `cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml`; keys `username`, `password`, `database` |
 
 `CANONICAL_ENDPOINT` is the host of `status.canonicalEndpoint`. Open a tunnel to the dashboard from your machine — this works whether or not public access is on:
 
@@ -249,13 +259,13 @@ Umami's bootstrap admin is a hardcoded `admin` / `umami`, seeded by its first da
     In the dashboard, open **Settings → Profile** and change the password. From then on the old password is rejected.
   </Step>
   <Step title="Publish the dashboard and tracking endpoint">
-    Upgrade the release with `publicAccess.enabled=true`, passing the **same** app secret name and database password you installed with (or the same values file):
+    Upgrade the release with `publicAccess.enabled=true`, passing the **same** app secret and database credentials secret names you installed with (or the same values file):
 
     ```bash
     cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/umami \
-      --version 1.3.1 --gvc GVC_NAME \
+      --version 1.4.0 --gvc GVC_NAME \
       --set app.appSecretName=APP_SECRET_NAME \
-      --set postgres.credentials.password='YOUR-STRONG-DB-PASSWORD' \
+      --set postgres.config.credentialsSecretName=my-umami-db-credentials \
       --set publicAccess.enabled=true
     ```
 
@@ -429,27 +439,79 @@ Version 1.2.0 moved the single-instance database credentials. Carrying the old k
 
 | 1.1.0 | 1.2.0 and later |
 |---|---|
-| `postgres.config.username`, `postgres.config.password`, `postgres.config.database` | `postgres.credentials.username`, `postgres.credentials.password`, `postgres.credentials.database` |
+| `postgres.config.username`, `postgres.config.password`, `postgres.config.database` | The `username`, `password` and `database` keys of the database credentials secret, named by `postgres.config.credentialsSecretName` |
 | `postgres.backup.minio.accessKey`, `postgres.backup.minio.secretKey` | A dictionary secret holding `accessKey` and `secretKey`, named by `postgres.backup.minio.credentialsSecretName` |
 
-Move the three credential values unchanged — the database was initialised with them. The error message comes from the bundled database (`config.username was REMOVED in postgres 3.4.0`) and tells you to create a credentials secret yourself; **ignore that part** — this template creates it from `postgres.credentials.*`. The MinIO keys, by contrast, are a real prerequisite secret: create it as shown in [Backing Up](#backing-up).
+Put the values your single-instance database was initialized with into the database credentials secret under [Prerequisites](#prerequisites), set `postgres.config.credentialsSecretName` to its name, and remove the three keys. The error message comes from the bundled database (`config.username was REMOVED in postgres 3.4.0`). The MinIO keys are a prerequisite secret too: create it as shown in [Backing Up](#backing-up).
 
 ### Upgrading From 1.2.0
 
-Version 1.3.0 moved the HA database credentials onto the same chart-created secret as single-instance mode. Carrying the old block forward fails at render with `the postgres block was REMOVED in 2.5.0`. The three `username`, `password` and `database` values that sat in a `postgres` block under `postgresHA` now come from `postgres.credentials.username`, `postgres.credentials.password` and `postgres.credentials.database`, and this chart writes them into the secret named by `postgresHA.config.credentialsSecretName`.
+Version 1.3.0 removed the HA database credentials block. Carrying the old block forward fails at render with `the postgres block was REMOVED in 2.5.0`.
 
-Delete that block from your values and set `postgres.credentials.*` to the **same** values it held — the HA database was initialised with them. Do not create the credentials secret yourself. This path has not been rehearsed on an existing HA install; take a backup before upgrading. Single-instance installs need no action.
+Put the `username`, `password` and `database` values that sat in a `postgres` block under `postgresHA` **unchanged** into the database credentials secret under [Prerequisites](#prerequisites) — the HA database was initialized with them — set `postgresHA.config.credentialsSecretName` to its name, and delete the block. Take a backup before upgrading. Single-instance installs need no action.
 
 ### Upgrading From 1.3.0
 
 Version 1.3.1 moved the HA database's MinIO backup keys into a prerequisite secret. With HA-mode MinIO backups on, the old `accessKey` and `secretKey` values under `postgresHA.backup.minio` now fail at render: create a dictionary secret holding `accessKey` and `secretKey` as shown in [Backing Up](#backing-up) and set `postgresHA.backup.minio.credentialsSecretName` to its name. No other install needs action.
+
+### Upgrading From 1.3.1
+
+Version 1.4.0 removed `postgres.credentials`: the database credentials are now a prerequisite secret, the same one the database templates require on their own. Carrying the old key forward fails the render.
+
+1.3.x created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or Umami loses its database connection. `OLD_SECRET_NAME` is the `credentialsSecretName` of the mode you use (default `my-umami-db-credentials`):
+
+```bash
+cpln secret reveal OLD_SECRET_NAME -o yaml   # the CURRENT values, until the upgrade deletes this secret
+cpln secret create-dictionary --name RELEASE_NAME-postgres-credentials \
+  --entry username='YOUR_CURRENT_USERNAME' --entry password='YOUR_CURRENT_PASSWORD' --entry database='YOUR_CURRENT_DATABASE'
+```
+
+Then upgrade with `postgres.config.credentialsSecretName` (single-instance mode) or `postgresHA.config.credentialsSecretName` (HA mode) set to that name, and `postgres.credentials` removed. Your current values are also in `postgres.credentials` of the 1.3.x release.
+
+The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), so Umami briefly loses its database and reconnects by itself. The new version of a workload can also wait for several minutes, with `get-deployments` reporting that it is not allowed to reveal the secret, while access to the new secret propagates; the previous version keeps serving meanwhile, and it clears by itself.
+
+### Rotating the Database Password
+
+PostgreSQL keeps the password it was initialized with, and a running workload keeps the values it started with, so a rotation takes three steps in order (single-instance; in HA mode follow [Rotating the Database Password in HA Mode](#rotating-the-database-password-in-ha-mode) instead):
+
+1. Change it in the database: `ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD';` (connected as that user, from inside the GVC).
+2. Update the secret: `cpln secret edit SECRET_NAME`.
+3. Right away, redeploy Umami with `cpln workload force-redeployment RELEASE_NAME-umami --gvc GVC_NAME`, and wait until `get-deployments` shows a higher version number, alone and ready (right after the command the status may not show the restart yet, and `ready: true` alone can still describe the old replica). Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime.
+
+Umami keeps serving on the database connections it already has open, so logins fail only briefly while its replica is swapped. Do step 3 right away: if those connections drop before Umami restarts, it cannot open new ones.
+
+### Rotating the Database Password in HA Mode
+
+The HA database (`postgresHA`) needs its own order. The replication role `repl` shares the password, and a member that restarts with the old password can be promoted to leader, which splits the cluster. Move the leader to member `-0` first, so it restarts last, after every other member already has the new password. `pgx` runs a command in one member (`LOCATION` is your GVC's location, `DB_USERNAME` the secret's `username`):
+
+```bash
+pgx() { cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --location LOCATION \
+  --container patroni-postgres --replica "RELEASE_NAME-postgres-ha-$1" -- "${@:2}"; }
+# 1. Find the leader ("role": "leader"); the other two must be "streaming" on the same "timeline"
+pgx 0 curl -s localhost:8008/cluster
+# 2. If the leader is not RELEASE_NAME-postgres-ha-0, move it there (N = current leader), then repeat step 1
+pgx 0 curl -s -XPOST -d '{"leader":"RELEASE_NAME-postgres-ha-N","candidate":"RELEASE_NAME-postgres-ha-0"}' localhost:8008/switchover
+# 3-5. Back to back: change BOTH roles on -0, put the same password in the secret, restart the members
+pgx 0 psql -h 127.0.0.1 -d postgres -c "ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD'; ALTER ROLE repl PASSWORD 'NEW_PASSWORD';"
+cpln secret edit SECRET_NAME
+cpln workload force-redeployment RELEASE_NAME-postgres-ha --gvc GVC_NAME
+# 6. Once the members have restarted, confirm one leader and two "streaming" replicas on one timeline (repeat step 1)
+# 7. Optional: remove the install-time password Patroni keeps in its cluster config
+pgx 0 curl -s -XPATCH -d '{"postgresql":{"authentication":null}}' localhost:8008/config
+```
+
+Then force-redeploy `RELEASE_NAME-umami`, which keeps the old password until it restarts. The database drops connections briefly at each switchover, and the app cannot open new connections from the `ALTER ROLE` until its own redeploy finishes, so rotate in a quiet window. If a member stays `starting`, or `running` without `streaming` for several minutes, re-copy it from the leader. This copies the whole database, so it costs network traffic in proportion to its size:
+
+```bash
+pgx N curl -s -XPOST -d '{"force": true}' localhost:8008/reinitialize
+```
 
 ### Scaling and Availability
 
 - **The app tier scales with `replicas`.** It is stateless — replicas share only the database and the app secret — so `2` or more gives an always-on tier whose rolling restarts cycle one replica at a time.
 - **The database is the availability limit.** In single-instance mode a database restart makes the dashboard and collection briefly unavailable; set `postgresHA.enabled: true` on a new install for automatic failover.
 - **The first `helm upgrade` after an install can restart the bundled database** even when no database value changed.
-- **Uninstall deletes every volume set the chart created**, so all analytics data is lost and does not survive a reinstall. The GVC is yours and is left alone, and your app secret survives. Enable backups if the data matters.
+- **Uninstall deletes every volume set the chart created**, so all analytics data is lost and does not survive a reinstall. The GVC is yours and is left alone, and your prerequisite secrets survive. Enable backups if the data matters.
 
 ### Troubleshooting
 
@@ -457,7 +519,7 @@ Version 1.3.1 moved the HA database's MinIO backup keys into a prerequisite secr
   <Accordion title="The Umami workload sits at 0 replicas after install while helm reported success">
     **Symptom:** `cpln helm install` succeeded, but `RELEASE_NAME-umami` shows no containers and `cpln logs` returns nothing.
 
-    **Cause:** The secret named by `app.appSecretName` does not exist. The deployment pauses on the unresolved reference.
+    **Cause:** The secret named by `app.appSecretName`, or the database credentials secret named by `postgres.config.credentialsSecretName` (HA mode: `postgresHA.config.credentialsSecretName`), does not exist. The deployment pauses on the unresolved reference.
 
     **Fix:** Read the message naming the secret, then create it as shown in [Prerequisites](#prerequisites):
 
@@ -481,13 +543,6 @@ Version 1.3.1 moved the HA database's MinIO backup keys into a prerequisite secr
 
     **Fix:** Enable exactly one — see [Choosing a Database Mode](#choosing-a-database-mode). For HA mode set `postgres.enabled: false` together with `postgresHA.enabled: true`.
   </Accordion>
-  <Accordion title="A second release is refused because a resource is managed by a different release">
-    **Symptom:** Installing a second release of this template in the same org fails with `cannot be updated because it is being managed by a different release`, naming the database credentials secret, and creates nothing.
-
-    **Cause:** Secret names are org-wide, and both releases are trying to create the same credentials secret (default `my-umami-db-credentials`). The first release owns it.
-
-    **Fix:** Give the new release its own `postgres.config.credentialsSecretName` (or `postgresHA.config.credentialsSecretName` in HA mode) and install again. The first release is unaffected.
-  </Accordion>
   <Accordion title="Every user is logged out after a change">
     **Symptom:** All dashboard sessions end at once and everyone has to sign in again.
 
@@ -496,22 +551,23 @@ Version 1.3.1 moved the HA database's MinIO backup keys into a prerequisite secr
     **Fix:** Nothing is lost — users sign in again. To avoid it, keep the app secret stable for the life of the install.
   </Accordion>
   <Accordion title="Upgrade fails with a key that was REMOVED or RENAMED">
-    **Symptom:** `helm upgrade` stops at render with `app.appSecret was removed in 1.1.0`, `resources.cpu was renamed to resources.maxCpu`, `config.username was REMOVED in postgres 3.4.0`, `the postgres block was REMOVED in 2.5.0`, or `backup.minio.accessKey and backup.minio.secretKey were REMOVED`.
+    **Symptom:** `helm upgrade` stops at render with `app.appSecret was removed in 1.1.0`, `resources.cpu was renamed to resources.maxCpu`, `config.username was REMOVED in postgres 3.4.0`, `the postgres block was REMOVED in 2.5.0`, `backup.minio.accessKey and backup.minio.secretKey were REMOVED`, or `postgres.credentials was REMOVED in 1.4.0`.
 
-    **Cause:** Your values still carry a key that moved in template versions 1.1.0 to 1.3.1. The existing release is left untouched and running.
+    **Cause:** Your values still carry a key that moved in template versions 1.1.0 to 1.4.0. The existing release is left untouched and running.
 
-    **Fix:** Follow the matching migration note above — [Upgrading From 1.0.1](#upgrading-from-1-0-1), [Upgrading From 1.1.0](#upgrading-from-1-1-0), [Upgrading From 1.2.0](#upgrading-from-1-2-0) or [Upgrading From 1.3.0](#upgrading-from-1-3-0) — keeping the credentials the database already uses. Do not create a database credentials secret yourself; this template creates it.
+    **Fix:** Follow the matching migration note above — [Upgrading From 1.0.1](#upgrading-from-1-0-1), [Upgrading From 1.1.0](#upgrading-from-1-1-0), [Upgrading From 1.2.0](#upgrading-from-1-2-0), [Upgrading From 1.3.0](#upgrading-from-1-3-0) or [Upgrading From 1.3.1](#upgrading-from-1-3-1) — keeping the credentials the database already uses in your database credentials secret.
   </Accordion>
 </AccordionGroup>
 
 ## Important Notes
 
-- **Create the app secret before installing**, and change `postgres.credentials.password` from its `change-me` placeholder. A missing app secret does not fail the install — the workload waits on it with no logs.
+- **Create the app secret and the database credentials secret before installing.** A missing one does not fail the install — the workload waits on it with no logs; see [Prerequisites](#prerequisites) for the diagnostic.
+- **Editing the database credentials secret alone changes nothing** — rotate with `ALTER ROLE` plus a forced redeployment of Umami (not the database); see [Rotating the Database Password](#rotating-the-database-password). In HA mode a leader switchover comes first.
 - **Change the hardcoded `admin` / `umami` password before turning public access on** — follow [First Run](#first-run) in order.
 - **Tracking collects nothing until `publicAccess.enabled` is `true`**, and the tracking script must be loaded from the public address.
 - **Keep the app secret stable** — changing it logs every user out. It is not owned by the release: it survives `helm uninstall` and must be deleted manually.
-- **Pass the same app secret name and database password on every upgrade** — a values file is the simplest way.
-- **Give each release its own `credentialsSecretName`** — secret names are org-wide, and a second release on the default name is refused at install.
+- **Pass the same app secret and database credentials secret names on every upgrade** — a values file is the simplest way.
+- **Give each release its own database credentials secret** — secret names are org-wide.
 - **Uninstall deletes the database volume sets** — enable backups if the analytics data matters.
 
 ## External References
