@@ -1,7 +1,7 @@
 ---
 title: Temporal
 icon: /template-catalog/templates/icons/temporal.png
-description: Deploy Temporal on Control Plane using the Template Catalog. An internal durable-execution server of one to five replicas, a Web UI you can open to listed IP ranges, optional S3 archival, and a bundled HA or single-instance PostgreSQL. Needs only an existing GVC.
+description: Deploy Temporal on Control Plane using the Template Catalog. An internal durable-execution server of one to five replicas, a Web UI you can open to listed IP ranges, optional S3 archival, and a bundled HA or single-instance PostgreSQL. Needs an existing GVC and a database credentials secret.
 keywords: ['workflow orchestration', 'workflow engine', 'cadence', 'step functions alternative', 'conductor alternative', 'camunda alternative', 'background jobs', 'task queue', 'saga pattern', 'automatic retries', 'grpc', 'history shards', 'namespace retention', 'self-hosted']
 ---
 
@@ -20,7 +20,7 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Workload | `RELEASE_NAME-temporal` | Temporal server (standard, `replicas` replicas, default 1, no volume). Each replica runs a `temporal` container (frontend, history, matching and worker services in one process; gRPC on `7233`, HTTP API on `7243`) and an `admin` sidecar that migrates the schema and serves the `temporal` CLI | — |
 | Workload | `RELEASE_NAME-temporal-ui` | Temporal Web UI on port `8080` (standard, 1 replica) | `ui.enabled: false` removes it |
 | Identity & Policy | `RELEASE_NAME-temporal-identity`, `RELEASE_NAME-temporal-policy` | Server identity with `reveal` on exactly the database credentials secret. With archival on, the identity is also bound to your AWS cloud account and bucket-scoped IAM policy. The UI has no identity because it mounts no secrets | — |
-| Secret | `my-temporal-db-credentials` | Dictionary secret **created by this chart** from `postgres.credentials.*`, holding `username`, `password` and `database`. Its name is the active database block's `config.credentialsSecretName` | — |
+
 | Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL cluster (stateful, 3 replicas) | HA mode (default) |
 | Workload | `RELEASE_NAME-etcd` | etcd consensus store for Patroni (stateful, 3 replicas) | HA mode |
 | Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy leader endpoint Temporal connects through (standard, 2 replicas) | HA mode |
@@ -38,7 +38,28 @@ In HA mode with `postgresHA.backup.mode: wal-g`, no cron workload is created; a 
 
 ## Prerequisites
 
-None for a default install. The database credentials are **not** a prerequisite: this chart creates the credentials secret for you from `postgres.credentials.*` and hands it to the bundled database by name. You only have to change the password before installing.
+**A database credentials secret must exist before you install.** It is a [dictionary secret](/guides/create-secret/dictionary) holding `username`, `password` and `database`; the bundled PostgreSQL initializes with it and Temporal connects with it. Secrets are org-level, so no GVC flag is involved:
+
+```bash
+cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+  --entry username=temporal \
+  --entry password="$(openssl rand -hex 24)" \
+  --entry database=temporal
+```
+
+- **`database` must be `temporal`.** The server reads its main store from the database named `temporal`, while PostgreSQL creates the one the secret names. With any other value both Temporal containers stop at boot and log `CPLN_TEMPORAL_DATABASE_GUARD`.
+- Set its name in the key of the database mode you use: `postgresHA.config.credentialsSecretName` (HA, the default) or `postgres.config.credentialsSecretName` (single-instance). Secret names are org-wide, so give each Temporal release its own secret.
+- PostgreSQL reads the secret only when its data is first initialized — see [Rotating the Database Password](#rotating-the-database-password).
+
+<Warning>
+**If the secret does not exist at install time the deployment wedges silently.** `cpln logs` returns zero lines — the containers never start, so there is nothing to log. The only place the missing secret is named is `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-temporal --gvc GVC_NAME -o yaml
+```
+
+Use `get-deployments`; plain `cpln workload get` has no `versions` key. Create the missing secret and the deployment recovers on its own after several minutes.
+</Warning>
 
 Optional database backups need a bucket and, for AWS or GCP, a Control Plane Cloud Account. Backups to MinIO or another S3-compatible endpoint additionally need a dictionary secret holding `accessKey` and `secretKey`, which must exist before you enable them. See [Backing Up](#backing-up).
 
@@ -46,13 +67,15 @@ Optional archival needs an S3 bucket, an AWS Cloud Account and a bucket-scoped I
 
 ## Installation
 
-Install with the database password set to something strong. Nothing else is required for a default install:
+Install with the name of the database credentials secret you created. Nothing else is required for a default install:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/temporal \
-  --version 2.0.0 --gvc GVC_NAME \
-  --set postgres.credentials.password='YOUR-STRONG-PASSWORD'
+  --version 2.1.0 --gvc GVC_NAME \
+  --set postgresHA.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME
 ```
+
+In single-instance mode set `postgres.config.credentialsSecretName` instead.
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -227,8 +250,13 @@ Exactly one of `postgresHA` and `postgres` must be enabled; the chart refuses to
 postgresHA:
   enabled: true
   config:
-    # Name of the dictionary secret this chart creates (from postgres.credentials.*)
-    # and the bundled postgres-highly-available reads. Org-wide: unique per release.
+    # REQUIRED PREREQUISITE SECRET (HA mode) — CREATE IT BEFORE YOU INSTALL. If
+    # it does not exist the deployment WEDGES silently and looks like a platform
+    # fault. A `dictionary` secret holding exactly three keys: username, password,
+    # database — and `database` MUST be `temporal` (the server's main store; any
+    # other value stops the admin container at boot). PostgreSQL reads it once, when
+    # its data is first initialized, and Temporal connects with the same keys. See
+    # README Prerequisites for the command.
     credentialsSecretName: my-temporal-db-credentials
   replicas: 3
   volumeset:
@@ -265,7 +293,7 @@ postgresHA:
       prefix: postgres/backups
 ```
 
-- `postgresHA.config.credentialsSecretName` — Name of the dictionary secret this chart creates and the HA cluster reads. Its contents come from `postgres.credentials.*` below, in both database modes. Secret names are organization-wide, so give each Temporal release its own name: a second release left on the default is refused at install and creates nothing, and the first release is unaffected.
+- `postgresHA.config.credentialsSecretName` — Name of the prerequisite database credentials secret the HA cluster and Temporal read (see [Prerequisites](#prerequisites)). Secret names are organization-wide, so give each Temporal release its own.
 - `postgresHA.replicas` / `postgresHA.volumeset.capacity` — PostgreSQL replica count and volume size per replica. The remaining cluster settings take the defaults of the [Postgres Highly Available](/template-catalog/templates/postgres-highly-available) template; the HAProxy leader endpoint must stay enabled because it is the address Temporal connects to.
 - `postgresHA.backup.*` — Optional backups of both Temporal databases, as scheduled logical dumps or continuous WAL-G archiving. Keep `resources.memory` at `512Mi` or more for WAL-G. See [Backing Up](#backing-up).
 
@@ -276,17 +304,11 @@ Enable this block and disable `postgresHA` for a lighter non-HA deployment.
 ```yaml
 postgres:
   enabled: false
-  # Credentials for the bundled database, used in BOTH database modes: this chart
-  # creates the secret from them, so there is nothing to create before installing.
-  # The password is set once, when the database volume is initialised.
-  # `database` MUST stay `temporal` (render-enforced in both modes).
-  credentials:
-    username: temporal
-    password: change-me-temporal-db-password # change before installing
-    database: temporal
   config:
-    # Name of the dictionary secret this chart creates and the bundled postgres reads.
-    # Org-wide: unique per release (a second release on this name is refused at install).
+    # REQUIRED PREREQUISITE SECRET (single-instance mode) — the same kind of
+    # `dictionary` secret as postgresHA.config.credentialsSecretName above
+    # (keys: username, password, database; database MUST be `temporal`).
+    # Create it BEFORE you install.
     credentialsSecretName: my-temporal-db-credentials
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
@@ -318,12 +340,10 @@ postgres:
       prefix: postgres/backups
 ```
 
-- `postgres.credentials.username` / `postgres.credentials.password` — The bundled database's credentials. **Change the password before installing.** These two values populate the chart-created credentials secret in **both** database modes, even though they sit under the `postgres` block.
-- `postgres.credentials.database` — Must remain `temporal`. The server reads its main store as the literal database `temporal`, so the chart refuses to render any other value.
-- `postgres.config.credentialsSecretName` — Name of the credentials secret in single-instance mode (the HA counterpart is `postgresHA.config.credentialsSecretName`).
+- `postgres.config.credentialsSecretName` — Name of the prerequisite credentials secret in single-instance mode (the HA counterpart is `postgresHA.config.credentialsSecretName`). Its `database` key must be `temporal`.
 
 <Note>
-The credentials are applied once, when the database volume is first initialized. Changing `postgres.credentials.password` on an existing release only rewrites the secret, not the password PostgreSQL enforces, so the server can no longer connect.
+The credentials are applied once, when the database volume is first initialized. Changing the secret on an existing release does not change the password PostgreSQL enforces, so the server can no longer connect. To rotate, follow [Rotating the Database Password](#rotating-the-database-password).
 </Note>
 
 ## Connecting
@@ -339,7 +359,7 @@ The server exposes no public endpoint: everything except the browser UI is reach
 | `temporal` CLI | The `admin` container of `RELEASE_NAME-temporal` | Already pointed at the server; see the command below. |
 | PostgreSQL (HA mode) | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432` | The HAProxy leader endpoint Temporal itself uses. |
 | PostgreSQL (single mode) | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | Only when `postgres.enabled: true`. |
-| Database credentials | `cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml` | `DB_CREDENTIALS_SECRET_NAME` is the active database block's `config.credentialsSecretName` (default `my-temporal-db-credentials`). |
+| Database credentials | `cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml` | `DB_CREDENTIALS_SECRET_NAME` is your secret named by the active database block's `config.credentialsSecretName`. |
 
 Confirm the server is serving by listing workflows with the `temporal` CLI in the `admin` sidecar. On a fresh install the list is empty and the command exits without an error:
 
@@ -571,16 +591,14 @@ For GCS replace the first line of the pipeline with `gsutil cp "gs://BUCKET_NAME
 
 Apply every subsection from your version onward, in order, ending with [Upgrading from 1.x](#upgrading-from-1-x). Each removed key is rejected at render, so an upgrade that still carries one fails before anything is applied and the running release is left untouched.
 
-Version `1.1.0` moved the bundled single-instance database to the `postgres` 3.4.1 template, which no longer takes credentials or MinIO keys as values. This template absorbed the credentials change rather than passing it on: it creates the credentials secret itself, so there is **no new prerequisite for the database**, only renames on the single-instance path:
+Version `1.1.0` moved the bundled single-instance database to the `postgres` 3.4.1 template, which no longer takes credentials or MinIO keys as values:
 
 | Removed key | Replacement |
 |---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` (must be `temporal`) |
+| `postgres.config.username` / `.password` / `.database` | the database credentials secret under [Prerequisites](#prerequisites) (`database` must be `temporal`), named by `postgres.config.credentialsSecretName` |
 | `postgres.backup.minio.accessKey`, `postgres.backup.minio.secretKey` | `postgres.backup.minio.credentialsSecretName`, a dictionary secret you create (MinIO backups only, see [Backing Up](#backing-up)) |
 
-Carrying an old credentials key forward fails with the **bundled Postgres template's** message, which begins `config.username was REMOVED in postgres 3.4.0` and tells you to create a dictionary secret yourself. Ignore that advice for the three credentials keys: this template creates that secret from `postgres.credentials.*`. Use the username and password your database was initialized with, not new ones.
+Carrying an old credentials key forward fails with the **bundled Postgres template's** message, which begins `config.username was REMOVED in postgres 3.4.0` and tells you to create a dictionary secret — that is correct here too. Use the username and password your database was initialized with, not new ones.
 
 <Warning>
 **Template version `1.0.0` did not compact the etcd cluster inside the bundled HA database**, so its backend grew with time alone and eventually went read-only, taking PostgreSQL failover with it. Only HA-mode installs are affected. Upgrading to `1.0.1` or later turns compaction on, which stops further growth but cannot shrink a backend that has already grown; a cluster that has already raised a `NOSPACE` alarm needs operator recovery rather than an upgrade. The mechanism and the inspection commands are on the [Postgres Highly Available](/template-catalog/templates/postgres-highly-available) page.
@@ -588,20 +606,13 @@ Carrying an old credentials key forward fails with the **bundled Postgres templa
 
 ### Upgrading from 1.1.0
 
-Version `1.2.0` moved the bundled HA database to `postgres-highly-available` 2.5.0, which removed the `postgresHA.postgres` block. The HA cluster now reads the same chart-created credentials secret as the single-instance path:
-
-| Removed key | Replacement |
-|---|---|
-| `postgresHA.postgres.username` | `postgres.credentials.username` |
-| `postgresHA.postgres.password` | `postgres.credentials.password` |
-| `postgresHA.postgres.database` | `postgres.credentials.database` (must be `temporal`) |
-| — | `postgresHA.config.credentialsSecretName` names the secret this chart creates (default `my-temporal-db-credentials`) |
+Version `1.2.0` moved the bundled HA database to `postgres-highly-available` 2.5.0, which removed the `postgresHA.postgres` block. The HA cluster now reads the database credentials secret under [Prerequisites](#prerequisites) (`database` must be `temporal`), named by `postgresHA.config.credentialsSecretName`.
 
 <Warning>
-**Use the credentials your cluster already has.** The HA cluster was initialized with the `postgresHA.postgres.*` values you installed with, and PostgreSQL still enforces them. Copy that username and password into `postgres.credentials.username` and `postgres.credentials.password` before upgrading. Putting new values there updates the secret but not the database, and Temporal can no longer authenticate.
+**Use the credentials your cluster already has.** The HA cluster was initialized with the `postgresHA.postgres.*` values you installed with, and PostgreSQL still enforces them. Put that username and password into the credentials secret before upgrading. Putting new values there does not change the database, and Temporal can no longer authenticate.
 </Warning>
 
-An upgrade that still carries the `postgresHA.postgres` block fails with the HA template's message, which begins ``postgres-highly-available: the `postgres` block was REMOVED in 2.5.0`` and tells you to create a dictionary secret. Ignore that part: delete the block and set `postgres.credentials.*` instead.
+An upgrade that still carries the `postgresHA.postgres` block fails with the HA template's message, which begins ``postgres-highly-available: the `postgres` block was REMOVED in 2.5.0`` and tells you to create a dictionary secret — that is correct here: delete the block and set `postgresHA.config.credentialsSecretName` to the secret's name.
 
 ### Upgrading from 1.2.x
 
@@ -656,6 +667,9 @@ Temporal supports upgrading **one minor version at a time**. Every 1.x release o
   <Step title="Upgrade to Temporal 1.32">
     Run the same command without the two `--set` values; the chart defaults are 1.32.1.
   </Step>
+  <Step title="Upgrade to 2.1.0">
+    Follow [Upgrading from 2.0.0](#upgrading-from-2-0-0).
+  </Step>
 </Steps>
 
 Each step migrates the schema before the new server starts. A step that skips a minor version is refused before the database is touched: the new replica never becomes ready while the old one keeps serving, and its `admin` container logs `CPLN_TEMPORAL_SKIP_GUARD` with the tag to use next. Set that tag and upgrade again.
@@ -665,6 +679,68 @@ Also in this version:
 - **AWS backups:** the HA backup no longer attaches AWS's `ReadOnlyAccess` policy. Update your bucket-scoped IAM policy to the full action list under [Backing Up](#backing-up) before upgrading.
 - **Temporal 1.32 visibility queries are stricter:** a list filter that compares a search attribute with the wrong type, or an empty `Text` filter, now returns an error instead of results.
 - **New optional features:** [archival](#archival) to S3, which needs Temporal 1.31 or later, so turn it on after the step to 1.31; and browser access to the Web UI from listed IP ranges with `ui.allowedCIDRs` (see [Web UI](#web-ui)).
+
+### Upgrading from 2.0.0
+
+Version `2.1.0` removed `postgres.credentials`: the database credentials are now a prerequisite secret, the same one the database templates require on their own. Carrying the old key forward fails the render.
+
+2.0.0 created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or Temporal loses its database connection. `database` stays `temporal`:
+
+```bash
+cpln secret reveal SECRET_NAME -o yaml   # the 2.0.0 secret: its CURRENT values, until the upgrade deletes it
+cpln secret create-dictionary --name RELEASE_NAME-postgres-credentials \
+  --entry username='YOUR_CURRENT_USERNAME' --entry password='YOUR_CURRENT_PASSWORD' --entry database=temporal
+```
+
+`SECRET_NAME` is the `credentialsSecretName` of the mode you use in the 2.0.0 release (default `my-temporal-db-credentials`). Then upgrade with `postgresHA.config.credentialsSecretName` (HA mode) or `postgres.config.credentialsSecretName` (single-instance mode) set to the new name, and `postgres.credentials` removed. Your current values are also in `postgres.credentials` of the 2.0.0 release.
+
+The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), so Temporal can briefly lose its database; it reconnects by itself. While access to the new secret propagates, the new version of a workload can wait in `get-deployments` reporting that it is not allowed to reveal the secret; the previous version keeps serving meanwhile, and it clears by itself.
+
+### Rotating the Database Password
+
+A running workload keeps the credential values it started with, and PostgreSQL reads the secret only when its data is first initialized, so editing the secret alone does not change the database password. Change one key and keep the others with export, edit, apply — keep `database` at `temporal`:
+
+```bash
+cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+# edit only the key you are rotating in secret.yaml
+cpln apply -f secret.yaml
+cpln secret reveal SECRET_NAME -o yaml
+```
+
+**Single-instance mode** takes three steps in order:
+
+1. Change it in the database: `ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD';` (connected as that user, from inside the GVC).
+2. Update the secret as above.
+3. Right away, redeploy Temporal, and wait until `get-deployments` shows a higher version number, alone and ready (right after the command the status may not show the restart yet, and `ready: true` alone can still describe the old replica). Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime.
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-temporal --gvc GVC_NAME
+```
+
+Temporal keeps serving on the database connections it already has open. Do step 3 right away: if those connections drop before Temporal restarts, it cannot open new ones.
+
+**HA mode** (the default) needs its own order. The replication role `repl` shares the password, and a member that restarts with the old password can be promoted to leader, which splits the cluster. Move the leader to member `-0` first, so it restarts last, after every other member already has the new password. `pgx` runs a command in one member (`LOCATION` is your GVC's location, `DB_USERNAME` the secret's `username`):
+
+```bash
+pgx() { cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --location LOCATION \
+  --container patroni-postgres --replica "RELEASE_NAME-postgres-ha-$1" -- "${@:2}"; }
+# 1. Find the leader ("role": "leader"); the other two must be "streaming" on the same "timeline"
+pgx 0 curl -s localhost:8008/cluster
+# 2. If the leader is not RELEASE_NAME-postgres-ha-0, move it there (N = current leader), then repeat step 1
+pgx 0 curl -s -XPOST -d '{"leader":"RELEASE_NAME-postgres-ha-N","candidate":"RELEASE_NAME-postgres-ha-0"}' localhost:8008/switchover
+# 3. Back to back: change BOTH roles on -0, put the same password in the secret (export, edit, apply above), restart the members
+pgx 0 psql -h 127.0.0.1 -d postgres -c "ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD'; ALTER ROLE repl PASSWORD 'NEW_PASSWORD';"
+cpln workload force-redeployment RELEASE_NAME-postgres-ha --gvc GVC_NAME
+# 4. Once the members are back, confirm one leader and two "streaming" replicas on one timeline (repeat step 1)
+# 5. Optional: remove the install-time password Patroni keeps in its cluster config
+pgx 0 curl -s -XPATCH -d '{"postgresql":{"authentication":null}}' localhost:8008/config
+```
+
+Then force-redeploy `RELEASE_NAME-temporal`, which keeps the old password until it restarts. The app cannot open new database connections from the `ALTER ROLE` until its own redeploy finishes, so rotate in a quiet window. If a member stays `starting`, or `running` without `streaming`, re-copy it from the leader. This copies the whole database, so it costs network traffic in proportion to its size:
+
+```bash
+pgx N curl -s -XPOST -d '{"force": true}' localhost:8008/reinitialize
+```
 
 ### Scaling and Availability
 
@@ -676,7 +752,7 @@ Also in this version:
 - **Losing a replica:** the remaining replicas take over its workflows and the platform replaces it. Timers fire on time and nothing is lost; clients may see a few timed-out calls right after the loss.
 - **Workers scale independently.** Run as many worker workloads and replicas as your task queues need.
 - **Database availability is the HA cluster's job.** In the default `postgresHA` mode a PostgreSQL leader failure is handled by Patroni and the HAProxy endpoint keeps the same address. In `postgres` mode there is no failover.
-- **Durability is in the database, not the server.** The server workload has no volume. `cpln helm uninstall` deletes the database volume sets and the chart-created credentials secret, taking every workflow history with it.
+- **Durability is in the database, not the server.** The server workload has no volume. `cpln helm uninstall` deletes the database volume sets, taking every workflow history with it.
 
 ### Troubleshooting
 
@@ -729,12 +805,19 @@ Also in this version:
 
     **Fix:** Set exactly one of `postgresHA.enabled` and `postgres.enabled` to `true`. Switching an existing release between modes is a new database, not a migration; the data stays on the old mode's volume set.
   </Accordion>
-  <Accordion title="Install fails with postgres.credentials.database must be temporal">
-    **Symptom:** Render fails with `temporal: postgres.credentials.database must be "temporal"`.
+  <Accordion title="Containers stop at boot with CPLN_TEMPORAL_DATABASE_GUARD">
+    **Symptom:** The server never becomes ready, and its `admin` container logs `CPLN_TEMPORAL_DATABASE_GUARD`.
 
-    **Cause:** The server reads its main store as the literal database `temporal`, so the chart refuses any other value.
+    **Cause:** The database credentials secret's `database` key is not `temporal`. The server reads its main store as the literal database `temporal`.
 
-    **Fix:** Leave `postgres.credentials.database` at `temporal`.
+    **Fix:** Set `database` to `temporal` in the secret, then force a redeployment of `RELEASE_NAME-temporal`. The database PostgreSQL created under the wrong name is unused and can be dropped.
+  </Accordion>
+  <Accordion title="Upgrade fails with postgres.credentials was REMOVED in 2.1.0">
+    **Symptom:** `helm upgrade` stops at render with `temporal: postgres.credentials was REMOVED in 2.1.0`.
+
+    **Cause:** Your values still carry the 2.0.0 `postgres.credentials` block.
+
+    **Fix:** Follow [Upgrading from 2.0.0](#upgrading-from-2-0-0).
   </Accordion>
   <Accordion title="Upgrade fails with resources.cpu was RENAMED to resources.maxCpu">
     **Symptom:** `helm upgrade` stops at render with `temporal: resources.cpu was RENAMED to resources.maxCpu` (or the same message for `resources.memory`, `ui.resources.cpu`, `ui.resources.memory`).
@@ -748,22 +831,16 @@ Also in this version:
 
     **Cause:** Your values still carry `postgresHA.postgres.username`, `postgresHA.postgres.password` or `postgresHA.postgres.database` from template version `1.1.0` or earlier.
 
-    **Fix:** Delete the `postgresHA.postgres` block and copy the same username and password into `postgres.credentials.*`. Do not create a secret yourself; this chart creates it. See [Upgrading from 1.1.0](#upgrading-from-1-1-0).
+    **Fix:** Delete the `postgresHA.postgres` block and put the same username and password into the database credentials secret. See [Upgrading from 1.1.0](#upgrading-from-1-1-0).
   </Accordion>
   <Accordion title="Upgrade fails with config.username was REMOVED in postgres 3.4.0">
     **Symptom:** `helm upgrade` stops at render with `config.username was REMOVED in postgres 3.4.0` (or the same for `config.password` / `config.database`).
 
     **Cause:** Your single-instance values still use `postgres.config.username`, `postgres.config.password` or `postgres.config.database` from template version `1.0.x`.
 
-    **Fix:** Move the three values to `postgres.credentials.*`. Do not create a secret yourself. See [Upgrading from 1.0.x](#upgrading-from-1-0-x).
+    **Fix:** Put the three values into the database credentials secret. See [Upgrading from 1.0.x](#upgrading-from-1-0-x).
   </Accordion>
-  <Accordion title="Second release fails with managed by a different release">
-    **Symptom:** Installing a second Temporal release in the same org fails with `The resource 'my-temporal-db-credentials' cannot be updated because it is being managed by a different release`, and nothing is created.
 
-    **Cause:** Secret names are organization-wide, and both releases are trying to create the credentials secret under the default name.
-
-    **Fix:** Give the new release its own `postgresHA.config.credentialsSecretName` (or `postgres.config.credentialsSecretName` in single mode). The first release is unaffected.
-  </Accordion>
   <Accordion title="Render fails with archival needs Temporal server 1.31 or later">
     **Symptom:** Render fails with `temporal: archival needs Temporal server 1.31 or later, and this release runs 1.30.x`.
 
@@ -817,15 +894,16 @@ Also in this version:
 
 ## Important Notes
 
-- **Change `postgres.credentials.password` before installing.** The default `change-me-temporal-db-password` is published in the template repository, and it is the database password in both database modes. It is set once, when the database volume is first initialized.
+- **Create the database credentials secret before installing**, with `database` set to `temporal`. A missing secret wedges the deployment with zero log lines; `status.versions[].message` in `cpln workload get-deployments RELEASE_NAME-temporal --gvc GVC_NAME -o yaml` names it.
+- **Editing the credentials secret does not change the database password** — run `ALTER ROLE` first, then force-redeploy Temporal; in HA mode move the leader first ([Rotating the Database Password](#rotating-the-database-password)).
 - **Upgrade Temporal one minor version at a time**, and back up through the database backup first. A skipped minor is refused; see [Upgrading from 1.x](#upgrading-from-1-x).
 - **`historyShards` is fixed at first install.** A later change is ignored, so size it before installing.
 - **The Web UI has no login.** List only addresses you trust in `ui.allowedCIDRs`; ranges broader than `/8` (IPv4) or `/32` (IPv6) are refused, and a change takes up to a few minutes to apply.
 - **To stop archiving, set `archival.defaultNamespace: false`.** Never set `archival.enabled: false` once archival has been used.
 - **Use the full `.cpln.local` hostname** in every worker and client; short workload names do not resolve.
-- **Give each release its own `config.credentialsSecretName`.** Secret names are organization-wide; a second release on the default name is refused at install.
+- **Give each release its own database credentials secret.** Secret names are organization-wide, so two releases pointed at one secret share a password.
 - **Keep the GVC to one location.** Each location would run its own servers against its own database.
-- **Uninstall deletes the database volume sets** and the chart-created credentials secret, taking every workflow history with it. Enable backups if the data matters.
+- **Uninstall deletes the database volume sets**, taking every workflow history with it. Enable backups if the data matters.
 
 ## External References
 
