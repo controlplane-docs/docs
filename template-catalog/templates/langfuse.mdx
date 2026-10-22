@@ -1,7 +1,7 @@
 ---
 title: Langfuse
 icon: /template-catalog/templates/icons/langfuse.png
-description: Langfuse LLM observability and evaluation, self-hosted. Web and worker tiers with bundled PostgreSQL, Redis and ClickHouse, trace data in your own S3 or GCS bucket. Deploys into an existing GVC. An auth secret and the bucket must exist before install.
+description: Langfuse LLM observability and evaluation, self-hosted. Web and worker tiers with bundled PostgreSQL, Redis and ClickHouse, trace data in your own S3 or GCS bucket. Deploys into an existing GVC. Auth and datastore credentials secrets and the bucket must exist before install.
 keywords: ['llm observability', 'llm tracing', 'prompt management', 'llm evaluation', 'langsmith alternative', 'helicone alternative', 'bullmq', 'nextauth', 'openai api key storage', 'ai agent monitoring', 'trace ingestion', 'headless initialization', 'encryptionKey']
 ---
 
@@ -28,8 +28,6 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data | — |
 | Volume set | `RELEASE_NAME-langfuse-redis-vs` | Redis append-only file | — |
 | Volume set | `RELEASE_NAME-langfuse-clickhouse-vs` | ClickHouse local metadata only — data parts live in your bucket | — |
-| Secret | `RELEASE_NAME-langfuse-config` | Bundled datastore credentials read by the web and worker tiers (dictionary) | — |
-| Secret | `my-langfuse-db-credentials` | Bundled PostgreSQL credentials, named by `postgres.config.credentialsSecretName` and created by the chart (dictionary) | — |
 | Secret | `RELEASE_NAME-langfuse-clickhouse-startup` | ClickHouse startup script (opaque) | — |
 | Secret | `RELEASE_NAME-langfuse-clickhouse-storage` | ClickHouse S3 / GCS disk configuration (opaque) | — |
 | Identity | `RELEASE_NAME-langfuse-identity` | Identity of the web, worker, Redis and ClickHouse workloads; linked to your AWS cloud account on the `aws` path | — |
@@ -37,11 +35,11 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Identity | `RELEASE_NAME-pg-identity` | Identity of the bundled PostgreSQL | — |
 | Policy | `RELEASE_NAME-pg-policy` | Grants PostgreSQL `reveal` on its own credentials secret | — |
 
-One bucket serves both ClickHouse (prefix `clickhouse/`) and Langfuse (prefixes `events/` and `media/`). The auth secret and, on GCS, the credentials secret are prerequisite secrets you create yourself: the chart references them by name and never creates, modifies, or deletes them.
+One bucket serves both ClickHouse (prefix `clickhouse/`) and Langfuse (prefixes `events/` and `media/`). The auth secret, the database, Redis and ClickHouse credentials secrets and, on GCS, the storage credentials secret are prerequisite secrets you create yourself: the chart references them by name and never creates, modifies, or deletes them.
 
 ## Prerequisites
 
-Two things must exist before you install: the auth secret, and the object storage that traces are written to.
+Three things must exist before you install: the auth secret, the datastore credentials secrets, and the object storage that traces are written to.
 
 <Steps>
   <Step title="Create the auth secret">
@@ -69,6 +67,32 @@ Two things must exist before you install: the auth secret, and the object storag
     Use three different random values for `nextAuthSecret`, `encryptionKey` and `salt`, and keep a copy of `encryptionKey` outside Control Plane. Read the values back later with `cpln secret reveal AUTH_SECRET_NAME -o yaml`.
 
     Set `langfuse.auth.secretName` to this name.
+  </Step>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) with the keys `username`, `password` and `database`. The bundled PostgreSQL initializes with it and Langfuse connects with it:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=langfuse \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=langfuse
+    ```
+
+    Set `postgres.config.credentialsSecretName` to this name. Keep all three values URL-safe (letters, digits, `-`, `_`): Langfuse puts them in its connection URL. PostgreSQL reads the secret only when its data directory is first initialized; to change the password later, see [Rotating Credentials](#rotating-credentials).
+  </Step>
+  <Step title="Create the Redis and ClickHouse credentials secrets">
+    One dictionary secret per datastore. Both datastores and both Langfuse workloads read them at every start:
+
+    ```bash
+    cpln secret create-dictionary --name REDIS_SECRET_NAME \
+      --entry password="$(openssl rand -hex 24)"
+
+    cpln secret create-dictionary --name CLICKHOUSE_SECRET_NAME \
+      --entry username=default \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `redis.credentialsSecretName` and `clickhouse.credentialsSecretName` to those names. Keep the ClickHouse values URL-safe (letters, digits, `-`, `_`; the username must also start with a letter): Langfuse puts them in its migration URL.
   </Step>
   <Step title="Set up object storage">
     Pick one provider. ClickHouse and Langfuse share the bucket under separate prefixes.
@@ -139,7 +163,7 @@ Two things must exist before you install: the auth secret, and the object storag
 </Steps>
 
 <Warning>
-**A missing prerequisite secret wedges the deployment instead of failing it.** `cpln helm install` reports success, but the web and worker workloads never start and `cpln logs` returns nothing. The only place the missing secret is named is `status.versions[].message`:
+**A missing prerequisite secret wedges the deployment instead of failing it.** `cpln helm install` reports success, but the workloads that read the missing secret never start and `cpln logs` returns nothing. The only place the missing secret is named is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-langfuse-web --gvc GVC_NAME -o yaml
@@ -152,19 +176,19 @@ Backing up the bundled PostgreSQL to a bucket is optional and needs its own buck
 
 ## Installation
 
-Install from the marketplace registry, naming your auth secret and bucket and replacing the three bundled datastore passwords, which the chart uses exactly as written:
+Install from the marketplace registry, naming your auth secret, your three datastore credentials secrets and your bucket:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/langfuse \
-  --version 1.2.1 --gvc GVC_NAME \
+  --version 1.3.0 --gvc GVC_NAME \
   --set langfuse.auth.secretName=AUTH_SECRET_NAME \
+  --set postgres.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
+  --set redis.credentialsSecretName=REDIS_SECRET_NAME \
+  --set clickhouse.credentialsSecretName=CLICKHOUSE_SECRET_NAME \
   --set objectStore.aws.bucket=YOUR_BUCKET_NAME \
   --set objectStore.aws.region=us-east-1 \
   --set objectStore.aws.cloudAccountName=YOUR_CLOUD_ACCOUNT_NAME \
-  --set objectStore.aws.policyName=YOUR_IAM_POLICY_NAME \
-  --set postgres.credentials.password='YOUR-POSTGRES-PASSWORD' \
-  --set redis.auth.password='YOUR-REDIS-PASSWORD' \
-  --set clickhouse.config.password='YOUR-CLICKHOUSE-PASSWORD'
+  --set objectStore.aws.policyName=YOUR_IAM_POLICY_NAME
 ```
 
 On the GCS path replace the four `objectStore.aws.*` values with `objectStore.provider=gcp`, `objectStore.gcp.bucket` and `objectStore.gcp.credentialsSecretName`.
@@ -267,12 +291,8 @@ postgres:
     maxCpu: 1
     minMemory: 512Mi
     maxMemory: 1Gi
-  credentials: # the chart writes these into the secret named below — nothing for you to create
-    username: langfuse
-    password: change-me-langfuse-db
-    database: langfuse
   config:
-    credentialsSecretName: my-langfuse-db-credentials # secret names are org-wide — give each release its own
+    credentialsSecretName: my-langfuse-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 ```
@@ -289,8 +309,7 @@ redis:
     maxCpu: 400m
     minMemory: 256Mi
     maxMemory: 512Mi
-  auth:
-    password: change-me-langfuse-redis
+  credentialsSecretName: my-langfuse-redis # PREREQUISITE dictionary secret (password) — must exist BEFORE install
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 ```
@@ -305,14 +324,12 @@ clickhouse:
     maxCpu: 2
     minMemory: 2Gi
     maxMemory: 4Gi
-  config:
-    password: change-me-langfuse-clickhouse
-    database: langfuse
+  credentialsSecretName: my-langfuse-clickhouse # PREREQUISITE dictionary secret (username, password) — must exist BEFORE install
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 ```
 
-The three datastore passwords are internal plumbing — PostgreSQL, Redis and ClickHouse serve Langfuse only — but they are used exactly as written, so change all three before installing.
+The three datastore credentials come from the prerequisite secrets you created; none of them is a Helm value.
 
 ## Connecting
 
@@ -323,9 +340,9 @@ The three datastore passwords are internal plumbing — PostgreSQL, Redis and Cl
 | Health check | `/api/public/health` on either address | Returns `{"status":"OK","version":"..."}`. |
 | First login | `adminEmail` / `adminPassword` | From your auth secret: `cpln secret reveal AUTH_SECRET_NAME -o yaml`. |
 | Langfuse API keys | **Settings → API Keys** in the UI | Per project, a public / secret key pair. |
-| PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | Internal only. Credentials are `postgres.credentials.*`. |
-| Redis | `RELEASE_NAME-langfuse-redis.GVC_NAME.cpln.local:6379` | Internal only. Password is `redis.auth.password`. |
-| ClickHouse | `RELEASE_NAME-langfuse-clickhouse.GVC_NAME.cpln.local:8123` (HTTP) and `:9000` (native) | Internal only. User `default`, password `clickhouse.config.password`. |
+| PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | Internal only. `username` / `password` / `database` from your `postgres.config.credentialsSecretName` secret. |
+| Redis | `RELEASE_NAME-langfuse-redis.GVC_NAME.cpln.local:6379` | Internal only. `password` from your `redis.credentialsSecretName` secret. |
+| ClickHouse | `RELEASE_NAME-langfuse-clickhouse.GVC_NAME.cpln.local:8123` (HTTP) and `:9000` (native) | Internal only. `username` / `password` from your `clickhouse.credentialsSecretName` secret. |
 
 Verify the web tier is serving once `cpln workload get-deployments RELEASE_NAME-langfuse-web --gvc GVC_NAME -o yaml` reports it ready:
 
@@ -402,7 +419,7 @@ A zero-length backup object is a failed run, not a backup. If the dump cannot re
 
 These paths have not been exercised against this template; verify them on a throwaway release before relying on them.
 
-- **From a scheduled dump:** the dump is a plain `pg_dumpall` output restored with `psql` against `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432`, using the `postgres.credentials.username` and `postgres.credentials.password` you installed with. The command sequence per provider is on the [postgres template's restore section](/template-catalog/templates/postgres#restoring-a-backup); it must run from a client that can reach the bucket and the database, which means a workload inside the GVC.
+- **From a scheduled dump:** the dump is a plain `pg_dumpall` output restored with `psql` against `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432`, using the `username` and `password` from your database credentials secret. The command sequence per provider is on the [postgres template's restore section](/template-catalog/templates/postgres#restoring-a-backup); it must run from a client that can reach the bucket and the database, which means a workload inside the GVC.
 - **From a volume set snapshot:** `cpln volumeset snapshot restore` exists (check `cpln volumeset snapshot restore --help`) but has not been run against this template.
 - **ClickHouse:** trace data is in your bucket under `clickhouse/`. A fresh ClickHouse workload pointed at the same bucket is the recovery path, but it has not been verified; deleting the bucket loses all trace history regardless of snapshots.
 
@@ -447,21 +464,62 @@ named by langfuse.auth.secretName (key: nextAuthSecret) — see the README.
 
 ### Upgrading from 1.1.0
 
-Version 1.2.0 moved the bundled PostgreSQL to the `postgres` 3.4.1 template, which reads its credentials from a dictionary secret. Langfuse creates that secret for you from values, so there is no new prerequisite — only a rename:
-
-| Removed key | Replacement |
-|---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` |
-
-Carrying an old key fails the render with the **postgres template's** message, which tells you to create a dictionary secret yourself. Ignore that advice here: move the three keys to `postgres.credentials.*` and you are done. `postgres.config.credentialsSecretName` is new and names the secret the chart creates; the default is fine for a single release. The auth, Redis and ClickHouse paths are unchanged.
+`postgres.config.username`, `.password` and `.database` were removed. Put the values your database was initialized with into a database credentials secret as under [Prerequisites](#prerequisites) (keys `username`, `password`, `database`), under any name except `RELEASE_NAME-pg-config` (the secret 1.1.0 created, which this upgrade deletes). Set `postgres.config.credentialsSecretName` to it and remove the three keys. The Redis and ClickHouse passwords move to prerequisite secrets too: follow [Upgrading from 1.2.x](#upgrading-from-1-2-x) for them (1.1.0 keeps them in the same `RELEASE_NAME-langfuse-config` secret). The auth path is unchanged.
 
 ### Upgrading from 1.2.0
 
 Version 1.2.1 removes the AWS managed policy `aws::ReadOnlyAccess` from the identity this template links to your AWS cloud account. That policy granted read access to every bucket in your AWS account and contained no write actions, so it was never carrying the object store itself — but it was silently supplying any read action your bucket-scoped policy omitted. The identity now carries `cpln-connector` and your own policy only.
 
 **Before upgrading, update your IAM policy to the ten-action list in [Prerequisites](#prerequisites)** — 1.2.0 documented six actions. If it already matches, no action is needed. Nothing else changes.
+
+### Upgrading from 1.2.x
+
+Version 1.3.0 removed `postgres.credentials`, `redis.auth.password` and `clickhouse.config.password`: all three datastores now read prerequisite secrets, and carrying any old key forward fails the render.
+
+1.2.x created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or Langfuse loses its database connection:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-langfuse-db \
+  --entry username='YOUR_CURRENT_USERNAME' --entry password='YOUR_CURRENT_PASSWORD' --entry database='YOUR_CURRENT_DATABASE'
+```
+
+Your current values are in `postgres.credentials` of the 1.2.x release, and also in the old secret named by `postgres.config.credentialsSecretName` in 1.2.x (`cpln secret reveal SECRET_NAME -o yaml`) until the upgrade deletes it.
+
+1.2.x kept the Redis and ClickHouse passwords in `RELEASE_NAME-langfuse-config` (keys `redisPassword`, `clickhousePassword`), which **this upgrade also deletes**, so use other names. Create them holding your current passwords, so the old and new versions keep talking to each other during the rollout:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-langfuse-redis-credentials \
+  --entry password='YOUR_CURRENT_REDIS_PASSWORD'
+
+cpln secret create-dictionary --name RELEASE_NAME-langfuse-clickhouse-credentials \
+  --entry username=default --entry password='YOUR_CURRENT_CLICKHOUSE_PASSWORD'
+```
+
+Your current values are `redis.auth.password` and `clickhouse.config.password` of the 1.2.x release, and also in `cpln secret reveal RELEASE_NAME-langfuse-config -o yaml` until the upgrade deletes it.
+
+Then upgrade with `postgres.config.credentialsSecretName`, `redis.credentialsSecretName` and `clickhouse.credentialsSecretName` set to those names, and `postgres.credentials`, `redis.auth` and `clickhouse.config.password` removed. The upgrade restarts the bundled PostgreSQL (it now reads the new secret), so Langfuse briefly loses its database and reconnects by itself. While access to the new secrets propagates, the new version of a workload can wait in `get-deployments` reporting that it is not allowed to reveal the secret; the previous version keeps serving meanwhile, and it clears by itself.
+
+### Rotating Credentials
+
+A running workload keeps the credential values it started with, so every rotation ends with a forced redeployment. Change one key and keep the others with export, edit, apply:
+
+```bash
+cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+# edit only the key you are rotating in secret.yaml
+cpln apply -f secret.yaml
+cpln secret reveal SECRET_NAME -o yaml
+```
+
+- **Database password:** PostgreSQL reads the secret only when it is first initialized, so run `ALTER ROLE` in the database first, then update the secret, then right away force a redeployment of `RELEASE_NAME-langfuse-web` and `RELEASE_NAME-langfuse-worker`. Do not redeploy the database; it would only add downtime. Connections already open keep working after `ALTER ROLE`, new ones fail until the redeploy finishes, so rotate in a quiet window.
+- **Redis and ClickHouse passwords:** neither datastore keeps its password in its data (Redis takes it on the command line, ClickHouse defines its user from the secret at every start), so there is no `ALTER` step. Update the secret, then force a redeployment of the datastore and of everything that connects to it, together:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-langfuse-redis --gvc GVC_NAME   # or RELEASE_NAME-langfuse-clickhouse
+cpln workload force-redeployment RELEASE_NAME-langfuse-web --gvc GVC_NAME
+cpln workload force-redeployment RELEASE_NAME-langfuse-worker --gvc GVC_NAME
+```
+
+Between the datastore restarting and the Langfuse workloads coming back, Langfuse cannot reach that datastore, so rotate in a quiet window. Changing the ClickHouse `username` works the same way.
 
 ### Scaling and Availability
 
@@ -477,7 +535,7 @@ Version 1.2.1 removes the AWS managed policy `aws::ReadOnlyAccess` from the iden
   <Accordion title="Web and worker never become ready and cpln logs returns nothing">
     **Symptom:** `cpln helm install` succeeded, but `RELEASE_NAME-langfuse-web` and `RELEASE_NAME-langfuse-worker` stay not-ready with no container output. `status.versions[].message` reads `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.`
 
-    **Cause:** the secret named by `langfuse.auth.secretName` (or, on GCS, `objectStore.gcp.credentialsSecretName`) did not exist at install time.
+    **Cause:** a secret named by `langfuse.auth.secretName`, `postgres.config.credentialsSecretName`, `redis.credentialsSecretName`, `clickhouse.credentialsSecretName` (or, on GCS, `objectStore.gcp.credentialsSecretName`) did not exist at install time. Check the datastore workloads the same way.
 
     **Fix:** create it as shown in [Prerequisites](#prerequisites). The deployment recovers on its own after a few minutes, or force it:
 
@@ -486,12 +544,12 @@ Version 1.2.1 removes the AWS managed policy `aws::ReadOnlyAccess` from the iden
     cpln workload force-redeployment RELEASE_NAME-langfuse-web --gvc GVC_NAME
     ```
   </Accordion>
-  <Accordion title="Install of a second release is refused as managed by a different release">
-    **Symptom:** a second Langfuse release in the same org fails at install with `The resource 'my-langfuse-db-credentials' cannot be updated because it is being managed by a different release` and creates nothing.
+  <Accordion title="Render fails with a key was removed in 1.3.0">
+    **Symptom:** `helm upgrade` aborts with `postgres.credentials was removed in 1.3.0 ...` (or the same for `redis.auth.password` or `clickhouse.config.password`).
 
-    **Cause:** `postgres.config.credentialsSecretName` names an org-wide secret, and the first release owns the default name. Nothing is shared, overwritten or deleted; the first release is unaffected.
+    **Cause:** your values file still carries a 1.2.x datastore credential key.
 
-    **Fix:** give the second release its own `--set postgres.config.credentialsSecretName=...` and install again.
+    **Fix:** follow [Upgrading from 1.2.x](#upgrading-from-1-2-x).
   </Accordion>
   <Accordion title="Render fails with a key was removed in 1.1.0">
     **Symptom:** `helm upgrade` aborts with `langfuse.auth.nextAuthSecret was removed in 1.1.0 ...` (or the same for `encryptionKey`, `salt`, `objectStore.gcp.accessKeyId`, `objectStore.gcp.secretAccessKey`, `langfuse.firewall.inboundAllowCIDR`).
@@ -548,15 +606,15 @@ Version 1.2.1 removes the AWS managed policy `aws::ReadOnlyAccess` from the iden
 
 ## Important Notes
 
-- Create the auth secret **before** installing; a missing one leaves the web and worker workloads waiting on a secret that does not exist.
+- Create the auth, database, Redis and ClickHouse credentials secrets **before** installing; a missing one leaves the workloads waiting on a secret that does not exist, named only in `status.versions[].message` of `cpln workload get-deployments RELEASE_NAME-langfuse-web --gvc GVC_NAME -o yaml`.
+- Rotating any of these secrets needs a forced redeployment; the database password also needs `ALTER ROLE` first (see [Rotating Credentials](#rotating-credentials)).
 - `encryptionKey` can never be rotated: it encrypts every provider key stored under **Settings → LLM Connections**, and changing it makes all of them unreadable. Keep a copy outside Control Plane and never delete the secret.
 - Sign-up is closed by default and the owner account comes from your secret. Record `adminPassword` — it is displayed nowhere, and with sign-up closed there is no other way to create the first account.
-- Change `postgres.credentials.password`, `redis.auth.password` and `clickhouse.config.password` before installing; they ship as `change-me-` placeholders and are used exactly as written.
 - Give each install its own bucket. Two installs on one bucket share ClickHouse data parts under `clickhouse/`.
-- Give each release its own `postgres.config.credentialsSecretName`; secret names are org-wide and a second release on the default name is refused at install.
+- Give each release its own database, Redis and ClickHouse secrets. Secret names are org-wide, so two releases pointed at one secret share a password, and rotating it for one breaks the other.
 - Serving Langfuse on your own domain requires `langfuse.publicUrl`, including the scheme.
 - With `publicAccess.enabled: false` there is no browser path to the UI; only other workloads in the GVC can reach the API.
-- Prerequisite secrets are not owned by the release: the auth and GCS credentials secrets survive `helm uninstall` and must be deleted by hand if no longer wanted.
+- Prerequisite secrets are not owned by the release: the auth, datastore credentials and GCS credentials secrets survive `helm uninstall` and must be deleted by hand if no longer wanted.
 - Uninstall deletes the volume sets, including PostgreSQL's. Trace data already in your bucket is untouched, but users, projects and API keys are not — back up PostgreSQL first.
 
 ## External References
