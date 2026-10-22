@@ -1,7 +1,7 @@
 ---
 title: NocoDB
 icon: /template-catalog/templates/icons/nocodb.png
-description: Deploy NocoDB, the open-source no-code database and Airtable alternative, on Control Plane. Single server with bundled PostgreSQL (single-instance by default, HA with one flag) and Redis, optional multi-replica on S3 attachment storage. Needs an existing GVC and a pre-created key secret.
+description: Deploy NocoDB, the open-source no-code database and Airtable alternative, on Control Plane. Single server with bundled PostgreSQL (single-instance by default, HA with one flag) and Redis, optional multi-replica on S3 attachment storage. Needs an existing GVC and three pre-created secrets.
 keywords: ['nocodb', 'airtable alternative', 'baserow alternative', 'teable alternative', 'no-code database', 'smart spreadsheet', 'grid kanban gallery', 'form builder', 'rest api database', 'low code app builder', 'webhooks', 'fair-code']
 ---
 
@@ -29,8 +29,6 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Volume set | `RELEASE_NAME-nocodb-redis-vs` | Redis append-only file at `/data` | — |
 | Volume set | `RELEASE_NAME-pg-vs` | Single-instance PostgreSQL data directory; takes no scheduled snapshots; a final snapshot is taken when the volume set is deleted and kept 7 days | `postgres.enabled: true` (default) |
 | Volume set | `RELEASE_NAME-postgres-ha-vs`, `RELEASE_NAME-etcd-vs` | Per-replica Patroni and etcd data directories in HA mode | `postgresHA.enabled: true` |
-| Secret | `RELEASE_NAME-nocodb-creds` | Dictionary secret the chart creates with the Redis password NocoDB uses to assemble `NC_REDIS_URL` | — |
-| Secret | the name in `postgres.config.credentialsSecretName` | Dictionary secret the chart creates (`username`, `password`, `database`) from `postgres.credentials.*` and hands to whichever database is enabled | — |
 | Identity | `RELEASE_NAME-nocodb-identity` | Bound to the NocoDB and Redis workloads; carries your AWS cloud account link in keyless S3 mode | — |
 | Policy | `RELEASE_NAME-nocodb-policy` | Grants that identity `reveal` on exactly the secrets it reads: the two chart-created secrets, your key secret, and your admin, S3-key, and SMTP secrets when configured | — |
 | Identity / Policy | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-pg-policy` | Bound to the single-instance PostgreSQL and its backup job; `reveal` on the credentials secret only | `postgres.enabled: true` (default) |
@@ -40,9 +38,31 @@ Your key secret is **not** created by the template — see [Prerequisites](#prer
 
 ## Prerequisites
 
-NocoDB signs its auth tokens and encrypts the stored credentials of external data sources with two keys that you supply through a [dictionary secret](/guides/create-secret/dictionary) created **before** installing. The values never pass through Helm values.
+Three [dictionary secrets](/guides/create-secret/dictionary) must exist **before** installing: NocoDB's two signing and encryption keys, the bundled database's credentials, and the bundled Redis password. The values never pass through Helm values.
 
 <Steps>
+  <Step title="Create the database credentials secret">
+    The bundled PostgreSQL initializes with these and NocoDB connects with them:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=nocodb \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=nocodb
+    ```
+
+    Set its name in the key of the database mode you use: `postgres.config.credentialsSecretName` (single-instance, the default) or `postgresHA.config.credentialsSecretName` (HA). Use only letters, digits, `-` and `_` in all three values: NocoDB receives them inside its `NC_DB` connection URL, unencoded, so other characters break the connection. Secret names are org-wide, so give each NocoDB release its own secret. PostgreSQL reads the secret only when its data is first initialized — see [Rotating the Database Password](#rotating-the-database-password).
+  </Step>
+  <Step title="Create the Redis credentials secret">
+    The bundled Redis requires this password and NocoDB connects with it:
+
+    ```bash
+    cpln secret create-dictionary --name REDIS_SECRET_NAME \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `redis.credentialsSecretName` to this name. Use only letters, digits, `-` and `_`: NocoDB receives the password inside its `NC_REDIS_URL`, unencoded. Give each NocoDB release its own secret. To change it later, see [Rotating the Redis Password](#rotating-the-redis-password).
+  </Step>
   <Step title="Create the key secret">
     The secret holds two random values under exactly these keys:
 
@@ -60,7 +80,7 @@ NocoDB signs its auth tokens and encrypts the stored credentials of external dat
 </Steps>
 
 <Warning>
-Create the secret **before** installing. Installing without it reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
+Create the secrets **before** installing. Installing without one reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message` (for the Redis secret, also check `RELEASE_NAME-nocodb-redis`; for the database secret, the database workload):
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-nocodb --gvc GVC_NAME -o yaml
@@ -78,17 +98,17 @@ Everything else works with the defaults. Four optional features need their own s
 
 ## Installation
 
-Once your key secret exists, install from the marketplace registry, pointing `secrets.name` at it and replacing both bundled-component passwords (letters, digits, `-`, and `_` only — both are embedded in connection URLs):
+Once your three secrets exist, install from the marketplace registry, pointing the chart at them:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/nocodb \
-  --version 1.3.0 --gvc GVC_NAME \
+  --version 1.4.0 --gvc GVC_NAME \
   --set secrets.name=KEYS_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-DB-PASSWORD' \
-  --set redis.auth.password='YOUR-REDIS-PASSWORD'
+  --set postgres.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
+  --set redis.credentialsSecretName=REDIS_SECRET_NAME
 ```
 
-Installing a second NocoDB release in the same org? Also set `postgres.config.credentialsSecretName` to a name no other release uses — secret names are org-wide.
+In HA mode set `postgresHA.config.credentialsSecretName` instead of `postgres.config.credentialsSecretName`.
 
 Other ways to install and manage the template:
 
@@ -234,8 +254,7 @@ Redis is required: it carries the job and event pub/sub, the metadata cache, and
 ```yaml
 redis:
   image: redis:8.10.0
-  auth:
-    password: change-me-nocodb-redis # change before installing; letters/digits/-/_ only — embedded in NC_REDIS_URL
+  credentialsSecretName: my-nocodb-redis # PREREQUISITE dictionary secret (key: password; letters/digits/-/_ only) — must exist BEFORE install
   resources:
     minCpu: 100m
     maxCpu: 400m
@@ -258,18 +277,14 @@ Enable exactly one of `postgres` (single instance, the default) and `postgresHA`
 
 The single instance is the default because on Control Plane the difference between the two modes is minutes of downtime, not data loss. The two paths run **different PostgreSQL majors**, so pick the mode before you have data — moving an existing database between them is a dump and restore, not a values change.
 
-In both modes the chart builds the database credentials secret from `postgres.credentials.*` for you — nothing to create before installing. The database **name** stays a plain value because it is written into NocoDB's `NC_DB` connection URL at install time; the username and password are read from the secret.
+In both modes the database credentials come from the prerequisite secret named by the enabled mode's `credentialsSecretName` (see [Prerequisites](#prerequisites)).
 
 ```yaml
 postgres:
   enabled: true
   image: postgres:18 # NocoDB supports PostgreSQL 12+ (the HA path below runs 17)
-  credentials: # the chart writes these into the secret named below — used by BOTH database modes
-    username: nocodb
-    password: change-me-nocodb-db # change before install; letters/digits/-/_ only (embedded in NC_DB)
-    database: nocodb
   config:
-    credentialsSecretName: my-nocodb-db-credentials # chart-created; secret names are org-wide, so give each release its own
+    credentialsSecretName: my-nocodb-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   resources:
     minCpu: 250m
     maxCpu: 1000m
@@ -287,7 +302,7 @@ postgres:
 postgresHA:
   enabled: false
   config:
-    credentialsSecretName: my-nocodb-db-credentials # the same chart-created secret, built from postgres.credentials.* above
+    credentialsSecretName: my-nocodb-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   replicas: 3
   resources: # per Patroni replica; the default install runs 3 of these
     minCpu: 500m
@@ -315,8 +330,8 @@ Both bundled passwords seed their component on first boot and are not updated by
 | Internal (same GVC) | `http://RELEASE_NAME-nocodb.GVC_NAME.cpln.local:8080` | Reachable per `internalAccess.type`. |
 | Login | The first account created after install, or the `admin.secretName` credentials | NocoDB ships no default account. |
 | PostgreSQL (single instance) | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | `username` / `password` / `database` from `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `postgres.config.credentialsSecretName`. |
-| PostgreSQL (HA mode) | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432` | Same credentials secret, named by `postgresHA.config.credentialsSecretName`. |
-| Redis | `RELEASE_NAME-nocodb-redis.GVC_NAME.cpln.local:6379` | Password is the `redisPassword` key of `cpln secret reveal RELEASE_NAME-nocodb-creds -o yaml`. |
+| PostgreSQL (HA mode) | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432` | Same keys, from the secret named by `postgresHA.config.credentialsSecretName`. |
+| Redis | `RELEASE_NAME-nocodb-redis.GVC_NAME.cpln.local:6379` | Password is the `password` key of your `redis.credentialsSecretName` secret: `cpln secret reveal SECRET_NAME -o yaml`. |
 
 With `publicAccess.enabled: false` there is no public endpoint; reach the UI from your machine through a tunnel instead and open `http://localhost:8080`:
 
@@ -522,15 +537,9 @@ This restore path has not been exercised against this template end to end. Rehea
 
 ### Upgrading from 1.0.x
 
-Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. NocoDB absorbed that change rather than passing it on — the chart now creates the credentials secret itself — so there is **no new prerequisite**, only a rename of three keys:
+Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. `postgres.config.username`, `.password` and `.database` were removed: put the values your single-instance database was initialized with into the database credentials secret under [Prerequisites](#prerequisites) (keys `username`, `password`, `database`), set `postgres.config.credentialsSecretName` to its name, and remove the three keys.
 
-| Removed key (1.0.x) | Replacement (1.1.0 and later) |
-|---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` |
-
-Move the three keys, keep the same values so the running database still matches, and upgrade in place. A values file that still carries an old key fails the render with the **postgres template's** message — `config.username was REMOVED in postgres 3.4.0` — which tells you to create a dictionary secret yourself; ignore that advice here, this template creates it. `postgres.backup.minio.accessKey` and `postgres.backup.minio.secretKey` were removed the same way: that path now reads a dictionary secret named by `postgres.backup.minio.credentialsSecretName` (see [Backing Up](#backing-up)).
+Keep the same values so the running database still matches. A values file that still carries an old key fails the render with the **postgres template's** message — `config.username was REMOVED in postgres 3.4.0` — which tells you to create a dictionary secret; that is correct here too. `postgres.backup.minio.accessKey` and `postgres.backup.minio.secretKey` were removed the same way: that path now reads a dictionary secret named by `postgres.backup.minio.credentialsSecretName` (see [Backing Up](#backing-up)).
 
 Version 1.0.1 also moved the bundled `postgres-highly-available` template to 2.4.2, which turns on [etcd history compaction](/template-catalog/templates/postgres-highly-available#etcd-history-compaction). HA installs still on 1.0.0 should upgrade; compaction stops further growth but cannot shrink a backend that has already grown.
 
@@ -538,20 +547,95 @@ If you run the HA database, continue with the section below as well.
 
 ### Upgrading from 1.1.x
 
-Version 1.2.0 adopted `postgres-highly-available` 2.5.0, which no longer creates its own credentials secret. The HA database now reads the same chart-created secret as the single-instance path, built from `postgres.credentials.*`, and the `postgresHA.postgres.*` keys were removed:
-
-| Removed key (1.1.x) | Replacement (1.2.0 and later) |
-|---|---|
-| `postgresHA.postgres.username` | `postgres.credentials.username` |
-| `postgresHA.postgres.password` | `postgres.credentials.password` |
-| `postgresHA.postgres.database` | `postgres.credentials.database` |
-| — | `postgresHA.config.credentialsSecretName` (name of the chart-created secret) |
-
-Set `postgres.credentials.*` to exactly the values your running Patroni cluster was initialised with — the database does not pick up a new password from a values change — and drop the old keys. Version 1.2.1 removed `postgresHA.backup.minio.accessKey` and `postgresHA.backup.minio.secretKey` the same way; that path now reads `postgresHA.backup.minio.credentialsSecretName`. An in-place upgrade across this boundary has not been exercised on a live HA install; rehearse it on a throwaway release first.
+Version 1.2.0 adopted `postgres-highly-available` 2.5.0, which no longer creates its own credentials secret, and the `postgresHA.postgres.*` keys were removed. Put `postgresHA.postgres.username`, `.password` and `.database` **unchanged** into the database credentials secret under [Prerequisites](#prerequisites), set `postgresHA.config.credentialsSecretName` to its name, and delete the `postgresHA.postgres` block — the running Patroni cluster was initialized with those values, and the database does not pick up a new password from a secret change. Version 1.2.1 removed `postgresHA.backup.minio.accessKey` and `postgresHA.backup.minio.secretKey` the same way; that path now reads `postgresHA.backup.minio.credentialsSecretName`.
 
 <Note>
 The first `helm upgrade` after an install can restart the bundled Redis even when nothing about Redis changed, and NocoDB exits and restarts rather than reconnecting — at a single replica that is a brief outage on a routine config change; a second replica absorbs it. Later upgrades of the same release do not restart Redis.
 </Note>
+
+### Upgrading from 1.3.x
+
+Version 1.4.0 removed `postgres.credentials`: the database credentials are now a prerequisite secret, the same one the database templates require on their own. `redis.auth.password` was removed the same way: the Redis password is now a prerequisite secret named by `redis.credentialsSecretName`. Carrying either old key forward fails the render.
+
+1.3.x created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or NocoDB loses its database connection:
+
+```bash
+cpln secret reveal SECRET_NAME -o yaml   # SECRET_NAME = your 1.3.x credentialsSecretName, my-nocodb-db-credentials by default
+cpln secret create-dictionary --name RELEASE_NAME-nocodb-db \
+  --entry username='YOUR_CURRENT_USERNAME' --entry password='YOUR_CURRENT_PASSWORD' --entry database='YOUR_CURRENT_DATABASE'
+```
+
+1.3.x also kept the Redis password in a secret it created, `RELEASE_NAME-nocodb-creds` (key `redisPassword`), which this upgrade deletes too. Create the Redis secret under a different name, holding the **current** Redis password:
+
+```bash
+cpln secret reveal RELEASE_NAME-nocodb-creds -o yaml   # redisPassword is the CURRENT Redis password
+cpln secret create-dictionary --name RELEASE_NAME-nocodb-redis \
+  --entry password='YOUR_CURRENT_REDIS_PASSWORD'
+```
+
+Then upgrade with `postgres.config.credentialsSecretName` (single-instance mode) or `postgresHA.config.credentialsSecretName` (HA mode) set to the database secret's name, `redis.credentialsSecretName` set to the Redis secret's name, and `postgres.credentials` and `redis.auth` removed. Your current values are also in `postgres.credentials` and `redis.auth.password` of the 1.3.x release.
+
+The upgrade restarts the bundled PostgreSQL and Redis too (they now read the new secrets), so NocoDB can briefly lose its database and Redis; it recovers by itself. While access to the new secrets propagates, the new version of a workload can wait in `get-deployments` reporting that it is not allowed to reveal the secret; the previous version keeps serving meanwhile, and it clears by itself.
+
+### Rotating the Database Password
+
+PostgreSQL keeps the password it was initialized with, and a running workload keeps the values it started with, so editing the secret alone does not change the database password. Change one key and keep the others with export, edit, apply (letters, digits, `-` and `_` only):
+
+```bash
+cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+# edit only the key you are rotating in secret.yaml
+cpln apply -f secret.yaml
+cpln secret reveal SECRET_NAME -o yaml
+```
+
+**Single-instance mode** takes three steps in order:
+
+1. Change it in the database: `ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD';` (connected as that user, from inside the GVC).
+2. Update the secret as above.
+3. Right away, redeploy NocoDB, and wait until `get-deployments` shows a higher version number, alone and ready (right after the command the status may not show the restart yet, and `ready: true` alone can still describe the old replica). Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime.
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-nocodb --gvc GVC_NAME
+```
+
+Connections the app already has open keep working after `ALTER ROLE`; new ones fail until its redeploy finishes, so redeploy right away and rotate in a quiet window.
+
+**HA mode** needs its own order. The replication role `repl` shares the password, and a member that restarts with the old password can be promoted to leader, which splits the cluster. Move the leader to member `-0` first, so it restarts last, after every other member already has the new password. `pgx` runs a command in one member (`LOCATION` is your GVC's location, `DB_USERNAME` the secret's `username`):
+
+```bash
+pgx() { cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --location LOCATION \
+  --container patroni-postgres --replica "RELEASE_NAME-postgres-ha-$1" -- "${@:2}"; }
+# 1. Find the leader ("role": "leader"); the other two must be "streaming" on the same "timeline"
+pgx 0 curl -s localhost:8008/cluster
+# 2. If the leader is not RELEASE_NAME-postgres-ha-0, move it there (N = current leader), then repeat step 1
+pgx 0 curl -s -XPOST -d '{"leader":"RELEASE_NAME-postgres-ha-N","candidate":"RELEASE_NAME-postgres-ha-0"}' localhost:8008/switchover
+# 3. Back to back: change BOTH roles on -0, put the same password in the secret (export, edit, apply above), restart the members
+pgx 0 psql -h 127.0.0.1 -d postgres -c "ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD'; ALTER ROLE repl PASSWORD 'NEW_PASSWORD';"
+cpln workload force-redeployment RELEASE_NAME-postgres-ha --gvc GVC_NAME
+# 4. Once the members are back, confirm one leader and two "streaming" replicas on one timeline (repeat step 1)
+# 5. Optional: remove the install-time password Patroni keeps in its cluster config
+pgx 0 curl -s -XPATCH -d '{"postgresql":{"authentication":null}}' localhost:8008/config
+```
+
+Then force-redeploy `RELEASE_NAME-nocodb`, which keeps the old password until it restarts. The app cannot open new database connections from the `ALTER ROLE` until its own redeploy finishes, so rotate in a quiet window. If a member stays `starting`, or `running` without `streaming`, re-copy it from the leader. This copies the whole database, so it costs network traffic in proportion to its size:
+
+```bash
+pgx N curl -s -XPOST -d '{"force": true}' localhost:8008/reinitialize
+```
+
+### Rotating the Redis Password
+
+Redis keeps no password on disk: it takes the password from the secret each time it starts, and NocoDB does the same. So rotation is the secret and then both restarts:
+
+1. Update the secret with export, edit, apply as above (letters, digits, `-` and `_` only), and check the new value with `cpln secret reveal SECRET_NAME -o yaml`.
+2. Redeploy Redis and NocoDB together. Neither picks up the change without its redeploy:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-nocodb-redis --gvc GVC_NAME
+cpln workload force-redeployment RELEASE_NAME-nocodb --gvc GVC_NAME
+```
+
+Expect a short interruption: until both have restarted, one side holds the old password and NocoDB cannot reach Redis.
 
 ### Scaling and Availability
 
@@ -585,7 +669,7 @@ Live updates reach the browser over HTTP long-poll (`POST /jobs/listen`) backed 
   <Accordion title="Deployment never becomes ready and the logs are empty">
     **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-nocodb --gvc GVC_NAME -o yaml` shows `The secret KEYS_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
 
-    **Cause:** The key secret named by `secrets.name` does not exist. The same applies to an `admin.secretName`, `storage.s3.auth.secretName`, or `smtp.auth.secretName` that was set but never created.
+    **Cause:** The key secret named by `secrets.name`, the database credentials secret or the Redis secret (`redis.credentialsSecretName`) does not exist. The same applies to an `admin.secretName`, `storage.s3.auth.secretName`, or `smtp.auth.secretName` that was set but never created. Check `RELEASE_NAME-nocodb-redis` and the database workload the same way.
 
     **Fix:** Create it (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-nocodb --gvc GVC_NAME` skips the wait.
   </Accordion>
@@ -603,13 +687,7 @@ Live updates reach the browser over HTTP long-poll (`POST /jobs/listen`) backed 
 
     **Fix:** Nothing to repair. Run `nocodb.replicas: 2` (with S3 storage) if a single-replica interruption on the first upgrade is unacceptable; later upgrades of the same release do not restart Redis.
   </Accordion>
-  <Accordion title="Second install refused as managed by a different release">
-    **Symptom:** Installing a second NocoDB release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
 
-    **Cause:** Both releases use the same `postgres.config.credentialsSecretName`. Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
-
-    **Fix:** Set `postgres.config.credentialsSecretName` (and `postgresHA.config.credentialsSecretName` in HA mode) to a distinct name for the second release and install again.
-  </Accordion>
   <Accordion title="Render fails because replicas above 1 require s3 storage">
     **Symptom:** `nocodb: nocodb.replicas > 1 requires storage.type: s3 — local attachments live on a per-replica volumeset and would 404 across replicas`.
 
@@ -636,7 +714,7 @@ Live updates reach the browser over HTTP long-poll (`POST /jobs/listen`) backed 
 
     **Cause:** Your values file still carries `postgres.config.username`, `postgres.config.password`, or `postgres.config.database`.
 
-    **Fix:** Rename them to `postgres.credentials.*` as described in [Upgrading from 1.0.x](#upgrading-from-1-0-x). Do not create a secret yourself — this template creates it.
+    **Fix:** Move their values into the database credentials secret as described in [Upgrading from 1.0.x](#upgrading-from-1-0-x). If your values carry `postgres.credentials` or `redis.auth.password`, follow [Upgrading from 1.3.x](#upgrading-from-1-3-x).
   </Accordion>
   <Accordion title="Webhook to another workload in the GVC is refused">
     **Symptom:** A webhook aimed at an internal address such as `http://WORKLOAD_NAME.GVC_NAME.cpln.local` never fires, and the hook log says to set `NC_ALLOW_LOCAL_HOOKS=true`.
@@ -670,7 +748,7 @@ Live updates reach the browser over HTTP long-poll (`POST /jobs/listen`) backed 
 
 ## Important Notes
 
-- **Create the key secret before installing** — `secrets.name` must name an existing dictionary secret holding `NC_AUTH_JWT_SECRET` and `NC_CONNECTION_ENCRYPT_KEY`. A missing secret wedges the deployment silently.
+- **Create the key, database credentials and Redis secrets before installing** — `secrets.name` must name an existing dictionary secret holding `NC_AUTH_JWT_SECRET` and `NC_CONNECTION_ENCRYPT_KEY`. A missing secret wedges the deployment silently; `status.versions[].message` in `cpln workload get-deployments RELEASE_NAME-nocodb --gvc GVC_NAME -o yaml` names it.
 - **Both keys are write-once** — rotating `NC_AUTH_JWT_SECRET` logs out every user, and changing `NC_CONNECTION_ENCRYPT_KEY` makes the stored credentials of external data sources undecryptable. Back both values up outside Control Plane.
 - **Sign up immediately after install** — signup is open by default, so the first visitor to sign up becomes the super admin. Then turn on invite-only in **Team & Settings**.
 - **With SMTP off, invitations and password resets cannot be delivered** — configure `smtp.*` before inviting collaborators.
@@ -679,12 +757,12 @@ Live updates reach the browser over HTTP long-poll (`POST /jobs/listen`) backed 
 - **`storage.fileUploadSizeLimit` is a byte count** — the default `20971520` is 20 MiB; over-limit uploads are rejected with `413`, not truncated.
 - **Webhooks to same-GVC targets are blocked by default** — set `nocodb.allowLocalWebhooks: true` to fire webhooks at other workloads in your GVC.
 - **`admin.secretName` re-applies on every boot** — a password changed in the UI reverts at the next restart. Leave it empty or treat the secret as the source of truth.
-- **Change `postgres.credentials.password` and `redis.auth.password` before installing** — both seed their component on first boot, are not updated by later value edits, and must use only letters, digits, `-`, and `_`.
+- **Database and Redis credentials use only letters, digits, `-`, and `_`** — they are embedded in connection URLs. Rotating the database password needs `ALTER ROLE` plus a forced redeployment of NocoDB; rotating the Redis password needs a forced redeployment of both Redis and NocoDB — see [Rotating the Database Password](#rotating-the-database-password) and [Rotating the Redis Password](#rotating-the-redis-password).
 - **Enable exactly one database** — `postgres` (PostgreSQL 18, default) or `postgresHA` (PostgreSQL 17). Choose before you have data; switching is a dump and restore.
-- **Give each release its own `postgres.config.credentialsSecretName`** — secret names are org-wide, and a second release on the same name is refused at install.
+- **Give each release its own database and Redis secrets** — secret names are org-wide, so two releases pointed at one secret share a password.
 - **Set `nocodb.siteUrl` when NocoDB sits behind a custom domain**, with the scheme — it drives invitation and password-reset links and the auth cookie's secure flag.
 - **Background jobs are in-process** — a long import, export, or base duplication does not survive the replica running it and must be re-run.
-- **Uninstalling deletes the volume sets** and every base and local attachment in them; your key secret is yours and survives.
+- **Uninstalling deletes the volume sets** and every base and local attachment in them; your prerequisite secrets are yours and survive.
 - **MCP endpoints are created per base in the UI** (base → **Settings → MCP Server**) and authenticate with an `xc-mcp-token`; account-level MCP and OAuth are Enterprise features and are not available on this edition.
 - **SSO/SAML/OIDC, audit logs, and row-level security are Enterprise features** — they ship in the same image but need a purchased licence key that this template never sets.
 - **NocoDB Community Edition is fair-code** — the Sustainable Use License permits self-hosting for your own use; offering NocoDB as a hosted service to others requires a commercial licence.
