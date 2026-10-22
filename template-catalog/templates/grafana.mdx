@@ -1,7 +1,7 @@
 ---
 title: Grafana
 icon: /template-catalog/templates/icons/grafana.png
-description: Grafana OSS dashboards and alerting over your own datasources, deployed into an existing GVC with a bundled PostgreSQL app database (highly available by default, single-instance optional) and optional Redis-coordinated multi-replica alerting. Two opaque prerequisite secrets must exist first.
+description: Grafana OSS dashboards and alerting over your own datasources, deployed into an existing GVC with a bundled PostgreSQL app database (highly available by default, single-instance optional) and optional Redis-coordinated multi-replica alerting. Three prerequisite secrets must exist first.
 keywords: ['promql', 'datasource provisioning', 'alert rules', 'alertmanager', 'kibana alternative', 'chronograf alternative', 'metrics visualization', 'time series dashboards', 'redis sentinel', 'prometheus datasource', 'thanos datasource', 'patroni', 'self-hosted', 'observability']
 ---
 
@@ -33,7 +33,6 @@ This template deploys into a GVC **you already have** — it does not create, pr
 | Workload | `RELEASE_NAME-redis`, `RELEASE_NAME-sentinel` | Alerting-HA coordination tier (stateful, 3 replicas each) | `redis.enabled: true` |
 | Volume set | `RELEASE_NAME-postgres-ha-vs`, `RELEASE_NAME-etcd-vs` | Highly available database and consensus-store data (10 GiB per replica by default) | Default; `postgresHA.enabled: true` |
 | Volume set | `RELEASE_NAME-pg-vs` | Single-instance database data (10 GiB by default) | `postgres.enabled: true` |
-| Secret | The name in `postgresHA.config.credentialsSecretName` or `postgres.config.credentialsSecretName` (default `my-grafana-db-credentials`) | App-database credentials, **created by this chart** from `postgres.credentials.*` and read by whichever database is enabled | — |
 | Secret | `RELEASE_NAME-grafana-datasources` | Rendered datasource provisioning file, mounted by the Grafana workload | `datasources.definitions` non-empty |
 | Secret | `RELEASE_NAME-etcd-startup`, `RELEASE_NAME-patroni-startup`, `RELEASE_NAME-postgres-proxy-startup`, `RELEASE_NAME-wal-g-backup-script` | Startup scripts of the highly available database tier | Default; `postgresHA.enabled: true` |
 | Secret | `RELEASE_NAME-postgres-config` | Non-sensitive backup settings of the highly available database (bucket, region, endpoint) | `postgresHA.backup.enabled: true` |
@@ -43,13 +42,25 @@ This template deploys into a GVC **you already have** — it does not create, pr
 | Identity / Policy | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-pg-policy` | The single-instance database's own identity and policy | `postgres.enabled: true` |
 | Identity / Policy | `RELEASE_NAME-redis-identity`, `RELEASE_NAME-redis-policy`, `RELEASE_NAME-sentinel-identity`, `RELEASE_NAME-sentinel-policy` | The coordination tier's own identities and policies | `redis.enabled: true` |
 
-The admin password and the encryption key are **prerequisite secrets you create yourself**; the chart references them by name and never creates, modifies or deletes them. The app-database credentials secret is the opposite: the chart creates it from `postgres.credentials.*`, so there is nothing for you to create for the database.
+The app-database credentials, the admin password and the encryption key are **prerequisite secrets you create yourself**; the chart references them by name and never creates, modifies or deletes them.
 
 ## Prerequisites
 
-Two [opaque secrets](/guides/create-secret/opaque) must exist before you install. Grafana's admin account is a human-facing login, and `publicAccess.enabled` defaults to `true`, so that account is reachable from the internet — neither credential is a Helm value, and neither ever lands in the release. Secrets are org-level, so no `--gvc` flag is involved.
+Three secrets must exist before you install: a [dictionary secret](/guides/create-secret/dictionary) with the app-database credentials, and two [opaque secrets](/guides/create-secret/opaque) for the admin password and the encryption key. Grafana's admin account is a human-facing login, and `publicAccess.enabled` defaults to `true`, so that account is reachable from the internet — none of these credentials is a Helm value, and none ever lands in the release. Secrets are org-level, so no `--gvc` flag is involved.
 
 <Steps>
+  <Step title="Create the app-database credentials secret">
+    The bundled PostgreSQL initializes with these values and Grafana connects with them, in either database mode:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=grafana \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=grafana
+    ```
+
+    Set `postgresHA.config.credentialsSecretName` (HA, the default) or `postgres.config.credentialsSecretName` (single-instance) to this name. Secret names are org-wide, so give each release its own. PostgreSQL reads it only when its data directory is first initialized — see [Rotating the Database Password](#rotating-the-database-password).
+  </Step>
   <Step title="Create the admin password secret">
     Choose your own strong password for the admin login and store it as the secret's payload with encoding `plain`. Grafana reads it only when the admin account is first created:
 
@@ -68,9 +79,6 @@ Two [opaque secrets](/guides/create-secret/opaque) must exist before you install
 
     Set `admin.secretKeySecretName` to this name.
   </Step>
-  <Step title="Choose the app-database password">
-    The bundled database's credentials are internal plumbing: this chart writes `postgres.credentials.username`, `postgres.credentials.password` and `postgres.credentials.database` into a dictionary secret it creates, and the database reads that secret. Nothing to create — but the password ships as the placeholder `change-me-grafana-db-password`, so set `postgres.credentials.password` to a value of your own before installing. This applies in both database modes.
-  </Step>
 </Steps>
 
 <Warning>
@@ -83,7 +91,7 @@ cpln workload get-deployments RELEASE_NAME-grafana --gvc GVC_NAME -o yaml
 The message reads `The secret <name> no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Create the missing secret and the deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-grafana --gvc GVC_NAME` to skip the wait.
 </Warning>
 
-The two secrets have **different lifecycles** — read [Admin Credentials](#admin-credentials) before you delete or rotate either one.
+The admin password and encryption key secrets have **different lifecycles** — read [Admin Credentials](#admin-credentials) before you delete or rotate either one.
 
 Optional features each need something created **before** you install:
 
@@ -95,17 +103,17 @@ Optional features each need something created **before** you install:
 
 ## Installation
 
-Once both secrets exist, install the template into your GVC, naming the secrets and replacing the database password placeholder:
+Once the three secrets exist, install the template into your GVC, naming the secrets:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/grafana \
-  --version 1.4.1 --gvc GVC_NAME \
+  --version 1.5.0 --gvc GVC_NAME \
+  --set postgresHA.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
   --set admin.passwordSecretName=ADMIN_PASSWORD_SECRET_NAME \
-  --set admin.secretKeySecretName=SECRET_KEY_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-STRONG-DB-PASSWORD'
+  --set admin.secretKeySecretName=SECRET_KEY_SECRET_NAME
 ```
 
-Prefer a values file (`--values`) over `--set` for the database password if you do not want it in your shell history. If you run more than one release of this template in the same org, also give each its own `postgresHA.config.credentialsSecretName` (or `postgres.config.credentialsSecretName` in single-instance mode) — see [App Database](#app-database).
+In single-instance mode set `postgres.config.credentialsSecretName` instead — see [App Database](#app-database).
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -347,7 +355,7 @@ Exactly one of the two database modes must be enabled — the chart enforces thi
 postgresHA: # default: highly available PostgreSQL app database
   enabled: true
   config:
-    credentialsSecretName: my-grafana-db-credentials # dictionary secret this chart CREATES from postgres.credentials.*; org-wide name — give each release its own
+    credentialsSecretName: my-grafana-db-credentials # PREREQUISITE dictionary secret (username, password, database), must exist BEFORE install
   replicas: 3
   volumeset:
     capacity: 10 # initial capacity in GiB per replica (minimum is 10)
@@ -358,19 +366,14 @@ postgresHA:
   enabled: false # set postgresHA.enabled: true (the default) for automatic database failover
 postgres: # dev/lightweight: single-instance PostgreSQL
   enabled: true
-  credentials: # the chart writes these into the secret named below — nothing for you to create
-    username: grafana
-    password: change-me-grafana-db-password # change before installing
-    database: grafana
   config:
-    credentialsSecretName: my-grafana-db-credentials # secret names are org-wide — give each release its own
+    credentialsSecretName: my-grafana-db-credentials # PREREQUISITE dictionary secret (username, password, database), must exist BEFORE install
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 ```
 
-In **both** modes the database credentials come from `postgres.credentials.*` — the chart writes them into the dictionary secret named by `postgresHA.config.credentialsSecretName` or `postgres.config.credentialsSecretName` (whichever database is enabled), and the database reads that secret. Change `postgres.credentials.password` before installing even when `postgres.enabled` is `false`. Grafana is wired to the active database automatically: the HAProxy leader endpoint in HA mode, or the single instance directly. In HA mode the proxy must stay enabled — that endpoint is Grafana's stable database address, and the chart refuses to render with it disabled.
+In **both** modes the database credentials come from your prerequisite dictionary secret (`username`, `password` and `database` — see [Prerequisites](#prerequisites)), named by the `credentialsSecretName` of the database you enable. Grafana is wired to the active database automatically: the HAProxy leader endpoint in HA mode, or the single instance directly. In HA mode the proxy must stay enabled — that endpoint is Grafana's stable database address, and the chart refuses to render with it disabled.
 
-Secret names are org-wide, so a second release of this template left on the default `credentialsSecretName` is **refused at install** with `cannot be updated because it is being managed by a different release` and creates nothing — the first release is unaffected. Give each release its own name.
 
 Everything else the bundled databases can do — volume autoscaling, PgBouncer pooling, etcd tuning — is documented on the [postgres-highly-available](/template-catalog/templates/postgres-highly-available) and [postgres](/template-catalog/templates/postgres) pages and is set under the same `postgresHA.*` / `postgres.*` prefixes. Their backup settings are covered under [Backing Up](#backing-up).
 
@@ -590,7 +593,7 @@ In HA mode `postgresHA.backup.mode` selects `logical` (a scheduled `pg_dump` run
 
 ### Restoring a Backup
 
-A restore goes into the **database**, not into Grafana: everything that makes up your Grafana lives there, so restoring it brings back dashboards, users, datasources and alert rules together. The restore procedures belong to the bundled database — follow [Restoring a Backup](/template-catalog/templates/postgres-highly-available#restoring-a-backup) on the `postgres-highly-available` page in HA mode, or [Restoring a Backup](/template-catalog/templates/postgres#restoring-a-backup) on the `postgres` page in single-instance mode, substituting this release's database address (`RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local` or `RELEASE_NAME-postgres.GVC_NAME.cpln.local`, port `5432`) and the credentials from the chart-created secret:
+A restore goes into the **database**, not into Grafana: everything that makes up your Grafana lives there, so restoring it brings back dashboards, users, datasources and alert rules together. The restore procedures belong to the bundled database — follow [Restoring a Backup](/template-catalog/templates/postgres-highly-available#restoring-a-backup) on the `postgres-highly-available` page in HA mode, or [Restoring a Backup](/template-catalog/templates/postgres#restoring-a-backup) on the `postgres` page in single-instance mode, substituting this release's database address (`RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local` or `RELEASE_NAME-postgres.GVC_NAME.cpln.local`, port `5432`) and the credentials from your database credentials secret:
 
 ```bash
 cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml
@@ -601,6 +604,56 @@ cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml
 </Warning>
 
 Restore into a release that uses the **same encryption key**: `admin.secretKeySecretName` decrypts the datasource credentials stored in the dump, and a different key makes every saved datasource credential unreadable.
+
+### Rotating the Database Password
+
+PostgreSQL keeps the password it was initialized with, and a running workload keeps the values it started with, so in single-instance mode a rotation takes three steps in order (in HA mode follow [Rotating the Database Password in HA Mode](#rotating-the-database-password-in-ha-mode) instead):
+
+1. Change it in the database: `ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD';` (`DB_USERNAME` is the secret's `username`; connect as that user from inside the GVC).
+2. Update the secret — export it, change only `password`, and apply it:
+
+   ```bash
+   cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+   # edit only the password key in secret.yaml
+   cpln apply -f secret.yaml
+   ```
+
+3. Right away, redeploy Grafana:
+
+   ```bash
+   cpln workload force-redeployment RELEASE_NAME-grafana --gvc GVC_NAME
+   ```
+
+Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime. A new value in the secret without `ALTER ROLE` breaks Grafana's login to the database.
+
+### Rotating the Database Password in HA Mode
+
+The HA database (`postgresHA`) needs its own order. The replication role `repl` shares the password, and a member that restarts with the old password can be promoted to leader, which splits the cluster. Move the leader to member `-0` first, so it restarts last, after every other member already has the new password. `pgx` runs a command in one member (`LOCATION` is your GVC's location, `DB_USERNAME` the secret's `username`):
+
+```bash
+pgx() { cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --location LOCATION \
+  --container patroni-postgres --replica "RELEASE_NAME-postgres-ha-$1" -- "${@:2}"; }
+# 1. Find the leader ("role": "leader"); the other two must be "streaming" on the same "timeline"
+pgx 0 curl -s localhost:8008/cluster
+# 2. If the leader is not RELEASE_NAME-postgres-ha-0, move it there (N = current leader), then repeat step 1
+pgx 0 curl -s -XPOST -d '{"leader":"RELEASE_NAME-postgres-ha-N","candidate":"RELEASE_NAME-postgres-ha-0"}' localhost:8008/switchover
+# 3. Change BOTH roles on -0
+pgx 0 psql -h 127.0.0.1 -d postgres -c "ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD'; ALTER ROLE repl PASSWORD 'NEW_PASSWORD';"
+# 4. Right after, put the same password in the secret (edit only the password key in secret.yaml)
+cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+cpln apply -f secret.yaml
+# 5. Restart the members
+cpln workload force-redeployment RELEASE_NAME-postgres-ha --gvc GVC_NAME
+# 6. Once the restart completes, confirm one leader and two "streaming" replicas on one timeline (repeat step 1)
+# 7. Optional: remove the install-time password Patroni keeps in its cluster config
+pgx 0 curl -s -XPATCH -d '{"postgresql":{"authentication":null}}' localhost:8008/config
+```
+
+Then force-redeploy `RELEASE_NAME-grafana`, which keeps the old password until it restarts. The database drops connections briefly at each switchover, and Grafana cannot open new connections from the `ALTER ROLE` until its own redeploy finishes, so rotate in a quiet window. If a member stays `starting`, or `running` without `streaming`, re-copy it from the leader. This copies the whole database, so it costs network traffic in proportion to its size:
+
+```bash
+pgx N curl -s -XPOST -d '{"force": true}' localhost:8008/reinitialize
+```
 
 ### Upgrading from 1.1.0 or Earlier
 
@@ -630,7 +683,7 @@ Template versions before 1.2.1 did not compact the etcd cluster inside the bundl
 
 ### Upgrading from 1.2.1 or Earlier
 
-Version 1.3.0 moved the single-instance database credentials from `postgres.config.username`, `postgres.config.password` and `postgres.config.database` to `postgres.credentials.username`, `postgres.credentials.password` and `postgres.credentials.database`, named by the new `postgres.config.credentialsSecretName`. `postgres.backup.minio.accessKey` and `postgres.backup.minio.secretKey` were replaced by `postgres.backup.minio.credentialsSecretName` at the same time. Carrying the old keys stops the upgrade at render, before anything is applied:
+Version 1.3.0 removed the single-instance database credential keys `postgres.config.username`, `postgres.config.password` and `postgres.config.database`. `postgres.backup.minio.accessKey` and `postgres.backup.minio.secretKey` were replaced by `postgres.backup.minio.credentialsSecretName` at the same time. Carrying the old keys stops the upgrade at render, before anything is applied:
 
 ```text
 Error: ... config.username was REMOVED in postgres 3.4.0. Database credentials are no longer values:
@@ -638,11 +691,11 @@ create a `dictionary` secret holding the keys `username`, `password` and `databa
 config.credentialsSecretName to its name. See Prerequisites in the README.
 ```
 
-Move the three keys to `postgres.credentials.*` **using the values the database was initialised with** — PostgreSQL enforces the credentials written when the volume was first created, and different values just leave Grafana unable to authenticate. **Ignore the message's advice to create the secret yourself:** this template creates it from `postgres.credentials.*`. If you back up to MinIO, create the dictionary secret described under [Backing Up](#backing-up) and set `postgres.backup.minio.credentialsSecretName`. The HA path, Redis and the admin and encryption-key secrets are unchanged by this step.
+Put the three values into the app-database credentials secret under [Prerequisites](#prerequisites) **using the values the database was initialized with** — PostgreSQL enforces the credentials written when the volume was first created, and different values just leave Grafana unable to authenticate — set `postgres.config.credentialsSecretName` to its name, and remove the three keys. If you back up to MinIO, create the dictionary secret described under [Backing Up](#backing-up) and set `postgres.backup.minio.credentialsSecretName`. The HA path, Redis and the admin and encryption-key secrets are unchanged by this step.
 
 ### Upgrading from 1.3.0
 
-Version 1.4.0 made the same change on the HA path: `postgresHA.postgres.username`, `postgresHA.postgres.password` and `postgresHA.postgres.database` were removed, and the bundled highly available database now reads the dictionary secret named by `postgresHA.config.credentialsSecretName` — which this chart creates from `postgres.credentials.*`, exactly as in single-instance mode. Carrying the old block stops the upgrade at render:
+Version 1.4.0 made the same change on the HA path: `postgresHA.postgres.username`, `postgresHA.postgres.password` and `postgresHA.postgres.database` were removed, and the bundled highly available database now reads the dictionary secret named by `postgresHA.config.credentialsSecretName`. Carrying the old block stops the upgrade at render:
 
 ```text
 Error: ... postgres-highly-available: the `postgres` block was REMOVED in 2.5.0. `postgres.username`,
@@ -651,7 +704,7 @@ Error: ... postgres-highly-available: the `postgres` block was REMOVED in 2.5.0.
 `postgres:` block from your values. See Prerequisites in the README.
 ```
 
-Delete `postgresHA.postgres.*`, and set `postgres.credentials.username`, `postgres.credentials.password` and `postgres.credentials.database` to the **same values the cluster already has** (the message's instruction to create the secret yourself does not apply — this template creates it). Leaving `postgres.enabled: false` is correct; the `postgres.credentials.*` values feed both database modes. If you run several releases in one org, give each its own `postgresHA.config.credentialsSecretName`.
+Delete `postgresHA.postgres.*`, put the **same values the cluster already has** into the app-database credentials secret under [Prerequisites](#prerequisites), and set `postgresHA.config.credentialsSecretName` to its name. If you run several releases in one org, give each its own secret.
 
 ### Upgrading from 1.4.0
 
@@ -664,6 +717,23 @@ backup.minio.credentialsSecretName to its name. See Backup setup in the README.
 ```
 
 Create the dictionary secret described under [Backing Up](#backing-up) with the same access key and secret key, set `postgresHA.backup.minio.credentialsSecretName` to its name, remove the two old keys, and upgrade.
+
+### Upgrading from 1.4.1
+
+Version 1.5.0 removed `postgres.credentials`: the database credentials are now a prerequisite secret, the same one the bundled database template requires on its own. Carrying the old key forward fails the render.
+
+1.4.1 created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with, not new ones, or Grafana loses its database connection:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-grafana-db \
+  --entry username=grafana \
+  --entry password='YOUR_CURRENT_PASSWORD' \
+  --entry database=grafana
+```
+
+Then upgrade with `postgres.credentials` removed and the `credentialsSecretName` of the mode you use (`postgresHA.config.credentialsSecretName` by default) set to that name. Your current values are in `postgres.credentials` of the 1.4.1 release, and also in the old secret (`cpln secret reveal my-grafana-db-credentials -o yaml`, or the name your release set in `credentialsSecretName`) until the upgrade deletes it.
+
+The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), so Grafana can briefly lose its database; it reconnects by itself. The new version of a workload can also wait several minutes with `is not allowed to reveal the secret` in `get-deployments` while access to the new secret propagates; the previous version keeps serving meanwhile, and it clears by itself.
 
 ### Scaling and Availability
 
@@ -679,7 +749,7 @@ Create the dictionary secret described under [Backing Up](#backing-up) with the 
   <Accordion title="The Grafana workload sits at 0 replicas after install while helm reported success">
     **Symptom:** `cpln helm install` succeeded, but `RELEASE_NAME-grafana` shows no containers and `cpln logs` returns nothing.
 
-    **Cause:** A prerequisite secret named in your values does not exist — the admin password, the encryption key, a datasource-credential secret or the SMTP password. The deployment pauses on the unresolved reference.
+    **Cause:** A prerequisite secret named in your values does not exist — the app-database credentials, the admin password, the encryption key, a datasource-credential secret or the SMTP password. The deployment pauses on the unresolved reference.
 
     **Fix:** Read the message naming the secret, then create it:
 
@@ -710,13 +780,6 @@ Create the dictionary secret described under [Backing Up](#backing-up) with the 
 
     **Fix:** Enable exactly one — see [App Database](#app-database). To use the single-instance database, set `postgresHA.enabled: false` together with `postgres.enabled: true`.
   </Accordion>
-  <Accordion title="A second release is refused because a resource is managed by a different release">
-    **Symptom:** Installing a second release of this template in the same org fails with `cannot be updated because it is being managed by a different release`, naming the database credentials secret, and creates nothing.
-
-    **Cause:** Secret names are org-wide, and both releases are trying to create the same `credentialsSecretName` (default `my-grafana-db-credentials`). The first release owns it.
-
-    **Fix:** Give the new release its own `postgresHA.config.credentialsSecretName` (or `postgres.config.credentialsSecretName` in single-instance mode) and install again. The first release is unaffected.
-  </Accordion>
   <Accordion title="Saved datasources stop working after the encryption key secret changed">
     **Symptom:** Datasources that worked before now fail their connection test, and Grafana cannot read the credentials it stored for them.
 
@@ -732,23 +795,24 @@ Create the dictionary secret described under [Backing Up](#backing-up) with the 
     **Fix:** Set `publicAccess.enabled: true` and upgrade, or use contact points that do not rely on absolute links.
   </Accordion>
   <Accordion title="Upgrade fails with a key that was REMOVED in postgres 3.4.0 or 2.5.0">
-    **Symptom:** `helm upgrade` stops at render with `config.username was REMOVED in postgres 3.4.0`, `the postgres block was REMOVED in 2.5.0`, or `backup.minio.accessKey and backup.minio.secretKey were REMOVED`.
+    **Symptom:** `helm upgrade` stops at render with `config.username was REMOVED in postgres 3.4.0`, `the postgres block was REMOVED in 2.5.0`, `backup.minio.accessKey and backup.minio.secretKey were REMOVED`, or a message that `postgres.credentials` was removed.
 
-    **Cause:** Your values still carry database or MinIO credential keys that moved in template versions 1.3.0, 1.4.0 or 1.4.1. The existing release is left untouched and running.
+    **Cause:** Your values still carry database or MinIO credential keys that moved in template versions 1.3.0, 1.4.0, 1.4.1 or 1.5.0. The existing release is left untouched and running.
 
-    **Fix:** Follow the matching migration note above — [Upgrading from 1.2.1 or Earlier](#upgrading-from-1-2-1-or-earlier), [Upgrading from 1.3.0](#upgrading-from-1-3-0) or [Upgrading from 1.4.0](#upgrading-from-1-4-0) — keeping the credentials the database already uses.
+    **Fix:** Follow the matching migration note above — [Upgrading from 1.2.1 or Earlier](#upgrading-from-1-2-1-or-earlier), [Upgrading from 1.3.0](#upgrading-from-1-3-0), [Upgrading from 1.4.0](#upgrading-from-1-4-0) or [Upgrading from 1.4.1](#upgrading-from-1-4-1) — keeping the credentials the database already uses.
   </Accordion>
 </AccordionGroup>
 
 ## Important Notes
 
-- **Create the admin-password and encryption-key secrets before installing**, and change `postgres.credentials.password` from its `change-me` placeholder. A missing prerequisite secret does not fail the install — the workload sits at zero replicas waiting on it.
+- **Create the app-database credentials, admin-password and encryption-key secrets before installing.** A missing prerequisite secret does not fail the install — the workload sits at zero replicas waiting on it, and `status.versions[].message` from `cpln workload get-deployments RELEASE_NAME-grafana --gvc GVC_NAME -o yaml` names it.
+- **Rotating the database password needs `ALTER ROLE` plus a forced redeployment of Grafana** (and a leader switchover first in HA mode) — see [Rotating the Database Password](#rotating-the-database-password).
 - **The encryption-key secret is permanent: never delete it, never rotate it.** Back the key up outside Control Plane.
 - **The admin password applies on first boot only.** Change it in the Grafana UI; then set `admin.applyPassword: false`, upgrade, and delete the password secret — see [First Run](#first-run).
 - **This template ships no dashboards and no datasources.** Control Plane's console already provides built-in workload-metrics dashboards; this is the pane for data you own.
 - **`replicas >= 2` requires `redis.enabled: true`** — the chart refuses to render multi-replica without the Sentinel tier that keeps one firing alert from producing one notification per replica.
 - **Dashboards, users and alert rules live in the app database** and survive Grafana restarts and replica replacement. **Uninstall deletes the database volume sets** — enable backups if the data matters.
-- **Give each release its own `credentialsSecretName`** — secret names are org-wide, and a second release on the default name is refused at install.
+- **Give each release its own app-database credentials secret** — secret names are org-wide.
 - **Prerequisite secrets you create are not owned by the release** — they survive `helm uninstall` and must be deleted manually if you no longer need them.
 - **Keep `publicAccess.enabled: true` if you rely on links in alert emails** — an internal-only instance has no derived `root_url` and links point at localhost.
 - **This template ships Grafana OSS only** — Enterprise features such as fine-grained RBAC, reporting and query caching are not available.
