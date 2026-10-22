@@ -1,7 +1,7 @@
 ---
 title: Docmost
 icon: /template-catalog/templates/icons/docmost.png
-description: Deploy Docmost, the open-source wiki and knowledge base with real-time collaborative editing, on Control Plane. Single server with bundled PostgreSQL and Redis, optional multi-replica on S3 attachment storage. Needs an existing GVC and a pre-created APP_SECRET opaque secret.
+description: Deploy Docmost, the open-source wiki and knowledge base with real-time collaborative editing, on Control Plane. Single server with bundled PostgreSQL and Redis, optional multi-replica on S3 attachment storage. Needs an existing GVC, an APP_SECRET secret and database and Redis credential secrets.
 keywords: ['docmost', 'wiki', 'knowledge base', 'confluence alternative', 'notion alternative', 'outline alternative', 'bookstack alternative', 'collaborative editing', 'team documentation', 'spaces and permissions', 'self-hosted wiki', 'agpl']
 ---
 
@@ -24,18 +24,16 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Volume set | `RELEASE_NAME-docmost-storage` | Local attachment storage, mounted at `/app/data/storage` only when `storage.type` is `local` | — |
 | Volume set | `RELEASE_NAME-docmost-redis-vs` | Redis append-only file at `/data` | — |
 | Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory; takes no scheduled snapshots; a final snapshot is taken when the volume set is deleted and kept 7 days | — |
-| Secret | `RELEASE_NAME-docmost-creds` | Dictionary secret the chart creates with the PostgreSQL and Redis credentials Docmost uses to assemble `DATABASE_URL` and `REDIS_URL` | — |
-| Secret | the name in `postgres.config.credentialsSecretName` | Dictionary secret the chart creates (`username`, `password`, `database`) and hands to the bundled PostgreSQL | — |
 | Identity | `RELEASE_NAME-docmost-identity` | Bound to the Docmost and Redis workloads; carries your AWS cloud account link in keyless S3 mode | — |
-| Policy | `RELEASE_NAME-docmost-policy` | Grants that identity `reveal` on exactly the secrets it reads: the credentials secret, your `APP_SECRET` secret, and your S3-key and SMTP secrets when configured | — |
+| Policy | `RELEASE_NAME-docmost-policy` | Grants that identity `reveal` on exactly the secrets it reads: your database credentials, Redis password and `APP_SECRET` secrets, and your S3-key and SMTP secrets when configured | — |
 | Identity | `RELEASE_NAME-pg-identity` | Bound to the bundled PostgreSQL (and its backup job) | — |
 | Policy | `RELEASE_NAME-pg-policy` | Grants the PostgreSQL identity `reveal` on its credentials secret only | — |
 
-Your `APP_SECRET` secret is **not** created by the template — see [Prerequisites](#prerequisites).
+Your `APP_SECRET`, database credentials and Redis password secrets are **not** created by the template — see [Prerequisites](#prerequisites).
 
 ## Prerequisites
 
-Docmost signs sessions, invitation links, and share links with an `APP_SECRET` that you supply through an [opaque secret](/guides/create-secret/opaque) created **before** installing. The value never passes through Helm values.
+Three secrets must exist **before** installing: the `APP_SECRET` Docmost signs sessions, invitation links, and share links with, supplied through an [opaque secret](/guides/create-secret/opaque), and two [dictionary secrets](/guides/create-secret/dictionary) holding the database credentials and the Redis password. The values never pass through Helm values.
 
 <Steps>
   <Step title="Create the APP_SECRET secret">
@@ -50,16 +48,38 @@ Docmost signs sessions, invitation links, and share links with an `APP_SECRET` t
   <Step title="Back the value up outside Control Plane">
     `APP_SECRET` is effectively write-once: rotating it logs out every user and invalidates every outstanding invitation and share link (stored documents are unaffected). Keep a copy somewhere safe.
   </Step>
+  <Step title="Create the database credentials secret">
+    The bundled PostgreSQL initializes with these values and Docmost connects with them:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=docmost \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=docmost
+    ```
+
+    Set `postgres.config.credentialsSecretName` to this name. Secret names are org-wide, so give each Docmost release its own secret. The three values are part of Docmost's connection URL, so use letters, digits, `-` and `_` only. PostgreSQL reads the secret only when its data is first initialized — see [Rotating the Database Password](#rotating-the-database-password).
+  </Step>
+  <Step title="Create the Redis password secret">
+    One key, `password`; the bundled Redis requires it and Docmost connects with it:
+
+    ```bash
+    cpln secret create-dictionary --name REDIS_SECRET_NAME \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `redis.credentialsSecretName` to this name. The password is part of Docmost's Redis URL, so use letters, digits, `-` and `_` only.
+  </Step>
 </Steps>
 
 <Warning>
-Create the secret **before** installing. Installing without it reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
+Create all three secrets **before** installing. Installing without it reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-docmost --gvc GVC_NAME -o yaml
 ```
 
-The message reads `The secret APP_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Creating the secret lets the deployment recover on its own; `cpln workload force-redeployment RELEASE_NAME-docmost --gvc GVC_NAME` skips the wait.
+The message reads `The secret APP_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` The message names whichever secret is missing. Creating the secret lets the deployment recover on its own; `cpln workload force-redeployment RELEASE_NAME-docmost --gvc GVC_NAME` skips the wait.
 </Warning>
 
 Everything else works with the defaults. Three optional features need their own setup first:
@@ -70,17 +90,15 @@ Everything else works with the defaults. Three optional features need their own 
 
 ## Installation
 
-Once your `APP_SECRET` secret exists, install from the marketplace registry, pointing `secrets.name` at it and replacing both bundled-component passwords:
+Once your three secrets exist, install from the marketplace registry, pointing the three secret-name keys at them:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/docmost \
-  --version 1.1.0 --gvc GVC_NAME \
+  --version 1.2.0 --gvc GVC_NAME \
   --set secrets.name=APP_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-DB-PASSWORD' \
-  --set redis.auth.password='YOUR-REDIS-PASSWORD'
+  --set postgres.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
+  --set redis.credentialsSecretName=REDIS_SECRET_NAME
 ```
-
-Installing a second Docmost release in the same org? Also set `postgres.config.credentialsSecretName` to a name no other release uses — secret names are org-wide.
 
 Other ways to install and manage the template:
 
@@ -196,17 +214,13 @@ A change to either access knob takes a couple of minutes to take effect after th
 
 ### Bundled PostgreSQL
 
-The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. The chart builds the credentials secret from `postgres.credentials.*` for you — nothing to create before installing.
+The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. The database credentials come from your prerequisite dictionary secret (`username`, `password` and `database` — see [Prerequisites](#prerequisites)), named by `postgres.config.credentialsSecretName`.
 
 ```yaml
 postgres:
   image: postgres:18
-  credentials: # the chart writes these into the secret named below
-    username: docmost
-    password: change-me-docmost-pg # change before installing — seeds the database on first boot
-    database: docmost
   config:
-    credentialsSecretName: my-docmost-db-credentials # chart-created; secret names are org-wide, so give each release its own
+    credentialsSecretName: my-docmost-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   resources:
     minCpu: 250m
     maxCpu: 1000m
@@ -227,8 +241,7 @@ Redis is required: Docmost's readiness check pings it alongside the database, an
 ```yaml
 redis:
   image: redis:8
-  auth:
-    password: change-me-docmost-redis # change before installing — wired into REDIS_URL
+  credentialsSecretName: my-docmost-redis # PREREQUISITE dictionary secret (key: password; letters, digits, - and _) — must exist BEFORE install
   resources:
     minCpu: 100m
     maxCpu: 400m
@@ -239,7 +252,7 @@ redis:
 ```
 
 <Note>
-Both bundled passwords seed their component on first boot and are not updated by later value edits. Uninstalling the release deletes the volume sets; reinstall to reset.
+PostgreSQL reads its password from the secret only when its data is first initialized; Redis reads its password each time it starts. To change either, follow [Rotating the Database Password](#rotating-the-database-password) or [Rotating the Redis Password](#rotating-the-redis-password). Uninstalling the release deletes the volume sets; reinstall to reset.
 </Note>
 
 ## Connecting
@@ -252,7 +265,7 @@ Both bundled passwords seed their component on first boot and are not updated by
 | Internal (same GVC) | `http://RELEASE_NAME-docmost.GVC_NAME.cpln.local:3000` | Reachable per `internalAccess.type`. |
 | Login | The account created on first run | Docmost ships no default account. |
 | PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | `username` / `password` / `database` from `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `postgres.config.credentialsSecretName`. |
-| Redis | `RELEASE_NAME-docmost-redis.GVC_NAME.cpln.local:6379` | Password is the `redisPassword` key of `cpln secret reveal RELEASE_NAME-docmost-creds -o yaml`. |
+| Redis | `RELEASE_NAME-docmost-redis.GVC_NAME.cpln.local:6379` | Password is the `password` key of `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `redis.credentialsSecretName`. |
 
 With `publicAccess.enabled: false` there is no public endpoint; reach the UI from your machine through a tunnel instead and open `http://localhost:3000`:
 
@@ -482,17 +495,76 @@ Two constraints make this a planned operation: the archive contains `CREATE ROLE
 This restore path has not been exercised against this template end to end. Rehearse it on a throwaway release before you depend on it. Restoring from a volume set snapshot is likewise unverified here.
 </Warning>
 
+### Rotating the Database Password
+
+PostgreSQL keeps the password it was initialized with, and a running workload keeps the values it started with, so a rotation takes three steps in order:
+
+1. Change it in the database: `ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD';` (`DB_USERNAME` is the secret's `username`; connect as that user from inside the GVC).
+2. Update the secret — export it, change only `password`, and apply it:
+
+   ```bash
+   cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+   # edit only the password key in secret.yaml
+   cpln apply -f secret.yaml
+   ```
+
+3. Right away, redeploy Docmost, and wait until `get-deployments` shows a higher version number, alone and ready (`ready: true` alone can still describe the old replica):
+
+   ```bash
+   cpln workload force-redeployment RELEASE_NAME-docmost --gvc GVC_NAME
+   ```
+
+   Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime.
+
+Connections the app already has open keep working after `ALTER ROLE`; new ones fail until its redeploy finishes, so redeploy right away and rotate in a quiet window.
+
+### Rotating the Redis Password
+
+Redis keeps no password on disk: it takes the password from the secret each time it starts, and so does Docmost.
+
+1. Update the secret — export it, change only `password`, apply it, and check it:
+
+   ```bash
+   cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+   # edit only the password key in secret.yaml
+   cpln apply -f secret.yaml
+   cpln secret reveal SECRET_NAME -o yaml
+   ```
+
+2. Redeploy Redis, then Docmost, and wait until `get-deployments` shows a higher version number for each, alone and ready:
+
+   ```bash
+   cpln workload force-redeployment RELEASE_NAME-docmost-redis --gvc GVC_NAME
+   cpln workload force-redeployment RELEASE_NAME-docmost --gvc GVC_NAME
+   ```
+
+Docmost cannot reach Redis between the two redeploys, so expect a short interruption and rotate in a quiet window.
+
 ### Upgrading from 1.0.0
 
-Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. Docmost absorbed that change rather than passing it on — the chart now creates the credentials secret itself — so there is **no new prerequisite**, only a rename of three keys:
+`postgres.config.username`, `postgres.config.password` and `postgres.config.database` were removed. Put the values your database was initialized with into the database credentials secret under [Prerequisites](#prerequisites) (keys `username`, `password` and `database`), set `postgres.config.credentialsSecretName` to its name, and remove the three keys. Then move the Redis password as described in [Upgrading from 1.1.0](#upgrading-from-1-1-0) (1.0.0 kept it in the same `RELEASE_NAME-docmost-creds` secret).
 
-| Removed key (1.0.0) | Replacement (1.1.0) |
-|---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` |
+### Upgrading from 1.1.0
 
-Move the three keys, keep the same values so the running database still matches, and upgrade in place. A values file that still carries an old key fails the render with the **postgres template's** message, which tells you to create a dictionary secret yourself — ignore that advice here; this template creates it.
+`postgres.credentials` was removed: the database credentials are now a prerequisite secret, the same one the `postgres` template requires on its own. `redis.auth.password` was removed too: the Redis password is now a prerequisite secret named by `redis.credentialsSecretName`. Carrying either old key forward fails the render.
+
+1.1.0 created both secrets itself, so **this upgrade deletes them**. Before upgrading, create secrets under **new** names holding the values your release uses today — not new ones, or Docmost loses its database and Redis connections:
+
+```bash
+cpln secret reveal my-docmost-db-credentials -o yaml   # default name: use your credentialsSecretName if you changed it
+cpln secret create-dictionary --name RELEASE_NAME-docmost-db \
+  --entry username='YOUR_CURRENT_USERNAME' \
+  --entry password='YOUR_CURRENT_PASSWORD' \
+  --entry database='YOUR_CURRENT_DATABASE'
+
+cpln secret reveal RELEASE_NAME-docmost-creds -o yaml   # redisPassword is the CURRENT Redis password
+cpln secret create-dictionary --name RELEASE_NAME-docmost-redis \
+  --entry password='YOUR_CURRENT_REDIS_PASSWORD'
+```
+
+The current values are also in `postgres.credentials` and `redis.auth.password` of the 1.1.0 release. Then upgrade with `postgres.config.credentialsSecretName` and `redis.credentialsSecretName` set to the new names, and with `postgres.credentials` and `redis.auth` removed from your values.
+
+The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), so Docmost briefly loses its database; it reconnects by itself. The new version of a workload can also wait several minutes with `is not allowed to reveal the secret` in `get-deployments` while access to the new secret propagates; the previous version keeps serving meanwhile, and it clears by itself.
 
 <Note>
 The first `helm upgrade` after an install can restart the bundled PostgreSQL even when its values are unchanged, so expect a brief interruption.
@@ -526,16 +598,9 @@ The bundled PostgreSQL and Redis are single-instance by design: Docmost has no S
   <Accordion title="Deployment never becomes ready and the logs are empty">
     **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-docmost --gvc GVC_NAME -o yaml` shows `The secret APP_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
 
-    **Cause:** The `APP_SECRET` prerequisite secret named by `secrets.name` does not exist.
+    **Cause:** A prerequisite secret does not exist — the `APP_SECRET` secret named by `secrets.name`, the database credentials secret named by `postgres.config.credentialsSecretName`, or the Redis password secret named by `redis.credentialsSecretName`. The message names the missing one.
 
     **Fix:** Create it (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-docmost --gvc GVC_NAME` skips the wait.
-  </Accordion>
-  <Accordion title="Second install refused as managed by a different release">
-    **Symptom:** Installing a second Docmost release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
-
-    **Cause:** Both releases use the same `postgres.config.credentialsSecretName`. Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
-
-    **Fix:** Set `postgres.config.credentialsSecretName` to a distinct name for the second release and install again.
   </Accordion>
   <Accordion title="Render fails because replicas above 1 require s3 storage">
     **Symptom:** `docmost: docmost.replicas > 1 requires storage.type: s3 — local attachments live on per-replica volumesets and would scatter/404 across replicas`.
@@ -556,7 +621,7 @@ The bundled PostgreSQL and Redis are single-instance by design: Docmost has no S
 
     **Cause:** Your values file still carries `postgres.config.username`, `postgres.config.password`, or `postgres.config.database`.
 
-    **Fix:** Rename them to `postgres.credentials.*` as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0). Do not create a secret yourself — this template creates it.
+    **Fix:** Put the three values into the database credentials secret and remove the keys, as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0).
   </Accordion>
   <Accordion title="Member invitations never arrive">
     **Symptom:** An invitation created in the UI reaches no one, and the workload logs contain no invitation link.
@@ -576,16 +641,16 @@ The bundled PostgreSQL and Redis are single-instance by design: Docmost has no S
 
 ## Important Notes
 
-- **Create the `APP_SECRET` secret before installing** — `secrets.name` must name an existing opaque secret (plain encoding) with a random payload of at least 32 characters. A missing secret wedges the deployment silently.
+- **Create the three prerequisite secrets before installing** — `secrets.name` must name an existing opaque secret (plain encoding) with a random payload of at least 32 characters, and `postgres.config.credentialsSecretName` and `redis.credentialsSecretName` existing dictionary secrets. A missing secret wedges the deployment silently; `status.versions[].message` from `cpln workload get-deployments RELEASE_NAME-docmost --gvc GVC_NAME -o yaml` names it.
 - **Treat `APP_SECRET` as write-once** — rotating it logs out every user and invalidates outstanding invitation and share links. Back the value up outside Control Plane.
 - **Claim the workspace right after install** — the first visitor to complete the setup form becomes the workspace owner, and the form is reachable by anyone who can reach the endpoint.
 - **With SMTP off, member invitations cannot be delivered** — configure `smtp.*` before inviting anyone.
 - **`docmost.replicas` above `1` requires `storage.type: s3`** — local attachments are per-replica.
 - **AWS S3 is keyless only** — a cloud account plus a bucket-scoped IAM policy; static keys are accepted only with an S3-compatible `storage.s3.endpoint`.
 - **Uploads larger than `storage.fileUploadSizeLimit` are truncated, not rejected** — raise the limit before importing large attachments.
-- **Change `postgres.credentials.password` and `redis.auth.password` before installing** — both seed their component on first boot and are not updated by later value edits.
-- **Give each release its own `postgres.config.credentialsSecretName`** — secret names are org-wide, and a second release on the same name is refused at install.
-- **Uninstalling deletes the volume sets** and every page and local attachment in them; your `APP_SECRET` secret is yours and survives.
+- **Rotating a password needs a forced redeployment** — the database password also needs `ALTER ROLE` first; see [Rotating the Database Password](#rotating-the-database-password) and [Rotating the Redis Password](#rotating-the-redis-password).
+- **Give each release its own database credentials secret** — secret names are org-wide.
+- **Uninstalling deletes the volume sets** and every page and local attachment in them; your prerequisite secrets are yours and survive.
 - **Docmost is licensed under the AGPL** — this template deploys the open-source edition.
 
 ## External References
