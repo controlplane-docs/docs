@@ -21,11 +21,11 @@ This template deploys into an **existing** [GVC](/reference/gvc) — the one you
 | Volume Set | `RELEASE_NAME-logs-0`, `RELEASE_NAME-logs-1` | One per path in `kafka.logDirs`; ext4 SSD, autoscaling, daily snapshots | `kafka.volumes.logs.externalVolumeSets` mounts existing volume sets instead |
 | Secret | `RELEASE_NAME-controller-configuration` | Broker `server.properties` (listeners, SASL, ACL, replication defaults) | — |
 | Secret | `RELEASE_NAME-init` | Broker startup script | — |
-| Secret | `RELEASE_NAME-secrets` | KRaft cluster ID, controller, inter-broker and listener admin passwords | — |
+| Secret | `RELEASE_NAME-secrets` | KRaft cluster ID, controller, inter-broker and listener admin passwords (references to your credentials secret when `kafka.credentialsSecretName` is set) | — |
 | Secret | `RELEASE_NAME-jmx-exporter-conf` | JMX exporter rules | with `jmx_exporter` |
-| Identity and Policy | `RELEASE_NAME` | `reveal` on the broker secrets | — |
+| Identity and Policy | `RELEASE_NAME` | `reveal` on the broker secrets, and on your credentials secret when `kafka.credentialsSecretName` is set | — |
 | Workload | `RELEASE_NAME-kafbat-ui` | Kafbat UI web console (standard), with an identity and policy of the same name reading your configuration secret | `kafbat_ui.enabled: true` (default) |
-| Workload | `RELEASE_NAME-rest-proxy` | Confluent REST Proxy (standard) on port 8082, with identity `RELEASE_NAME-rest-proxy-identity`, policy `RELEASE_NAME-rest-proxy-policy` and secrets `RELEASE_NAME-rest-properties`, `RELEASE_NAME-rest-jaas-conf` (plus `RELEASE_NAME-rest-password-properties` when BASIC-auth users are set) | `kafka_rest_proxy.enabled: true` (default) |
+| Workload | `RELEASE_NAME-rest-proxy` | Confluent REST Proxy (standard) on port 8082, with identity `RELEASE_NAME-rest-proxy-identity`, policy `RELEASE_NAME-rest-proxy-policy` and secrets `RELEASE_NAME-rest-properties`, `RELEASE_NAME-rest-jaas-conf` (not created when `kafka_rest_proxy.jaas_conf_secret` names your own secret) and `RELEASE_NAME-rest-password-properties` (only when BASIC-auth users are set inline) | `kafka_rest_proxy.enabled: true` (default) |
 | Workload | `RELEASE_NAME-client` | Kafka CLI tools container for testing from inside the GVC | `kafka_client` block (default on; set to `null` to omit) |
 | Workload | `RELEASE_NAME-connect-` followed by the connector `name` | Kafka Connect worker (stateful). Containers: `kafka-connect` and `plugins-downloader`. Comes with a plugins volume set, identity and policy of the same name, and secrets with the suffixes `-props`, `-init` and `-download` | `kafka_connectors` list |
 | Domain | the hostname you configure | TLS entry point for the public listener, Kafbat UI or REST Proxy | `kafka.listeners.<listener>.directReplicaRouting.publicAddress`, `kafbat_ui.domain`, `kafka_rest_proxy.domain` |
@@ -34,7 +34,7 @@ This template deploys into an **existing** [GVC](/reference/gvc) — the one you
 
 <Steps>
   <Step title="Create the Kafbat UI configuration secret">
-    Kafbat UI is on by default and reads its whole configuration from an **opaque** secret mounted as a file. The secret must exist **before** you install. Replace `ADMIN_PASSWORD` with the value you will pass as `kafka.listeners.client.sasl.admin.password`, and `UI_PASSWORD` with the login you want for the console. The full file format is in the [Kafbat configuration reference](https://ui.docs.kafbat.io/configuration/configuration-file).
+    Kafbat UI is on by default and reads its whole configuration from an **opaque** secret mounted as a file. The secret must exist **before** you install. Replace `ADMIN_PASSWORD` with the client admin password (`client-admin-password` in your credentials secret, or `kafka.listeners.client.sasl.admin.password` if you set it inline), and `UI_PASSWORD` with the login you want for the console. The full file format is in the [Kafbat configuration reference](https://ui.docs.kafbat.io/configuration/configuration-file).
 
     ```bash
     cat > kafbat-config.yaml <<'EOF'
@@ -69,14 +69,30 @@ This template deploys into an **existing** [GVC](/reference/gvc) — the one you
     Create the secret and the deployment recovers on its own after a few minutes, or force it with `cpln workload force-redeployment RELEASE_NAME-kafbat-ui --gvc GVC_NAME`.
     </Warning>
   </Step>
-  <Step title="Choose the cluster credentials">
-    The KRaft cluster ID and the SASL passwords are template values, set at install time. Generate a cluster ID with the Kafka tooling (the same image the template runs):
+  <Step title="Create the credentials secret (recommended)">
+    Every broker password can come from one [dictionary secret](/guides/create-secret/dictionary) named by `kafka.credentialsSecretName`, which keeps the passwords out of the Helm release. It holds `inter-broker-password`, `controller-password`, and one `<listener>-<username>-password` key for each SASL admin and user, where `<listener>` is the listener's `name` in lower case. For the default listeners:
+
+    ```bash
+    cpln secret create-dictionary --name my-kafka-credentials \
+      --entry inter-broker-password="$(openssl rand -hex 24)" \
+      --entry controller-password="$(openssl rand -hex 24)" \
+      --entry client-admin-password="$(openssl rand -hex 24)" \
+      --entry client-user-password="$(openssl rand -hex 24)"
+    ```
+
+    Create it before you install: while it is missing the brokers wait and `cpln logs` shows nothing, and `status.versions[].message` in `cpln workload get-deployments RELEASE_NAME-cluster --gvc GVC_NAME -o yaml` names it. Without this secret, the passwords are the inline values `kafka.secrets.inter_broker_password`, `kafka.secrets.controller_password`, `kafka.listeners.client.sasl.admin.password` and `kafka.listeners.client.sasl.passwords`; their `your-…` defaults work as literal passwords, so never leave them in place. See [Credentials](#credentials).
+  </Step>
+  <Step title="Choose the KRaft cluster ID">
+    The KRaft cluster ID is a template value, set at install time. Generate one with the Kafka tooling (the same image the template runs):
 
     ```bash
     docker run --rm apache/kafka:3.9.1 /opt/kafka/bin/kafka-storage.sh random-uuid
     ```
 
-    Pick strong values for `kafka.secrets.inter_broker_password`, `kafka.secrets.controller_password`, `kafka.listeners.client.sasl.admin.password` and `kafka.listeners.client.sasl.passwords`. The `your-…` defaults in `values.yaml` are placeholders that work as literal passwords, so never leave them in place. The cluster ID is written into the log volumes at first start and cannot be changed afterwards without a new cluster.
+    The cluster ID is written into the log volumes at first start and cannot be changed afterwards without a new cluster.
+  </Step>
+  <Step title="Create the REST Proxy JAAS secret (recommended)">
+    The REST Proxy is on by default, and its JAAS file holds the client admin password. Put the whole file in an opaque secret named by `kafka_rest_proxy.jaas_conf_secret`; see [REST Proxy Credentials](#rest-proxy-credentials).
   </Step>
   <Step title="Public listener (optional)">
     Exposing brokers to clients outside the GVC needs a domain you control and a **dedicated load balancer** enabled on the GVC. Follow the [Configure Domain](/guides/configure-domain) guide first, then see [Public Listener](#public-listener) below.
@@ -85,20 +101,19 @@ This template deploys into an **existing** [GVC](/reference/gvc) — the one you
 
 ## Installation
 
-Install into an existing GVC, supplying the credentials from the prerequisites:
+Install into an existing GVC, naming the credentials secret from the prerequisites:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/kafka \
-  --version 4.3.0 --gvc GVC_NAME \
+  --version 4.4.0 --gvc GVC_NAME \
   --set kafka.secrets.kraft_cluster_id=KRAFT_CLUSTER_ID \
-  --set kafka.secrets.inter_broker_password=INTER_BROKER_PASSWORD \
-  --set kafka.secrets.controller_password=CONTROLLER_PASSWORD \
-  --set kafka.listeners.client.sasl.admin.password=ADMIN_PASSWORD \
-  --set kafka.listeners.client.sasl.passwords=USER_PASSWORD
+  --set kafka.credentialsSecretName=my-kafka-credentials
 ```
 
+Without a credentials secret, set the passwords inline instead of `kafka.credentialsSecretName`: `kafka.secrets.inter_broker_password`, `kafka.secrets.controller_password`, `kafka.listeners.client.sasl.admin.password` and `kafka.listeners.client.sasl.passwords`. They are then stored in the release values.
+
 <Note>
-The REST Proxy ships pointing at a bootstrap address and admin password that only match a release named `kafka-dev` with the default password. Either put `kafka_rest_proxy.properties.bootstrap.servers`, `kafka_rest_proxy.jaas_conf` and `kafka_rest_proxy.password_properties` in a values file (`-f values.yaml`) as shown under [Kafka REST Proxy](#kafka-rest-proxy), or add `--set kafka_rest_proxy.enabled=false`.
+The REST Proxy ships pointing at a bootstrap address and admin password that only match a release named `kafka-dev` with the default password. Either put `kafka_rest_proxy.properties.bootstrap.servers`, `kafka_rest_proxy.jaas_conf_secret` (or `jaas_conf`) and `kafka_rest_proxy.password_properties_secret` (or `password_properties`) in a values file (`-f values.yaml`) as shown under [Kafka REST Proxy](#kafka-rest-proxy), or add `--set kafka_rest_proxy.enabled=false`.
 </Note>
 
 <CardGroup cols={2}>
@@ -246,6 +261,27 @@ public:
     passwords: "your-public-user-password"
 ```
 
+### Credentials
+
+Every broker password can come from one dictionary secret instead of values; create it as in [Prerequisites](#prerequisites).
+
+```yaml
+kafka:
+  credentialsSecretName: my-kafka-credentials # "" = the inline passwords are used
+  listeners:
+    client:
+      sasl:
+        admin:
+          username: admin # usernames stay in values; their passwords come from the secret
+        users: "user"
+```
+
+- When `credentialsSecretName` is set it wins over `sasl.admin.password`, `sasl.passwords`, `secrets.inter_broker_password` and `secrets.controller_password`, which are then ignored. The health sidecar, the Kafka exporter and the deprecated Kafka UI read the admin password from the secret too.
+- The secret needs a `<listener>-<username>-password` key for every SASL admin and user on every listener, including a [public listener](#public-listener)'s `sasl.users`.
+- The brokers resolve the passwords through Kafka's `env` config provider. If you set `config.providers` in `kafka.extra_configurations`, keep `env` in the list.
+- **Changing a password:** update the secret, then run `cpln workload force-redeployment RELEASE_NAME-cluster --gvc GVC_NAME`. Running brokers keep the old password until they restart, and clients that log in with it need the new one.
+- Inline passwords keep working: with `credentialsSecretName: ""` the brokers use the values below.
+
 ### ACL and Cluster Secrets
 
 ```yaml
@@ -384,9 +420,37 @@ kafka_rest_proxy:
   #   user: your-user-password,user
 ```
 
+#### REST Proxy Credentials
+
+The REST Proxy's JAAS file holds a Kafka password. Put the whole file in an **opaque** secret and name it in `kafka_rest_proxy.jaas_conf_secret`; it then replaces `jaas_conf`. BASIC-auth users work the same way through `password_properties_secret`, which replaces `password_properties`:
+
+```yaml
+kafka_rest_proxy:
+  jaas_conf_secret: my-kafka-rest-jaas # "" = jaas_conf is used
+  password_properties_secret: "" # e.g. my-kafka-rest-users: one "user: password,role" line per user
+```
+
+```bash
+cat > kafka-rest.jaas.conf <<'EOF'
+KafkaClient {
+  org.apache.kafka.common.security.plain.PlainLoginModule required
+  username="admin"
+  password="THE_CLIENT_ADMIN_PASSWORD";
+};
+KafkaRest {
+  org.eclipse.jetty.security.jaas.spi.PropertyFileLoginModule required
+  debug="true"
+  file="/etc/kafka-rest/password.properties";
+};
+EOF
+cpln secret create-opaque --name my-kafka-rest-jaas --encoding plain -f kafka-rest.jaas.conf
+```
+
+After changing either secret, run `cpln workload force-redeployment RELEASE_NAME-rest-proxy --gvc GVC_NAME`.
+
 ### Kafka Connect
 
-`kafka_connectors` is a list; each entry deploys a Kafka Connect worker cluster named `RELEASE_NAME-connect-` plus the entry's `name`, with a volume set for plugins and a `plugins-downloader` container that fetches plugin artifacts into `plugins_folder` (see [Kafka Connect Plugins](#kafka-connect-plugins)). Connectors listed under `plugins` are created or updated through the Connect REST API when the worker starts; an entry with `enabled: false` is removed. The shipped `values.yaml` carries complete, commented examples for MirrorMaker 2, a Camel S3 sink, a ClickHouse sink and a Snowflake sink.
+A connector worker's Kafka login and its plugins' passwords can come from secrets; see [Kafka Connect Credentials](#kafka-connect-credentials). `kafka_connectors` is a list; each entry deploys a Kafka Connect worker cluster named `RELEASE_NAME-connect-` plus the entry's `name`, with a volume set for plugins and a `plugins-downloader` container that fetches plugin artifacts into `plugins_folder` (see [Kafka Connect Plugins](#kafka-connect-plugins)). Connectors listed under `plugins` are created or updated through the Connect REST API when the worker starts; an entry with `enabled: false` is removed. The shipped `values.yaml` carries complete, commented examples for MirrorMaker 2, a Camel S3 sink, a ClickHouse sink and a Snowflake sink.
 
 ```yaml
 kafka_connectors:
@@ -444,6 +508,24 @@ kafka_connectors:
           "topics": "your-topic"
 ```
 
+#### Kafka Connect Credentials
+
+Use Kafka's `env` config provider: add an `env` entry that references the secret (the chart grants the worker `reveal` on it) and use `${env:VAR}` in `connector_properties` or a plugin's `config`:
+
+```yaml
+kafka_connectors:
+  - name: cluster
+    env:
+      - name: CONNECT_ADMIN_PASSWORD
+        value: cpln://secret/my-kafka-credentials.client-admin-password
+    connector_properties:
+      config.providers: env
+      config.providers.env.class: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      sasl.jaas.config: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"${env:CONNECT_ADMIN_PASSWORD}\";"
+```
+
+In a plugin's `config`, write values with single quotes instead (`username='admin' password='${env:VAR}'`): plugin values are placed into the connector's JSON as they are, and a double quote breaks it.
+
 #### Kafka Connect Plugins
 
 Every Kafka Connect replica runs two containers: `kafka-connect` and `plugins-downloader`. The downloader fetches every artifact of each plugin that has `enabled: true` onto the plugins volume set. Kafka Connect scans its plugins folder only once per start, so it waits until every artifact is in place before it starts. Each artifact is downloaded to a staging area on the volume, verified, and only then moved into its own directory (`<plugins_folder>/<plugin>/<key>/`), so in a normal start Kafka Connect never sees a half-written file. An artifact that is already installed and unchanged is not downloaded again, so a restart does not repeat the downloads.
@@ -494,12 +576,12 @@ kafka_client: # Kafka CLI tools for testing from inside the GVC; set the whole b
 
 | What | Address | Notes |
 |---|---|---|
-| Kafka bootstrap server (inside the GVC) | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092` | `security.protocol=SASL_PLAINTEXT`, `sasl.mechanism=PLAIN`, credentials from `kafka.listeners.client.sasl` |
+| Kafka bootstrap server (inside the GVC) | `RELEASE_NAME-cluster.GVC_NAME.cpln.local:9092` | `security.protocol=SASL_PLAINTEXT`, `sasl.mechanism=PLAIN`, usernames from `kafka.listeners.client.sasl`; passwords from your credentials secret (or the inline values) |
 | Kafka public listener | `<replica>-<location>.<publicAddress>:<containerPort>` per broker (direct replica routing) or `<publicAddress>:3000`, `:3001`, … (multi-port) | `security.protocol=SASL_SSL`; users from the public listener's `sasl.users` |
 | Kafbat UI | `status.canonicalEndpoint` of `RELEASE_NAME-kafbat-ui`, or `kafbat_ui.domain` | Login from `spring.security.user` in your configuration secret |
-| REST Proxy | `status.canonicalEndpoint` of `RELEASE_NAME-rest-proxy`, `kafka_rest_proxy.domain`, or `RELEASE_NAME-rest-proxy.GVC_NAME.cpln.local:8082` inside the GVC | HTTP BASIC auth with a user from `kafka_rest_proxy.password_properties` |
+| REST Proxy | `status.canonicalEndpoint` of `RELEASE_NAME-rest-proxy`, `kafka_rest_proxy.domain`, or `RELEASE_NAME-rest-proxy.GVC_NAME.cpln.local:8082` inside the GVC | HTTP BASIC auth with a user from `kafka_rest_proxy.password_properties_secret` (or `password_properties`) |
 | Kafka Connect REST API | `RELEASE_NAME-connect-<name>.GVC_NAME.cpln.local:8083` inside the GVC | Standard Connect REST API |
-| Stored credentials | `cpln secret reveal RELEASE_NAME-secrets -o yaml` | KRaft cluster ID and the admin, controller and inter-broker passwords |
+| Stored credentials | `cpln secret reveal my-kafka-credentials -o yaml` | The passwords, when `kafka.credentialsSecretName` is set. With inline passwords, `cpln secret reveal RELEASE_NAME-secrets -o yaml` holds them and the KRaft cluster ID |
 
 Read a canonical endpoint from the workload:
 
@@ -596,6 +678,10 @@ Since 3.0.0 the chart only supports Apache Kafka images. A values file that stil
 - 4.2.x printed artifact URLs, including any credentials in them, in the downloader log; 4.3.0 redacts them. Consider rotating any credential that was part of an artifact URL.
 - Rolling back to 4.2.x works and the connectors keep running, but 4.2.x writes its `<plugin>/<plugin>.jar` files again beside the 4.3.0 directories (both load in one classloader) and its 60-second startup race returns. Upgrading to 4.3.0 again retires those files.
 
+### Upgrading from 4.3.x
+
+4.4.0 adds the option to read every credential from a secret; inline passwords keep working unchanged, so nothing in your values has to change. To move a running cluster to the secret, put the passwords the cluster uses today in the credentials secret (see [Prerequisites](#prerequisites)), then upgrade with `kafka.credentialsSecretName` set. The brokers restart once. Move the REST Proxy JAAS file and BASIC-auth users the same way with `kafka_rest_proxy.jaas_conf_secret` and `password_properties_secret`.
+
 ### Scaling and Availability
 
 - `kafka.replicas` accepts 1, 3, 4 or 5. Rendering fails with `Invalid value for kafka.replicas. It must be less than or equal to 5 and not equal to 2.` otherwise. Every broker is also a KRaft controller, so never shrink a running cluster below the number of controllers it was formed with — the quorum is lost and the cluster stops.
@@ -672,11 +758,12 @@ cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cluster"} |= "ERROR"' --limit
 
 ## Important Notes
 
-- Replace every `your-…` placeholder (`kafka.secrets.*`, `kafka.listeners.client.sasl.*`) before installing; they are accepted as literal passwords. They are plain template values and therefore land in the Helm release.
+- Set `kafka.credentialsSecretName` to keep the broker passwords out of the Helm release. Inline passwords still work but are stored in the release values, and their `your-…` defaults are accepted as literal passwords, so replace them.
+- A changed password in a credentials secret takes effect only after `cpln workload force-redeployment` of the workloads that read it.
 - `kafka.secrets.kraft_cluster_id` is fixed once the brokers have started; changing it later means a new cluster.
 - `kafka.replicas` must be 1, 3, 4 or 5. Never shrink a running cluster below its controller count.
 - Kafbat UI and the REST Proxy are open to the internet by default (`external_inboundAllowCIDR: 0.0.0.0/0`); set a strong console login and BASIC-auth users, or narrow the CIDR.
-- The REST Proxy defaults only work for a release named `kafka-dev`: set `kafka_rest_proxy.properties.bootstrap.servers`, `kafka_rest_proxy.jaas_conf` and `kafka_rest_proxy.password_properties` for your release, or disable it.
+- The REST Proxy defaults only work for a release named `kafka-dev`: set `kafka_rest_proxy.properties.bootstrap.servers`, `kafka_rest_proxy.jaas_conf_secret` (or `jaas_conf`) and `kafka_rest_proxy.password_properties_secret` (or `password_properties`) for your release, or disable it.
 - `ghcr.io/kafbat/kafka-ui`, `confluentinc/cp-kafka-rest:latest` and the JMX exporter image are not pinned, so a redeploy may pick up a newer build; pin a tag in your values if that matters.
 - Uninstalling deletes the volume sets and every topic's data; a final snapshot is kept for `retentionDuration` because `createFinalSnapshot` is `true`.
 - Only set `KAFKA_LOG4J_ROOT_LOGLEVEL` in `kafka.env` on `apache/kafka:3.x` images; on a 4.x image it removes every output from the root logger, including `cpln logs`.

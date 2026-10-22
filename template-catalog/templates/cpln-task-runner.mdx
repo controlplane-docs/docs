@@ -1,7 +1,7 @@
 ---
 title: CPLN Task Runner
 icon: /template-catalog/templates/icons/cpln-task-runner.png
-description: CPLN Task Runner is a self-hosted HTTP task queue and scheduler like Google Cloud Tasks. Deploys an API, autoscaling workers and a bundled Redis Sentinel cluster into an existing GVC. An opaque admin API key secret must exist before install.
+description: CPLN Task Runner is a self-hosted HTTP task queue and scheduler like Google Cloud Tasks. Deploys an API, autoscaling workers and a bundled Redis Sentinel cluster into an existing GVC. An admin API key secret and Redis and Sentinel password secrets must exist before install.
 keywords: ['job runner', 'cloud tasks alternative', 'sidekiq alternative', 'celery alternative', 'background worker', 'delayed job', 'work queue', 'job processor', 'webhook delivery', 'priority queue', 'prerequisite secret', 'admin api key', 'redis sentinel', 'ssrf']
 ---
 
@@ -27,21 +27,30 @@ This template deploys into an **existing GVC** that you already have. It does no
 | Workload | `RELEASE_NAME-sentinel` | Redis Sentinel on port 26379, tracks the Redis primary (stateful, 3 replicas) | — |
 | Volume set | `RELEASE_NAME-redis-vs` | Redis data, daily snapshots kept 7 days | `redis.redis.persistence.enabled: true` (default) |
 | Volume set | `RELEASE_NAME-sentinel-vs` | Sentinel state | `redis.sentinel.persistence.enabled: true` (default) |
-| Secret | `task-runner-secrets` | Dictionary holding the bundled Redis and Sentinel passwords (name set by `secretName`) | `createSecret: true` (default) |
 | Secret | `RELEASE_NAME-redis-config`, `RELEASE_NAME-sentinel-config` | Redis and Sentinel configuration | — |
 | Identity | `RELEASE_NAME-task-runner-identity` | Identity used by the API and worker workloads | — |
-| Policy | `RELEASE_NAME-task-runner-policy` | Grants that identity `reveal` on the Redis password secret and on your admin key secret, nothing else | — |
+| Policy | `RELEASE_NAME-task-runner-policy` | Grants that identity `reveal` on your Redis and Sentinel credentials secrets and on your admin key secret, nothing else | — |
 | Identity and policy | `RELEASE_NAME-redis-identity`, `RELEASE_NAME-sentinel-identity` and matching `-policy` | Grant Redis and Sentinel `reveal` on their own configuration and password secrets | — |
 
 The policies grant only the `reveal` permission on secrets. The template's identities have no cloud access and no permission on any other Control Plane resource.
 
 ## Prerequisites
 
-**One secret must exist before you install: the admin API key.** The `/admin/*` endpoints create, edit and delete clients and rate-limit tiers, and they are guarded by the `X-Admin-Key` header. Secrets are org-level, so no GVC flag is involved.
+**Three secrets must exist before you install: the Redis password, the Sentinel password and the admin API key.** Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
+  <Step title="Create the Redis and Sentinel credentials secrets">
+    Two [dictionary secrets](/guides/create-secret/dictionary), each with the key `password`: one holds the bundled Redis password, the other the Sentinel password. Redis, Sentinel, the API and the worker read both. The names below are the chart defaults for `redis.redis.auth.fromSecret.name` and `redis.sentinel.auth.fromSecret.name`:
+
+    ```bash
+    cpln secret create-dictionary --name my-cpln-task-runner-redis-credentials --entry password="$(openssl rand -hex 24)"
+    cpln secret create-dictionary --name my-cpln-task-runner-sentinel-credentials --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Upgrading from 1.3.0? Do not generate new passwords; see [Upgrading From 1.3.0](#upgrading-from-1-3-0).
+  </Step>
   <Step title="Create the admin key secret">
-    An [opaque secret](/guides/create-secret/opaque) with encoding `plain` whose payload is the key itself:
+    The `/admin/*` endpoints create, edit and delete clients and rate-limit tiers, and they are guarded by the `X-Admin-Key` header. The key is an [opaque secret](/guides/create-secret/opaque) with encoding `plain` whose payload is the key itself:
 
     ```bash
     printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name SECRET_NAME --encoding plain -f -
@@ -59,7 +68,7 @@ The policies grant only the `reveal` permission on secrets. The template's ident
 </Steps>
 
 <Warning>
-**Create the secret before installing, or the deployment wedges silently.** An install that names a secret which does not exist still reports success, and the API workload then never starts while the other workloads come up normally. The container never runs, so `cpln logs` returns **zero lines**. The one place the reason appears is `status.versions[].message`:
+**Create the secrets before installing, or the deployment wedges silently.** An install that names a secret which does not exist still reports success, and every workload that reads it never starts. The container never runs, so `cpln logs` returns **zero lines**. The one place the reason appears is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-task-runner-api --gvc GVC_NAME -o yaml
@@ -70,21 +79,17 @@ The secret SECRET_NAME no longer exists. Workload updates are paused until the
 secret is added or the reference to the secret removed.
 ```
 
-Use `get-deployments`. Plain `cpln workload get` has no `versions` key. Once the secret exists the workload recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-task-runner-api --gvc GVC_NAME` to skip the wait.
+Use `get-deployments`. Plain `cpln workload get` has no `versions` key. Run the same command for `RELEASE_NAME-redis`, `RELEASE_NAME-sentinel` and `RELEASE_NAME-task-runner-worker` when a credentials secret is missing. Once the secret exists the workload recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-task-runner-api --gvc GVC_NAME` to skip the wait.
 </Warning>
-
-Nothing else is required. The bundled Redis and Sentinel passwords are ordinary values, since only the API and worker containers use them, but they are used exactly as written, so replace the `change-me-` defaults at install time.
 
 ## Installation
 
-Create the admin key secret first, then install with its name and your own Redis and Sentinel passwords:
+Create the three secrets first, then install with the admin key secret's name. If you named the credentials secrets differently from the defaults, also set `redis.redis.auth.fromSecret.name` and `redis.sentinel.auth.fromSecret.name`:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/cpln-task-runner \
-  --version 1.3.0 --gvc GVC_NAME \
-  --set api.admin.apiKeySecretName=SECRET_NAME \
-  --set redis.redisPassword='YOUR-REDIS-PASSWORD' \
-  --set redis.sentinelPassword='YOUR-SENTINEL-PASSWORD'
+  --version 1.4.0 --gvc GVC_NAME \
+  --set api.admin.apiKeySecretName=SECRET_NAME
 ```
 
 For the other install methods, follow the instructions for your preferred tool:
@@ -176,41 +181,29 @@ Workers fetch whatever URL a task carries. `allowPrivateUrls: false` is what kee
 
 ### Secrets and Redis
 
-```yaml
-createSecret: true                  # false = bring your own secret (see below)
-secretName: task-runner-secrets     # org-level name of the secret this chart creates
+Redis and Sentinel read their passwords from the prerequisite credentials secrets:
 
+```yaml
 redis:
-  redisPassword: change-me-cpln-task-runner-redis        # used as written when createSecret is true; change it
-  sentinelPassword: change-me-cpln-task-runner-sentinel  # used as written when createSecret is true; change it
   redis:
     auth:
       fromSecret:
-        enabled: true
-        name: task-runner-secrets   # must equal secretName, or your own secret's name
-        passwordKey: redis-password
+        enabled: true          # must stay true
+        name: my-cpln-task-runner-redis-credentials   # prerequisite dictionary secret for Redis
+        passwordKey: password  # key holding the Redis password
     persistence:
-      enabled: true                 # false = no volume set, Redis data is not persisted
+      enabled: true            # false = no volume set, Redis data is not persisted
   sentinel:
     auth:
       fromSecret:
-        enabled: true
-        name: task-runner-secrets
-        passwordKey: redis-sentinel-password
+        enabled: true          # must stay true
+        name: my-cpln-task-runner-sentinel-credentials   # prerequisite dictionary secret for Sentinel
+        passwordKey: password  # key holding the Sentinel password
     persistence:
       enabled: true
 ```
 
-The admin API key is never in this secret. It is always your own opaque secret, whatever `createSecret` is set to.
-
-- **`secretName` is an org-level name and is not prefixed with the release name.** A second install in the same org needs a different `secretName`, with both `fromSecret.name` values changed to match.
-- **To bring your own secret,** set `createSecret: false`, create a [dictionary secret](/guides/create-secret/dictionary) holding the two keys named by the `passwordKey` fields, and point both `fromSecret.name` values at it:
-
-```bash
-cpln secret create-dictionary --name SECRET_NAME \
-  --entry redis-password='YOUR-REDIS-PASSWORD' \
-  --entry redis-sentinel-password='YOUR-SENTINEL-PASSWORD'
-```
+The admin API key is never in these secrets. It is always its own opaque secret, named by `api.admin.apiKeySecretName`.
 
 ## Connecting
 
@@ -218,9 +211,9 @@ cpln secret create-dictionary --name SECRET_NAME \
 |---|---|---|
 | API (internal, default) | `RELEASE_NAME-task-runner-api.GVC_NAME.cpln.local:8080` | Reachable from workloads in the same GVC. No credential for `/v1/*`; `X-Admin-Key` for `/admin/*` |
 | API (public, opt-in) | the workload's canonical endpoint | Only with `api.public.enabled: true`. Read it from `status.canonicalEndpoint` |
-| Redis Sentinel | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Master name `mymaster`; used by the API and worker |
+| Redis Sentinel | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Master name `mymaster`; used by the API and worker. Password is `password` in your Sentinel credentials secret |
 | Admin key | your opaque secret | `cpln secret reveal SECRET_NAME -o yaml` |
-| Redis passwords | `task-runner-secrets` (the `secretName` value) | `cpln secret reveal task-runner-secrets -o yaml` |
+| Redis and Sentinel passwords | your two credentials secrets | `cpln secret reveal my-cpln-task-runner-redis-credentials -o yaml` (and the same for the Sentinel secret) |
 
 Read the public endpoint, when enabled:
 
@@ -332,6 +325,63 @@ cpln workload force-redeployment RELEASE_NAME-task-runner-api --gvc GVC_NAME
 
 Every admin caller must then send the new key.
 
+### Rotating the Redis and Sentinel Passwords
+
+Redis reads its password from the secret at every start, but Sentinel keeps the passwords it first started with on its volume, so editing the secrets alone locks the API and worker out. Apply the new passwords live on every node first, then restart the API and worker. `rx` and `sx` run a command on one Redis node or Sentinel (`LOCATION` is your GVC's location; nodes and Sentinels are numbered from 0 up to `redis.redis.replicas` and `redis.sentinel.replicas` minus one).
+
+1. Accept the new passwords alongside the old ones on every Redis node and Sentinel:
+
+```bash
+rx() { cpln workload exec RELEASE_NAME-redis --gvc GVC_NAME --location LOCATION \
+  --container redis --replica "RELEASE_NAME-redis-$1" -- "${@:2}"; }
+sx() { cpln workload exec RELEASE_NAME-sentinel --gvc GVC_NAME --location LOCATION \
+  --container sentinel --replica "RELEASE_NAME-sentinel-$1" -- "${@:2}"; }
+# The loops cover the default 3 Redis nodes and 3 Sentinels; list one number per node if you changed the counts
+# On every Redis node: accept the new Redis password alongside the old one, and replicate with it
+for n in 0 1 2; do
+  rx $n redis-cli --no-auth-warning -a OLD_REDIS_PASSWORD ACL SETUSER default ">NEW_REDIS_PASSWORD"
+  rx $n redis-cli --no-auth-warning -a OLD_REDIS_PASSWORD CONFIG SET masterauth NEW_REDIS_PASSWORD
+done
+# On every Sentinel: monitor Redis with the new Redis password, and accept the new Sentinel password alongside the old one
+for n in 0 1 2; do
+  sx $n redis-cli -p 26379 --no-auth-warning -a OLD_SENTINEL_PASSWORD SENTINEL SET mymaster auth-pass NEW_REDIS_PASSWORD
+  sx $n redis-cli -p 26379 --no-auth-warning -a OLD_SENTINEL_PASSWORD ACL SETUSER default ">NEW_SENTINEL_PASSWORD"
+done
+```
+
+2. Put the new passwords in the two secrets (key `password`). For each secret, export it, change only `password`, apply it and read it back:
+
+```bash
+cpln secret reveal my-cpln-task-runner-redis-credentials -o yaml > secret.yaml
+# edit only the password key in secret.yaml
+cpln apply -f secret.yaml
+cpln secret reveal my-cpln-task-runner-redis-credentials -o yaml
+```
+
+3. Restart the API and worker, which keep the old passwords until they restart:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-task-runner-api --gvc GVC_NAME
+cpln workload force-redeployment RELEASE_NAME-task-runner-worker --gvc GVC_NAME
+```
+
+4. Once `get-deployments` shows both at a higher version, alone and ready, retire the old passwords and check that the Sentinels can still fail over:
+
+```bash
+for n in 0 1 2; do rx $n redis-cli --no-auth-warning -a NEW_REDIS_PASSWORD ACL SETUSER default "<OLD_REDIS_PASSWORD"; done
+# Sentinels authenticate to each other with this password; without it they lose quorum once the old one is retired
+for n in 0 1 2; do sx $n redis-cli -p 26379 --no-auth-warning -a NEW_SENTINEL_PASSWORD SENTINEL CONFIG SET sentinel-pass NEW_SENTINEL_PASSWORD; done
+# FLUSHCONFIG writes Sentinel's own password change to its volume, so it survives a restart
+for n in 0 1 2; do
+  sx $n redis-cli -p 26379 --no-auth-warning -a NEW_SENTINEL_PASSWORD ACL SETUSER default "<OLD_SENTINEL_PASSWORD"
+  sx $n redis-cli -p 26379 --no-auth-warning -a NEW_SENTINEL_PASSWORD SENTINEL FLUSHCONFIG
+done
+# Prints OK 3 usable Sentinels
+sx 0 redis-cli -p 26379 --no-auth-warning -a NEW_SENTINEL_PASSWORD SENTINEL CKQUORUM mymaster
+```
+
+If both `fromSecret.name` values point at one secret, edit that one secret in step 2, each password under its own key.
+
 ### Upgrading From 1.2.x
 
 Two defaults change, and both break an existing workflow that relied on the old behaviour.
@@ -366,7 +416,41 @@ An upgrade that still carries `api.env.adminApiKey` or `redis.admin.fromSecret`,
   </Step>
 </Steps>
 
-The bundled Redis and Sentinel passwords keep whatever you already set. Only their defaults changed.
+Then follow [Upgrading From 1.3.0](#upgrading-from-1-3-0): the Redis and Sentinel passwords your 1.2.x release runs with (`mypassword` if never changed) go into the two credentials secrets.
+
+### Upgrading From 1.3.0
+
+1.4.0 no longer takes the Redis and Sentinel passwords as values, and no longer creates the `task-runner-secrets` secret. Use the CURRENT passwords: Redis and Sentinel keep the ones they started with, so new ones would lock the API and worker out. To change them, upgrade first, then follow [Rotating the Redis and Sentinel Passwords](#rotating-the-redis-and-sentinel-passwords).
+
+**With `createSecret: true` (the default)**, the upgrade **deletes** `task-runner-secrets` (or the secret named by your `secretName`, if you changed it), so copy the passwords into two new secrets **before** upgrading:
+
+<Steps>
+  <Step title="Read the current passwords">
+    `redis-password` is the Redis password, `redis-sentinel-password` the Sentinel password. Use the name you set in `secretName` if you changed it:
+
+    ```bash
+    cpln secret reveal task-runner-secrets -o yaml
+    ```
+  </Step>
+  <Step title="Create the two credentials secrets with those values">
+    ```bash
+    cpln secret create-dictionary --name my-cpln-task-runner-redis-credentials --entry password='YOUR-CURRENT-REDIS-PASSWORD'
+    cpln secret create-dictionary --name my-cpln-task-runner-sentinel-credentials --entry password='YOUR-CURRENT-SENTINEL-PASSWORD'
+    ```
+  </Step>
+  <Step title="Drop the removed keys from your values">
+    Remove `createSecret`, `secretName`, `redis.redisPassword` and `redis.sentinelPassword`, and point `redis.redis.auth.fromSecret.name` and `redis.sentinel.auth.fromSecret.name` at the new secrets (the defaults above). The chart refuses to render while any of the removed keys is still set, and refuses the name `task-runner-secrets`; do not reuse a custom `secretName` either, because the upgrade deletes that secret too.
+  </Step>
+  <Step title="Upgrade">
+    ```bash
+    cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/cpln-task-runner \
+      --version 1.4.0 --gvc GVC_NAME \
+      --set api.admin.apiKeySecretName=SECRET_NAME
+    ```
+  </Step>
+</Steps>
+
+**With `createSecret: false`** and a secret of your own, keep it: remove the same four keys, keep both `fromSecret.name` values pointing at your secret, and set both `passwordKey` values to its key names explicitly (`redis-password` and `redis-sentinel-password` if you kept the 1.3.0 defaults; 1.4.0 defaults both to `password`). Nothing is deleted.
 
 ### Public Access and the Open Queue
 
@@ -387,7 +471,7 @@ The API and worker are serverless workloads that autoscale on concurrent request
 
 <AccordionGroup>
   <Accordion title="The API workload never starts and cpln logs returns nothing">
-    **Cause:** the secret named by `api.admin.apiKeySecretName` does not exist. `get-deployments` shows `The secret SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.`
+    **Cause:** a prerequisite secret does not exist: the one named by `api.admin.apiKeySecretName`, or a Redis or Sentinel credentials secret. `get-deployments` shows `The secret SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.`
 
     **Fix:** create the secret as in [Prerequisites](#prerequisites). The workload recovers on its own, or run `cpln workload force-redeployment RELEASE_NAME-task-runner-api --gvc GVC_NAME`.
   </Accordion>
@@ -400,6 +484,11 @@ The API and worker are serverless workloads that autoscale on concurrent request
     **Cause:** your values still carry the 1.2.x admin key (`api.env.adminApiKey` or `redis.admin.fromSecret`).
 
     **Fix:** follow [Upgrading From 1.2.x](#upgrading-from-1-2-x).
+  </Accordion>
+  <Accordion title="Install or upgrade fails with Removed in cpln-task-runner 1.4.0">
+    **Cause:** your values still carry `createSecret`, `secretName`, `redis.redisPassword` or `redis.sentinelPassword`.
+
+    **Fix:** follow [Upgrading From 1.3.0](#upgrading-from-1-3-0).
   </Accordion>
   <Accordion title="Admin requests are rejected">
     **Cause:** the `X-Admin-Key` header is missing or does not match the secret payload, for example because the key was created with `echo` and carries a trailing newline, or the secret was rotated without a redeployment.
@@ -415,10 +504,9 @@ The API and worker are serverless workloads that autoscale on concurrent request
 
 ## Important Notes
 
-- **Create the admin key secret before installing.** A missing secret wedges the API with no log output; the reason is in `status.versions[].message`.
+- **Create the admin key secret and the Redis and Sentinel credentials secrets before installing.** A missing secret wedges the workloads that read it with no log output; the reason is in `status.versions[].message` from `cpln workload get-deployments`.
 - **Leave `api.public.enabled` at `false` unless an authenticating proxy fronts the API.** `/v1/enqueue` is unauthenticated and auto-registers unknown client IDs.
-- **Change the `change-me-` Redis and Sentinel passwords at install time.** Once the volumes are initialised, changing them requires uninstalling (which deletes the volume sets) and reinstalling.
-- **`secretName` is org-wide.** Give each install in the same org its own `secretName` and matching `fromSecret.name` values.
+- **Never change the Redis or Sentinel password by editing the secrets alone.** Sentinel keeps the passwords it first started with on its volume, so that locks the API and worker out. Follow [Rotating the Redis and Sentinel Passwords](#rotating-the-redis-and-sentinel-passwords).
 - **Force a redeployment after rotating the admin key.** A running replica keeps the old key.
 
 ## External References
