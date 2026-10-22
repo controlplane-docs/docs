@@ -1,7 +1,7 @@
 ---
 title: NATS
 icon: /template-catalog/templates/icons/nats.png
-description: Deploy NATS. One NATS cluster per location, joined into a cross-region super cluster over gateways, with optional JetStream persistence and a WebSocket listener on by default (internal-only until you allow CIDRs). Installs into an existing GVC whose locations you list; no secrets to create.
+description: Deploy NATS. One NATS cluster per location, joined into a cross-region super cluster over gateways, with optional JetStream persistence and a WebSocket listener on by default (internal-only until you allow CIDRs). Installs into an existing GVC whose locations you list; optional auth from a secret.
 keywords: ['pubsub', 'event bus', 'lightweight broker', 'rabbitmq alternative', 'kafka alternative', 'streaming', 'request reply', 'cncf', 'message broker', 'key-value store', 'object store', 'nats-server', 'nats cli', 'wss', 'durable consumers']
 ---
 
@@ -22,10 +22,10 @@ This template deploys into an existing [GVC](/reference/gvc) you already have; i
 | Secret | `RELEASE_NAME-nats-secret` | The startup script that builds each server's `nats.conf` at boot from the location and replica it runs as | — |
 | Secret | `RELEASE_NAME-nats-extra-data` | Your `nats_extra_config`, appended verbatim to the generated configuration | `nats_extra_config` non-empty |
 | Identity | `RELEASE_NAME-nats-identity` | Bound to the workload so it can read its startup script and its own GVC | — |
-| Policy | `RELEASE_NAME-nats-policy` | Grants the identity `reveal` on this release's secrets and nothing else | — |
+| Policy | `RELEASE_NAME-nats-policy` | Grants the identity `reveal` on this release's secrets, and on your credentials secret when authentication is on, and nothing else | — |
 | Policy | `RELEASE_NAME-nats-gvc-policy` | Grants the identity `view` on exactly the one GVC the release is installed into, so each server can confirm at boot that the GVC really has every location in `locations` | — |
 
-The template creates no credential secret: NATS here runs without authentication, and access is governed by the internal firewall (see [Internal Access](#internal-access)) and the public CIDR list (see [Public Access](#public-access)).
+The template creates no credential secret. Authentication is off by default, and access is then governed by the internal firewall (see [Internal Access](#internal-access)) and the public CIDR list (see [Public Access](#public-access)). To require a username and password, name your own secret in `auth.credentialsSecretName` (see [Authentication](#authentication)).
 
 ## Prerequisites
 
@@ -41,7 +41,26 @@ The template creates no credential secret: NATS here runs without authentication
   </Step>
 </Steps>
 
-Nothing else is needed: no secret to create, no cloud account, no bucket, no custom domain.
+Nothing else is needed for a default install: no cloud account, no bucket, no custom domain.
+
+To require authentication, create a [dictionary secret](/guides/create-secret/dictionary) with the keys `username` and `password` **before** you install or upgrade, and set `auth.credentialsSecretName` to its name:
+
+```bash
+cpln secret create-dictionary --name my-nats-credentials \
+  --entry username=nats --entry password="$(openssl rand -hex 24)"
+```
+
+Store the plain password (any characters except a line break); a bcrypt hash is refused, because the servers also present the password to each other.
+
+<Warning>
+If the secret is missing, the deployment waits silently and `cpln logs` shows nothing. The reason is in `status.versions[].message`:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-nats --gvc GVC_NAME -o yaml
+```
+
+A secret without a `username` or `password` key waits the same way, and the same message names the missing key; an empty value stops each server at boot with a `[nats] FATAL` line.
+</Warning>
 
 ## Installation
 
@@ -56,7 +75,7 @@ locations:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/nats \
-  --version 3.0.0 --gvc GVC_NAME -f nats-locations.yaml
+  --version 3.1.0 --gvc GVC_NAME -f nats-locations.yaml
 ```
 
 To install with another method, follow the instructions for your preferred tool:
@@ -151,6 +170,15 @@ nats_defaults:
 
 The template refuses at render time to bind a port Control Plane reserves for system use, and to put two listeners on the same port. Both failures are otherwise invisible to `helm template`: a reserved port is rejected by the API at install, and a port collision is accepted and then stops the container at boot with `address already in use`.
 
+### Authentication
+
+```yaml
+auth:
+  credentialsSecretName: "" # dictionary secret with `username` and `password`; empty = no authentication
+```
+
+When set, every connection must present these credentials: clients on 4222, WebSocket clients, and the route and gateway connections between the servers themselves. The credentials reach the servers at container start and never appear in the Helm release. To turn authentication on for a running release or change the password, see [Rotating the Credentials](#rotating-the-credentials).
+
 ### Public Access
 
 ```yaml
@@ -162,7 +190,7 @@ allowCIDR: []
 - `allowCIDR` — The inbound CIDR ranges allowed to reach the WebSocket endpoint from the internet. It applies to the WebSocket port only — the client (`4222`), route (`6222`) and gateway (`7222`) ports are never exposed publicly.
 
 <Warning>
-**This template configures no NATS authentication, so opening `allowCIDR` publishes an unauthenticated message bus.** An anonymous outside client can publish, subscribe, and read the cluster name and every server name. Version 3.0.0 changed the default from `0.0.0.0/0` to `[]` for this reason. Open it only alongside an `authorization { ... }` block in [`nats_extra_config`](#extra-nats-configuration), and prefer the narrowest ranges that cover your clients.
+**Without `auth.credentialsSecretName`, opening `allowCIDR` publishes an unauthenticated message bus.** An anonymous outside client can publish, subscribe, and read the cluster name and every server name. Version 3.0.0 changed the default from `0.0.0.0/0` to `[]` for this reason. Open it only with [authentication](#authentication) on, and prefer the narrowest ranges that cover your clients.
 </Warning>
 
 <Note>
@@ -193,23 +221,22 @@ Streams default to a single replica, so stream data lives on one server. A strea
 ```yaml
 # Any additional valid NATS configuration — appended verbatim to the generated
 # server config at startup. A syntax error here is a container that will not
-# start, not a render failure.
+# start, not a render failure. It lands in the Helm release as plain text, so
+# never put credentials here — use `auth.credentialsSecretName` instead.
 nats_extra_config: ""
 ```
 
-- `nats_extra_config` — Appended verbatim to the generated server configuration. Use it for anything the template does not expose — payload limits, accounts, authorization:
+- `nats_extra_config` — Appended verbatim to the generated server configuration. Use it for anything the template does not expose, such as payload limits:
 
 ```yaml
 nats_extra_config: |
   max_payload: 8MB
-  authorization {
-    user: USERNAME
-    password: PASSWORD
-  }
 ```
 
+With `auth.credentialsSecretName` set, the chart refuses an `authorization` or `accounts` block here, since it would replace the generated credentials.
+
 <Warning>
-**This block is injected verbatim and is not validated at render time.** A syntax error here is a container that will not start, which is easy to mistake for an infrastructure problem — read the server's own parse error in the workload log (see [Troubleshooting](#troubleshooting)). Note also that the template has no prerequisite-secret path for NATS credentials: anything you put here is stored in the Helm release values and in the `RELEASE_NAME-nats-extra-data` secret.
+**This block is injected verbatim and is not validated at render time.** A syntax error here is a container that will not start, which is easy to mistake for an infrastructure problem — read the server's own parse error in the workload log (see [Troubleshooting](#troubleshooting)). Anything you put here is stored in the Helm release values and in the `RELEASE_NAME-nats-extra-data` secret, so never put credentials here; use [Authentication](#authentication).
 </Warning>
 
 ### Internal Access
@@ -244,7 +271,9 @@ internalAccess:
 | A specific server | `nats://replica-N.RELEASE_NAME-nats.LOCATION.GVC_NAME.cpln.local:4222` | `N` is `0` to `replicas - 1`; `LOCATION` is one of the names in `locations` |
 | Browser and WebSocket clients from the internet | `wss://` + the workload's canonical endpoint | Only once `allowCIDR` covers the client; Control Plane terminates TLS and serves it on port 443 |
 | Monitoring | `http://127.0.0.1:8222` from inside a server's container | `/healthz`, `/varz`, `/routez`, `/gatewayz`, `/jsz`; not published as a container port |
-| Credentials | none | No authentication unless you add an `authorization { ... }` block in [`nats_extra_config`](#extra-nats-configuration) |
+| Credentials | your credentials secret | With `auth.credentialsSecretName` set, the `username` and `password` from that secret on every address above; otherwise none |
+
+Clients pass the credentials as options (`nats --user USERNAME --password PASSWORD`, or the user/password options of your client library), or in the URL as `nats://USERNAME:PASSWORD@host:4222` with the password URL-encoded. A workload can read them from the same secret with `cpln://secret/SECRET_NAME.username` and `.password` env vars, given `reveal` on the secret.
 
 Always use the fully qualified hostname; the bare workload name is not reliably resolvable. Read the public hostname rather than assembling it — its shape varies between GVCs:
 
@@ -273,6 +302,8 @@ cpln port-forward RELEASE_NAME-nats 4222:4222 --gvc GVC_NAME
 nats --server nats://127.0.0.1:4222 sub demo.hello
 nats --server nats://127.0.0.1:4222 pub demo.hello 'hello from Control Plane'
 ```
+
+With authentication on, add `--user USERNAME --password PASSWORD` to each `nats` command.
 
 ## Operations
 
@@ -356,6 +387,13 @@ Values that moved or were removed in 3.0.0. The chart names each one at render t
 | `volumeset.autoscaling` | Gone. `volumeset.capacity` is the only storage knob |
 | `locations[].replicas: 0` | Not allowed. Remove the location instead |
 
+### Rotating the Credentials
+
+Both turning authentication on and changing the password take effect only when the servers restart.
+
+- **Turning authentication on for a running release** restarts every server and disconnects clients that send no credentials, so update your clients in the same window. If the servers then wait on the new secret, give it about 5 minutes, then run `cpln workload force-redeployment RELEASE_NAME-nats --gvc GVC_NAME`.
+- **Rotating the password does not apply by itself.** After updating the secret, run `cpln workload force-redeployment RELEASE_NAME-nats --gvc GVC_NAME`; until then the old password keeps working. Clients need the new password once the servers restart. While the redeploy rolls, restarted and not-yet-restarted servers refuse each other's routes, so messages published on one side do not reach subscribers on the other until every server has restarted; rotate in a quiet window.
+
 ### Scaling and Availability
 
 - **Fault tolerance follows the total server count.** Core NATS keeps routing with any number of servers up. JetStream keeps serving while a majority of servers is up: 3 survive losing one, 5 survive losing two, and 2 survive none, which is why that shape is refused (see [Locations and Cluster Sizing](#locations-and-cluster-sizing)).
@@ -437,6 +475,11 @@ cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-nats"} |= "[nats]"' --limit 5
     cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-nats"}' --limit 50 --since 10m
     ```
   </Accordion>
+  <Accordion title="Install or upgrade fails: nats_extra_config contains an authorization or accounts block">
+    **Cause:** `auth.credentialsSecretName` is set, and the chart generates the authorization itself from that secret; a second block in `nats_extra_config` would replace it.
+
+    **Fix:** Remove the `authorization` or `accounts` block from `nats_extra_config` and keep the credentials in the secret.
+  </Accordion>
   <Accordion title="Servers are ready but /routez shows no routes">
     **Cause:** `ready: true` says nothing about clustering — this workload has no readiness probe. An empty `routes` list on a multi-server deployment means the servers cannot reach each other on the route port: `internalAccess` is `workload-list` with a list that was edited outside the chart, or a declared location is missing from the GVC so the peers never started.
 
@@ -445,7 +488,7 @@ cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-nats"} |= "[nats]"' --limit 5
   <Accordion title="WebSocket clients get 403 from the public endpoint">
     **Cause:** `allowCIDR` is empty (the default), or does not cover the client's current egress address — a client behind a proxy pool or a rotating address moves to an IP outside a narrow range.
 
-    **Fix:** Set `allowCIDR` to a range that covers your clients' egress, together with an `authorization { ... }` block in `nats_extra_config`, and upgrade the release. Allow a few minutes for the change to take effect.
+    **Fix:** Set `allowCIDR` to a range that covers your clients' egress, with [authentication](#authentication) on, and upgrade the release. Allow a few minutes for the change to take effect.
   </Accordion>
 </AccordionGroup>
 
@@ -454,11 +497,13 @@ cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-nats"} |= "[nats]"' --limit 5
 - **Do not `cpln helm upgrade` a 2.x release onto this version.** It deletes the GVC the old release created and everything inside it. Follow [Migrating from 2.x](#migrating-from-2-x).
 - **`locations` must match the GVC's locations.** A declared location the GVC lacks is not caught at install; a fresh JetStream server refuses to start on it, and every other server warns. Read the GVC's list with `cpln gvc get GVC_NAME -o yaml` before installing.
 - **A GVC location you did not list runs nothing.** Its deployment reads `This workload location is deactivated because maxScale is set to 0`; that is expected.
-- **No public access by default, and no authentication.** Opening `allowCIDR` without an `authorization { ... }` block in `nats_extra_config` publishes an unauthenticated message bus. Never pin a single `/32`.
+- **No public access by default, and no authentication.** Opening `allowCIDR` without `auth.credentialsSecretName` publishes an unauthenticated message bus. Turn authentication on before adding ranges. Never pin a single `/32`.
+- **Create the credentials secret before turning authentication on.** A missing secret waits silently; `status.versions[].message` from `cpln workload get-deployments` names it.
+- **A rotated password applies only after `cpln workload force-redeployment`.** Cluster routes between restarted and not-yet-restarted servers are refused until every server has restarted; see [Rotating the Credentials](#rotating-the-credentials).
 - **`internalAccess` governs the servers' traffic to each other.** With `workload-list`, list only your clients — the template adds its own workload. `none` is refused for more than one server.
 - **JetStream data lives on the volume set and is deleted when you uninstall.** Streams default to one replica; create them with `--replicas=3` if a stream must survive a server loss.
 - **Do not run JetStream on exactly two servers.** The chart refuses it in values and warns if a missing GVC location produces it at runtime.
-- **`nats_extra_config` is injected verbatim**, so a syntax error there stops the container rather than failing the render, and anything you put in it is stored in the release values.
+- **`nats_extra_config` is injected verbatim**, so a syntax error there stops the container rather than failing the render, and anything you put in it is stored in the release values; never put credentials in it.
 - **A firewall change takes a few minutes to take effect.** After changing `allowCIDR` or `internalAccess`, keep re-testing rather than concluding the knob is broken.
 
 ## External References
