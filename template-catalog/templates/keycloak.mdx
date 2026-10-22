@@ -1,7 +1,7 @@
 ---
 title: Keycloak
 icon: /template-catalog/templates/icons/keycloak.png
-description: Keycloak 26 identity provider (SSO, OIDC, SAML) on Control Plane. Two clustered replicas in production mode with a bundled highly available PostgreSQL store by default, or a single-instance store for dev/test. Deploys into an existing GVC; a bootstrap admin dictionary secret must exist first.
+description: Keycloak 26 identity provider (SSO, OIDC, SAML) on Control Plane. Two clustered replicas in production mode with a bundled highly available PostgreSQL store by default, or a single-instance store for dev/test. Deploys into an existing GVC; admin and database dictionary secrets must exist first.
 keywords: ['auth server', 'oauth2', 'oidc', 'saml', 'sso', 'iam', 'idp', 'auth0 alternative', 'okta alternative', 'single sign-on', 'user federation', 'infinispan', 'realm', 'identity provider', 'login']
 ---
 
@@ -30,19 +30,31 @@ All durable state — realms, users, and active sessions — lives in PostgreSQL
 | Volume set | `RELEASE_NAME-postgres-ha-vs`, `RELEASE_NAME-etcd-vs` | Persistent data for the Patroni and etcd replicas | default store |
 | Volume set | `RELEASE_NAME-pg-vs` | Persistent data for the single-instance store | `postgres.enabled: true` |
 | Secret | your `admin.secretName` | Dictionary secret holding the bootstrap admin `username` and `password`. **Created by you, not by the template** — see [Prerequisites](#prerequisites) | — |
-| Secret | `my-keycloak-db-credentials` (the value of `postgresHA.config.credentialsSecretName` or `postgres.config.credentialsSecretName`) | Dictionary secret holding the database `username`, `password` and `database`. Created by this template from `postgres.credentials.*` for whichever store is enabled | — |
+| Secret | your `postgresHA.config.credentialsSecretName` or `postgres.config.credentialsSecretName` | Dictionary secret holding the database `username`, `password` and `database`. **Created by you, not by the template** — see [Prerequisites](#prerequisites) | — |
 | Secret | `RELEASE_NAME-keycloak-startup` | Opaque startup script: waits for the database, then configures clustering | — |
 | Secret | `RELEASE_NAME-patroni-startup`, `RELEASE_NAME-postgres-proxy-startup`, `RELEASE_NAME-etcd-startup`, `RELEASE_NAME-wal-g-backup-script` | Startup and backup scripts for the HA store | default store |
 | Secret | `RELEASE_NAME-postgres-config` | Non-sensitive backup destination settings for the HA store | `postgresHA.backup.enabled: true` |
-| Identity + Policy | `RELEASE_NAME-keycloak-identity`, `RELEASE_NAME-keycloak-policy` | Grants the Keycloak workload `reveal` on exactly three secrets: your admin secret, the startup script and the database credentials | — |
+| Identity + Policy | `RELEASE_NAME-keycloak-identity`, `RELEASE_NAME-keycloak-policy` | Grants the Keycloak workload `reveal` on exactly three secrets: your admin secret, your database credentials secret and the startup script | — |
 | Identity + Policy | `RELEASE_NAME-postgres-ha-identity`, `RELEASE_NAME-postgres-ha-policy`, `RELEASE_NAME-etcd-identity`, `RELEASE_NAME-etcd-policy` | Least-privilege access for the HA store's own workloads | default store |
 | Identity + Policy | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-pg-policy` | Least-privilege access for the single-instance store | `postgres.enabled: true` |
 
 ## Prerequisites
 
-**One dictionary secret must exist before you install.** The bootstrap admin guards a login form on the public endpoint, so its credentials are a prerequisite secret rather than template values. The template creates no admin secret of its own; it references yours by name and grants the workload `reveal` on exactly that one secret.
+**Two dictionary secrets must exist before you install.** The database credentials and the bootstrap admin login (which guards a login form on the public endpoint) are prerequisite secrets rather than template values. The template creates neither; it references yours by name and grants the workload `reveal` on exactly those secrets.
 
 <Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding `username`, `password` and `database`. The bundled PostgreSQL initializes with them and Keycloak connects with them:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=keycloak \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=keycloak
+    ```
+
+    Set its name in the key of the store you use: `postgresHA.config.credentialsSecretName` (HA, the default) or `postgres.config.credentialsSecretName` (single-instance). Secret names are org-wide, so give each release its own. `database` must be URL-safe (letters, digits, `_`) because Keycloak's JDBC URL is assembled from it at container start. PostgreSQL reads the secret only when its data is first initialized — see [Rotating the Database Password](#rotating-the-database-password).
+  </Step>
   <Step title="Create the admin credentials secret">
     A [dictionary secret](/guides/create-secret/dictionary) holding exactly the keys `username` and `password`. Secrets are org-level, so no GVC flag is involved:
 
@@ -82,25 +94,27 @@ The secret ADMIN_SECRET_NAME no longer exists. Workload updates are paused until
 the secret is added or the reference to the secret removed.
 ```
 
-It is **`get-deployments`** — plain `cpln workload get` has no `versions` key. Once you create the secret the deployment recovers on its own; to skip the wait, force a redeployment:
+The message names whichever secret is missing — the admin secret or the database credentials secret. It is **`get-deployments`** — plain `cpln workload get` has no `versions` key. Once you create the secret the deployment recovers on its own; to skip the wait, force a redeployment:
 
 ```bash
 cpln workload force-redeployment RELEASE_NAME-keycloak --gvc GVC_NAME
 ```
 </Warning>
 
-The database password is **not** a prerequisite: this template creates the database credentials secret itself from `postgres.credentials.*`, so there is nothing to create — only a placeholder to change at install time. Optional database backups need a bucket plus a cloud account (AWS or GCP) or a MinIO credentials secret; see [Backing Up](#backing-up).
+Optional database backups need a bucket plus a cloud account (AWS or GCP) or a MinIO credentials secret; see [Backing Up](#backing-up).
 
 ## Installation
 
-Install from the marketplace registry, naming your admin secret and replacing the placeholder database password:
+Install from the marketplace registry, naming your two secrets:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/keycloak \
-  --version 1.4.0 --gvc GVC_NAME \
+  --version 1.5.0 --gvc GVC_NAME \
   --set admin.secretName=ADMIN_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-STRONG-DB-PASSWORD'
+  --set postgresHA.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME
 ```
+
+For the single-instance store set `postgres.config.credentialsSecretName` instead.
 
 To install using another method, follow the instructions for your preferred tool:
 
@@ -159,14 +173,12 @@ admin:
 ### Database Credentials
 
 ```yaml
-postgres:
-  credentials: # internal plumbing; this template creates the dictionary secret from these
-    username: keycloak
-    password: change-me-keycloak-db # change before installing
-    database: keycloak
+postgresHA:
+  config:
+    credentialsSecretName: my-keycloak-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
 ```
 
-- `postgres.credentials.*` — Username, password and database name for the bundled database. **They feed whichever store is enabled**, including the default HA store, even though the rest of the `postgres` block is off by default. The template writes them into the dictionary secret named by `postgresHA.config.credentialsSecretName` or `postgres.config.credentialsSecretName`, and both Keycloak and the database read that secret. Change the password before installing.
+- `postgresHA.config.credentialsSecretName` / `postgres.config.credentialsSecretName` — Name of the dictionary secret you created in [Prerequisites](#prerequisites), holding `username`, `password` and `database`. Set it in the block of the store you enable; both Keycloak and the database read that secret.
 
 ### Backing Store
 
@@ -178,7 +190,7 @@ Exactly one of the two stores must be enabled; the chart refuses both-on and bot
 postgresHA:
   enabled: true # set postgres.enabled: true (and this to false) for a lighter single-instance dev/test store
   config:
-    credentialsSecretName: my-keycloak-db-credentials # created by this template; secret names are org-wide, so give each release its own
+    credentialsSecretName: my-keycloak-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   replicas: 3
   volumeset:
     capacity: 10 # initial capacity in GiB per replica (minimum is 10)
@@ -196,7 +208,7 @@ postgresHA:
 postgres:
   enabled: true
   config:
-    credentialsSecretName: my-keycloak-db-credentials # created by this template; secret names are org-wide, so give each release its own
+    credentialsSecretName: my-keycloak-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 
@@ -204,7 +216,7 @@ postgres:
     enabled: false
 ```
 
-- `postgresHA.config.credentialsSecretName` / `postgres.config.credentialsSecretName` — Name of the database credentials secret this template creates. Secret names are organization-wide: a second release left on the default name is refused at install (see [Troubleshooting](#troubleshooting)).
+- `postgresHA.config.credentialsSecretName` / `postgres.config.credentialsSecretName` — Name of your database credentials secret (see [Database Credentials](#database-credentials)). Secret names are organization-wide, so give each release its own.
 - `postgresHA.proxy.enabled` must stay `true` — Keycloak writes through the HAProxy leader endpoint, and the chart refuses the install at render if it is disabled.
 - Any other setting of the backing template can be set under the same prefix (`postgresHA.pgbouncer.*`, `postgresHA.etcd.*`, `postgres.pgbouncer.*`, volume-set autoscaling, and so on); see the backing template's page for those keys.
 
@@ -337,7 +349,7 @@ cpln secret create-dictionary --name MINIO_CREDENTIALS_SECRET_NAME \
   --entry secretKey=MINIO_SECRET_KEY
 ```
 
-Like the admin secret, a MinIO credentials secret that does not exist at install time wedges the backup workload silently; the diagnostic is the same `status.versions[].message` described in [Prerequisites](#prerequisites).
+Like the admin and database credentials secrets, a MinIO credentials secret that does not exist at install time wedges the backup workload silently; the diagnostic is the same `status.versions[].message` described in [Prerequisites](#prerequisites).
 
 ### Restoring a Backup
 
@@ -350,6 +362,56 @@ cpln workload force-redeployment RELEASE_NAME-keycloak --gvc GVC_NAME
 <Warning>
 This restore path has **not** been verified end to end against a live Keycloak install. The database steps are the backing template's, verified there; the Keycloak-specific part is only the restart above. Test a restore on a non-production release before relying on it.
 </Warning>
+
+### Rotating the Database Password
+
+PostgreSQL keeps the password it was initialized with, and a running workload keeps the values it started with, so on the single-instance store a rotation takes three steps in order (on the HA store follow [Rotating the Database Password in HA Mode](#rotating-the-database-password-in-ha-mode) instead):
+
+1. Change it in the database: `ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD';` (`DB_USERNAME` is the secret's `username`; connect as that user from inside the GVC).
+2. Update the secret — export it, change only `password`, and apply it:
+
+   ```bash
+   cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+   # edit only the password key in secret.yaml
+   cpln apply -f secret.yaml
+   ```
+
+3. Right away, redeploy Keycloak:
+
+   ```bash
+   cpln workload force-redeployment RELEASE_NAME-keycloak --gvc GVC_NAME
+   ```
+
+Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime.
+
+### Rotating the Database Password in HA Mode
+
+The HA store (`postgresHA`) needs its own order. The replication role `repl` shares the password, and a member that restarts with the old password can be promoted to leader, which splits the cluster. Move the leader to member `-0` first, so it restarts last, after every other member already has the new password. `pgx` runs a command in one member (`LOCATION` is your GVC's location, `DB_USERNAME` the secret's `username`):
+
+```bash
+pgx() { cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --location LOCATION \
+  --container patroni-postgres --replica "RELEASE_NAME-postgres-ha-$1" -- "${@:2}"; }
+# 1. Find the leader ("role": "leader"); the other two must be "streaming" on the same "timeline"
+pgx 0 curl -s localhost:8008/cluster
+# 2. If the leader is not RELEASE_NAME-postgres-ha-0, move it there (N = current leader), then repeat step 1
+pgx 0 curl -s -XPOST -d '{"leader":"RELEASE_NAME-postgres-ha-N","candidate":"RELEASE_NAME-postgres-ha-0"}' localhost:8008/switchover
+# 3. Change BOTH roles on -0
+pgx 0 psql -h 127.0.0.1 -d postgres -c "ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD'; ALTER ROLE repl PASSWORD 'NEW_PASSWORD';"
+# 4. Right after, put the same password in the secret (edit only the password key in secret.yaml)
+cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+cpln apply -f secret.yaml
+# 5. Restart the members
+cpln workload force-redeployment RELEASE_NAME-postgres-ha --gvc GVC_NAME
+# 6. Once the restart completes, confirm one leader and two "streaming" replicas on one timeline (repeat step 1)
+# 7. Optional: remove the install-time password Patroni keeps in its cluster config
+pgx 0 curl -s -XPATCH -d '{"postgresql":{"authentication":null}}' localhost:8008/config
+```
+
+Then force-redeploy `RELEASE_NAME-keycloak`, which keeps the old password until it restarts. The database drops connections briefly at each switchover, and Keycloak cannot open new connections from the `ALTER ROLE` until its own redeploy finishes, so rotate in a quiet window. If a member stays `starting`, or `running` without `streaming`, re-copy it from the leader. This copies the whole database, so it costs network traffic in proportion to its size:
+
+```bash
+pgx N curl -s -XPOST -d '{"force": true}' localhost:8008/reinitialize
+```
 
 ### Upgrading From 1.0.x
 
@@ -370,29 +432,25 @@ Installs created on `1.0.0` with the default HA store also predate the etcd hist
 
 ### Upgrading From 1.1.0
 
-Version `1.2.0` adopted the `postgres` 3.4.1 template for the single-instance store, which no longer takes credentials as values. This template absorbed that change rather than passing it on — **there is no new prerequisite**, only renames on the single-instance path:
+Version `1.2.0` adopted the `postgres` 3.4.1 template for the single-instance store, which no longer takes credentials as values:
 
 | Removed key | Replacement |
 |---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` |
+| `postgres.config.username` / `postgres.config.password` / `postgres.config.database` | the `username`, `password` and `database` keys of the database credentials secret named by `postgres.config.credentialsSecretName` |
 | `postgres.backup.minio.accessKey` and `postgres.backup.minio.secretKey` | `postgres.backup.minio.credentialsSecretName` — a dictionary secret you create; MinIO backups only |
 
-An upgrade carrying an old key is refused at render with the **PostgreSQL template's** message, which tells you to create a credentials secret yourself. Ignore that part here: this template creates the database credentials secret from `postgres.credentials.*`. Move the keys and the upgrade proceeds. The HA path was unchanged in `1.2.0`.
+An upgrade carrying an old key is refused at render with the **PostgreSQL template's** message. Put the values your database was initialized with into the database credentials secret under [Prerequisites](#prerequisites), set `postgres.config.credentialsSecretName` to its name, and remove the old keys. The HA path was unchanged in `1.2.0`.
 
 ### Upgrading From 1.2.x and 1.3.0
 
-Version `1.3.0` adopted the `postgres-highly-available` 2.5.0 template for the default store, which likewise no longer takes credentials as values. The HA store now reads the same template-created credentials secret as the single-instance store, named by the new `postgresHA.config.credentialsSecretName` key:
+Version `1.3.0` adopted the `postgres-highly-available` 2.5.0 template for the default store, which likewise no longer takes credentials as values. The HA store reads the database credentials secret named by `postgresHA.config.credentialsSecretName`:
 
 | Removed key | Replacement |
 |---|---|
-| `postgresHA.postgres.username` | `postgres.credentials.username` |
-| `postgresHA.postgres.password` | `postgres.credentials.password` |
-| `postgresHA.postgres.database` | `postgres.credentials.database` |
+| `postgresHA.postgres.username` / `postgresHA.postgres.password` / `postgresHA.postgres.database` | the `username`, `password` and `database` keys of the database credentials secret named by `postgresHA.config.credentialsSecretName` |
 | `postgresHA.backup.minio.accessKey` and `postgresHA.backup.minio.secretKey` | `postgresHA.backup.minio.credentialsSecretName` — a dictionary secret you create; MinIO backups only (the values file caught up with this in `1.3.1`) |
 
-An upgrade carrying a removed key is refused at render with the **PostgreSQL Highly Available template's** message, which tells you to create a credentials secret yourself; as above, ignore that part — this template creates it. Set `postgres.credentials.username`, `password` and `database` to **the same values your install already uses** under `postgresHA.postgres.*`: the database volume was initialised with those credentials and keeps them. Changing the database password as part of this upgrade has not been verified and is not recommended.
+An upgrade carrying a removed key is refused at render with the **PostgreSQL Highly Available template's** message. Put **the same values your install already uses** under `postgresHA.postgres.*` into the database credentials secret under [Prerequisites](#prerequisites) — the database volume was initialized with those credentials and keeps them — set `postgresHA.config.credentialsSecretName` to its name, and delete the `postgresHA.postgres` block. Do not change the database password as part of this upgrade.
 
 ### Upgrading From 1.3.1
 
@@ -404,6 +462,23 @@ Version `1.4.0` renamed the Keycloak resource limits so it is unambiguous which 
 | `resources.memory` | `resources.maxMemory` |
 
 An upgrade that still carries a bare `resources.cpu` or `resources.memory` is refused at render: `keycloak: resources.cpu was RENAMED to resources.maxCpu.` The reservation keys `minCpu` and `minMemory` are unchanged.
+
+### Upgrading From 1.4.0
+
+Version `1.5.0` removed `postgres.credentials`: the database credentials are now a prerequisite secret, the same one the database templates require on their own. Carrying the old key forward fails the render.
+
+1.4.0 created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or Keycloak loses its database connection:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-keycloak-db \
+  --entry username=keycloak \
+  --entry password='YOUR_CURRENT_PASSWORD' \
+  --entry database=keycloak
+```
+
+Your current values are in `postgres.credentials` of the 1.4.0 release, and also in the old secret (`cpln secret reveal my-keycloak-db-credentials -o yaml`, or the name your release set in `credentialsSecretName`) until the upgrade deletes it. Then upgrade with `postgresHA.config.credentialsSecretName` (HA store) or `postgres.config.credentialsSecretName` (single-instance store) set to the new name, and `postgres.credentials` removed.
+
+The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), so Keycloak can briefly lose its database; it reconnects by itself. The new version of a workload can also wait several minutes with `is not allowed to reveal the secret` in `get-deployments` while access to the new secret propagates; the previous version keeps serving meanwhile, and it clears by itself.
 
 ### Scaling and Availability
 
@@ -417,7 +492,7 @@ An upgrade that still carries a bare `resources.cpu` or `resources.memory` is re
 
 <AccordionGroup>
   <Accordion title="The Keycloak workload never starts and cpln logs returns nothing">
-    **Cause:** the admin secret named by `admin.secretName` (or, with MinIO backups, the secret named by `backup.minio.credentialsSecretName`) does not exist. The container never ran, so there is nothing to log.
+    **Cause:** the admin secret named by `admin.secretName`, the database credentials secret named by `postgresHA.config.credentialsSecretName` or `postgres.config.credentialsSecretName` (or, with MinIO backups, the secret named by `backup.minio.credentialsSecretName`) does not exist. The container never ran, so there is nothing to log.
 
     **Fix:** read the message that names the missing secret, create it, then force a redeployment to skip the wait:
 
@@ -440,8 +515,9 @@ An upgrade that still carries a bare `resources.cpu` or `resources.memory` is re
     | `keycloak: replicas > 1 requires internalAccess.type other than 'none'` | Set `internalAccess.type` to `same-gvc`, `same-org` or `workload-list`, or run `replicas: 1` |
     | `keycloak: enable exactly one backing store` | Set exactly one of `postgresHA.enabled` and `postgres.enabled` to `true` |
     | `keycloak: postgresHA.proxy.enabled must remain true` | Remove the override; Keycloak connects through the HAProxy leader endpoint |
-    | `postgres-highly-available: the postgres block was REMOVED in 2.5.0` | Move `postgresHA.postgres.*` to `postgres.credentials.*`; see [Upgrading From 1.2.x and 1.3.0](#upgrading-from-1-2-x-and-1-3-0) |
-    | `config.username was REMOVED in postgres 3.4.0` | Move `postgres.config.{username,password,database}` to `postgres.credentials.*`; see [Upgrading From 1.1.0](#upgrading-from-1-1-0) |
+    | `postgres-highly-available: the postgres block was REMOVED in 2.5.0` | Move `postgresHA.postgres.*` into the database credentials secret; see [Upgrading From 1.2.x and 1.3.0](#upgrading-from-1-2-x-and-1-3-0) |
+    | `config.username was REMOVED in postgres 3.4.0` | Move `postgres.config.{username,password,database}` into the database credentials secret; see [Upgrading From 1.1.0](#upgrading-from-1-1-0) |
+    | `keycloak: postgres.credentials was REMOVED in 1.5.0` | Move the values into a database credentials secret; see [Upgrading From 1.4.0](#upgrading-from-1-4-0) |
     | `backup.minio.accessKey and backup.minio.secretKey were REMOVED` | Create the MinIO credentials secret and set `…backup.minio.credentialsSecretName`; see [Backing Up](#backing-up) |
   </Accordion>
   <Accordion title="Logs show Waiting for PostgreSQL for several minutes">
@@ -461,11 +537,6 @@ An upgrade that still carries a bare `resources.cpu` or `resources.memory` is re
     ```bash
     cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres-ha"}' --limit 50 --since 10m
     ```
-  </Accordion>
-  <Accordion title="A second release is refused: cannot be updated because it is being managed by a different release">
-    **Cause:** the database credentials secret is named by a plain value (`my-keycloak-db-credentials` by default) and secret names are organization-wide, so a second Keycloak release on the same name tries to take over a secret the first release owns. Nothing is shared, overwritten or deleted; the second release simply does not install.
-
-    **Fix:** give each release its own `postgresHA.config.credentialsSecretName` (and `postgres.config.credentialsSecretName`) and install again.
   </Accordion>
   <Accordion title="I changed the admin secret but the old password still works">
     **Cause:** the bootstrap credentials are read on first boot only, when no admin account exists yet. Afterwards the account lives in the database, and neither editing the secret nor redeploying the workload changes it.
@@ -487,9 +558,9 @@ An upgrade that still carries a bare `resources.cpu` or `resources.memory` is re
 
 ## Important Notes
 
-- **Create the admin secret before installing** — a missing prerequisite secret wedges the deployment with zero log lines; `status.versions[].message` is the only diagnostic (see [Prerequisites](#prerequisites)).
-- **Change the database password before installing** (`postgres.credentials.password`) — it is used exactly as given and feeds whichever store is enabled.
-- **Give each release its own `credentialsSecretName`** (`postgresHA.config.` and `postgres.config.`) — secret names are organization-wide, and a second release on the default name is refused at install.
+- **Create the admin and database credentials secrets before installing** — a missing prerequisite secret wedges the deployment with zero log lines; `status.versions[].message` is the only diagnostic (see [Prerequisites](#prerequisites)).
+- **Rotating the database password needs `ALTER ROLE` plus a forced redeployment of Keycloak** (and a leader switchover first on the HA store) — see [Rotating the Database Password](#rotating-the-database-password).
+- **Give each release its own database credentials secret** — secret names are organization-wide.
 - **The bootstrap admin is temporary by design** — sign in, create a permanent admin, then delete the bootstrap account. Its credentials are read on first boot only, so change the password in the console, not by editing the secret.
 - **Keep `publicAccess` enabled for browser SSO** — end-user browsers must reach Keycloak's login endpoints; disable it only for pure service-to-service deployments.
 - **Do not disable the HA proxy** (`postgresHA.proxy.enabled`) — Keycloak writes through the HAProxy leader endpoint; the chart refuses the install otherwise.
