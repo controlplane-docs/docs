@@ -22,17 +22,17 @@ This template deploys into an **existing GVC** that you already have. It does no
 | Workload | `RELEASE_NAME-sftpgo` | SFTPGo server (stateful, 1 replica); SFTP on port `2022`, web admin and REST API on port `8080` when `webAdmin.enabled` | — |
 | Workload | `RELEASE_NAME-sftpgo-proxy` | Always-on proxy that holds client connections, wakes SFTPGo and suspends it again after `scaleToZero.idleHold` (standard, 1 replica) | `mode: scale_to_zero` (default) |
 | Volume set | `RELEASE_NAME-sftpgo-vs` | SFTPGo's embedded user database and SSH host keys (10 GiB); a final snapshot is kept for 7 days on deletion | — |
-| Secret | `RELEASE_NAME-sftpgo-users` | The declared-users file built from `users[]` and the storage block | — |
+| Secret | `RELEASE_NAME-sftpgo-users` | The declared-users template built from `users[]` and the storage block; it holds no credentials — passwords and S3-compatible keys are filled in from your secrets at start | — |
 | Identity | `RELEASE_NAME-sftpgo-identity` | SFTPGo's identity; carries the AWS or GCP cloud account binding for keyless bucket access | — |
 | Identity | `RELEASE_NAME-sftpgo-proxy-identity` | The proxy's identity | `mode: scale_to_zero` (default) |
-| Policy | `RELEASE_NAME-sftpgo-policy` | Grants SFTPGo's identity `reveal` on your admin secret and the users secret | — |
+| Policy | `RELEASE_NAME-sftpgo-policy` | Grants SFTPGo's identity `reveal` on the secrets you create (admin, user passwords and, with `minio`, the S3-compatible credentials) and the users secret | — |
 | Policy | `RELEASE_NAME-sftpgo-proxy-policy` | Lets the proxy's identity view and edit exactly the `RELEASE_NAME-sftpgo` workload, so it can suspend and wake it | `mode: scale_to_zero` (default) |
 
 The files your users upload are not stored on the volume set — they go to your bucket, which the template never creates or deletes.
 
 ## Prerequisites
 
-Two things must exist before you install: the administrator secret, and a bucket in one of the supported backends with its access setup.
+These must exist before you install: the administrator secret, the SFTP user passwords secret (while any user logs in with a password, as the default `sftpuser` does), and a bucket in one of the supported backends with its access setup — for an S3-compatible server that includes a credentials secret.
 
 ### Admin Credentials Secret
 
@@ -80,11 +80,24 @@ Use **`get-deployments`** — plain `cpln workload get` has no `versions` key. O
 ```bash
 cpln workload force-redeployment RELEASE_NAME-sftpgo --gvc GVC_NAME
 ```
+
+The same applies to the user passwords and S3-compatible credentials secrets below.
 </Warning>
+
+### SFTP User Passwords
+
+Required while any `users[]` entry logs in with a password (the default `sftpuser` does). A [dictionary secret](/guides/create-secret/dictionary) with one key per such username; the value is that user's password. Users with only `publicKeys` need no entry.
+
+```bash
+cpln secret create-dictionary --name my-sftpgo-user-passwords \
+  --entry sftpuser="$(openssl rand -hex 16)"
+```
+
+Set `userPasswords.secretName` to that name. Declared users are re-applied on every start, so the value in this secret **is** the password: to change one, update the secret and force a redeployment. If a password user has no key in the secret, the deployment wedges with nothing in the log: `cpln workload get-deployments RELEASE_NAME-sftpgo --gvc GVC_NAME -o yaml` shows `couldn't find key USERNAME in Secret` under `status.versions[].message`. Add the key, then force a redeployment. An empty value stops SFTPGo with `USERPW_<index> is empty` in its log.
 
 ### Object Storage
 
-Choose a backend with `storage.type` and complete its setup. AWS and GCP are keyless: SFTPGo's workload identity receives temporary credentials through a Control Plane cloud account, and no keys are stored. An S3-compatible server takes static keys.
+Choose a backend with `storage.type` and complete its setup. AWS and GCP are keyless: SFTPGo's workload identity receives temporary credentials through a Control Plane cloud account, and no keys are stored. An S3-compatible server takes static keys from a secret you create.
 
 <Tabs>
   <Tab title="AWS S3">
@@ -144,10 +157,16 @@ Choose a backend with `storage.type` and complete its setup. AWS and GCP are key
       <Step title="Set the endpoint">
         Set `storage.minio.endpoint` to the S3 API address including the scheme and port. For an S3 server deployed from the catalog in the same GVC, use its fully qualified internal name, for example `http://WORKLOAD_NAME.GVC_NAME.cpln.local:9000` for [MinIO](/template-catalog/templates/minio).
       </Step>
-      <Step title="Set the access keys">
-        Set `storage.minio.accessKey` and `storage.minio.accessSecret` to a key pair with access to the bucket. For the MinIO template, these are the `username` and `password` in the dictionary secret named by its `admin.credentialsSecretName`.
+      <Step title="Create the credentials secret">
+        A [dictionary secret](/guides/create-secret/dictionary) with keys `accessKey` and `secretKey` that can access the bucket. For the MinIO template, these are the `username` and `password` in the dictionary secret named by its `admin.credentialsSecretName`.
 
-        These two keys are **Helm values**, not a secret reference: SFTPGo reads them from its declared-users file, which cannot resolve a secret. They are stored in the Helm release.
+        ```bash
+        cpln secret create-dictionary --name my-sftpgo-minio-credentials \
+          --entry accessKey=YOUR_ACCESS_KEY \
+          --entry secretKey=YOUR_SECRET_KEY
+        ```
+
+        Set `storage.minio.credentialsSecretName` to that name.
       </Step>
     </Steps>
   </Tab>
@@ -155,18 +174,17 @@ Choose a backend with `storage.type` and complete its setup. AWS and GCP are key
 
 ## Installation
 
-With the admin secret and your bucket in place, install into your existing GVC. This example uses the default AWS backend and replaces the default SFTP user, whose shipped password is a placeholder:
+With the admin secret, the user passwords secret and your bucket in place, install into your existing GVC. This example uses the default AWS backend and the default `sftpuser`, whose password comes from the user passwords secret:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/sftpgo \
-  --version 1.1.0 --gvc GVC_NAME \
+  --version 1.2.0 --gvc GVC_NAME \
   --set admin.secretName=SECRET_NAME \
+  --set userPasswords.secretName=my-sftpgo-user-passwords \
   --set storage.aws.bucket=BUCKET_NAME \
   --set storage.aws.region=REGION \
   --set storage.aws.cloudAccountName=CLOUD_ACCOUNT_NAME \
-  --set storage.aws.policyName=IAM_POLICY_NAME \
-  --set 'users[0].username=sftpuser' \
-  --set 'users[0].password=YOUR-STRONG-PASSWORD'
+  --set storage.aws.policyName=IAM_POLICY_NAME
 ```
 
 Setting any `users[...]` entry with `--set` replaces the whole default list, so always pass `username` with it. For more than one user, or for public-key users, put `users` in a values file instead.
@@ -223,7 +241,7 @@ scaleToZero: # only used when mode is scale_to_zero
 ### SFTPGo Server
 
 ```yaml
-image: drakkan/sftpgo:v2.7.4-distroless-slim
+image: drakkan/sftpgo:v2.7.4-alpine-slim # needs /bin/sh: the chart runs a start script
 
 resources: # SFTPGo container; CPU governs transfer throughput and wake speed
   minCpu: 250m
@@ -235,7 +253,7 @@ volumeset:
   capacity: 10 # GiB (minimum 10) — stores the embedded database and SSH host keys
 ```
 
-The volume set keeps SFTPGo's SSH host keys stable across restarts and wakes, so clients do not see a changed host key. The template prepares the volume for the image's non-root user, so if you change `image`, stay on the same `drakkan/sftpgo` distroless image family.
+The volume set keeps SFTPGo's SSH host keys stable across restarts and wakes, so clients do not see a changed host key. The template prepares the volume for the image's non-root user, so if you change `image`, stay on the same `drakkan/sftpgo` image family. A custom `image` must contain `/bin/sh` and `awk`: the chart builds the users file, with the passwords from your secret, in a start script (the default `alpine-slim` tag has both; `distroless` tags do not).
 
 ### Admin
 
@@ -275,8 +293,9 @@ storage:
     bucket: my-sftp-bucket # bucket must already exist
     region: us-east-1
     keyPrefix: "" # optional bucket-wide folder prefix, e.g. sftp/
-    accessKey: my-minio-username
-    accessSecret: my-minio-password
+    # REQUIRED with type minio — CREATE IT BEFORE YOU INSTALL: a dictionary secret
+    # with keys accessKey and secretKey (see README Prerequisites).
+    credentialsSecretName: my-sftpgo-minio-credentials
 ```
 
 Only the block matching `storage.type` is used. The `my-…` defaults are placeholders for resources you own and must replace. For `minio`, use the fully qualified internal hostname shown in [Prerequisites](#prerequisites) rather than the short name in the default.
@@ -284,16 +303,21 @@ Only the block matching `storage.type` is used. The `my-…` defaults are placeh
 ### Users
 
 ```yaml
+# REQUIRED while any user logs in with a password — CREATE IT BEFORE YOU INSTALL.
+# A dictionary secret with one key per such username; the value is its password.
+# If it does not exist the deployment wedges silently. See README Prerequisites.
+userPasswords:
+  secretName: my-sftpgo-user-passwords
+
 users:
   - username: sftpuser
-    password: change-me-sftp-user # omit when publicKeys is set
     publicKeys: [] # SSH public keys, e.g. ["ssh-ed25519 AAAA... user@laptop"]
+    # passwordLogin: true # password from userPasswords; default true only when publicKeys is empty
     # keyPrefix: custom/folder/ # optional per-user bucket folder override
 ```
 
-- At least one user is required, usernames must be unique, and every user needs a `password`, at least one entry in `publicKeys`, or both.
+- At least one user is required and usernames must be unique. Passwords never go in values: they come from the `userPasswords.secretName` secret (see [SFTP User Passwords](#sftp-user-passwords)), keyed by username. A user logs in with a password when it has no `publicKeys`, or when `passwordLogin: true` is set alongside its keys; a user with `passwordLogin: false` needs at least one public key.
 - Each user is confined to the bucket folder `{keyPrefix}{username}/`, where `keyPrefix` is the backend's bucket-wide prefix; a per-user `keyPrefix` replaces that folder entirely.
-- **`users[].password` is a Helm value used exactly as written** — it cannot be moved into a secret, because SFTPGo reads it from a file that does not resolve secret references. Change the `change-me-sftp-user` default, or better, omit `password` and use `publicKeys`, which needs no credential in your values at all.
 - The list is re-applied every time SFTPGo starts or wakes. Edits made to a declared user through the web admin or REST API are overwritten; users created there are left alone.
 
 ### Access
@@ -332,7 +356,7 @@ webAdmin:
 | SFTP, inside the GVC (`scale_to_zero`) | `RELEASE_NAME-sftpgo-proxy.GVC_NAME.cpln.local:2022` | Reachable from any workload in the same GVC. |
 | SFTP, inside the GVC (`always_warm`) | `RELEASE_NAME-sftpgo.GVC_NAME.cpln.local:2022` | Scoped by `internalAccess`. |
 | Web admin and REST API | `http://localhost:8080` through a port-forward | Requires `webAdmin.enabled: true`. |
-| SFTP logins | Your `users[]` values | Password or SSH key. |
+| SFTP logins | Usernames from your `users[]` values; passwords from your `userPasswords.secretName` secret | Password or SSH key. |
 | Administrator login | `cpln secret reveal SECRET_NAME -o yaml` | `username` / `password` from your admin secret. |
 
 Find the public endpoint on the client-facing workload (the proxy in the default mode):
@@ -422,15 +446,41 @@ sftpgo: admin.password was removed in 1.1.0. Put it in the prerequisite dictiona
     Remove `admin.username` and `admin.password`, and set `admin.secretName` instead. Leave `users` and the storage block as they are.
   </Step>
   <Step title="Upgrade the release">
-    Run `cpln helm upgrade` with `--version 1.1.0` and your updated values, as described in the [CLI guide](/template-catalog/install-manage/cli). In `scale_to_zero` mode an upgrade wakes a suspended server; it suspends again after the next connection comes and goes.
+    Run `cpln helm upgrade` with `--version 1.1.0` and your updated values, as described in the [CLI guide](/template-catalog/install-manage/cli). In `scale_to_zero` mode an upgrade wakes a suspended server; it suspends again after the next connection comes and goes. When upgrading straight to 1.2.0 or later, also follow [Upgrading from 1.1.0](#upgrading-from-1-1-0).
   </Step>
 </Steps>
+
+### Upgrading from 1.1.0
+
+Version `1.2.0` removes `users[].password`, `storage.minio.accessKey` and `storage.minio.accessSecret`; the render fails naming the replacement while any of them is still in your values. Before upgrading, read the values the release runs with today. The 1.1.0 users file holds each user's `password` and, with `minio`, the `access_key` and the `access_secret` `payload`:
+
+```bash
+cpln secret reveal RELEASE_NAME-sftpgo-users -o yaml
+```
+
+Create the new secrets with those **current** values, so every login keeps working:
+
+```bash
+cpln secret create-dictionary --name my-sftpgo-user-passwords \
+  --entry 'sftpuser=YOUR_CURRENT_SFTPUSER_PASSWORD'
+
+# storage.type minio only
+cpln secret create-dictionary --name my-sftpgo-minio-credentials \
+  --entry 'accessKey=YOUR_CURRENT_ACCESS_KEY' \
+  --entry 'secretKey=YOUR_CURRENT_ACCESS_SECRET'
+```
+
+Then delete those keys from your values, set `userPasswords.secretName` (and `storage.minio.credentialsSecretName`), and upgrade. A user that had both a password and `publicKeys` needs `passwordLogin: true` to keep its password. The upgrade grants the workload access to the new secrets; if `status.versions[].message` reports it is not allowed to reveal one, wait a few minutes, then run `cpln workload force-redeployment RELEASE_NAME-sftpgo --gvc GVC_NAME`.
 
 ### Changing Credentials
 
 - **Administrator password** — change it in the web admin or through the REST API. Editing the admin secret has no effect on an install that has already booted.
-- **SFTP user passwords and keys** — edit `users` in your values and run `cpln helm upgrade`, then force a redeployment of `RELEASE_NAME-sftpgo` (in `scale_to_zero` mode the change applies at the next wake). The declared-users file is re-applied when SFTPGo restarts, and the upgrade alone does not restart it.
-- **S3-compatible access keys** — edit `storage.minio.accessKey` and `storage.minio.accessSecret` and run `cpln helm upgrade`, then force a redeployment of `RELEASE_NAME-sftpgo` (in `scale_to_zero` mode the change applies at the next wake).
+- **SFTP user passwords** — update the user's key in the `userPasswords.secretName` secret (`cpln secret edit SECRET_NAME`), then force a redeployment of `RELEASE_NAME-sftpgo` (in `scale_to_zero` mode the change applies at the next wake). The declared-users file is re-applied when SFTPGo restarts, and a secret change alone does not restart it. Public keys are edited in `users` and applied with `cpln helm upgrade` plus the same redeployment.
+- **S3-compatible access keys** — update the `storage.minio.credentialsSecretName` secret, then force a redeployment of `RELEASE_NAME-sftpgo` (in `scale_to_zero` mode the change applies at the next wake).
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-sftpgo --gvc GVC_NAME
+```
 
 ### Switching Modes
 
@@ -446,7 +496,7 @@ The template runs **one SFTPGo replica** and exposes no replica count. A restart
   <Accordion title="Deployment never starts and cpln logs returns nothing">
     **Symptom:** `cpln helm install` succeeded, but SFTPGo never starts and `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-sftpgo"}' --limit 50 --since 10m` returns no lines at all.
 
-    **Cause:** The admin secret named by `admin.secretName` does not exist, so the container is never started. The deployment message names it:
+    **Cause:** A prerequisite secret — the admin secret named by `admin.secretName`, the user passwords secret named by `userPasswords.secretName` (or a password user's key in it), or the S3-compatible credentials secret — does not exist, so the container is never started. The deployment message names it:
 
     ```bash
     cpln workload get-deployments RELEASE_NAME-sftpgo --gvc GVC_NAME -o yaml
@@ -455,11 +505,11 @@ The template runs **one SFTPGo replica** and exposes no replica count. A restart
     **Fix:** Create the secret as shown in [Prerequisites](#prerequisites). The deployment recovers on its own after several minutes, or immediately with `cpln workload force-redeployment RELEASE_NAME-sftpgo --gvc GVC_NAME`.
   </Accordion>
   <Accordion title="Install fails saying every users entry requires a username">
-    **Symptom:** The install stops at render time with `sftpgo: every users[] entry requires a username`, or with `sftpgo: user 'NAME' needs a password or at least one entry in publicKeys`.
+    **Symptom:** The install stops at render time with `sftpgo: every users[] entry requires a username`, or with `sftpgo: user 'NAME' has passwordLogin: false and no publicKeys, so it could never log in`.
 
-    **Cause:** Setting `users[0].password` alone with `--set` replaces the default user list, dropping its `username`. Or a user has neither a password nor a public key.
+    **Cause:** Setting a `users[0]` field alone with `--set` replaces the default user list, dropping its `username`. Or a user has `passwordLogin: false` and no public key.
 
-    **Fix:** Pass `--set 'users[0].username=...'` alongside the password, or define `users` in a values file with a `password` or `publicKeys` for every entry.
+    **Fix:** Pass `--set 'users[0].username=...'` alongside the other field, or define `users` in a values file; give every user with `passwordLogin: false` at least one entry in `publicKeys`.
   </Accordion>
   <Accordion title="Upgrade fails saying admin.password was removed in 1.1.0">
     **Symptom:** The upgrade stops at render time naming `admin.username` or `admin.password`, and no revision is created.
@@ -467,6 +517,13 @@ The template runs **one SFTPGo replica** and exposes no replica count. A restart
     **Cause:** Your values still carry a key that `1.1.0` removed.
 
     **Fix:** Follow the steps under Upgrading from 1.0.0 above.
+  </Accordion>
+  <Accordion title="Upgrade fails saying users[].password or storage.minio.accessKey was removed in 1.2.0">
+    **Symptom:** The upgrade stops at render time with `sftpgo: users[].password was removed in 1.2.0`, `sftpgo: storage.minio.accessKey was removed in 1.2.0` or the `accessSecret` equivalent.
+
+    **Cause:** Your values still carry a plaintext credential that `1.2.0` moved into a prerequisite secret.
+
+    **Fix:** Create the secrets holding your current values and delete the keys, as described in [Upgrading from 1.1.0](#upgrading-from-1-1-0).
   </Accordion>
   <Accordion title="Render fails with mode scale_to_zero requires internalAccess.type other than none">
     **Symptom:** The install or upgrade stops with `sftpgo: mode 'scale_to_zero' requires internalAccess.type other than 'none'`.
@@ -500,8 +557,8 @@ The template runs **one SFTPGo replica** and exposes no replica count. A restart
 
 ## Important Notes
 
-- **Create the admin secret before installing.** A missing secret wedges the deployment silently; `cpln workload get-deployments` names it.
-- **Change or remove the default `users[].password`.** It is used exactly as written and stays a Helm value; prefer `publicKeys`.
+- **Create the admin secret, the user passwords secret and, with `minio`, the S3-compatible credentials secret before installing.** A missing secret wedges the deployment silently; `cpln workload get-deployments` names it.
+- **Rotating a secret needs a forced redeployment** — changing the user passwords or the S3-compatible credentials does nothing until `cpln workload force-redeployment RELEASE_NAME-sftpgo --gvc GVC_NAME`.
 - **The admin secret seeds the first boot only.** Change an existing administrator's password in the web admin or REST API.
 - **Declared users are authoritative.** Web admin edits to them are overwritten on the next restart or wake.
 - **`scale_to_zero` clients need generous timeouts.** Use 120-second timeouts or retries, or choose `always_warm`.

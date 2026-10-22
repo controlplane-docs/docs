@@ -1,7 +1,7 @@
 ---
 title: LiteLLM
 icon: /template-catalog/templates/icons/litellm.png
-description: Deploy LiteLLM, the OpenAI-compatible LLM gateway with virtual keys, spend tracking, budgets and rate limiting, on Control Plane. A stateless proxy tier (one replica by default, scale with a knob) over bundled PostgreSQL and Sentinel Redis. Needs an existing GVC and a pre-created dictionary secret.
+description: Deploy LiteLLM, the OpenAI-compatible LLM gateway with virtual keys, spend tracking, budgets and rate limiting, on Control Plane. A stateless proxy tier (one replica by default, scale with a knob) over bundled PostgreSQL and Sentinel Redis. Needs an existing GVC plus keys and database secrets.
 keywords: ['litellm', 'llm gateway', 'llm proxy', 'openai-compatible api', 'ai gateway', 'llm router', 'virtual api keys', 'llm spend tracking', 'openai proxy', 'self-hosted llm gateway', 'openrouter alternative', 'portkey alternative', 'model fallbacks', 'litellm template']
 ---
 
@@ -24,22 +24,19 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Workload | `RELEASE_NAME-sentinel` | Redis Sentinel that monitors the Redis master as `mymaster` and promotes a replica on failure (stateful, `redis.sentinel.replicas` replicas) | `redis.enabled: true` (default) |
 | Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory | — |
 | Secret | `RELEASE_NAME-litellm-config` | Opaque secret the chart creates with the proxy's `config.yaml` (model list and Redis cache block), mounted at `/app/config.yaml` | — |
-| Secret | `RELEASE_NAME-litellm-db` | Dictionary secret the chart creates (`postgresUsername`, `postgresPassword`) from which the proxy assembles `DATABASE_URL` | — |
-| Secret | the name in `postgres.config.credentialsSecretName` | Dictionary secret the chart creates (`username`, `password`, `database`) and hands to the bundled PostgreSQL | — |
 | Secret | `RELEASE_NAME-redis-config`, `RELEASE_NAME-sentinel-config` | Redis and Sentinel configuration files created by the bundled redis template | `redis.enabled: true` (default) |
-| Secret | `RELEASE_NAME-redis-auth-password` | Redis master password, created by the bundled redis template and wired into the proxy's cache config | `redis.redis.auth.password.enabled: true` |
 | Identity | `RELEASE_NAME-litellm-identity` | Bound to the proxy workload | — |
-| Policy | `RELEASE_NAME-litellm-policy` | Grants that identity `reveal` on exactly the secrets it reads: the config and database secrets, your prerequisite secret, and the Redis password secret when auth is on | — |
+| Policy | `RELEASE_NAME-litellm-policy` | Grants that identity `reveal` on exactly the secrets it reads: the config secret, your keys and database credentials secrets, and your Redis password secret when auth is on | — |
 | Identity | `RELEASE_NAME-pg-identity` | Bound to the bundled PostgreSQL (and its backup job) | — |
 | Policy | `RELEASE_NAME-pg-policy` | Grants the PostgreSQL identity `reveal` on its credentials secret only | — |
 | Identity | `RELEASE_NAME-redis-identity`, `RELEASE_NAME-sentinel-identity` | Bound to the Redis and Sentinel workloads | `redis.enabled: true` (default) |
 | Policy | `RELEASE_NAME-redis-policy`, `RELEASE_NAME-sentinel-policy` | Grant those identities `reveal` on their configuration secrets | `redis.enabled: true` (default) |
 
-Your master key, salt key, and provider API keys are **not** created by the template — see [Prerequisites](#prerequisites).
+Your master key, salt key, and provider API keys, your database credentials secret and, when Redis auth is on, your Redis password secret are **not** created by the template — see [Prerequisites](#prerequisites).
 
 ## Prerequisites
 
-LiteLLM needs three kinds of credential that never pass through Helm values: the **master key** that gates the Admin API and UI and mints virtual keys, the **salt key** that encrypts provider keys stored in PostgreSQL, and one **provider API key** per entry in `litellm.providerEnv`. All of them live in a single [dictionary secret](/guides/create-secret/dictionary) you create **before** installing; the chart references it by name and grants the proxy identity `reveal` on exactly that secret.
+LiteLLM needs three kinds of credential that never pass through Helm values: the **master key** that gates the Admin API and UI and mints virtual keys, the **salt key** that encrypts provider keys stored in PostgreSQL, and one **provider API key** per entry in `litellm.providerEnv`. All of them live in a single [dictionary secret](/guides/create-secret/dictionary) you create **before** installing; the chart references it by name and grants the proxy identity `reveal` on exactly that secret. The bundled PostgreSQL's credentials live in a second dictionary secret you also create before installing (a third holds the Redis password when Redis auth is on).
 
 <Steps>
   <Step title="Create the dictionary secret">
@@ -57,10 +54,22 @@ LiteLLM needs three kinds of credential that never pass through Helm values: the
   <Step title="Back the salt key up outside Control Plane">
     `LITELLM_SALT_KEY` is write-once: it encrypts every provider key stored in PostgreSQL, and changing it corrupts all of them. The master key can be rotated later; the salt key cannot once models or keys are stored. Keep a copy somewhere safe.
   </Step>
+  <Step title="Create the database credentials secret">
+    The bundled PostgreSQL initializes with it and the proxy connects with it. Set `postgres.config.credentialsSecretName` to its name (default `my-litellm-db-credentials`); secret names are org-wide, so give each LiteLLM release its own:
+
+    ```bash
+    cpln secret create-dictionary --name my-litellm-db-credentials \
+      --entry username=litellm \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=litellm
+    ```
+
+    All three values must be URL-safe (letters, digits, `_`): the proxy's `DATABASE_URL` is assembled from them at container start. The snippet's hex password is URL-safe. PostgreSQL reads the secret only when its data directory is first initialized — see [Important Notes](#important-notes) for how to change the password later.
+  </Step>
 </Steps>
 
 <Warning>
-Create the secret **before** installing. Installing without it reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
+Create the secrets **before** installing. Installing without one reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-litellm --gvc GVC_NAME -o yaml
@@ -69,20 +78,20 @@ cpln workload get-deployments RELEASE_NAME-litellm --gvc GVC_NAME -o yaml
 The message reads `The secret LITELLM_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Creating the secret lets the deployment recover on its own; `cpln workload force-redeployment RELEASE_NAME-litellm --gvc GVC_NAME` skips the wait.
 </Warning>
 
-Everything else works with the defaults. The bundled database password is template-managed plumbing — the chart creates the PostgreSQL credentials secret for you — and scheduled database backups, which need a bucket and cloud account, are described under [Backing Up](#backing-up).
+Everything else works with the defaults. Redis authentication needs a third dictionary secret holding the key `password` (see [Bundled Redis](#bundled-redis)), and scheduled database backups, which need a bucket and cloud account, are described under [Backing Up](#backing-up).
 
 ## Installation
 
-Once your dictionary secret exists, install from the marketplace registry, pointing `secrets.name` at it and replacing the bundled database password:
+Once both dictionary secrets exist, install from the marketplace registry, pointing `secrets.name` and `postgres.config.credentialsSecretName` at them:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/litellm \
-  --version 1.1.0 --gvc GVC_NAME \
+  --version 1.2.1 --gvc GVC_NAME \
   --set secrets.name=LITELLM_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-DB-PASSWORD'
+  --set postgres.config.credentialsSecretName=my-litellm-db-credentials
 ```
 
-Installing a second LiteLLM release in the same org? Also set `postgres.config.credentialsSecretName` to a name no other release uses — secret names are org-wide.
+Installing a second LiteLLM release in the same org? Create a separate database credentials secret for it — secret names are org-wide.
 
 Other ways to install and manage the template:
 
@@ -161,17 +170,13 @@ The public endpoint is key-gated, not open: every request still needs a valid ma
 
 ### Bundled PostgreSQL
 
-The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. The chart builds the credentials secret from `postgres.credentials.*` for you — nothing to create before installing.
+The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. Its credentials come from the prerequisite database credentials secret you created (see [Prerequisites](#prerequisites)).
 
 ```yaml
 postgres:
   image: postgres:18
-  credentials: # the chart writes these into the secret named below
-    username: litellm
-    password: change-me-litellm-pg # change before installing — seeds the database on first boot
-    database: litellm
   config:
-    credentialsSecretName: my-litellm-db-credentials # chart-created; secret names are org-wide, so give each release its own
+    credentialsSecretName: my-litellm-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   resources:
     minCpu: 250m
     maxCpu: 1000m
@@ -196,9 +201,9 @@ redis:
     image: redis:7.4
     replicas: 3
     auth:
-      password:
-        enabled: false # true = require AUTH; the master password is wired into LiteLLM's cache config
-        value: change-me-litellm-redis # change before enabling
+      fromSecret:
+        enabled: false # true = require AUTH (Redis, Sentinel and the proxy read the secret below)
+        name: "" # prerequisite dictionary secret (key: password); used only when enabled
     resources:
       cpu: 200m
       memory: 256Mi
@@ -206,7 +211,7 @@ redis:
       minMemory: 128Mi
   sentinel:
     image: redis:7.4
-    replicas: 3
+    replicas: 3 # no `auth:` block — Sentinel auth (incl. a plaintext `auth.password`) is refused at render
     resources:
       cpu: 200m
       memory: 256Mi
@@ -214,10 +219,17 @@ redis:
       minMemory: 128Mi
 ```
 
-Redis ships authless by default, with the same-GVC firewall as the boundary. Set `redis.redis.auth.password.enabled: true` to require `AUTH`: the redis template then creates `RELEASE_NAME-redis-auth-password`, and the chart passes that master password into the proxy's cache config. Sentinel authentication must stay off — the proxy sends only the master password, and the chart refuses to render if `redis.sentinel.auth` is enabled.
+Redis ships authless by default, with the same-GVC firewall as the boundary. To require `AUTH`, create a dictionary secret holding the key `password` **before** you install, then set `redis.redis.auth.fromSecret.enabled: true` and `redis.redis.auth.fromSecret.name` to its name. Redis, Sentinel and the proxy all read it:
+
+```bash
+cpln secret create-dictionary --name my-litellm-redis \
+  --entry password="$(openssl rand -hex 24)"
+```
+
+Sentinel authentication must stay off — the proxy sends only the master password, and the chart refuses to render with any `redis.sentinel.auth` setting, including a plaintext `redis.sentinel.auth.password`. Redis keeps no password on disk, so changing it later follows [Rotating the Redis Password](#rotating-the-redis-password).
 
 <Note>
-The database password seeds PostgreSQL on first boot and is not updated by later value edits. Uninstalling the release deletes the volume set; reinstall to reset.
+The database credentials secret seeds PostgreSQL on first boot; editing it later does not change the database password. Uninstalling the release deletes the volume set; reinstall to reset.
 </Note>
 
 ## Connecting
@@ -229,7 +241,7 @@ The database password seeds PostgreSQL on first boot and is not updated by later
 | Health | `/health/readiness`, `/health/liveliness` | The endpoints the readiness and liveness probes use, on the same host. |
 | Master key | `LITELLM_MASTER_KEY` in your prerequisite secret | `cpln secret reveal LITELLM_SECRET_NAME -o yaml`. Send it as `Authorization: Bearer …`; it is also the Admin UI password. |
 | PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | `username` / `password` / `database` from `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `postgres.config.credentialsSecretName`. |
-| Redis | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` (Sentinel, master `mymaster`); `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` | Internal only. Password is the `password` key of `cpln secret reveal RELEASE_NAME-redis-auth-password -o yaml` when auth is on. |
+| Redis | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` (Sentinel, master `mymaster`); `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` | Internal only. When auth is on, the password is the `password` key of the secret named by `redis.redis.auth.fromSecret.name` (`cpln secret reveal SECRET_NAME -o yaml`). |
 
 Verify the proxy answers with your master key — the response lists the models from `modelList`:
 
@@ -417,19 +429,72 @@ This restore path has not been exercised against this template end to end. Rehea
 
 ### Upgrading from 1.0.0
 
-Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. LiteLLM absorbed that change rather than passing it on — the chart now creates the credentials secret itself — so there is **no new prerequisite**, only a rename of three keys:
+Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. Three keys were removed:
 
-| Removed key (1.0.0) | Replacement (1.1.0) |
+| Removed key (1.0.0) | Replacement (1.2.0 and later) |
 |---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` |
+| `postgres.config.username` | `username` key in the database credentials secret named by `postgres.config.credentialsSecretName` |
+| `postgres.config.password` | `password` key in the same secret |
+| `postgres.config.database` | `database` key in the same secret |
 
-Move the three keys, keep the same values so the running database still matches, and upgrade in place. A values file that still carries an old key fails the render with the **postgres template's** message (`config.username was REMOVED in postgres 3.4.0`), which tells you to create a dictionary secret yourself — ignore that advice here; this template creates it, and the database password stays a value exactly as before.
+Put the values your database was initialized with into the database credentials secret under [Prerequisites](#prerequisites), set `postgres.config.credentialsSecretName` to its name, and remove the three keys. A values file that still carries an old key fails the render with the **postgres template's** message (`config.username was REMOVED in postgres 3.4.0`).
 
 <Note>
 The first `helm upgrade` after an install can restart the bundled PostgreSQL and Redis even when their values are unchanged, so expect a brief interruption.
 </Note>
+
+### Upgrading from 1.1.0
+
+Version 1.2.0 removed `postgres.credentials`: the database credentials are now a prerequisite secret, the same one the `postgres` template requires on its own. Carrying the old key forward fails the render.
+
+1.1.0 created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or the proxy loses its database connection. Read your current values from the old secret (named by `postgres.config.credentialsSecretName` in the installed release, `my-litellm-db-credentials` by default) before the upgrade deletes it:
+
+```bash
+cpln secret reveal my-litellm-db-credentials -o yaml
+cpln secret create-dictionary --name RELEASE_NAME-postgres-credentials \
+  --entry username=litellm --entry password='YOUR_CURRENT_PASSWORD' --entry database=litellm
+```
+
+(`litellm` / `litellm` were the 1.1.0 defaults; use your own values if you overrode them.) **If you never overrode the password, it is literally `change-me-litellm-pg`** — put that in the new secret, and rotate it afterwards as described under [Important Notes](#important-notes).
+
+Then upgrade with `postgres.config.credentialsSecretName` set to the new name and `postgres.credentials` removed. The old `RELEASE_NAME-litellm-db` secret is deleted too; nothing replaces it.
+
+The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), so LiteLLM briefly loses its database; it reconnects by itself. The new version of a workload can also wait for several minutes, with `get-deployments` reporting that it is not allowed to reveal the secret, while access to the new secret propagates; the previous version keeps serving meanwhile, and it clears by itself.
+
+**If you ran 1.1.0 with Redis auth on**, `redis.redis.auth.password` was removed too (carrying it forward fails the render), and the chart-created `RELEASE_NAME-redis-auth-password` secret is deleted by the upgrade. Before upgrading, copy your current Redis password into a secret under a **new** name, keeping the same value so the replicas keep replicating while they restart:
+
+```bash
+cpln secret reveal RELEASE_NAME-redis-auth-password -o yaml
+cpln secret create-dictionary --name RELEASE_NAME-litellm-redis \
+  --entry password='YOUR_CURRENT_REDIS_PASSWORD'
+```
+
+Then upgrade with `redis.redis.auth.fromSecret.enabled: true`, `redis.redis.auth.fromSecret.name` set to the new name, and `redis.redis.auth.password` removed. With Redis auth off in 1.1.0 (the default), just remove `redis.redis.auth.password` from your values. Version 1.2.1 also refuses any `redis.sentinel.auth` setting, so remove that block too if your values carry one.
+
+### Rotating the Redis Password
+
+Only with Redis auth on. Redis keeps no password on disk, but a running Sentinel holds the one it started with, so a new password is applied live in three places before the proxy restarts. Each Redis node first accepts both passwords, which keeps replication and every connected client working throughout. `rx` and `sx` run a command on one Redis node or Sentinel (`LOCATION` is your GVC's location; nodes and Sentinels are numbered from 0 up to `redis.redis.replicas` and `redis.sentinel.replicas` minus one):
+
+```bash
+rx() { cpln workload exec RELEASE_NAME-redis --gvc GVC_NAME --location LOCATION \
+  --container redis --replica "RELEASE_NAME-redis-$1" -- "${@:2}"; }
+sx() { cpln workload exec RELEASE_NAME-sentinel --gvc GVC_NAME --location LOCATION \
+  --container sentinel --replica "RELEASE_NAME-sentinel-$1" -- "${@:2}"; }
+# 1. On EVERY Redis node: accept the new password alongside the old one, and replicate with it
+rx 0 redis-cli --no-auth-warning -a OLD_PASSWORD ACL SETUSER default ">NEW_PASSWORD"
+rx 0 redis-cli --no-auth-warning -a OLD_PASSWORD CONFIG SET masterauth NEW_PASSWORD
+# 2. On EVERY Sentinel
+sx 0 redis-cli -p 26379 SENTINEL SET mymaster auth-pass NEW_PASSWORD
+# 3. Put the new password in the secret and read it back
+cpln secret edit SECRET_NAME
+cpln secret reveal SECRET_NAME -o yaml
+# 4. Restart the proxy, which keeps the old password until it restarts
+cpln workload force-redeployment RELEASE_NAME-litellm --gvc GVC_NAME
+# 5. Once get-deployments shows a higher version, alone and ready: retire the old password on EVERY Redis node
+rx 0 redis-cli --no-auth-warning -a NEW_PASSWORD ACL SETUSER default "<OLD_PASSWORD"
+```
+
+The proxy is briefly unavailable while it restarts (with `litellm.replicas` of 2 or more it rolls one replica at a time). Redis and Sentinel need no restart: when they next start they read the new password from the secret.
 
 ### Scaling and Availability
 
@@ -454,7 +519,7 @@ The bundled Redis is already highly available: three Redis replicas with three S
   <Accordion title="Deployment never becomes ready and the logs are empty">
     **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-litellm --gvc GVC_NAME -o yaml` shows `The secret LITELLM_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
 
-    **Cause:** The prerequisite dictionary secret named by `secrets.name` does not exist, or it is missing one of the keys the workload references (`LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, or a name listed in `litellm.providerEnv`).
+    **Cause:** The prerequisite dictionary secret named by `secrets.name` does not exist, or it is missing one of the keys the workload references (`LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, or a name listed in `litellm.providerEnv`). The database credentials secret named by `postgres.config.credentialsSecretName`, or with Redis auth on the secret named by `redis.redis.auth.fromSecret.name`, may also be missing.
 
     **Fix:** Create the secret with every required key (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-litellm --gvc GVC_NAME` skips the wait.
   </Accordion>
@@ -471,33 +536,33 @@ The bundled Redis is already highly available: three Redis replicas with three S
 
     A single `P1001` (cannot reach database server) followed by one restart on a cold install is normal and recovers on its own.
   </Accordion>
-  <Accordion title="Second install refused as managed by a different release">
-    **Symptom:** Installing a second LiteLLM release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
+  <Accordion title="Render fails because the Redis password secret name is required">
+    **Symptom:** `litellm: redis.redis.auth.fromSecret.name is required when redis.redis.auth.fromSecret.enabled is true`.
 
-    **Cause:** Both releases use the same `postgres.config.credentialsSecretName`. Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
+    **Cause:** `redis.redis.auth.fromSecret.enabled` is `true` with an empty `redis.redis.auth.fromSecret.name`.
 
-    **Fix:** Set `postgres.config.credentialsSecretName` to a distinct name for the second release and install again.
-  </Accordion>
-  <Accordion title="Render fails because the Redis password value is required">
-    **Symptom:** `litellm: redis.redis.auth.password.value is required when redis.redis.auth.password.enabled is true — LiteLLM's cache config reads this master password`.
-
-    **Cause:** `redis.redis.auth.password.enabled` is `true` with an empty `redis.redis.auth.password.value`.
-
-    **Fix:** Set `redis.redis.auth.password.value` to the password the bundled Redis should require, or set `enabled` back to `false`.
+    **Fix:** Create the Redis password secret and set `redis.redis.auth.fromSecret.name` to its name (see [Bundled Redis](#bundled-redis)), or set `enabled` back to `false`.
   </Accordion>
   <Accordion title="Render fails because Sentinel auth must stay disabled">
-    **Symptom:** `litellm: redis.sentinel.auth must stay disabled — LiteLLM sends only the master password, not a sentinel password`.
+    **Symptom:** `litellm: redis.sentinel.auth must stay disabled — LiteLLM sends only the Redis master password, not a Sentinel password`.
 
-    **Cause:** `redis.sentinel.auth.password.enabled` or `redis.sentinel.auth.fromSecret.enabled` is `true`. The proxy authenticates to the Redis master only, so a Sentinel password would lock it out.
+    **Cause:** Your values carry a `redis.sentinel.auth` setting — `redis.sentinel.auth.password.enabled`, a plaintext `redis.sentinel.auth.password.value`, or `redis.sentinel.auth.fromSecret.enabled`. The proxy authenticates to the Redis master only, so a Sentinel password would lock it out.
 
-    **Fix:** Leave both Sentinel auth toggles at `false`. Use `redis.redis.auth.password.enabled: true` to protect the master; the same-GVC firewall is the boundary for Sentinel.
+    **Fix:** Remove `redis.sentinel.auth` from your values. Use `redis.redis.auth.fromSecret` to protect the master; the same-GVC firewall is the boundary for Sentinel.
   </Accordion>
   <Accordion title="Upgrade from 1.0.0 fails asking you to create a dictionary secret">
     **Symptom:** The render fails with `config.username was REMOVED in postgres 3.4.0` and the postgres template's advice to create a prerequisite dictionary secret.
 
     **Cause:** Your values file still carries `postgres.config.username`, `postgres.config.password`, or `postgres.config.database`.
 
-    **Fix:** Rename them to `postgres.credentials.*` as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0). Do not create a secret yourself — this template creates it.
+    **Fix:** Put their values into the database credentials secret and remove the keys, as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0).
+  </Accordion>
+  <Accordion title="Upgrade from 1.1.0 fails because postgres.credentials or redis.redis.auth.password was removed">
+    **Symptom:** The render fails with `postgres.credentials was removed in litellm 1.2.0` or `redis.redis.auth.password was removed in litellm 1.2.0`.
+
+    **Cause:** Your values file still carries the 1.1.0 plaintext database credentials or Redis password.
+
+    **Fix:** Create the prerequisite secrets holding your current values and remove the old keys, as described in [Upgrading from 1.1.0](#upgrading-from-1-1-0).
   </Accordion>
   <Accordion title="Requests are rejected with 401 on the public endpoint">
     **Symptom:** API calls return `401`, including on the public endpoint.
@@ -510,13 +575,13 @@ The bundled Redis is already highly available: three Redis replicas with three S
 
 ## Important Notes
 
-- **Create the prerequisite secret before installing.** `secrets.name` must be a dictionary secret with `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, and every `litellm.providerEnv` key; without it the deployment wedges silently.
+- **Create every prerequisite secret before installing.** `secrets.name` must be a dictionary secret with `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, and every `litellm.providerEnv` key; `postgres.config.credentialsSecretName` one with `username`, `password` and `database`; and, with Redis auth on, `redis.redis.auth.fromSecret.name` one with `password`. A missing one wedges the deployment silently.
 - **Never rotate `LITELLM_SALT_KEY`.** It encrypts the provider keys stored in PostgreSQL; changing it corrupts every stored key. The master key may be rotated — force a redeployment of `RELEASE_NAME-litellm` afterwards so the proxy picks up the new value.
 - **Hand out virtual keys, not the master key.** The public endpoint is key-gated, and virtual keys carry their own budgets, rate limits, and model lists.
 - **Keep Redis enabled for `litellm.replicas` of 2 or more.** Otherwise rate limits are counted per replica.
-- **Redis is authless by default**, bounded by the same-GVC firewall. Set `redis.redis.auth.password.enabled: true` (with a changed `value`) to require a master password; Sentinel auth must stay off.
-- **Give each release its own `postgres.config.credentialsSecretName`.** Secret names are org-wide; a second release on the default name is refused at install.
-- **Change `postgres.credentials.password` before installing.** It seeds the database on first boot and later value edits do not change it.
+- **Redis is authless by default**, bounded by the same-GVC firewall. To require a master password, create the Redis password secret and set `redis.redis.auth.fromSecret.enabled: true` with its name; changing it later follows [Rotating the Redis Password](#rotating-the-redis-password). Sentinel auth must stay off.
+- **Give each release its own database credentials secret.** Secret names are org-wide.
+- **Rotating the database password needs `ALTER ROLE` plus a forced redeployment of the proxy** (not the database). PostgreSQL keeps the password it was initialized with, and a running workload keeps the values it started with. Run `ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD';` first, then `cpln secret edit SECRET_NAME`, then right away `cpln workload force-redeployment RELEASE_NAME-litellm --gvc GVC_NAME`, and wait until `get-deployments` shows a higher version number, alone and ready. Connections the proxy already has open keep working after `ALTER ROLE`; new ones fail until its redeploy finishes, so rotate in a quiet window.
 - **PostgreSQL data survives proxy restarts and redeploys.** To reset virtual keys and spend, uninstall the whole release — that deletes the volume set.
 
 ## External References

@@ -1,7 +1,7 @@
 ---
 title: Infisical
 icon: /template-catalog/templates/icons/infisical.png
-description: Deploy Infisical, the open-source secrets-management platform with a web UI and REST API, on Control Plane. Single or multi-replica server over bundled PostgreSQL and Sentinel-backed HA Redis. Needs an existing GVC and a pre-created ENCRYPTION_KEY + AUTH_SECRET dictionary secret.
+description: Deploy Infisical, the open-source secrets-management platform with a web UI and REST API, on Control Plane. Single or multi-replica server over bundled PostgreSQL and Sentinel-backed HA Redis. Needs an existing GVC plus pre-created root-key and database-credentials secrets.
 keywords: ['secret manager', 'vault alternative', 'hashicorp vault alternative', 'doppler alternative', 'secrets vault', 'env vars', 'api keys', 'self-hosted secrets', 'secret versioning', 'redis sentinel', 'server admin console', 'signup mode']
 ---
 
@@ -23,22 +23,33 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Workload | `RELEASE_NAME-sentinel` | Redis Sentinel monitoring master `mymaster`, so the server follows a Redis failover without reconfiguration (stateful, 3 replicas) | — |
 | Workload | `RELEASE_NAME-postgres-backup` | Cron job that dumps the database to object storage on a schedule | `postgres.backup.enabled: true` |
 | Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory; takes no scheduled snapshots; a final snapshot is taken when the volume set is deleted and kept 7 days | — |
-| Secret | `RELEASE_NAME-infisical-db` | Dictionary secret the chart creates with the PostgreSQL username and password the server uses to assemble `DB_CONNECTION_URI` | — |
-| Secret | the name in `postgres.config.credentialsSecretName` | Dictionary secret the chart creates (`username`, `password`, `database`) and hands to the bundled PostgreSQL | — |
 | Secret | `RELEASE_NAME-redis-config`, `RELEASE_NAME-sentinel-config` | Redis and Sentinel configuration files for the bundled cache | — |
-| Secret | `RELEASE_NAME-redis-auth-password` | Redis password, created by the bundled redis template and wired into the server as `REDIS_PASSWORD` | `redis.redis.auth.password.enabled: true` |
 | Identity | `RELEASE_NAME-infisical-identity` | Bound to the server workload | — |
-| Policy | `RELEASE_NAME-infisical-policy` | Grants that identity `reveal` on exactly the secrets the server reads: its database secret, your root-of-trust secret, and the SMTP and Redis password secrets when configured | — |
+| Policy | `RELEASE_NAME-infisical-policy` | Grants that identity `reveal` on exactly the secrets the server reads: your database credentials secret, your root-of-trust secret, and the SMTP and Redis password secrets when configured | — |
 | Identity | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-redis-identity`, `RELEASE_NAME-sentinel-identity` | Bound to the bundled PostgreSQL (and its backup job), Redis, and Sentinel workloads | — |
 | Policy | `RELEASE_NAME-pg-policy`, `RELEASE_NAME-redis-policy`, `RELEASE_NAME-sentinel-policy` | Grant each bundled identity `reveal` on its own configuration or credentials secrets only | — |
 
-Your root-of-trust secret holding `ENCRYPTION_KEY` and `AUTH_SECRET` is **not** created by the template — see [Prerequisites](#prerequisites).
+Your root-of-trust secret holding `ENCRYPTION_KEY` and `AUTH_SECRET`, your database credentials secret and, when Redis auth is on, your Redis password secret are **not** created by the template — see [Prerequisites](#prerequisites).
 
 ## Prerequisites
 
-Infisical encrypts every stored secret with an `ENCRYPTION_KEY` and signs every session and token with an `AUTH_SECRET`. Both are long-lived root-of-trust values, so you supply them through a [dictionary secret](/guides/create-secret/dictionary) created **before** installing; neither value ever passes through Helm values.
+Two [dictionary secrets](/guides/create-secret/dictionary) must exist **before** installing. They hold credentials and key material, so they are prerequisite secrets rather than values — a value would sit in plaintext in the Helm release for the life of the install.
+
+Infisical encrypts every stored secret with an `ENCRYPTION_KEY` and signs every session and token with an `AUTH_SECRET`. Both are long-lived root-of-trust values; neither ever passes through Helm values. The bundled PostgreSQL takes its credentials from the second secret.
 
 <Steps>
+  <Step title="Create the database credentials secret">
+    A dictionary secret with exactly three keys. The bundled PostgreSQL initializes with these values and Infisical connects with them:
+
+    ```bash
+    cpln secret create-dictionary --name my-infisical-db-credentials \
+      --entry username=infisical \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=infisical
+    ```
+
+    Set `postgres.config.credentialsSecretName` to this name. Keep the password and database name URL-safe (letters, digits, `-`, `_`) — Infisical places them in a connection URL as-is. PostgreSQL reads the secret only when its data directory is first initialized; see [Important Notes](#important-notes) for how to change the password later.
+  </Step>
   <Step title="Create the root-of-trust secret">
     A dictionary secret with exactly two keys: `ENCRYPTION_KEY`, a 16-byte hex string, and `AUTH_SECRET`, a 32-byte base64 string.
 
@@ -56,7 +67,7 @@ Infisical encrypts every stored secret with an `ENCRYPTION_KEY` and signs every 
 </Steps>
 
 <Warning>
-Create the secret **before** installing. Installing without it reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
+Create the secrets **before** installing. Installing without one reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message` (also check `RELEASE_NAME-postgres` for the database secret, and `RELEASE_NAME-redis` and `RELEASE_NAME-sentinel` for the Redis password secret):
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-infisical --gvc GVC_NAME -o yaml
@@ -65,23 +76,24 @@ cpln workload get-deployments RELEASE_NAME-infisical --gvc GVC_NAME -o yaml
 The message reads `The secret INFISICAL_KEYS_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` Creating the secret lets the deployment recover on its own; `cpln workload force-redeployment RELEASE_NAME-infisical --gvc GVC_NAME` skips the wait.
 </Warning>
 
-Everything else works with the defaults. Two optional features need their own setup first:
+Everything else works with the defaults. Three optional features need their own setup first:
 
 - **Authenticated SMTP** — a dictionary secret holding `SMTP_USERNAME` and `SMTP_PASSWORD`. See [Email](#email).
+- **Redis authentication** — a dictionary secret holding the key `password`. See [Bundled Redis](#bundled-redis).
 - **Scheduled database backups** — a bucket and cloud account (or S3-compatible credentials) for the bundled PostgreSQL. See [Backing Up](#backing-up).
 
 ## Installation
 
-Once the root-of-trust secret exists, install from the marketplace registry, pointing `secrets.name` at it and replacing the bundled database password:
+Once both prerequisite secrets exist, install from the marketplace registry, pointing `secrets.name` and `postgres.config.credentialsSecretName` at them:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/infisical \
-  --version 1.1.0 --gvc GVC_NAME \
+  --version 1.2.1 --gvc GVC_NAME \
   --set secrets.name=INFISICAL_KEYS_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-STRONG-DB-PASSWORD'
+  --set postgres.config.credentialsSecretName=my-infisical-db-credentials
 ```
 
-Installing a second Infisical release in the same org? Also set `postgres.config.credentialsSecretName` to a name no other release uses — secret names are org-wide.
+Installing a second Infisical release in the same org? Create a separate database credentials secret for it — secret names are org-wide.
 
 Other ways to install and manage the template:
 
@@ -177,17 +189,13 @@ A change to either access knob takes a couple of minutes to take effect after th
 
 ### Bundled PostgreSQL
 
-The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. The chart builds the credentials secret from `postgres.credentials.*` for you — nothing to create before installing.
+The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. Its credentials come from the prerequisite database credentials secret you created (see [Prerequisites](#prerequisites)).
 
 ```yaml
 postgres:
   image: postgres:18
-  credentials: # the chart writes these into the secret named below
-    username: infisical
-    password: change-me-infisical-pg # change before installing — seeds the database on first boot
-    database: infisical
   config:
-    credentialsSecretName: my-infisical-db-credentials # chart-created; secret names are org-wide, so give each release its own
+    credentialsSecretName: my-infisical-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   resources:
     minCpu: 250m
     maxCpu: 1000m
@@ -211,9 +219,9 @@ redis:
     image: redis:7.4
     replicas: 3
     auth:
-      password:
-        enabled: false # true = require AUTH on the data nodes; the password is wired into Infisical as REDIS_PASSWORD
-        value: change-me-infisical-redis # used only when enabled is true — change it then
+      fromSecret:
+        enabled: false # true = require AUTH, with the password from the secret below (wired into Infisical as REDIS_PASSWORD)
+        name: "" # dictionary secret with the key `password`, e.g. my-infisical-redis — must exist BEFORE install
     resources:
       cpu: 200m
       memory: 256Mi
@@ -221,7 +229,7 @@ redis:
       minMemory: 128Mi
   sentinel:
     image: redis:7.4
-    replicas: 3
+    replicas: 3 # no `auth:` block — Sentinel auth (incl. a plaintext `auth.password`) is refused at render
     resources:
       cpu: 200m
       memory: 256Mi
@@ -229,7 +237,14 @@ redis:
       minMemory: 128Mi
 ```
 
-Leave Sentinel authentication off: the server authenticates only to the data nodes, and the chart refuses to render if `redis.sentinel.auth` is enabled.
+To require a Redis password, create a dictionary secret holding the key `password` **before** you install or upgrade, then set `redis.redis.auth.fromSecret.enabled: true` and `redis.redis.auth.fromSecret.name` to its name. Redis, Sentinel and the Infisical server all read it. Leave auth off for the authless default behind the same-GVC firewall.
+
+```bash
+cpln secret create-dictionary --name my-infisical-redis \
+  --entry password="$(openssl rand -hex 24)"
+```
+
+Leave Sentinel authentication off: the server authenticates only to the data nodes, and the chart refuses to render with any `redis.sentinel.auth` setting, including a plaintext `redis.sentinel.auth.password`. To change the Redis password later, see [Rotating the Redis Password](#rotating-the-redis-password).
 
 ## Connecting
 
@@ -240,7 +255,7 @@ Leave Sentinel authentication off: the server authenticates only to the data nod
 | Internal API (same GVC) | `http://RELEASE_NAME-infisical.GVC_NAME.cpln.local:8080` | For other workloads using the Infisical SDK, CLI, or agent; reachable per `internalAccess.type`. |
 | Login | The account created on first run | Infisical ships no default account. |
 | PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | `username` / `password` / `database` from `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `postgres.config.credentialsSecretName`. |
-| Redis Sentinel | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Master name `mymaster`; data nodes are unauthenticated unless `redis.redis.auth.password.enabled` is `true`. |
+| Redis Sentinel | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Master name `mymaster`; data nodes are unauthenticated unless `redis.redis.auth.fromSecret.enabled` is `true`, with the password in the `password` key of the secret named by `redis.redis.auth.fromSecret.name`. |
 
 With `publicAccess.enabled: false` there is no public endpoint; reach the UI from your machine through a tunnel instead and open `http://localhost:8080`:
 
@@ -405,19 +420,67 @@ This restore path has not been exercised against this template end to end. Rehea
 
 ### Upgrading from 1.0.0
 
-Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. Infisical absorbed that change rather than passing it on — the chart now creates the credentials secret itself — so there is **no new prerequisite**, only a rename of three keys:
+Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. Three keys were removed:
 
-| Removed key (1.0.0) | Replacement (1.1.0) |
+| Removed key (1.0.0) | Replacement (1.2.0 and later) |
 |---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` |
+| `postgres.config.username` | `username` key in the database credentials secret named by `postgres.config.credentialsSecretName` |
+| `postgres.config.password` | `password` key in the same secret |
+| `postgres.config.database` | `database` key in the same secret |
 
-Move the three keys, keep the same values so the running database still matches, and upgrade in place. A values file that still carries an old key fails the render with the **postgres template's** message, which tells you to create a dictionary secret yourself — ignore that advice here; this template creates it.
+Put the values your database was initialized with into the database credentials secret under [Prerequisites](#prerequisites), set `postgres.config.credentialsSecretName` to its name, and remove the three keys. A values file that still carries an old key fails the render with the **postgres template's** message. The keys secret is unchanged.
 
 <Note>
 The first `helm upgrade` after an install can restart the bundled PostgreSQL even when its values are unchanged, so expect a brief interruption.
 </Note>
+
+### Upgrading from 1.1.0
+
+Version 1.2.0 removed `postgres.credentials`: the database credentials are now a prerequisite secret, the same one the `postgres` template requires on its own. Carrying the old key forward fails the render.
+
+1.1.0 created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or Infisical loses its database connection:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-postgres-credentials \
+  --entry username=infisical --entry password='YOUR_CURRENT_PASSWORD' --entry database=infisical
+```
+
+Then upgrade with `postgres.config.credentialsSecretName` set to that name and `postgres.credentials` removed. Your current values are in `postgres.credentials` of the 1.1.0 release, and also in the old secret (`cpln secret reveal my-infisical-db-credentials -o yaml`, or the name your release set in `credentialsSecretName`) until the upgrade deletes it.
+
+`redis.redis.auth.password` was removed the same way. With Redis auth off (the default) just delete the block. With it on, this upgrade deletes the `RELEASE_NAME-redis-auth-password` secret 1.1.0 had the redis chart create, so first create one under a **new** name holding your **current** Redis password:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-infisical-redis --entry password='YOUR_CURRENT_REDIS_PASSWORD'
+```
+
+Your current password is `redis.redis.auth.password.value` of the 1.1.0 release, and also in `cpln secret reveal RELEASE_NAME-redis-auth-password -o yaml` until the upgrade deletes it. Upgrade with `redis.redis.auth.fromSecret.enabled: true`, `redis.redis.auth.fromSecret.name` set to the new name, and the `redis.redis.auth.password` block removed. Version 1.2.1 also refuses any `redis.sentinel.auth` setting, so remove that block too if your values carry one.
+
+The upgrade restarts the bundled PostgreSQL (and, with auth on, Redis) too, since they now read the new secrets, so Infisical briefly loses its database; it reconnects by itself. The new version of a workload can also wait for several minutes, with `get-deployments` reporting that it is not allowed to reveal the secret, while access to the new secret propagates; the previous version keeps serving meanwhile, and it clears by itself.
+
+### Rotating the Redis Password
+
+Only with Redis auth on. Redis keeps no password on disk, but a running Sentinel holds the one it started with, so a new password is applied live in three places before Infisical restarts. Each Redis node first accepts both passwords, which keeps replication and every connected client working throughout. `rx` and `sx` run a command on one Redis node or Sentinel (`LOCATION` is your GVC's location; nodes and Sentinels are numbered from 0 up to `redis.redis.replicas` and `redis.sentinel.replicas` minus one):
+
+```bash
+rx() { cpln workload exec RELEASE_NAME-redis --gvc GVC_NAME --location LOCATION \
+  --container redis --replica "RELEASE_NAME-redis-$1" -- "${@:2}"; }
+sx() { cpln workload exec RELEASE_NAME-sentinel --gvc GVC_NAME --location LOCATION \
+  --container sentinel --replica "RELEASE_NAME-sentinel-$1" -- "${@:2}"; }
+# 1. On EVERY Redis node: accept the new password alongside the old one, and replicate with it
+rx 0 redis-cli --no-auth-warning -a OLD_PASSWORD ACL SETUSER default ">NEW_PASSWORD"
+rx 0 redis-cli --no-auth-warning -a OLD_PASSWORD CONFIG SET masterauth NEW_PASSWORD
+# 2. On EVERY Sentinel
+sx 0 redis-cli -p 26379 SENTINEL SET mymaster auth-pass NEW_PASSWORD
+# 3. Put the new password in the secret and read it back
+cpln secret edit SECRET_NAME
+cpln secret reveal SECRET_NAME -o yaml
+# 4. Restart Infisical, which keeps the old password until it restarts
+cpln workload force-redeployment RELEASE_NAME-infisical --gvc GVC_NAME
+# 5. Once get-deployments shows a higher version, alone and ready: retire the old password on EVERY Redis node
+rx 0 redis-cli --no-auth-warning -a NEW_PASSWORD ACL SETUSER default "<OLD_PASSWORD"
+```
+
+Infisical is briefly unavailable while it restarts (with `infisical.replicas` of 2 or more it rolls one replica at a time). Redis and Sentinel need no restart: when they next start they read the new password from the secret.
 
 ### Scaling and Availability
 
@@ -438,7 +501,7 @@ The bundled Redis is already highly available (three data nodes, three Sentinels
   <Accordion title="Deployment never becomes ready and the logs are empty">
     **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-infisical --gvc GVC_NAME -o yaml` shows `The secret INFISICAL_KEYS_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
 
-    **Cause:** The root-of-trust secret named by `secrets.name` does not exist (or, with SMTP auth on, the secret named by `smtp.auth.secretName` does not).
+    **Cause:** The root-of-trust secret named by `secrets.name` or the database credentials secret named by `postgres.config.credentialsSecretName` does not exist (or, with SMTP or Redis auth on, the secret named by `smtp.auth.secretName` or `redis.redis.auth.fromSecret.name` does not).
 
     **Fix:** Create it (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-infisical --gvc GVC_NAME` skips the wait.
   </Accordion>
@@ -449,26 +512,26 @@ The bundled Redis is already highly available (three data nodes, three Sentinels
 
     **Fix:** Nothing — the retries stop once the database accepts connections and the workload becomes ready. If the lines keep coming, check `RELEASE_NAME-postgres` with `cpln workload get-deployments RELEASE_NAME-postgres --gvc GVC_NAME -o yaml`.
   </Accordion>
-  <Accordion title="Second install refused as managed by a different release">
-    **Symptom:** Installing a second Infisical release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
-
-    **Cause:** Both releases use the same `postgres.config.credentialsSecretName`. Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
-
-    **Fix:** Set `postgres.config.credentialsSecretName` to a distinct name for the second release and install again.
-  </Accordion>
   <Accordion title="Upgrade from 1.0.0 fails with config.username was REMOVED in postgres 3.4.0">
     **Symptom:** The render fails with `config.username was REMOVED in postgres 3.4.0` (or the same message for `config.password` / `config.database`) and tells you to create a dictionary secret.
 
     **Cause:** Your values file still carries `postgres.config.username`, `postgres.config.password`, or `postgres.config.database`.
 
-    **Fix:** Rename them to `postgres.credentials.*` as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0). Do not create a secret yourself — this template creates it.
+    **Fix:** Put their values into the database credentials secret and remove the keys, as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0).
+  </Accordion>
+  <Accordion title="Upgrade from 1.1.0 fails because postgres.credentials or redis.redis.auth.password was removed">
+    **Symptom:** The render fails with `postgres.credentials was removed in 1.2.0` or `infisical: redis.redis.auth.password was REMOVED in 1.2.0`.
+
+    **Cause:** Your values file still carries the 1.1.0 plaintext database credentials or Redis password.
+
+    **Fix:** Create the prerequisite secrets holding your current values and remove the old keys, as described in [Upgrading from 1.1.0](#upgrading-from-1-1-0).
   </Accordion>
   <Accordion title="Render fails because redis.sentinel.auth must stay disabled">
-    **Symptom:** `infisical: redis.sentinel.auth must stay disabled — Infisical authenticates only the data nodes (REDIS_PASSWORD), not the sentinels`.
+    **Symptom:** `infisical: redis.sentinel.auth must stay disabled — Infisical authenticates only the Redis nodes (REDIS_PASSWORD), not the Sentinels`.
 
-    **Cause:** `redis.sentinel.auth.password.enabled` or `redis.sentinel.auth.fromSecret.enabled` is `true`.
+    **Cause:** Your values carry a `redis.sentinel.auth` setting — `redis.sentinel.auth.password.enabled`, a plaintext `redis.sentinel.auth.password.value`, or `redis.sentinel.auth.fromSecret.enabled`.
 
-    **Fix:** Turn Sentinel authentication off. To require a password on the data nodes, set `redis.redis.auth.password.enabled: true` and a value for `redis.redis.auth.password.value` instead.
+    **Fix:** Remove `redis.sentinel.auth` from your values. To require a password on the data nodes, use `redis.redis.auth.fromSecret` instead — see [Bundled Redis](#bundled-redis).
   </Accordion>
   <Accordion title="Login does not stick or links point at the wrong host">
     **Symptom:** Signing in returns you to the login page, or emails and UI links use a host other than the one you browse to.
@@ -481,15 +544,16 @@ The bundled Redis is already highly available (three data nodes, three Sentinels
 
 ## Important Notes
 
-- **Create the root-of-trust secret before installing** — `secrets.name` must name an existing dictionary secret with `ENCRYPTION_KEY` and `AUTH_SECRET`. A missing secret wedges the deployment silently.
+- **Create both prerequisite secrets before installing** — `secrets.name` must name an existing dictionary secret with `ENCRYPTION_KEY` and `AUTH_SECRET`, and `postgres.config.credentialsSecretName` one with `username`, `password` and `database`; with Redis auth on, the Redis password secret too. A missing secret wedges the deployment silently.
 - **`ENCRYPTION_KEY` and `AUTH_SECRET` are write-once — never rotate them.** A changed `ENCRYPTION_KEY` makes every stored secret unreadable; a changed `AUTH_SECRET` invalidates every session. Back both up outside Control Plane.
 - **Sign up right after install** — the first account becomes the server administrator and the form is open to anyone who can reach the endpoint. Then set **Signup mode** to **Disabled** in the Server Console.
 - **Redis is required, not optional** — the server does not boot without it, and Sentinel authentication must stay off.
 - **Keep `infisical.resources.maxMemory` at `2Gi`** — a cold boot with `infisical.replicas` of 2 or more runs out of memory at `1Gi`.
-- **Change `postgres.credentials.password` before installing** — it seeds the database on first boot and is not updated by later value edits.
-- **Give each release its own `postgres.config.credentialsSecretName`** — secret names are org-wide, and a second release on the same name is refused at install.
+- **Changing the database password is a database change first.** Editing the secret alone does nothing to the database, and a running workload keeps the values it started with. Run `ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD';` in PostgreSQL, then `cpln secret edit SECRET_NAME`, then right away `cpln workload force-redeployment RELEASE_NAME-infisical --gvc GVC_NAME`, and wait until `get-deployments` shows a higher version number, alone and ready (right after the command the status may not show the restart yet, and `ready: true` alone can still describe the old replica). Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime.
+- **Rotating the Redis password needs live changes on every Redis node and Sentinel before Infisical restarts** — see [Rotating the Redis Password](#rotating-the-redis-password).
+- **Give each release its own database credentials secret** — secret names are org-wide.
 - **A database backup is only as good as the key** — a restored dump is unreadable without the `ENCRYPTION_KEY` it was written under.
-- **Uninstalling deletes the PostgreSQL volume set** and every stored secret in it; your root-of-trust secret is yours and survives.
+- **Uninstalling deletes the PostgreSQL volume set** and every stored secret in it; your prerequisite secrets are yours and survive.
 - **Set `smtp.requireTls: false` only for a plaintext mail catcher** — real providers on port `587` need it left `true`.
 
 ## External References
