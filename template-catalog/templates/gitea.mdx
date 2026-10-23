@@ -1,7 +1,7 @@
 ---
 title: Gitea
 icon: /template-catalog/templates/icons/gitea.png
-description: Single-replica Gitea Git server with web UI, Git-over-HTTPS, package registry and optional Git-over-SSH, backed by a bundled PostgreSQL. Deploys into an existing GVC and needs one dictionary auth secret (admin login plus signing keys) created before install.
+description: Single-replica Gitea Git server with web UI, Git-over-HTTPS, package registry and optional Git-over-SSH, backed by a bundled PostgreSQL. Deploys into an existing GVC and needs two dictionary secrets created before install: auth (admin login plus signing keys) and database credentials.
 keywords: ['self-hosted git', 'git server', 'github alternative', 'gitlab alternative', 'gogs', 'source code management', 'pull requests', 'git clone', 'git lfs', 'container registry', 'jwt secret', 'secret key', 'rootless', 'developer tools']
 ---
 
@@ -9,7 +9,7 @@ keywords: ['self-hosted git', 'git server', 'github alternative', 'gitlab altern
 
 Gitea is a lightweight self-hosted Git service — repositories, pull requests, issues and a built-in package registry. This template deploys one Gitea server (the rootless image) on a persistent volume, a bundled PostgreSQL database from the [PostgreSQL](/template-catalog/templates/postgres) template, a public HTTPS endpoint serving the web UI, Git-over-HTTPS and the package registry, and optional Git-over-SSH.
 
-The site administrator's login and Gitea's three long-lived signing keys are **not** template values. They come from one [dictionary secret](/guides/create-secret/dictionary) you create before installing, so they never pass through Helm and never land in the release. The bundled database's credentials are internal plumbing: the template builds that secret for you from plain values.
+The site administrator's login and Gitea's three long-lived signing keys are **not** template values. They come from one [dictionary secret](/guides/create-secret/dictionary) you create before installing, so they never pass through Helm and never land in the release. The bundled database's credentials come from a second dictionary secret you create before installing.
 
 <Note>
 This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create or manage a GVC.
@@ -24,20 +24,31 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Volume Set | `RELEASE_NAME-gitea-vs` | `/var/lib/gitea` — repositories, LFS objects, attachments and SSH host keys on an `ext4` general-purpose SSD volume; a final snapshot is taken when the volume set is deleted and kept 7 days | — |
 | Volume Set | `RELEASE_NAME-pg-vs` | PostgreSQL data | — |
 | Secret | `RELEASE_NAME-gitea-bootstrap` | Opaque secret holding the admin-bootstrap script mounted into the Gitea container | — |
-| Secret | `my-gitea-db-credentials` | Dictionary secret with the bundled database's `username`, `password` and `database`, built from `postgres.credentials.*`; its name is `postgres.config.credentialsSecretName` | — |
 | Identity | `RELEASE_NAME-gitea-identity` | Bound to the Gitea workload | — |
-| Policy | `RELEASE_NAME-gitea-policy` | Grants the Gitea identity `reveal` on exactly three secrets: the bootstrap script, the database credentials and the auth secret you created | — |
+| Policy | `RELEASE_NAME-gitea-policy` | Grants the Gitea identity `reveal` on exactly three secrets: the bootstrap script, and the database credentials and auth secrets you created | — |
 | Identity | `RELEASE_NAME-pg-identity` | Bound to the database and backup workloads; carries the cloud account binding when backups use AWS or GCP | — |
 | Policy | `RELEASE_NAME-pg-policy` | Grants the database identity `reveal` on the database credentials secret | — |
 | Workload | `RELEASE_NAME-postgres-backup` | Scheduled `pg_dumpall` of the bundled database to S3, GCS or MinIO (cron) | `postgres.backup.enabled: true` |
 
-The template creates **no credential secret for Gitea itself** — the admin login and signing keys live only in the auth secret you create.
+The template creates **no credential secret** — the admin login and signing keys live only in the auth secret you create, and the database credentials only in the database credentials secret you create.
 
 ## Prerequisites
 
-One secret must exist before you install. Secrets are org-level, so no GVC flag is involved.
+Two secrets must exist before you install. Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) the bundled PostgreSQL initializes with and Gitea connects with:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=gitea \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=gitea
+    ```
+
+    Set `postgres.config.credentialsSecretName` to this name. Secret names are org-wide, so give each Gitea release its own. PostgreSQL reads it only when its data directory is first initialized — see [Bundled Database](#bundled-database) for changing the password later.
+  </Step>
   <Step title="Create the auth secret">
     A [dictionary secret](/guides/create-secret/dictionary) holding exactly six keys. The three `admin*` keys create the first site-admin account on first boot; the other three are Gitea's signing keys:
 
@@ -67,7 +78,7 @@ One secret must exist before you install. Secrets are org-level, so no GVC flag 
 </Warning>
 
 <Warning>
-**Create the secret before installing, or the deployment wedges silently.** The chart refuses to render when `gitea.auth.secretName` is blank, but a name pointing at a secret that does not exist installs successfully and then never starts. The container never runs, so `cpln logs` returns zero lines. The one place the reason appears is `status.versions[].message`:
+**Create both secrets before installing, or the deployment wedges silently.** The chart refuses to render when `gitea.auth.secretName` is blank, but a name pointing at a secret that does not exist installs successfully and then never starts. The container never runs, so `cpln logs` returns zero lines. The one place the reason appears is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-gitea --gvc GVC_NAME -o yaml
@@ -81,20 +92,18 @@ secret is added or the reference to the secret removed.
 Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the missing secret repairs the deployment on its own within several minutes, or run `cpln workload force-redeployment RELEASE_NAME-gitea --gvc GVC_NAME` to skip the wait.
 </Warning>
 
-The bundled database needs nothing created in advance: the template writes its credentials secret from `postgres.credentials.*`. Pick a database password at install time (see [Installation](#installation)). Database backups are optional and need a bucket plus, for AWS or GCP, a Control Plane [cloud account](/guides/create-cloud-account) — see [Backing Up](#backing-up).
+Database backups are optional and need a bucket plus, for AWS or GCP, a Control Plane [cloud account](/guides/create-cloud-account) — see [Backing Up](#backing-up).
 
 ## Installation
 
-Install the chart from the marketplace registry, pointing it at the auth secret and replacing the published database-password placeholder:
+Install the chart from the marketplace registry, pointing it at your two secrets:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/gitea \
-  --version 1.2.0 --gvc GVC_NAME \
+  --version 1.3.0 --gvc GVC_NAME \
   --set gitea.auth.secretName=GITEA_AUTH_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-STRONG-DB-PASSWORD'
+  --set postgres.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME
 ```
-
-For a second Gitea release in the same org, also set `postgres.config.credentialsSecretName` to a name unique to that release — secret names are org-wide, and a second release left on the default is refused at install (see [Troubleshooting](#troubleshooting)).
 
 Or follow the instructions for your preferred method:
 
@@ -219,17 +228,13 @@ internalAccess: # internal firewall scope
 
 ### Bundled Database
 
-The database is internal plumbing: it serves Gitea only, is unreachable from outside the GVC, and no human types its password into a client — so the credentials stay plain values and the template writes them into the dictionary secret named by `postgres.config.credentialsSecretName`. The password is used as-is, so change it before installing.
+The database serves Gitea only and is unreachable from outside the GVC. Its credentials come from your prerequisite dictionary secret (`username`, `password` and `database` — see [Prerequisites](#prerequisites)), named by `postgres.config.credentialsSecretName`.
 
 ```yaml
 postgres:
   image: postgres:18
-  credentials:
-    username: gitea
-    password: change-me-gitea-db
-    database: gitea
   config:
-    credentialsSecretName: my-gitea-db-credentials
+    credentialsSecretName: my-gitea-db-credentials  # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   resources:
     minCpu: 200m
     minMemory: 256Mi
@@ -247,12 +252,12 @@ postgres:
 ```
 
 <Note>
-PostgreSQL applies `postgres.credentials.*` only when its volume is first initialized. Changing them afterwards rewrites the secret but not the running database's password — rotate inside PostgreSQL first, as described in the [PostgreSQL template](/template-catalog/templates/postgres#rotating-the-password), then update the value and force a redeployment of `RELEASE_NAME-gitea` so it reconnects with the new password.
+PostgreSQL reads the credentials secret only when its volume is first initialized, and a running workload keeps the values it started with. To change the password later, run `ALTER ROLE` first, then update the secret (export it with `cpln secret reveal SECRET_NAME -o yaml > secret.yaml`, change only `password`, and `cpln apply -f secret.yaml`), and right away force a redeployment of `RELEASE_NAME-gitea` with `cpln workload force-redeployment RELEASE_NAME-gitea --gvc GVC_NAME`. Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime.
 </Note>
 
 ### Database Backup
 
-Every knob of the PostgreSQL template is available under `postgres.*`, including its scheduled backup. It is off by default; enabling it adds one cron workload that runs `pg_dumpall` and uploads a gzip-compressed dump to your bucket. The job authenticates with the chart-created database credentials secret, and the database identity picks up the bucket-scoped policy or cloud account automatically.
+Every knob of the PostgreSQL template is available under `postgres.*`, including its scheduled backup. It is off by default; enabling it adds one cron workload that runs `pg_dumpall` and uploads a gzip-compressed dump to your bucket. The job authenticates with your database credentials secret, and the database identity picks up the bucket-scoped policy or cloud account automatically.
 
 ```yaml
 postgres:
@@ -428,19 +433,24 @@ If your install still carries the published 1.0.0 defaults, everything it has en
 
 ### Upgrading from 1.1.0
 
-Version 1.2.0 adopted the PostgreSQL template 3.4.1 as its bundled database. That template no longer takes credentials as values, and Gitea absorbed the change rather than passing it on: **there is no new prerequisite**, only a rename. The database keeps the credentials it was initialized with, so carry the **same three values** over under the new keys.
+`postgres.config.username`, `postgres.config.password` and `postgres.config.database` were removed. The database keeps the credentials it was initialized with, so put the **same three values** into the database credentials secret under [Prerequisites](#prerequisites) (keys `username`, `password` and `database`), set `postgres.config.credentialsSecretName` to its name, and remove the three keys. The auth secret is unchanged.
 
-| Removed key | Replacement |
-|---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` |
+### Upgrading from 1.2.0
 
-The chart now writes those values into a dictionary secret named by `postgres.config.credentialsSecretName` (default `my-gitea-db-credentials`) and hands only the name to the database. Secret names are org-wide, so give each Gitea release its own.
+`postgres.credentials` was removed in 1.3.0: the database credentials are now a prerequisite secret, the same one the `postgres` template requires on its own. Carrying the old key forward fails the render.
 
-<Warning>
-**A values file that still carries the old keys fails with the PostgreSQL template's message, not this template's.** It tells you to create a dictionary secret yourself — ignore that advice here, because this template creates the secret for you. Move the three keys and the upgrade proceeds; the auth secret is unchanged.
-</Warning>
+1.2.0 created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or Gitea loses its database connection:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-gitea-db \
+  --entry username=gitea \
+  --entry password='YOUR_CURRENT_PASSWORD' \
+  --entry database=gitea
+```
+
+Then upgrade with `postgres.config.credentialsSecretName` set to that name and `postgres.credentials` removed. Your current values are in `postgres.credentials` of the 1.2.0 release, and also in the old secret (`cpln secret reveal my-gitea-db-credentials -o yaml`, or the name your release set in `credentialsSecretName`) until the upgrade deletes it.
+
+The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), so Gitea can briefly lose its database; it reconnects by itself. The new version of a workload can also wait several minutes with `is not allowed to reveal the secret` in `get-deployments` while access to the new secret propagates; the previous version keeps serving meanwhile, and it clears by itself.
 
 ### Scaling and Availability
 
@@ -499,16 +509,9 @@ The chart now writes those values into a dictionary secret named by `postgres.co
     config.credentialsSecretName to its name. ...
     ```
 
-    **Cause:** your values still set `postgres.config.username`, `postgres.config.password` or `postgres.config.database`, which moved to `postgres.credentials.*` in 1.2.0.
+    **Cause:** your values still set `postgres.config.username`, `postgres.config.password` or `postgres.config.database`, which were removed.
 
-    **Fix:** rename the three keys as in [Upgrading from 1.1.0](#upgrading-from-1-1-0). Do not create a database secret yourself — this template creates it.
-  </Accordion>
-  <Accordion title="Second release refused: 'cannot be updated because it is being managed by a different release'">
-    **Symptom:** installing a second Gitea release in the same org fails and creates nothing.
-
-    **Cause:** both releases render the same database credentials secret name, `postgres.config.credentialsSecretName` (default `my-gitea-db-credentials`), and secret names are org-wide. The first release owns it; nothing is shared, overwritten or deleted.
-
-    **Fix:** install the second release with `--set postgres.config.credentialsSecretName=UNIQUE_NAME`.
+    **Fix:** create the database credentials secret with those three values and remove the keys, as in [Upgrading from 1.1.0](#upgrading-from-1-1-0).
   </Accordion>
   <Accordion title="Admin password changed in the secret but the old one still works">
     **Symptom:** you updated `adminPassword` in the auth secret, but Gitea still accepts the previous password.
@@ -528,15 +531,15 @@ The chart now writes those values into a dictionary secret named by `postgres.co
 
 ## Important Notes
 
-- **Create the auth secret before installing.** A reference to a secret that does not exist wedges the workload with no log output; see [Prerequisites](#prerequisites) for the one command that shows the reason.
+- **Create both secrets before installing.** A reference to a secret that does not exist wedges the workload with no log output; see [Prerequisites](#prerequisites) for the one command that shows the reason.
+- **Rotating the database password needs `ALTER ROLE` plus a forced redeployment of `RELEASE_NAME-gitea`** — a running workload keeps the values it started with; see [Bundled Database](#bundled-database).
 - **Never rotate `secretKey` or `jwtSecret` after install.** The first makes stored 2FA secrets, tokens and mirror credentials permanently unreadable; the second invalidates issued OAuth2 tokens.
 - **`jwtSecret` must be base64url of exactly 32 bytes** — use the command in [Prerequisites](#prerequisites).
-- **Change `postgres.credentials.password` before installing.** The shipped `change-me-gitea-db` is a published placeholder used as-is.
-- **Give each Gitea release its own `postgres.config.credentialsSecretName`.** Secret names are org-wide; a second release on the default name is refused at install.
+- **Give each Gitea release its own database credentials secret.** Secret names are org-wide.
 - **Public SSH and the public web UI cannot share the canonical endpoint** — SSH is off by default. See [Git-over-SSH](#git-over-ssh).
 - **Do not scale past one replica.** Replicas would each get a separate repository volume.
 - **Editing the auth secret after first boot does not change the administrator account.** Change the password in Gitea — see [Rotating the Admin Password](#rotating-the-admin-password).
-- **`cpln helm uninstall` deletes both volume sets** — repositories and database alike. Your auth secret is yours and is left alone.
+- **`cpln helm uninstall` deletes both volume sets** — repositories and database alike. Your auth and database credentials secrets are yours and are left alone.
 
 ## External References
 

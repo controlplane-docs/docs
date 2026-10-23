@@ -1,7 +1,7 @@
 ---
 title: Guacamole
 icon: /template-catalog/templates/icons/guacamole.png
-description: Deploy Apache Guacamole on Control Plane. A clientless remote desktop gateway that opens RDP, VNC, SSH and telnet sessions to internal machines in a browser tab. Single replica with a bundled PostgreSQL, private by default. Needs an existing GVC and a pre-created admin dictionary secret.
+description: Deploy Apache Guacamole on Control Plane. A clientless remote desktop gateway that opens RDP, VNC, SSH and telnet sessions to internal machines in a browser tab. Single replica with a bundled PostgreSQL, private by default. Needs an existing GVC and pre-created admin and database dictionary secrets.
 keywords: ['guacd', 'browser rdp', 'rdp gateway', 'vnc gateway', 'ssh in browser', 'html5 remote access', 'bastion host', 'jump host', 'vpn alternative', 'audited remote access', 'teleport alternative', 'remote desktop']
 ---
 
@@ -9,7 +9,7 @@ keywords: ['guacd', 'browser rdp', 'rdp gateway', 'vnc gateway', 'ssh in browser
 
 Apache Guacamole is a clientless remote desktop gateway: users open RDP, VNC, SSH, and telnet sessions to internal machines in a plain browser tab, with no client, plugin, or VPN to install. This template deploys the Guacamole web application together with the `guacd` protocol daemon in one workload, backed by a bundled PostgreSQL that holds users, connections, permissions, and session history. The gateway runs as a single replica and is **private by default** — you reach the UI over a port forward and opt in to publishing it.
 
-The administrator login is not a template value. It comes from a dictionary secret you create before installing, so it never passes through Helm and never lands in the release.
+The administrator login and the database credentials are not template values. They come from dictionary secrets you create before installing, so they never pass through Helm and never land in the release.
 
 <Note>
 This template deploys into an existing [GVC](/reference/gvc) that you already have — it does not create or manage a GVC.
@@ -23,15 +23,14 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Workload | `RELEASE_NAME-postgres` | Bundled PostgreSQL from the [postgres](/template-catalog/templates/postgres) template — users, connections, connection parameters, permissions, and session history (stateful, 1 replica) | — |
 | Workload | `RELEASE_NAME-postgres-backup` | Cron job that dumps the database to object storage on a schedule | `postgres.backup.enabled: true` |
 | Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory; takes no scheduled snapshots; a final snapshot is taken when the volume set is deleted and kept 7 days. The gateway workload itself mounts no volume set | — |
-| Secret | the name in `postgres.config.credentialsSecretName` | Dictionary secret the chart creates (`username`, `password`, `database`) from `postgres.credentials.*` and hands to the bundled PostgreSQL | — |
 | Secret | `RELEASE_NAME-guacamole-start` | Opaque secret holding the start script of the `guacamole` container; contains no credential | — |
 | Secret | `RELEASE_NAME-guacamole-init` | Opaque secret holding the schema bootstrap script of the `schema-init` container; contains no credential | — |
 | Identity | `RELEASE_NAME-guacamole-identity` | Bound to the gateway workload; no cloud bindings | — |
-| Policy | `RELEASE_NAME-guacamole-policy` | Grants that identity `reveal` on exactly four secrets: your admin secret, the database credentials secret, and the two script secrets | — |
+| Policy | `RELEASE_NAME-guacamole-policy` | Grants that identity `reveal` on exactly four secrets: your admin and database credentials secrets, and the two script secrets | — |
 | Identity | `RELEASE_NAME-pg-identity` | Bound to the bundled PostgreSQL (and its backup job) | — |
 | Policy | `RELEASE_NAME-pg-policy` | Grants the PostgreSQL identity `reveal` on the database credentials secret only | — |
 
-Your admin secret is **not** created by the template — see [Prerequisites](#prerequisites).
+Your admin and database credentials secrets are **not** created by the template — see [Prerequisites](#prerequisites).
 
 <Warning>
 `guacd` listens on port `4822` and that port is deliberately **not published**. The protocol daemon is unauthenticated — anything that can reach it can drive an arbitrary RDP, VNC, or SSH session — so only the web application running beside it in the same workload can reach it. Do not "fix" this by declaring the port.
@@ -39,9 +38,21 @@ Your admin secret is **not** created by the template — see [Prerequisites](#pr
 
 ## Prerequisites
 
-**One secret must exist before you install.** It holds the Guacamole administrator login. The values never pass through Helm, so they do not land in the release. Secrets are org-level, so no GVC flag is involved.
+**Two secrets must exist before you install.** They hold the database credentials and the Guacamole administrator login. The values never pass through Helm, so they do not land in the release. Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding `username`, `password` and `database`. The bundled PostgreSQL initializes with them, and Guacamole and its `schema-init` container connect with them:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=guacamole \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=guacamole
+    ```
+
+    Set `postgres.config.credentialsSecretName` to this name. Secret names are org-wide, so give each release its own. PostgreSQL reads it only when its data directory is first initialized — see [Bundled PostgreSQL](#bundled-postgresql) for changing the password later.
+  </Step>
   <Step title="Create the admin secret">
     A [dictionary secret](/guides/create-secret/dictionary) holding exactly two keys — `username` and `password`. They become the Guacamole administrator account, replacing the well-known stock `guacadmin` account before the web application ever serves a request:
 
@@ -63,7 +74,7 @@ Your admin secret is **not** created by the template — see [Prerequisites](#pr
 </Steps>
 
 <Warning>
-**Create the secret before installing, or the deployment wedges silently.** The template refuses to render when `admin.secretName` is blank, but a name that points at a secret which does not exist installs "successfully" and then never starts. No container runs, so `cpln logs` returns **zero lines**. The one place the reason appears is `status.versions[].message`:
+**Create both secrets before installing, or the deployment wedges silently.** The template refuses to render when `admin.secretName` is blank, but a name that points at a secret which does not exist installs "successfully" and then never starts. A missing database credentials secret also wedges `RELEASE_NAME-postgres`. No container runs, so `cpln logs` returns **zero lines**. The one place the reason appears is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-guacamole --gvc GVC_NAME -o yaml
@@ -81,20 +92,18 @@ Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creat
 **The administrator credentials are applied on first boot only.** They seed the database once. Rotating the secret afterwards does not change your login — change the password in the Guacamole UI instead (see [First Run](#first-run)).
 </Note>
 
-Nothing else is required for a default install: the bundled database password is internal plumbing that this template turns into a secret for you. Scheduled database backups need a bucket and, for AWS or GCP, a Control Plane cloud account — see [Backing Up](#backing-up).
+Nothing else is required for a default install. Scheduled database backups need a bucket and, for AWS or GCP, a Control Plane cloud account — see [Backing Up](#backing-up).
 
 ## Installation
 
-Once your admin secret exists, install from the marketplace registry, pointing `admin.secretName` at it and replacing the bundled database password:
+Once both secrets exist, install from the marketplace registry, pointing `admin.secretName` and `postgres.config.credentialsSecretName` at them:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/guacamole \
-  --version 1.0.0 --gvc GVC_NAME \
+  --version 1.1.0 --gvc GVC_NAME \
   --set admin.secretName=ADMIN_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-DB-PASSWORD'
+  --set postgres.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME
 ```
-
-Installing a second Guacamole release in the same org? Also set `postgres.config.credentialsSecretName` to a name no other release uses — secret names are org-wide.
 
 Other ways to install and manage the template:
 
@@ -188,17 +197,13 @@ These knobs govern **inbound** traffic to Guacamole. They do not restrict which 
 
 ### Bundled PostgreSQL
 
-The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. The chart builds the credentials secret from `postgres.credentials.*` for you — nothing to create before installing. `postgres.image` also sets the image of the `schema-init` container, so `psql` always matches the server version.
+The database is the [postgres](/template-catalog/templates/postgres) template as a subchart, so every knob of that template is available under `postgres.*`. The database credentials come from your prerequisite dictionary secret (`username`, `password` and `database` — see [Prerequisites](#prerequisites)), named by `postgres.config.credentialsSecretName`. `postgres.image` also sets the image of the `schema-init` container, so `psql` always matches the server version.
 
 ```yaml
 postgres:
   image: postgres:18 # also used by the schema-init container, so psql matches the server
-  credentials: # the chart writes these into the secret named below
-    username: guacamole
-    password: change-me-guacamole-db # change before installing — seeds the database on first boot
-    database: guacamole
   config:
-    credentialsSecretName: my-guacamole-db-credentials # chart-created; secret names are org-wide, so give each release its own
+    credentialsSecretName: my-guacamole-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   resources:
     minCpu: 250m
     maxCpu: 1000m
@@ -213,7 +218,7 @@ postgres:
 ```
 
 <Note>
-`postgres.credentials.password` seeds the database on first boot and is not updated by later value edits. Uninstalling the release deletes the volume set; reinstall to reset.
+PostgreSQL reads the credentials secret only when its data directory is first initialized, and a running workload keeps the values it started with. To change the password later, run `ALTER ROLE` first, then update the secret (export it with `cpln secret reveal SECRET_NAME -o yaml > secret.yaml`, change only `password`, and `cpln apply -f secret.yaml`), and right away force a redeployment of the gateway with `cpln workload force-redeployment RELEASE_NAME-guacamole --gvc GVC_NAME`. Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime. Uninstalling the release deletes the volume set; reinstall to reset.
 </Note>
 
 ## Connecting
@@ -411,6 +416,23 @@ Two constraints make this a planned operation: the archive contains `CREATE ROLE
 This restore path has not been exercised against this template end to end. Rehearse it on a throwaway release before you depend on it. Restoring from a volume set snapshot is likewise unverified here.
 </Warning>
 
+### Upgrading from 1.0.0
+
+`postgres.credentials` was removed in 1.1.0: the database credentials are now a prerequisite secret, the same one the `postgres` template requires on its own. Carrying the old key forward fails the render.
+
+1.0.0 created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or Guacamole loses its database connection:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-guacamole-db \
+  --entry username=guacamole \
+  --entry password='YOUR_CURRENT_PASSWORD' \
+  --entry database=guacamole
+```
+
+Then upgrade with `postgres.config.credentialsSecretName` set to that name and `postgres.credentials` removed. Your current values are in `postgres.credentials` of the 1.0.0 release, and also in the old secret (`cpln secret reveal my-guacamole-db-credentials -o yaml`, or the name you gave it) until the upgrade deletes it.
+
+The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), so expect a short database outage and dropped sessions; Guacamole reconnects by itself. The new version of a workload can also wait several minutes with `is not allowed to reveal the secret` in `get-deployments` while access to the new secret propagates; the previous version keeps serving meanwhile, and it clears by itself. The admin secret is unchanged.
+
 ### Scaling and Availability
 
 This template runs **exactly one replica**, and there is no `replicas` knob. Guacamole keeps authentication tokens in each web application's memory with no cross-instance sharing, so a second replica would randomly sign users out.
@@ -429,7 +451,7 @@ Rotating a secret the workload references does not restart it; the old value sta
   <Accordion title="Deployment never becomes ready and the logs are empty">
     **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-guacamole --gvc GVC_NAME -o yaml` shows `The secret ADMIN_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
 
-    **Cause:** The prerequisite admin secret named by `admin.secretName` does not exist.
+    **Cause:** A prerequisite secret does not exist — the admin secret named by `admin.secretName` or the database credentials secret named by `postgres.config.credentialsSecretName`. The message names the missing one.
 
     **Fix:** Create it (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-guacamole --gvc GVC_NAME` skips the wait.
   </Accordion>
@@ -443,13 +465,6 @@ Rotating a secret the workload references does not restart it; the old value sta
     ```bash
     cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-guacamole"} |= "schema-init"' --limit 50 --since 10m
     ```
-  </Accordion>
-  <Accordion title="Second install refused as managed by a different release">
-    **Symptom:** Installing a second Guacamole release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
-
-    **Cause:** Both releases use the same `postgres.config.credentialsSecretName`. Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
-
-    **Fix:** Set `postgres.config.credentialsSecretName` to a distinct name for the second release and install again.
   </Accordion>
   <Accordion title="Rotated the admin secret but the old password still works">
     **Symptom:** You changed `username` or `password` in the admin secret (and even forced a redeployment), yet the original credentials still sign in and the new ones are rejected.
@@ -490,7 +505,7 @@ Rotating a secret the workload references does not restart it; the old value sta
 
 ## Important Notes
 
-- **Create the admin secret before installing** — `admin.secretName` must name an existing dictionary secret with `username` and `password`. A missing secret wedges the deployment silently; see [Prerequisites](#prerequisites) for the one command that shows the reason.
+- **Create both secrets before installing** — `admin.secretName` must name an existing dictionary secret with `username` and `password`, and `postgres.config.credentialsSecretName` one with `username`, `password` and `database`. A missing secret wedges the deployment silently; see [Prerequisites](#prerequisites) for the one command that shows the reason.
 - **The admin credentials are first-boot only.** Rotating the secret afterwards does not change your login. Change the password in the Guacamole UI instead.
 - **`guacadmin` / `guacadmin` is never valid here** — the stock account is replaced by yours before the web application starts.
 - **Rotating any referenced secret does not restart the workload.** The old value stays in force until you run `cpln workload force-redeployment RELEASE_NAME-guacamole --gvc GVC_NAME`.
@@ -500,8 +515,8 @@ Rotating a secret the workload references does not restart it; the old value sta
 - **Only RDP, VNC, SSH, and telnet are available** in `guacd:1.6.0`. The Kubernetes protocol is not compiled in.
 - **Use fully qualified internal names** — `WORKLOAD_NAME.GVC_NAME.cpln.local` — both for reaching Guacamole from other workloads and for the connection targets you configure in it.
 - **Keep `guacamole.image` and `guacd.image` on the same tag** — the web application and the protocol daemon are versioned together upstream.
-- **Change `postgres.credentials.password` before installing** and give each release its own `postgres.config.credentialsSecretName` — secret names are org-wide, and a second release on the same name is refused at install.
-- **Uninstalling deletes the volume set** and every user, connection, and history row in it; your admin secret is yours and survives.
+- **Rotating the database password needs `ALTER ROLE` first and a forced redeployment of `RELEASE_NAME-guacamole`**, not the database — see [Bundled PostgreSQL](#bundled-postgresql). Give each release its own database credentials secret; secret names are org-wide.
+- **Uninstalling deletes the volume set** and every user, connection, and history row in it; your prerequisite secrets are yours and survive.
 
 ## External References
 

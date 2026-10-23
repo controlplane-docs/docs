@@ -1,7 +1,7 @@
 ---
 title: Ghost
 icon: /template-catalog/templates/icons/ghost.png
-description: Deploy Ghost on Control Plane. Open-source publishing platform for blogs, newsletters and paid memberships, as a single-replica Ghost 6 workload with a bundled MySQL 8 database, persistent content volume, public HTTPS endpoint, optional SMTP and scheduled database backups. Needs an existing GVC.
+description: Deploy Ghost on Control Plane. Open-source publishing platform for blogs, newsletters and paid memberships, as a single-replica Ghost 6 workload with a bundled MySQL 8 database, persistent content volume, public HTTPS endpoint, optional SMTP and backups. Needs an existing GVC and database secrets.
 keywords: ['blogging platform', 'cms', 'wordpress alternative', 'substack alternative', 'medium alternative', 'headless cms', 'content api', 'admin api', 'self-hosted publishing', 'mysqldump', 'staff 2fa', 'custom domain']
 ---
 
@@ -20,17 +20,41 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Workload | `RELEASE_NAME-ghost` | Ghost server — site, editor and Content/Admin APIs on port `2368` (stateful, 1 replica, container `ghost`) | — |
 | Volume Set | `RELEASE_NAME-ghost-vs` | Content directory at `/var/lib/ghost/content`: uploaded images, themes, logs, adapters | — |
 | Secret | `RELEASE_NAME-ghost-start` | Startup script that sets Ghost's `url` and hands off to the image entrypoint | — |
-| Identity & Policy | `RELEASE_NAME-ghost-identity`, `RELEASE_NAME-ghost-policy` | `reveal` on exactly the startup script, the MySQL credentials secret, and your SMTP secret when `mail.secretName` is set | — |
+| Identity & Policy | `RELEASE_NAME-ghost-identity`, `RELEASE_NAME-ghost-policy` | `reveal` on exactly the startup script, your database credentials secret, and your SMTP secret when `mail.secretName` is set | — |
 | Workload | `RELEASE_NAME-mysql` | MySQL 8 database (stateful, 1 replica, container `mysql`, port `3306`) from the bundled [mysql](/template-catalog/templates/mysql) subchart | — |
 | Volume Set | `RELEASE_NAME-mysql-vs` | MySQL data directory at `/var/lib/mysql` | — |
-| Secret | `RELEASE_NAME-mysql-config` | Dictionary secret the chart writes from `mysql.config` — keys `database`, `user`, `password`, `rootPassword` | — |
-| Identity & Policy | `RELEASE_NAME-mysql-identity`, `RELEASE_NAME-mysql-policy` | `reveal` on the MySQL credentials secret; carries the cloud-account binding when backups are on | — |
+| Identity & Policy | `RELEASE_NAME-mysql-identity`, `RELEASE_NAME-mysql-policy` | `reveal` on your two database secrets; carries the cloud-account binding when backups are on | — |
 | Workload | `RELEASE_NAME-mysql-backup` | Cron job running a scheduled `mysqldump` to S3 or GCS | `mysql.backup.enabled: true` |
-| Workload | `RELEASE_NAME-mysql-phpmyadmin` | phpMyAdmin console, published to the internet with the root password in its environment | `mysql.enablePhpMyAdmin: true` |
 
 ## Prerequisites
 
-None for a default install — it deploys with a working MySQL 8 backend and an auto-assigned HTTPS endpoint. The two bundled database passwords ship as `change-me-…` placeholders and **must** be changed at install time; see [Installation](#installation).
+Two database secrets must exist **before** you install; the chart never creates them. They hold credentials, so they are prerequisite secrets rather than values — a value would sit in plaintext in the Helm release for the life of the install. Secrets are org-level, so no GVC flag is involved.
+
+<Steps>
+  <Step title="Database credentials">
+    A [dictionary secret](/guides/create-secret/dictionary) with keys `username`, `password` and `database`. MySQL is initialized with it on first boot, and Ghost connects with the same keys:
+
+    ```bash
+    cpln secret create-dictionary --name my-ghost-db-credentials \
+      --entry username=ghost --entry password='YOUR-STRONG-PASSWORD' --entry database=ghost
+    ```
+
+    Set `mysql.credentialsSecretName` to this name.
+  </Step>
+  <Step title="MySQL root password">
+    An [opaque secret](/guides/create-secret/opaque) holding the MySQL root password, kept separate so Ghost never reads it:
+
+    ```bash
+    printf '%s' 'YOUR-STRONG-ROOT-PASSWORD' | cpln secret create-opaque --name my-ghost-mysql-root-password --encoding plain -f -
+    ```
+
+    Set `mysql.rootPasswordSecretName` to this name. The two names must differ.
+  </Step>
+</Steps>
+
+<Warning>
+If either database secret is missing, the install reports success and then waits silently: `cpln logs` shows nothing, and the missing secret is named only in `status.versions[].message` of `cpln workload get-deployments RELEASE_NAME-mysql --gvc GVC_NAME -o yaml`. The workload recovers on its own once the secret exists, or immediately after `cpln workload force-redeployment RELEASE_NAME-mysql --gvc GVC_NAME`.
+</Warning>
 
 Two optional features need setup before you install:
 
@@ -57,13 +81,13 @@ Create the SMTP secret **before** installing with `mail.secretName` set. A name 
 
 ## Installation
 
-A default install needs only the two database passwords — leave neither on its `change-me-…` placeholder:
+A default install needs only the names of the two database secrets:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/ghost \
-  --version 1.2.0 --gvc GVC_NAME \
-  --set mysql.config.password='YOUR-STRONG-PASSWORD' \
-  --set mysql.config.rootPassword='YOUR-STRONG-ROOT-PASSWORD'
+  --version 1.3.0 --gvc GVC_NAME \
+  --set mysql.credentialsSecretName=my-ghost-db-credentials \
+  --set mysql.rootPasswordSecretName=my-ghost-mysql-root-password
 ```
 
 Or install using your preferred method:
@@ -186,12 +210,13 @@ internalAccess:
 # Ghost supports ONLY MySQL 8 (not MySQL 9, not MariaDB) — image pinned to mysql:8.
 mysql:
   image: mysql:8
-  enablePhpMyAdmin: false # keep the footprint to Ghost + its DB
-  config:
-    db: ghost
-    user: ghost
-    password: change-me-ghost-db      # change before installing
-    rootPassword: change-me-mysql-root # change before installing
+  # BOTH SECRETS MUST EXIST BEFORE YOU INSTALL — the deployment waits silently on a
+  # secret that does not exist. See Prerequisites for the exact commands.
+  # `dictionary` secret with keys `username`, `password`, `database`: MySQL is
+  # initialized with it on first boot, and Ghost connects with the same keys.
+  credentialsSecretName: my-ghost-db-credentials
+  # `opaque` secret (encoding: plain) holding the MySQL root password.
+  rootPasswordSecretName: my-ghost-mysql-root-password
   resources:
     minCpu: 150m        # keep cpu:minCpu ratio under the platform's 4:1 (500/150 = 3.3:1)
     maxCpu: 500m
@@ -224,14 +249,13 @@ mysql:
 ```
 
 - `mysql.image` — Pinned to `mysql:8`. Ghost supports **only MySQL 8** — not MySQL 9 and not MariaDB. Do not change it.
-- `mysql.config.db` / `user` / `password` / `rootPassword` — The database, user and passwords the chart writes into the `RELEASE_NAME-mysql-config` secret and MySQL applies on first boot. **Both passwords must be changed before installing** — the `change-me-…` defaults are published in the public template repository, and an install that keeps them runs with a known password. They are internal to the release: Ghost reads them from the secret, and nothing outside the GVC can reach the database.
+- `mysql.credentialsSecretName` / `mysql.rootPasswordSecretName` — The names of your two prerequisite database secrets (see [Prerequisites](#prerequisites)): a dictionary with `username`, `password` and `database`, and an opaque secret with the root password. MySQL applies them on first boot; Ghost reads only the first. Both must exist before installing and must be two different secrets.
 - `mysql.resources` / `mysql.volumeset.capacity` — CPU and memory bounds and the initial data volume size in GiB (minimum 10). The reservation-to-limit ratio is tuned to the platform's cap for stateful workloads; keep it when you raise the limits.
 - `mysql.internalAccess.type` — Which workloads can reach MySQL directly on port `3306`, using the same four types as Ghost's `internalAccess`.
-- `mysql.enablePhpMyAdmin` — Off by default. When `true`, the subchart adds a `RELEASE_NAME-mysql-phpmyadmin` workload that is **open to the whole internet** and carries the root password in its environment. Leave it off on a public site.
 - `mysql.backup.*` — Scheduled dumps to S3 or GCS, off by default. See [Backing Up](#backing-up) for the bucket, Cloud Account and IAM setup.
 
 <Note>
-MySQL applies `mysql.config.*` only on first startup, when the data directory is empty. Changing a password in values after the initial deployment does not change the running database — change it inside MySQL with `ALTER USER` and upgrade the release so the secret matches. To fully reset, `cpln helm uninstall RELEASE_NAME --gvc GVC_NAME` (which deletes both volume sets and all data) and reinstall, or install under a new release name.
+MySQL applies the database secrets only on first startup, when the data directory is empty. Editing a secret after the initial deployment does not change the running database — change the password inside MySQL with `ALTER USER` first, then update the secret's `password` key (`cpln secret edit SECRET_NAME`) and force a redeployment of `RELEASE_NAME-mysql` and `RELEASE_NAME-ghost` (a secret change is not picked up until the workloads redeploy). To fully reset, `cpln helm uninstall RELEASE_NAME --gvc GVC_NAME` (which deletes both volume sets and all data) and reinstall, or install under a new release name.
 </Note>
 
 ## Connecting
@@ -241,7 +265,7 @@ MySQL applies `mysql.config.*` only on first startup, when the data directory is
 | Public site | `https://CANONICAL_ENDPOINT` | Assigned automatically when `publicAccess.enabled: true`. Read it from `status.canonicalEndpoint` in `cpln workload get RELEASE_NAME-ghost --gvc GVC_NAME -o yaml`. |
 | Admin panel | `https://CANONICAL_ENDPOINT/ghost` | Editor, settings, members and staff. The owner account is created here on first visit — see [First Run](#first-run). |
 | Internal (same GVC) | `http://RELEASE_NAME-ghost.GVC_NAME.cpln.local:2368` | Subject to `internalAccess.type`. With public access on, Ghost redirects plain-HTTP requests to its HTTPS `url` unless the request carries `X-Forwarded-Proto: https`. |
-| Database | `RELEASE_NAME-mysql.GVC_NAME.cpln.local:3306` | Subject to `mysql.internalAccess.type`. Credentials: `cpln secret reveal RELEASE_NAME-mysql-config -o yaml` (keys `database`, `user`, `password`, `rootPassword`). |
+| Database | `RELEASE_NAME-mysql.GVC_NAME.cpln.local:3306` | Subject to `mysql.internalAccess.type`. Credentials: the secret named by `mysql.credentialsSecretName` — `cpln secret reveal SECRET_NAME -o yaml` (keys `username`, `password`, `database`). |
 
 Verify the site is serving once the workload reports ready — the default theme answers `200` before any owner exists:
 
@@ -278,7 +302,7 @@ Ghost ships no bootstrap credentials. The first visitor to `/ghost` creates the 
 
 Two things hold your data: the MySQL database (posts, pages, members, settings, staff accounts) and the content volume set (uploaded images, themes). A database dump does not include media.
 
-**Scheduled database dumps** are off by default. When `mysql.backup.enabled: true`, the `RELEASE_NAME-mysql-backup` cron workload runs `mysqldump --databases` of the database named in `mysql.config.db` on `mysql.backup.schedule` and uploads a gzipped archive named `mysql-TIMESTAMP.sql.gz` under `mysql.backup.*.prefix` in your bucket. Pick a `mysql.backup.provider` and complete the storage setup **before** enabling it:
+**Scheduled database dumps** are off by default. When `mysql.backup.enabled: true`, the `RELEASE_NAME-mysql-backup` cron workload runs `mysqldump --databases` of the database named in the `database` key of your `mysql.credentialsSecretName` secret on `mysql.backup.schedule` and uploads a gzipped archive named `mysql-TIMESTAMP.sql.gz` under `mysql.backup.*.prefix` in your bucket. Pick a `mysql.backup.provider` and complete the storage setup **before** enabling it:
 
 <Tabs>
   <Tab title="AWS S3">
@@ -339,7 +363,7 @@ This ad-hoc command has **not been run against a live install of this template**
 This restore procedure was written against the chart's configuration and the backup image's dump format. It has **not been exercised against a live install of this template** — rehearse it on a throwaway release before you need it, and treat any step that errors as a stop.
 </Warning>
 
-Scheduled dumps are gzipped `mysqldump --databases` output of the database named in `mysql.config.db`, created with `--set-gtid-purged=OFF`, so the archive recreates the database itself (`CREATE DATABASE` and `USE` are embedded) and carries no GTID statement to strip. Download the archive from your bucket (`aws s3 cp` or `gsutil cp`), then stream it into the running MySQL through `cpln workload exec`. Stdin is off by default on `exec`, so pass `--stdin`, and base64-wrap the stream so nothing is altered in transit:
+Scheduled dumps are gzipped `mysqldump --databases` output of the database named in the `database` key of your `mysql.credentialsSecretName` secret, created with `--set-gtid-purged=OFF`, so the archive recreates the database itself (`CREATE DATABASE` and `USE` are embedded) and carries no GTID statement to strip. Download the archive from your bucket (`aws s3 cp` or `gsutil cp`), then stream it into the running MySQL through `cpln workload exec`. Stdin is off by default on `exec`, so pass `--stdin`, and base64-wrap the stream so nothing is altered in transit:
 
 ```bash
 gunzip -c mysql-TIMESTAMP.sql.gz \
@@ -383,6 +407,26 @@ Blocks that expose only a limit (`mysql.backup.resources`) keep the bare `cpu` /
 Template version 1.2.0 adds `staffDeviceVerification` (default `false`), which turns off the emailed sign-in code Ghost 6 requires on every new-device admin login. On a 1.1.0 install without SMTP that code could never be delivered and `/ghost` was unreachable from a new browser; after the upgrade admin login works without mail. If you have SMTP configured and want the check back, set `staffDeviceVerification: true`.
 
 The first `cpln helm upgrade` after an install can restart the bundled MySQL even when no database value changed, so run it during a quiet period.
+
+### Upgrading from 1.2.0
+
+Template version 1.3.0 removed `mysql.config` (database name, user, password and root password): the database credentials are now the two prerequisite secrets under [Prerequisites](#prerequisites), the same ones the `mysql` template requires on its own. An upgrade that still carries `mysql.config` is refused at render, before anything changes; `mysql.enablePhpMyAdmin` is refused the same way, so remove it too.
+
+1.2.0 created the secret `RELEASE_NAME-mysql-config` itself, and **this upgrade deletes it**. Create the new secrets under **different** names, holding the values your database was initialized with (not new ones, or Ghost and MySQL lose their login). Read the current values first:
+
+```bash
+cpln secret reveal RELEASE_NAME-mysql-config -o yaml
+```
+
+Then create the two secrets from them (`user` becomes `username`; `rootPassword` gets its own secret). Use your current user and database names too, not `ghost`, if you changed them:
+
+```bash
+cpln secret create-dictionary --name my-ghost-db-credentials \
+  --entry username='YOUR_CURRENT_USER' --entry password='YOUR_CURRENT_PASSWORD' --entry database='YOUR_CURRENT_DATABASE'
+printf '%s' 'YOUR_CURRENT_ROOT_PASSWORD' | cpln secret create-opaque --name my-ghost-mysql-root-password --encoding plain -f -
+```
+
+Upgrade with `mysql.credentialsSecretName` and `mysql.rootPasswordSecretName` set to those names, and `mysql.config` and `mysql.enablePhpMyAdmin` removed. The upgrade restarts MySQL and Ghost, so the site is briefly unavailable. The new version of a workload can wait for several minutes, with `get-deployments` reporting that it is not allowed to reveal the secret, while access to the new secrets propagates; the previous version keeps serving meanwhile, and it clears by itself.
 
 ### Scaling and Availability
 
@@ -428,25 +472,39 @@ Durability comes from the two volume sets and, optionally, scheduled database du
 
     **Fix:** Set `publicUrl` to the full `https://` address visitors use, upgrade the release, then run `cpln workload force-redeployment RELEASE_NAME-ghost --gvc GVC_NAME`.
   </Accordion>
-  <Accordion title="Changed a database password in values but MySQL still uses the old one">
-    **Symptom:** After `cpln helm upgrade` with a new `mysql.config.password` or `rootPassword`, Ghost fails to authenticate with `Access denied for user`.
+  <Accordion title="Changed a database password in the secret but MySQL still uses the old one">
+    **Symptom:** After editing the `password` key of your database credentials secret and redeploying, Ghost fails to authenticate with `Access denied for user`.
 
-    **Cause:** MySQL applies `mysql.config.*` only when the data directory is first initialized. The upgrade changed the secret, so Ghost now sends a password the database never learned.
+    **Cause:** MySQL applies the database secrets only when the data directory is first initialized. Ghost now sends a password the database never learned.
 
-    **Fix:** Either change the password inside MySQL to match the new value (`ALTER USER 'ghost'@'%' IDENTIFIED BY '...'` via `cpln workload exec RELEASE_NAME-mysql --gvc GVC_NAME --container mysql -- mysql -u root -p ...`), or put the old value back in values and upgrade again. A clean reset is uninstall (deletes both volume sets) and reinstall.
+    **Fix:** Either change the password inside MySQL to match the new value (`ALTER USER 'ghost'@'%' IDENTIFIED BY '...'` via `cpln workload exec RELEASE_NAME-mysql --gvc GVC_NAME --container mysql -- mysql -u root -p ...`), or put the old value back in the secret and force a redeployment of `RELEASE_NAME-ghost`. A clean reset is uninstall (deletes both volume sets) and reinstall.
+  </Accordion>
+  <Accordion title="MySQL never becomes ready and cpln logs shows nothing">
+    **Symptom:** `RELEASE_NAME-mysql` stays not ready after install, and `cpln logs` returns no lines for it.
+
+    **Cause:** A secret named by `mysql.credentialsSecretName` or `mysql.rootPasswordSecretName` does not exist, so the container never starts.
+
+    **Fix:** Read `status.versions[].message` in `cpln workload get-deployments RELEASE_NAME-mysql --gvc GVC_NAME -o yaml` — it names the missing secret. Create it as shown in [Prerequisites](#prerequisites); the workload recovers on its own, or immediately after `cpln workload force-redeployment RELEASE_NAME-mysql --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Upgrade fails with mysql.config was removed in 1.3.0">
+    **Symptom:** `cpln helm upgrade` stops at render with `ghost: mysql.config was removed in 1.3.0` (or `mysql.enablePhpMyAdmin was removed in 1.3.0`). Nothing is changed on the platform.
+
+    **Cause:** Your values still carry the 1.2.0 plaintext database passwords.
+
+    **Fix:** Create the two database secrets holding your current values and remove the old keys — see [Upgrading from 1.2.0](#upgrading-from-1-2-0).
   </Accordion>
 </AccordionGroup>
 
 ## Important Notes
 
-- **Change both `mysql.config` passwords at install time** — the `change-me-…` defaults are public, and they seed the database on first boot; later value edits do not change the stored passwords.
+- **Create both database secrets before installing** — a missing one wedges `RELEASE_NAME-mysql` silently; see [Prerequisites](#prerequisites).
+- **The database secrets seed MySQL on first boot only** — editing them later does not change the stored passwords: change the password inside MySQL first, then update the secret and force a redeployment of `RELEASE_NAME-mysql` and `RELEASE_NAME-ghost`.
 - **Create the owner account right after install** — until someone completes the form at `/ghost`, the public site has no admin and anyone who reaches it can claim ownership.
 - **MySQL 8 only** — keep `mysql.image: mysql:8`; Ghost does not support MySQL 9 or MariaDB.
 - **SMTP is a prerequisite secret, not a value** — create the dictionary secret (keys `user`, `password`) before installing with `mail.secretName` set; a missing secret wedges the deployment silently.
 - **Set `publicUrl` when you attach a custom domain**, then force a redeployment of `RELEASE_NAME-ghost` — links and emails use whatever `url` the container started with.
 - **`staffDeviceVerification: true` requires working SMTP** — the chart refuses it otherwise, and a mis-delivering mail setup locks staff out of `/ghost` from new devices.
 - **Single replica by design** — there is no `replicas` knob; expect a brief interruption on restart or upgrade, and the first upgrade after install can restart the bundled MySQL.
-- **Leave `mysql.enablePhpMyAdmin` off on a public site** — the console it adds is open to the internet and holds the root password.
 - **Data survives redeploys under the same release name** — content in `RELEASE_NAME-ghost-vs`, the database in `RELEASE_NAME-mysql-vs`. `cpln helm uninstall` deletes both; a database dump does not include uploaded media.
 
 ## External References

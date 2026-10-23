@@ -22,8 +22,8 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Workload | `RELEASE_NAME-redis-backup` | Cron job that uploads an RDB snapshot to S3 or GCS; runs as the Redis identity | `backup.enabled: true` |
 | Secret | `RELEASE_NAME-redis-config` | `redis.conf`, file-mounted into each Redis container | — |
 | Secret | `RELEASE_NAME-sentinel-config` | `sentinel.conf`, file-mounted into each Sentinel container | `mode: production` (default) |
-| Secret | `RELEASE_NAME-redis-auth-password` | Redis password | `redis.auth.password.enabled: true` |
-| Secret | `RELEASE_NAME-sentinel-auth-password` | Sentinel password | `sentinel.auth.password.enabled: true` (production mode) |
+| Secret | `RELEASE_NAME-redis-auth-password` | Redis password, created only for a password set in values | `redis.auth.password.enabled: true` |
+| Secret | `RELEASE_NAME-sentinel-auth-password` | Sentinel password, created only for a password set in values | `sentinel.auth.password.enabled: true` (production mode) |
 | Secret | `RELEASE_NAME-redis-backup-config` | Bucket and region for the backup job | `backup.enabled: true` |
 | Identity | `RELEASE_NAME-redis-identity` | Identity of the Redis workload and the backup job; carries the cloud account binding when backup is enabled | — |
 | Identity | `RELEASE_NAME-sentinel-identity` | Sentinel workload identity | `mode: production` (default) |
@@ -40,15 +40,14 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 None for a default install. Three optional features need something to exist first:
 
 <Steps>
-  <Step title="Optional: bring your own password secret">
-    By default authentication is off, and `redis.auth.password` creates the password secret for you. To supply the password from a secret you manage instead, create a dictionary secret whose key matches `passwordKey` (default `password`) before installing. Use a separate secret for the Sentinel tier if you enable `sentinel.auth.fromSecret`.
+  <Step title="Optional: a password secret for authentication (recommended)">
+    Authentication is off by default. To turn it on, the recommended way is a password secret you create **before** install, so the password never enters the release values. Create a [dictionary secret](/guides/create-secret/dictionary) with the password under the key `password` (the default `passwordKey`); one secret can serve both Redis and Sentinel:
 
     ```bash
-    cpln secret create-dictionary --name SECRET_NAME \
-      --entry password='YOUR-STRONG-PASSWORD'
+    cpln secret create-dictionary --name my-redis-password --entry password="$(openssl rand -hex 32)"
     ```
 
-    Set `redis.auth.fromSecret.name` (and `sentinel.auth.fromSecret.name`) to this name and `fromSecret.enabled` to `true`. See [Authentication](#authentication).
+    Set `redis.auth.fromSecret.name` (and, in production mode, `sentinel.auth.fromSecret.name`) to this name and `fromSecret.enabled` to `true`. See [Authentication](#authentication).
 
     <Warning>
     If the secret does not exist when the workload starts, the deployment wedges silently: `cpln logs` returns nothing and the workload never becomes ready. The missing secret is named only in `status.versions[].message`:
@@ -76,6 +75,8 @@ A default install needs no values:
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/redis \
   --version 3.9.0 --gvc GVC_NAME
 ```
+
+To turn on authentication from the password secret in [Prerequisites](#prerequisites), set `redis.auth.fromSecret.enabled=true` and `redis.auth.fromSecret.name=my-redis-password`, and the same two keys under `sentinel.auth` in production mode.
 
 <CardGroup cols={2}>
     <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
@@ -189,22 +190,40 @@ redis:
 
 #### Authentication
 
-Authentication is off by default. Enable exactly one method per tier; the chart refuses to render with both enabled. In production mode the Sentinel tier takes the same two options under `sentinel.auth`; dev mode uses `redis.auth` only and refuses `sentinel.auth`.
+Authentication is off by default. Enable exactly one method per tier; the chart refuses to render with both enabled. In production mode apply the same config under both `redis.auth` and `sentinel.auth`; dev mode uses `redis.auth` only and refuses `sentinel.auth`.
+
+Recommended: read the password from the secret created in [Prerequisites](#prerequisites):
 
 ```yaml
 redis:
   auth:
     fromSecret:
-      enabled: false              # set true to read the password from a secret you created (see Prerequisites)
-      name: example-redis-auth-password
+      enabled: true
+      name: my-redis-password   # dictionary secret; must exist before install
+      passwordKey: password     # key holding the password
+
+sentinel:
+  auth:
+    fromSecret:
+      enabled: true
+      name: my-redis-password   # the same secret can serve both tiers
       passwordKey: password
+```
+
+Still supported, but less secure: a password in values is stored in the Helm release, and the chart creates the password secret from it:
+
+```yaml
+redis:
+  auth:
     password:
-      enabled: false              # set true to have the chart create the password secret from `value`
+      enabled: true
       value: change-me-redis-password
 ```
 
+Set the password at install. Nodes read the secret only when they start, so a new value reaches them only after `cpln workload force-redeployment`, and that is a password change on a running release (see the warning below). With Sentinel persistence on, Sentinel also keeps the password it wrote at its first start.
+
 <Warning>
-**Do not change the password on a running release.** Changing `redis.auth.password.value` (or the contents of the referenced secret) stops the rolling update: a restarted replica can no longer authenticate to the master, so it never becomes ready and the rollout stops advancing. Setting the previous password back recovers it. To change the password, uninstall and reinstall.
+**Do not change the password on a running release,** in values or in the password secret. Changing `redis.auth.password.value` (or the contents of the referenced secret) stops the rolling update: a restarted replica can no longer authenticate to the master, so it never becomes ready and the rollout stops advancing. Setting the previous password back recovers it. To change the password, uninstall and reinstall.
 </Warning>
 
 A password may contain spaces, quotes, backslashes and any other printable character. Line breaks, tabs and other control characters are not supported, because each password is written on a single configuration line.
@@ -675,7 +694,8 @@ Afterwards, point your clients at Sentinel (`RELEASE_NAME-sentinel.GVC_NAME.cpln
 - **Choose `engine` at install time.** Switching it on a running release does not migrate anything; Valkey cannot read data written by Redis 8.
 - **Choose persistence at install time when you can.** To add it to a running release, set `suspend: true` in the same upgrade, then `suspend: false`; data held only in memory is lost.
 - **`suspend: true` stops every node.** Without persistence, the data in memory is lost.
-- **Never change the password in place.** The rolling update stops advancing; set the previous password back to recover, and reinstall to change it.
+- **Prefer `auth.fromSecret` over a password in values**, which is stored in the Helm release. Create the secret before install; a missing one is named only in `status.versions[].message` from `cpln workload get-deployments`.
+- **Never change the password in place,** in values or in the password secret. The rolling update stops advancing; set the previous password back to recover, and reinstall to change it.
 - **In production mode, always discover the master through Sentinel** (`mymaster` at `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379`). A client pinned to replica 0 gets `READONLY` errors after any failover or upgrade. In dev mode, connect to `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` directly.
 - **Enable `sentinel.persistence` in production** so the elected master survives Sentinel restarts.
 - **The Redis 7.4 to 8 upgrade is one-way.** Snapshot the volume set before upgrading if you need a rollback path.

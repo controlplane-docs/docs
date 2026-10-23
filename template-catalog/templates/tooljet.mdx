@@ -1,7 +1,7 @@
 ---
 title: ToolJet
 icon: /template-catalog/templates/icons/tooljet.png
-description: Deploy ToolJet, the open-source low-code platform for internal tools, on Control Plane. Single server that scales out with Redis, with bundled PostgreSQL for the app and the ToolJet Database. Needs an existing GVC and a pre-created dictionary secret holding its three keys.
+description: Deploy ToolJet, the open-source low-code platform for internal tools, on Control Plane. Single server that scales out with Redis, with bundled PostgreSQL for the app and the ToolJet Database. Needs an existing GVC and pre-created key and database credentials secrets.
 keywords: ['tooljet', 'low-code', 'no-code', 'internal tools', 'admin panel', 'app builder', 'retool alternative', 'appsmith alternative', 'budibase alternative', 'crud dashboard', 'postgrest', 'self-hosted', 'agpl']
 ---
 
@@ -23,24 +23,33 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Workload | `RELEASE_NAME-redis` | Redis data node from the [redis](/template-catalog/templates/redis) template — the shared job queue and multiplayer coordination for more than one ToolJet replica (1 replica) | `redis.enabled: true` |
 | Workload | `RELEASE_NAME-sentinel` | Redis Sentinel, monitor-only (1 replica) | `redis.enabled: true` |
 | Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory | — |
-| Secret | `RELEASE_NAME-tooljet-db` | Dictionary secret the chart creates with the database username and password ToolJet uses for its `PG_*`, `TOOLJET_DB_*`, and `PGRST_DB_URI` settings | — |
-| Secret | the name in `postgres.config.credentialsSecretName` | Dictionary secret the chart creates (`username`, `password`, `database`) and hands to the bundled PostgreSQL | — |
 | Secret | `RELEASE_NAME-tooljet-startup` | Startup script that waits for PostgreSQL to accept connections before handing off to the image entrypoint | — |
-| Secret | `RELEASE_NAME-redis-auth-password` | Redis password, wired into ToolJet as `REDIS_PASSWORD` | `redis.redis.auth.password.enabled: true` |
 | Secret | `RELEASE_NAME-redis-config`, `RELEASE_NAME-sentinel-config` | Redis and Sentinel configuration files | `redis.enabled: true` |
 | Identity | `RELEASE_NAME-tooljet-identity` | Bound to the ToolJet workload | — |
-| Policy | `RELEASE_NAME-tooljet-policy` | Grants that identity `reveal` on exactly the secrets it reads: the two chart-created ToolJet secrets, your key secret, and the SMTP and Redis password secrets when configured | — |
+| Policy | `RELEASE_NAME-tooljet-policy` | Grants that identity `reveal` on exactly the secrets it reads: the chart's startup script, your key secret and database credentials secret, and the SMTP and Redis password secrets when configured | — |
 | Identity | `RELEASE_NAME-pg-identity` | Bound to the bundled PostgreSQL and its backup job; carries your cloud account link when backups are on | — |
 | Policy | `RELEASE_NAME-pg-policy` | Grants the PostgreSQL identity `reveal` on its credentials secret only | — |
 | Identity / Policy | `RELEASE_NAME-redis-identity`, `RELEASE_NAME-redis-policy`, `RELEASE_NAME-sentinel-identity`, `RELEASE_NAME-sentinel-policy` | Identities and secret policies for the Redis and Sentinel workloads | `redis.enabled: true` |
 
-Your key secret is **not** created by the template — see [Prerequisites](#prerequisites).
+Your prerequisite secrets are **not** created by the template — see [Prerequisites](#prerequisites).
 
 ## Prerequisites
 
-ToolJet reads its three root-of-trust keys from a [dictionary secret](/guides/create-secret/dictionary) that you create **before** installing. The key values never pass through Helm values.
+Two [dictionary secrets](/guides/create-secret/dictionary) must exist **before** installing: the bundled database's credentials, and ToolJet's three root-of-trust keys. Their values never pass through Helm values.
 
 <Steps>
+  <Step title="Create the database credentials secret">
+    The bundled PostgreSQL initializes with these and ToolJet connects with them (it creates its `tooljet_db` database alongside):
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=tooljet \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=tooljet
+    ```
+
+    Set `postgres.config.credentialsSecretName` to this name. Keep the password URL-safe (letters, digits, `-`, `_`) — ToolJet places it in a connection URL as-is. PostgreSQL reads the secret only when its data directory is first initialized; see [Rotating the Database Password](#rotating-the-database-password) for changing it later.
+  </Step>
   <Step title="Create the key secret">
     Generate the three keys the same way ToolJet's own setup scripts do, straight into the secret:
 
@@ -64,8 +73,15 @@ ToolJet reads its three root-of-trust keys from a [dictionary secret](/guides/cr
   </Step>
 </Steps>
 
+Only if you turn Redis auth on, create one more dictionary secret with the key `password` and name it in `redis.redis.auth.fromSecret.name` (with `redis.redis.auth.fromSecret.enabled: true`). Redis, its Sentinel and ToolJet all read it:
+
+```bash
+cpln secret create-dictionary --name REDIS_SECRET_NAME \
+  --entry password="$(openssl rand -hex 24)"
+```
+
 <Warning>
-Create the secret **before** installing. Installing without it reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message`:
+Create the secrets **before** installing. Installing without one reports success, but the deployment then wedges silently — `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message` (also check `RELEASE_NAME-postgres` for the database secret and `RELEASE_NAME-redis` for the Redis secret):
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-tooljet --gvc GVC_NAME -o yaml
@@ -81,16 +97,16 @@ Everything else works with the defaults. Two optional features need their own se
 
 ## Installation
 
-Once your key secret exists, install from the marketplace registry, pointing `secrets.name` at it and replacing the bundled database password:
+Once your key and database credentials secrets exist, install from the marketplace registry, pointing the chart at them:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/tooljet \
-  --version 1.2.0 --gvc GVC_NAME \
+  --version 1.3.0 --gvc GVC_NAME \
   --set secrets.name=KEYS_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-DB-PASSWORD'
+  --set postgres.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME
 ```
 
-Installing a second ToolJet release in the same org? Also set `postgres.config.credentialsSecretName` to a name no other release uses — secret names are org-wide. If you want email invitations, add the `smtp.*` values to this first install as well (see [Email](#email)).
+Installing a second ToolJet release in the same org? Give it its own database credentials secret — secret names are org-wide. If you want email invitations, add the `smtp.*` values to this first install as well (see [Email](#email)).
 
 Other ways to install and manage the template:
 
@@ -197,12 +213,8 @@ With `publicAccess.enabled: false` there is no public endpoint; external request
 ```yaml
 postgres:
   image: postgres:16          # upstream-proven with the bundled PostgREST 12.2.0
-  credentials:                # the chart writes these into the secret named below — nothing for you to create
-    username: tooljet
-    password: change-me-tooljet-pg   # change before installing — seeds the database on first boot
-    database: tooljet         # application database; tooljet_db is auto-created alongside it
   config:
-    credentialsSecretName: my-tooljet-db-credentials   # secret this chart CREATES; names are org-wide, so one per release
+    credentialsSecretName: my-tooljet-db-credentials  # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   resources:
     minCpu: 250m
     maxCpu: 1000m
@@ -212,7 +224,7 @@ postgres:
     capacity: 10              # GiB (minimum 10)
 ```
 
-One PostgreSQL instance backs the whole deployment, and ToolJet's boot scripts create every database it needs using the credentials above:
+One PostgreSQL instance backs the whole deployment, and ToolJet's boot scripts create every database it needs using the credentials from that secret:
 
 | Database | Contents |
 |---|---|
@@ -220,7 +232,7 @@ One PostgreSQL instance backs the whole deployment, and ToolJet's boot scripts c
 | `tooljet_db` | The ToolJet Database — user tables created in the UI, served through the in-image PostgREST. |
 | `sample_db` | Sample data created by ToolJet's boot scripts. |
 
-`postgres.credentials.password` seeds the database on first boot and is not updated by later value edits — set it before you install. It is bundled plumbing, so the chart creates the credentials secret for you; it is not a prerequisite. Scheduled backups of this database are configured under [Backing Up](#backing-up).
+The credentials secret seeds the database on first boot; editing it later does not change the database password (see [Rotating the Database Password](#rotating-the-database-password)). Scheduled backups of this database are configured under [Backing Up](#backing-up).
 
 <Note>
 The ToolJet Database is a core part of ToolJet 3.x and cannot be turned off.
@@ -235,9 +247,9 @@ redis:
     image: redis:7.4
     replicas: 1               # keep at 1 — ToolJet is not Sentinel-aware
     auth:
-      password:
-        enabled: false        # true = require AUTH; the password is wired into ToolJet as REDIS_PASSWORD
-        value: change-me-tooljet-redis
+      fromSecret:
+        enabled: false        # true = require AUTH (Redis, Sentinel and ToolJet read the secret below)
+        name: ""              # prerequisite dictionary secret (key: password); used only when enabled
     resources:
       cpu: 200m
       memory: 256Mi
@@ -253,7 +265,7 @@ redis:
       minMemory: 128Mi
 ```
 
-`redis.enabled: true` deploys the [redis](/template-catalog/templates/redis) template and points ToolJet at it; it is required for more than one ToolJet replica (see [Scaling and Availability](#scaling-and-availability)). With `redis.redis.auth.password.enabled: true` the password is stored in the chart-created `RELEASE_NAME-redis-auth-password` secret, which the ToolJet identity is granted `reveal` on.
+`redis.enabled: true` deploys the [redis](/template-catalog/templates/redis) template and points ToolJet at it; it is required for more than one ToolJet replica (see [Scaling and Availability](#scaling-and-availability)). With `redis.redis.auth.fromSecret.enabled: true` Redis, Sentinel and ToolJet read the password from the prerequisite secret named by `redis.redis.auth.fromSecret.name` (see [Prerequisites](#prerequisites)), which the ToolJet identity is granted `reveal` on.
 
 <Warning>
 Keep `redis.redis.replicas` and `redis.sentinel.replicas` at `1`. ToolJet's Redis client is not Sentinel-aware and connects straight to the service DNS name, so additional data nodes would spread writes onto read-only replicas. The chart refuses to render any other value.
@@ -268,7 +280,7 @@ Keep `redis.redis.replicas` and `redis.sentinel.replicas` at `1`. ToolJet's Redi
 | Internal (same GVC) | `http://RELEASE_NAME-tooljet.GVC_NAME.cpln.local:3000` | Reachable per `internalAccess.type`. |
 | Login | The Super Admin account created during first-run onboarding | ToolJet ships no default account. |
 | PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | `username` / `password` / `database` from `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `postgres.config.credentialsSecretName`. |
-| Redis | `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` | Only with `redis.enabled: true`. |
+| Redis | `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` | Only with `redis.enabled: true`. With Redis auth on, the password is the `password` key of your `redis.redis.auth.fromSecret.name` secret. |
 
 With `publicAccess.enabled: false` there is no public endpoint; reach the UI from your machine through a tunnel instead and open `http://localhost:3000`:
 
@@ -341,23 +353,83 @@ This restore path has not been exercised against this template end to end. Rehea
 
 ### Upgrading from 1.0.0
 
-Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. ToolJet absorbed that change rather than passing it on — the chart now creates the credentials secret itself — so there is **no new prerequisite**, only a rename of three keys:
+Version 1.1.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. `postgres.config.username`, `.password` and `.database` were removed: put the values your database was initialized with into the database credentials secret under [Prerequisites](#prerequisites) (keys `username`, `password`, `database`), set `postgres.config.credentialsSecretName` to its name, and remove the three keys. The key secret is unchanged.
 
-| Removed key (1.0.0) | Replacement (1.1.0 and later) |
-|---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` |
-
-Move the three keys, keep the same values so the running database still matches, and upgrade in place. A values file that still carries an old key fails the render with the **postgres template's** message — `config.username was REMOVED in postgres 3.4.0` — which tells you to create a dictionary secret yourself; ignore that advice here, this template creates it. Then continue with the section below.
+Keep the same values so the running database still matches. A values file that still carries an old key fails the render with the **postgres template's** message — `config.username was REMOVED in postgres 3.4.0` — which tells you to create a dictionary secret; that is correct here too. Then continue with the sections below.
 
 ### Upgrading from 1.1.0
 
-Version 1.2.0 changes no values. The ToolJet container now starts through a chart-provided script that waits until PostgreSQL actually accepts connections before running the image's own entrypoint, which removes a failed first attempt that earlier versions logged on a fresh install. Upgrade in place.
+Version 1.2.0 changes no values. The ToolJet container now starts through a chart-provided script that waits until PostgreSQL actually accepts connections before running the image's own entrypoint, which removes a failed first attempt that earlier versions logged on a fresh install. Upgrade in place, then continue with [Upgrading from 1.2.0](#upgrading-from-1-2-0).
 
 <Note>
 The first `helm upgrade` after an install can restart the bundled PostgreSQL even when nothing about it changed, which interrupts ToolJet briefly; later upgrades of the same release do not.
 </Note>
+
+### Upgrading from 1.2.0
+
+Version 1.3.0 removed `postgres.credentials`: the database credentials are now a prerequisite secret, the same one the `postgres` template requires on its own. Carrying the old key forward fails the render.
+
+1.2.0 created the database secret itself (and a second copy, `RELEASE_NAME-tooljet-db`), so **this upgrade deletes both**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or ToolJet loses its database connection:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-postgres-credentials \
+  --entry username='YOUR_CURRENT_USERNAME' --entry password='YOUR_CURRENT_PASSWORD' --entry database='YOUR_CURRENT_DATABASE'
+```
+
+Then upgrade with `postgres.config.credentialsSecretName` set to that name and `postgres.credentials` removed. Your current values are in `postgres.credentials` of the 1.2.0 release, and also in the old secret named by its `postgres.config.credentialsSecretName` (`cpln secret reveal SECRET_NAME -o yaml`) until the upgrade deletes it.
+
+**If you ran 1.2.0 with Redis auth on**, `redis.redis.auth.password` was removed too (carrying it forward fails the render), and the chart-created `RELEASE_NAME-redis-auth-password` secret is deleted by the upgrade. Copy your current Redis password into a secret under a **new** name first:
+
+```bash
+cpln secret reveal RELEASE_NAME-redis-auth-password -o yaml
+cpln secret create-dictionary --name RELEASE_NAME-tooljet-redis \
+  --entry password='YOUR_CURRENT_REDIS_PASSWORD'
+```
+
+Then also set `redis.redis.auth.fromSecret.enabled: true` and `redis.redis.auth.fromSecret.name` to the new name, and remove `redis.redis.auth.password`. With Redis auth off in 1.2.0 (the default), just remove `redis.redis.auth.password` from your values.
+
+The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), so ToolJet briefly loses its database; it reconnects by itself. While access to the new secret propagates, the new version of a workload can wait in `get-deployments` reporting that it is not allowed to reveal the secret; the previous version keeps serving meanwhile, and it clears by itself.
+
+### Rotating the Database Password
+
+Editing the secret alone does nothing to the database, and a running workload keeps the values it started with. Change one key and keep the others with export, edit, apply:
+
+```bash
+cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+# edit only the key you are rotating in secret.yaml
+cpln apply -f secret.yaml
+cpln secret reveal SECRET_NAME -o yaml
+```
+
+Run `ALTER ROLE` for the secret's `username` in PostgreSQL first (URL-safe characters only), then update the secret, then right away force a redeployment of ToolJet, and wait until `get-deployments` shows a higher version number, alone and ready (right after the command the status may not show the restart yet, and `ready: true` alone can still describe the old replica). Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime. Connections the app already has open keep working after `ALTER ROLE`; new ones fail until its redeploy finishes, so redeploy right away and rotate in a quiet window.
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-tooljet --gvc GVC_NAME
+```
+
+### Rotating the Redis Password
+
+Only with Redis auth on. Redis keeps no password on disk, but a running Sentinel holds the one it started with, so a new password is applied live in three places before ToolJet restarts. Each Redis node first accepts both passwords, which keeps replication and every connected client working throughout. `rx` and `sx` run a command on one Redis node or Sentinel (`LOCATION` is your GVC's location; nodes and Sentinels are numbered from 0 up to `redis.redis.replicas` and `redis.sentinel.replicas` minus one):
+
+```bash
+rx() { cpln workload exec RELEASE_NAME-redis --gvc GVC_NAME --location LOCATION \
+  --container redis --replica "RELEASE_NAME-redis-$1" -- "${@:2}"; }
+sx() { cpln workload exec RELEASE_NAME-sentinel --gvc GVC_NAME --location LOCATION \
+  --container sentinel --replica "RELEASE_NAME-sentinel-$1" -- "${@:2}"; }
+# 1. On EVERY Redis node: accept the new password alongside the old one, and replicate with it
+rx 0 redis-cli --no-auth-warning -a OLD_PASSWORD ACL SETUSER default ">NEW_PASSWORD"
+rx 0 redis-cli --no-auth-warning -a OLD_PASSWORD CONFIG SET masterauth NEW_PASSWORD
+# 2. On EVERY Sentinel
+sx 0 redis-cli -p 26379 SENTINEL SET mymaster auth-pass NEW_PASSWORD
+# 3. Put the new password in the secret (export, edit, apply above) and read it back
+cpln secret reveal SECRET_NAME -o yaml
+# 4. Restart ToolJet, which keeps the old password until it restarts
+cpln workload force-redeployment RELEASE_NAME-tooljet --gvc GVC_NAME
+# 5. Once get-deployments shows a higher version, alone and ready: retire the old password on EVERY Redis node
+rx 0 redis-cli --no-auth-warning -a NEW_PASSWORD ACL SETUSER default "<OLD_PASSWORD"
+```
+
+ToolJet is briefly unavailable while it restarts (with `tooljet.replicas` of 2 or more it rolls one replica at a time). Redis and Sentinel need no restart: when they next start they read the new password from the secret.
 
 ### Scaling and Availability
 
@@ -378,7 +450,7 @@ The chart refuses to render `tooljet.replicas` of `2` or more while `redis.enabl
   <Accordion title="Deployment never becomes ready and the logs are empty">
     **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-tooljet --gvc GVC_NAME -o yaml` shows `The secret KEYS_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
 
-    **Cause:** The key secret named by `secrets.name` does not exist. The same applies to an `smtp.auth.secretName` that was set but never created.
+    **Cause:** The key secret named by `secrets.name` or the database credentials secret named by `postgres.config.credentialsSecretName` does not exist. The same applies to an `smtp.auth.secretName` or `redis.redis.auth.fromSecret.name` that was set but never created. Check `RELEASE_NAME-postgres` and `RELEASE_NAME-redis` the same way.
 
     **Fix:** Create it (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-tooljet --gvc GVC_NAME` skips the wait.
   </Accordion>
@@ -403,13 +475,7 @@ The chart refuses to render `tooljet.replicas` of `2` or more while `redis.enabl
 
     **Fix:** Set both back to `1`. ToolJet connects to the Redis service name directly, so extra data nodes would receive writes they cannot accept.
   </Accordion>
-  <Accordion title="Second install refused as managed by a different release">
-    **Symptom:** Installing a second ToolJet release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
 
-    **Cause:** Both releases use the same `postgres.config.credentialsSecretName`. Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
-
-    **Fix:** Set `postgres.config.credentialsSecretName` to a distinct name for the second release and install again.
-  </Accordion>
   <Accordion title="SMTP was enabled through an upgrade but no email is sent">
     **Symptom:** `smtp.enabled: true` was applied with `helm upgrade`, the `SMTP_*` variables are on the workload, yet invitations and password resets send nothing and the instance still reports mail as disabled.
 
@@ -422,7 +488,14 @@ The chart refuses to render `tooljet.replicas` of `2` or more while `redis.enabl
 
     **Cause:** Your values file still carries `postgres.config.username`, `postgres.config.password`, or `postgres.config.database`.
 
-    **Fix:** Rename them to `postgres.credentials.*` as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0). Do not create a secret yourself — this template creates it.
+    **Fix:** Move their values into the database credentials secret as described in [Upgrading from 1.0.0](#upgrading-from-1-0-0).
+  </Accordion>
+  <Accordion title="Upgrade from 1.2.0 fails because postgres.credentials was removed">
+    **Symptom:** The render fails with `postgres.credentials was removed in 1.3.0` or `redis.redis.auth.password was removed in tooljet 1.3.0`.
+
+    **Cause:** Your values file still carries the 1.2.0 database or Redis password keys.
+
+    **Fix:** Follow [Upgrading from 1.2.0](#upgrading-from-1-2-0).
   </Accordion>
   <Accordion title="Logs repeat Invalid License Key and the health check reports an invalid license">
     **Symptom:** The ToolJet logs repeat `Invalid License Key:Parse error`, and `/api/health` reports the license as invalid or expired.
@@ -435,15 +508,15 @@ The chart refuses to render `tooljet.replicas` of `2` or more while `redis.enabl
 
 ## Important Notes
 
-- **Create the key secret before installing** — `secrets.name` must name an existing dictionary secret with `SECRET_KEY_BASE`, `LOCKBOX_MASTER_KEY`, and `PGRST_JWT_SECRET`. A missing secret wedges the deployment silently.
+- **Create every prerequisite secret before installing** — the key secret (`secrets.name`, with `SECRET_KEY_BASE`, `LOCKBOX_MASTER_KEY`, and `PGRST_JWT_SECRET`), the database credentials secret (`postgres.config.credentialsSecretName`) and, with Redis auth on, the Redis password secret. A missing secret wedges the deployment silently; `status.versions[].message` in `cpln workload get-deployments RELEASE_NAME-tooljet --gvc GVC_NAME -o yaml` names it.
 - **`SECRET_KEY_BASE` and `LOCKBOX_MASTER_KEY` are write-once** — rotating `LOCKBOX_MASTER_KEY` makes every stored datasource credential undecryptable. Back the keys up outside Control Plane.
 - **Do not lower `tooljet.resources.maxMemory` below `4Gi`** — the first boot's migrations run out of memory below it and the workload never becomes ready.
 - **Claim the Super Admin account right after install** — the first visitor to complete onboarding owns the instance, and the endpoint is public by default.
 - **Configure SMTP at the initial install** — enabling it through a later upgrade does nothing.
 - **`tooljet.replicas` of `2` or more requires `redis.enabled: true`**, and both the Redis data node and the Sentinel must stay at one replica.
-- **Change `postgres.credentials.password` before installing** — it seeds the database on first boot and is not updated by later value edits.
-- **Give each release its own `postgres.config.credentialsSecretName`** — secret names are org-wide, and a second release on the same name is refused at install.
-- **Uninstalling deletes the PostgreSQL volume set** and every app, user, and ToolJet Database table in it; your key secret is yours and survives.
+- **Changing the database password is a database change first** — run `ALTER ROLE`, update the secret, then force-redeploy ToolJet ([Rotating the Database Password](#rotating-the-database-password)).
+- **Give each release its own database credentials secret** — secret names are org-wide, so two releases pointed at one secret share a password.
+- **Uninstalling deletes the PostgreSQL volume set** and every app, user, and ToolJet Database table in it; your prerequisite secrets are yours and survive.
 - **ToolJet is licensed under the AGPL** — the deployed image is the LTS build and runs the free tier without a license key.
 
 ## External References

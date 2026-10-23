@@ -26,16 +26,15 @@ The admin password, the JWT signing secret and the Fernet key are not template v
 | Volume set | `RELEASE_NAME-airflow-vs` | Shared Airflow home (`/opt/airflow`: DAGs and task logs) mounted by the webserver and every worker | — |
 | Volume set | `RELEASE_NAME-airflow-postgres-vs` | `ext4` volume holding the metadata database | — |
 | Volume set | `RELEASE_NAME-airflow-redis-vs` | `ext4` volume holding the broker's data | — |
-| Secret | `RELEASE_NAME-airflow-config` | Dictionary secret with the metadata database username and password | — |
 | Secret | `RELEASE_NAME-airflow-webserver-startup` | Opaque secret holding the webserver's startup script | — |
 | Identity | `RELEASE_NAME-airflow-identity` | Identity shared by the webserver, workers and database | — |
-| Policy | `RELEASE_NAME-airflow-policy` | `reveal` on the config secret, the startup script, your auth secret and, when set, your git token secret | — |
+| Policy | `RELEASE_NAME-airflow-policy` | `reveal` on your database credentials secret, the startup script, your auth secret and, when set, your git token secret | — |
 | Policy | `RELEASE_NAME-airflow-gvc-policy` | `view` on the one GVC you install into, so the webserver can check its location and KEDA settings at boot | — |
 | Container | `git-sync` (sidecar on the webserver and worker workloads) | Clones a Git repository onto the shared volume and keeps it in sync | `gitSync.enabled: true` |
 
 ## Prerequisites
 
-One secret must exist before you install, and the GVC must already have the location you configure. Secrets are org-level, so no GVC flag is involved.
+Two secrets must exist before you install, and the GVC must already have the location you configure. Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
   <Step title="Confirm the GVC has the location you will configure">
@@ -72,6 +71,18 @@ One secret must exist before you install, and the GVC must already have the loca
     cpln secret reveal AIRFLOW_AUTH_SECRET_NAME -o yaml
     ```
   </Step>
+  <Step title="Create the database credentials secret">
+    A [dictionary secret](/guides/create-secret/dictionary) holding `username`, `password` and `database`. The bundled PostgreSQL initializes from it, and the webserver and workers connect with it:
+
+    ```bash
+    cpln secret create-dictionary --name my-airflow-db-credentials \
+      --entry username=airflow \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=airflow
+    ```
+
+    Set its name in `postgres.config.credentialsSecretName`. Secret names are org-wide, so give each Airflow release its own secret. The three values are part of Airflow's connection URLs, so use letters, digits, `-` and `_` only. PostgreSQL reads the secret only when its data is first initialized — see [Rotating the Database Password](#rotating-the-database-password).
+  </Step>
   <Step title="Optional: create a git token secret for a private DAG repository">
     Only when `gitSync.enabled` is `true` and the repository is private. An [opaque secret](/guides/create-secret/opaque) with encoding `plain` whose payload is a personal access token; the sidecar sends it as the Git password:
 
@@ -101,7 +112,7 @@ One secret must exist before you install, and the GVC must already have the loca
 </Steps>
 
 <Warning>
-**Create the auth secret before installing, or the deployment wedges silently.** A `secretName` pointing at a secret that does not exist installs "successfully" and then never starts. No container runs, so `cpln logs` returns **zero lines**. The one place the reason appears is `status.versions[].message`:
+**Create the auth and database credentials secrets before installing, or the deployment wedges silently.** A `secretName` pointing at a secret that does not exist installs "successfully" and then never starts. No container runs, so `cpln logs` returns **zero lines**. The one place the reason appears is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-airflow-webserver --gvc GVC_NAME -o yaml
@@ -124,13 +135,14 @@ cpln workload force-redeployment RELEASE_NAME-airflow-webserver --gvc GVC_NAME
 
 ## Installation
 
-Install from the marketplace registry, naming the location your GVC has and the auth secret you created:
+Install from the marketplace registry, naming the location your GVC has and the two secrets you created:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/airflow \
-  --version 2.0.0 --gvc GVC_NAME \
+  --version 2.1.0 --gvc GVC_NAME \
   --set location=aws-us-east-1 \
-  --set airflow.auth.secretName=AIRFLOW_AUTH_SECRET_NAME
+  --set airflow.auth.secretName=AIRFLOW_AUTH_SECRET_NAME \
+  --set postgres.config.credentialsSecretName=my-airflow-db-credentials
 ```
 
 <CardGroup cols={2}>
@@ -176,14 +188,18 @@ postgres:
     minMemory: 512Mi
     maxMemory: 1024Mi
   config:
-    username: username
-    password: change-me-airflow-db # set at FIRST install; cannot be changed once the volume is initialized
-    database: airflow
+    # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL. If it does not
+    # exist the deployment WEDGES silently and `cpln logs` returns nothing at all.
+    # A `dictionary` secret holding exactly three keys: username, password and
+    # database. Postgres reads them only when its data directory is first
+    # initialized. Upgrading from 2.0.0: give it a NEW name (not
+    # RELEASE-airflow-config) — see `Upgrading from 2.0.0` in the README.
+    credentialsSecretName: my-airflow-db-credentials
   volumeset:
     capacity: 10 # initial capacity in GiB (minimum is 10)
 ```
 
-The database serves Airflow only and is unreachable from outside the GVC, so its credentials stay values and the chart writes them into `RELEASE_NAME-airflow-config`. **Set `postgres.config.password` at first install:** the shipped placeholder is published, and PostgreSQL reads the password only when the data directory is initialized, so it cannot be changed through values afterwards.
+The metadata database credentials come from your prerequisite dictionary secret (see [Prerequisites](#prerequisites)), named by `postgres.config.credentialsSecretName`. PostgreSQL reads them only when the data directory is first initialized, so editing the secret afterwards does not change the database password — see [Rotating the Database Password](#rotating-the-database-password).
 
 ### Redis Broker
 
@@ -305,7 +321,7 @@ KEDA scales the Celery workers on the Redis queue length, including down to zero
 |---|---|---|
 | UI and REST API (closed default) | `cpln port-forward RELEASE_NAME-airflow-webserver 8080:8080 --gvc GVC_NAME`, then `http://localhost:8080` | The tunnel works while the canonical endpoint returns `403` |
 | UI and REST API (public) | `status.canonicalEndpoint` from `cpln workload get RELEASE_NAME-airflow-webserver --gvc GVC_NAME -o yaml` | Returns `403` until you add a CIDR to `firewallConfig.inboundAllowCIDR` |
-| Metadata database (in-GVC) | `RELEASE_NAME-airflow-postgres.GVC_NAME.cpln.local:5432` | Credentials are `postgres.config.*` |
+| Metadata database (in-GVC) | `RELEASE_NAME-airflow-postgres.GVC_NAME.cpln.local:5432` | Credentials are the `username`, `password` and `database` keys of the secret named by `postgres.config.credentialsSecretName` |
 | Redis broker (in-GVC) | `RELEASE_NAME-airflow-redis.GVC_NAME.cpln.local:6379` | No authentication |
 | Login | `airflow.admin.username` and the `adminPassword` key of your auth secret | `cpln secret reveal AIRFLOW_AUTH_SECRET_NAME -o yaml` |
 
@@ -431,6 +447,26 @@ cpln workload force-redeployment RELEASE_NAME-airflow-webserver --gvc GVC_NAME
 
 `jwtSecret` can be rotated the same way — redeploy both the webserver and `RELEASE_NAME-airflow-celery-worker`, and every outstanding API token becomes invalid. **Never change `fernetKey`.**
 
+### Rotating the Database Password
+
+PostgreSQL keeps the password it was initialized with, and a running workload keeps the values it started with, so a rotation takes three steps in order:
+
+1. Change it in the database (`DB_USERNAME` and `DB_NAME` are the secret's `username` and `database`):
+
+   ```bash
+   cpln workload exec RELEASE_NAME-airflow-postgres --gvc GVC_NAME --container postgresql -- psql -U DB_USERNAME -d DB_NAME -c "ALTER ROLE \"DB_USERNAME\" PASSWORD 'NEW_PASSWORD'"
+   ```
+
+2. Update the `password` key of the secret: `cpln secret edit SECRET_NAME`.
+3. Right away, redeploy the webserver and the workers, and wait until `get-deployments` shows a higher version number for each, alone and ready. Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime.
+
+   ```bash
+   cpln workload force-redeployment RELEASE_NAME-airflow-webserver --gvc GVC_NAME
+   cpln workload force-redeployment RELEASE_NAME-airflow-celery-worker --gvc GVC_NAME
+   ```
+
+Connections Airflow already has open keep working after `ALTER ROLE`; new ones fail until the redeploy finishes, so rotate in a quiet window. Without step 3 the old password stays in use indefinitely: updating a secret does not restart the workloads that read it.
+
 ### Upgrading from 1.4.x or Earlier
 
 Template version 1.5.0 removed the credentials that 1.4.x took as plain Helm values. Each removed key is rejected at render with a message naming its replacement, so an old values file fails loudly instead of being silently ignored. There is no in-place path from 1.4.x to 2.0.0 — follow [Migrating from 1.x](#migrating-from-1-x), carrying only the new keys:
@@ -471,7 +507,7 @@ An upgrade run with no values at all has no `gvc` key to catch and proceeds, so 
     Choose a GVC that already has the location you will set as `location`, and enable KEDA on it first if you plan to use it. See [Prerequisites](#prerequisites).
   </Step>
   <Step title="Install 2.0.0 as a new release against the same auth secret">
-    Use a **different release name** — policy and secret names are org-wide, so a same-named release collides with the 1.x one even in another GVC. Point `airflow.auth.secretName` at the **same auth secret** the 1.x release used: the `fernetKey` must be identical, or every restored Connection and Variable becomes unreadable.
+    Use a **different release name** — policy and secret names are org-wide, so a same-named release collides with the 1.x one even in another GVC. Point `airflow.auth.secretName` at the **same auth secret** the 1.x release used: the `fernetKey` must be identical, or every restored Connection and Variable becomes unreadable. With 2.1.0 or later, also point `postgres.config.credentialsSecretName` at a new database credentials secret (see [Prerequisites](#prerequisites)).
   </Step>
   <Step title="Move the metadata database">
     Dump from the old release's database workload, in the GVC the 1.x chart created, and restore into the new one. Both go through base64 because `cpln workload exec` is not binary-safe:
@@ -484,10 +520,10 @@ An upgrade run with no values at all has no `gvc` key to catch and proceeds, so 
     ```bash
     base64 < airflow.dump | cpln workload exec RELEASE_NAME-airflow-postgres --gvc GVC_NAME \
       --container postgresql --stdin --quiet -- \
-      sh -c 'base64 -d | pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists'
+      sh -c 'base64 -d | pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists --no-owner --no-acl'
     ```
 
-    This data move has not been exercised end to end; see [Restoring a Backup](#restoring-a-backup).
+    `--no-owner --no-acl` let the restore succeed when the new database credentials secret uses a different `username` from the old release. This data move has not been exercised end to end; see [Restoring a Backup](#restoring-a-backup).
   </Step>
   <Step title="Move the DAGs">
     With `gitSync.enabled: true` there is nothing to do — the sidecar clones onto the new volume. Otherwise copy them off the old shared volume:
@@ -516,6 +552,22 @@ Values that moved or were removed in 2.0.0:
 | `keda.enabled: true` by default | `false` by default, and it requires KEDA enabled on your GVC |
 | — | `airflow.celeryWorker.replicas`, the fixed worker count used when KEDA is off |
 | — | `internalAccess.type` / `internalAccess.workloads` |
+
+### Upgrading from 2.0.0
+
+Template version 2.1.0 removed `postgres.config.username`, `postgres.config.password` and `postgres.config.database`: the metadata database credentials are now a prerequisite secret. Carrying the old keys forward fails the render.
+
+2.0.0 created that secret itself (`RELEASE_NAME-airflow-config`), so **this upgrade deletes it**, and the chart refuses that name for the new secret. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or Airflow loses its database connection:
+
+```bash
+cpln secret reveal RELEASE_NAME-airflow-config -o yaml   # username and password the database runs with today
+cpln secret create-dictionary --name RELEASE_NAME-airflow-db \
+  --entry username='YOUR_CURRENT_USERNAME' --entry password='YOUR_CURRENT_PASSWORD' --entry database='YOUR_CURRENT_DATABASE'
+```
+
+`YOUR_CURRENT_DATABASE` is `postgres.config.database` of the 2.0.0 release — `airflow` unless you changed it; the old secret does not hold it. Then upgrade with `postgres.config.credentialsSecretName` set to the new name and the three old keys removed. An upgrade that passes no values at all uses the default name `my-airflow-db-credentials`, so create the secret under that name instead if you upgrade that way.
+
+The upgrade restarts PostgreSQL, the webserver and the workers (they now read the new secret), so Airflow is briefly unavailable. The new version of a workload can also wait for several minutes, with `get-deployments` reporting that it is not allowed to reveal the secret, while access to the new secret propagates; the previous version keeps running meanwhile, and it clears by itself (or wait a few minutes, then `cpln workload force-redeployment` the waiting workload).
 
 ### Scaling and Availability
 
@@ -586,23 +638,30 @@ Values that moved or were removed in 2.0.0:
 
     **Fix:** use the port-forward from [First Run](#first-run), or add your CIDR ranges and allow a few minutes for the change to apply.
   </Accordion>
-  <Accordion title="Airflow cannot connect to the metadata database after changing postgres.config.password">
-    **Symptom:** after an upgrade that changed `postgres.config.password`, the webserver and workers fail to authenticate against PostgreSQL.
+  <Accordion title="Airflow cannot connect to the metadata database after changing the database secret">
+    **Symptom:** after editing the `password` key of the database credentials secret and redeploying, the webserver and workers fail to authenticate against PostgreSQL.
 
     **Cause:** PostgreSQL reads `POSTGRES_PASSWORD` only when the data directory is initialized, so the database still has the old password while Airflow's connection string carries the new one.
 
-    **Fix:** revert the value to the password the volume was initialized with. The password can only be set at first install.
+    **Fix:** change the password in the database first, as described in [Rotating the Database Password](#rotating-the-database-password), or put the old value back in the secret and redeploy the webserver and workers.
+  </Accordion>
+  <Accordion title="Upgrade fails because postgres.config.username, password and database were REMOVED">
+    **Symptom:** upgrading a 2.0.0 release fails at render with `airflow 2.1.0: postgres.config.username, postgres.config.password and postgres.config.database were REMOVED`.
+
+    **Cause:** your values still carry the 2.0.0 plaintext database credentials.
+
+    **Fix:** create the database credentials secret holding your current values and remove the old keys — see [Upgrading from 2.0.0](#upgrading-from-2-0-0).
   </Accordion>
 </AccordionGroup>
 
 ## Important Notes
 
-- **Create the auth secret before installing.** Without it the deployment wedges with no log output; `cpln workload get-deployments` is the one place the missing secret is named.
+- **Create the auth and database credentials secrets before installing.** Without either the deployment wedges with no log output; `cpln workload get-deployments` is the one place the missing secret is named.
 - **The Fernet key can never be rotated.** Generate it once, keep it, and back it up with the auth secret.
 - **Never upgrade a 1.x release onto 2.0.0 in place** — it deletes the GVC the 1.x chart created and everything in it. See [Migrating from 1.x](#migrating-from-1-x).
 - **`location` must be a location of your GVC.** Otherwise the install succeeds and nothing starts anywhere.
 - **Enable KEDA on the GVC before setting `keda.enabled: true`**, or the workers sit at `keda.minScale` forever with no error.
-- **Set `postgres.config.password` at first install.** The shipped placeholder is published and the value cannot be changed once the data directory exists.
+- **Rotating the database password needs `ALTER ROLE` plus a forced redeployment of the webserver and workers** — editing the secret alone changes nothing; see [Rotating the Database Password](#rotating-the-database-password).
 - **The UI is closed by default.** Reach it with `cpln port-forward`; a firewall change takes a few minutes to apply.
 - **The first Helm upgrade after an install can restart the database and webserver** even with unchanged values; expect a brief interruption.
 - **Changing the admin password means editing the secret and forcing a webserver redeployment**; see [Rotating the Admin Password](#rotating-the-admin-password).

@@ -28,14 +28,13 @@ A default install is private: `publicAccess.enabled` is `false` and `limiter.ena
 | Workload | `RELEASE_NAME-searxng` | SearXNG web UI and JSON API (standard, `replicas` replicas, HTTP `8080`) | — |
 | Secret | `RELEASE_NAME-searxng-settings` | Rendered `settings.yml`, mounted read-only at `/etc/searxng/settings.yml` | — |
 | Identity | `RELEASE_NAME-searxng-identity` | Identity of the SearXNG workload | — |
-| Policy | `RELEASE_NAME-searxng-policy` | Grants the identity `reveal` on exactly the secrets the workload reads, including your signing-key secret | — |
+| Policy | `RELEASE_NAME-searxng-policy` | Grants the identity `reveal` on exactly the secrets the workload reads, including your signing-key secret and, when configured, your Redis and `/metrics` password secrets | — |
 | Secret | `RELEASE_NAME-searxng-startup` | Start-up script that waits for the datastore before starting SearXNG | `redis.enabled: true` (default) |
 | Workload | `RELEASE_NAME-redis` | Redis for limiter counters and shared state (stateful, 1 replica, TCP `6379`); not a result cache | `redis.enabled: true` (default) |
 | Workload | `RELEASE_NAME-sentinel` | Redis Sentinel the bundled [redis](/template-catalog/templates/redis) template requires (stateful, 1 replica, TCP `26379`) | `redis.enabled: true` (default) |
 | Identity | `RELEASE_NAME-redis-identity`, `RELEASE_NAME-sentinel-identity` | Identities of the datastore workloads | `redis.enabled: true` (default) |
 | Policy | `RELEASE_NAME-redis-policy`, `RELEASE_NAME-sentinel-policy` | Secret access for the datastore workloads | `redis.enabled: true` (default) |
 | Secret | `RELEASE_NAME-redis-config`, `RELEASE_NAME-sentinel-config` | Redis and Sentinel configuration files | `redis.enabled: true` (default) |
-| Secret | `RELEASE_NAME-redis-auth-password` | Datastore password, wired into the SearXNG connection URL | `redis.redis.auth.password.enabled: true` |
 
 No volume set is created anywhere in this template. Everything durable is either your signing-key secret or a preference cookie in a user's own browser, so an uninstall leaves no storage behind.
 
@@ -72,13 +71,24 @@ Use `get-deployments` — plain `cpln workload get` has no `versions` key. Creat
 
 Treat the key as write-once and keep a copy outside Control Plane: replacing it discards every saved preference in every browser, and reinstalling against the same secret loses nothing. See [Rotating the Signing Key](#rotating-the-signing-key). Nothing else is required — no cloud account, no domain, no external database.
 
+**Optional secrets**, each needed only for the feature it turns on, and each created before the install or upgrade that uses it:
+
+```bash
+# Redis password (redis.redis.auth.fromSecret) — a dictionary secret with the key `password`.
+# Use only letters, digits, - and _: SearXNG puts it in its connection URL as-is.
+cpln secret create-dictionary --name my-searxng-redis --entry password="$(openssl rand -hex 24)"
+
+# /metrics basic-auth password (metrics.secretName) — an opaque secret.
+printf '%s' "$(openssl rand -hex 24)" | cpln secret create-opaque --name my-searxng-metrics-password --encoding plain -f -
+```
+
 ## Installation
 
 Install the chart from the marketplace registry, pointing it at the secret you created:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/searxng \
-  --version 1.0.0 --gvc GVC_NAME \
+  --version 1.1.0 --gvc GVC_NAME \
   --set secretKey.secretName=SECRET_NAME
 ```
 
@@ -133,7 +143,7 @@ imageProxy: true               # proxy result images through this instance inste
 baseUrl: ""                    # set only behind a custom domain, e.g. https://search.example.com (empty = derive from request)
 limiter:
   enabled: false               # bot-detection rate limiter; requires redis.enabled. NOTE: it 429s non-browser clients, including the JSON API
-extraSettings: {}              # merged into settings.yml verbatim, e.g. {general: {enable_metrics: false}}
+extraSettings: {}              # merged into settings.yml verbatim, e.g. {general: {enable_metrics: false}}; general.open_metrics is refused — use metrics.secretName
 ```
 
 - `formats` — a format that is not listed is refused, so removing `json` disables the API.
@@ -157,6 +167,15 @@ secretKey:
 ```
 
 The opaque secret from [Prerequisites](#prerequisites). The chart grants the workload `reveal` on exactly that secret and injects it as an environment variable, so the key never appears in the rendered configuration.
+
+### Metrics Password
+
+```yaml
+metrics:
+  secretName: ""               # e.g. my-searxng-metrics-password; must exist BEFORE install
+```
+
+Empty keeps `/metrics` closed (404). Name the opaque secret from [Prerequisites](#prerequisites) and `/metrics` serves Prometheus metrics behind HTTP basic auth — any user name, the secret's payload as the password. The password is written into `settings.yml` inside the container when it starts, so it never appears in the Helm release.
 
 ### Access
 
@@ -190,9 +209,9 @@ redis:
     image: redis:8
     replicas: 1                # MUST be 1 (validated) — SearXNG must reach the master directly
     auth:
-      password:
-        enabled: false         # true = require AUTH; password is wired into the connection URL
-        value: change-me-searxng-redis
+      fromSecret:
+        enabled: false         # true = require AUTH, password read from the secret below
+        name: ""               # prerequisite dictionary secret (key: password); URL-safe characters only
     resources:
       minCpu: 80m
       maxCpu: 200m
@@ -210,7 +229,7 @@ redis:
 
 - `redis.enabled: false` runs SearXNG standalone; `limiter.enabled` must then stay `false`, and the chart refuses to render the combination.
 - `redis.redis.replicas` must stay `1`, and the chart rejects anything else: SearXNG's client is not Sentinel-aware and has to reach the master directly, so extra replicas would be read-only and would silently break the limiter. One Sentinel is required by the redis template and cannot be scaled to zero.
-- Change `redis.redis.auth.password.value` from the placeholder if you enable `AUTH`. `redis.redis.auth.fromSecret` is not supported by this template.
+- `AUTH` is off by default; the same-GVC firewall is the boundary. To require it, create the Redis password secret from [Prerequisites](#prerequisites) before installing, then set `redis.redis.auth.fromSecret.enabled: true` and `redis.redis.auth.fromSecret.name` to its name. Sentinel authentication must stay off; the chart refuses it, because SearXNG never talks to the Sentinel.
 
 ## Connecting
 
@@ -222,7 +241,8 @@ SearXNG has no login, so there are no credentials anywhere in this table. A defa
 | JSON API for in-GVC agents | `http://RELEASE_NAME-searxng.GVC_NAME.cpln.local:8080/search?q=QUERY&format=json` | Always use the fully-qualified name; the bare short name does not resolve to this workload. |
 | Web UI and API, public | `status.canonicalEndpoint` of `RELEASE_NAME-searxng` (`https://...cpln.app`) | Only when `publicAccess.enabled: true`. Unauthenticated. |
 | Health | `GET /healthz` on port `8080` | Unaffected by the limiter. |
-| Redis | `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` | Only when `redis.enabled: true`; `AUTH` only when `redis.redis.auth.password.enabled: true`. |
+| Redis | `RELEASE_NAME-redis.GVC_NAME.cpln.local:6379` | Only when `redis.enabled: true`; `AUTH` only when `redis.redis.auth.fromSecret.enabled: true`, with the `password` key of that secret. |
+| Metrics | `/metrics` on any of the addresses above | Only when `metrics.secretName` is set; HTTP basic auth, any user name, the password in that secret. |
 
 To verify from your own machine, open a tunnel and call the API through it:
 
@@ -309,6 +329,23 @@ cpln apply -f rotate.yaml
 cpln workload force-redeployment RELEASE_NAME-searxng --gvc GVC_NAME
 ```
 
+### Upgrading from 1.0.0
+
+1.1.0 takes no password as a plaintext value. Carrying either old key forward fails the render with a message naming the replacement, before anything is changed.
+
+**If you ran 1.0.0 with Redis auth on** (`redis.redis.auth.password.enabled: true`), the chart-created `RELEASE_NAME-redis-auth-password` secret is deleted by the upgrade. Copy your current password into a secret under a **new** name first:
+
+```bash
+cpln secret reveal RELEASE_NAME-redis-auth-password -o yaml
+cpln secret create-dictionary --name my-searxng-redis --entry password='YOUR-CURRENT-REDIS-PASSWORD'
+```
+
+Then upgrade with `redis.redis.auth.fromSecret.enabled: true` and `redis.redis.auth.fromSecret.name: my-searxng-redis`, and remove `redis.redis.auth.password` (and any `redis.sentinel.auth.password`). With Redis auth off in 1.0.0 (the default), just remove `redis.redis.auth.password` from your values if you set it.
+
+**If you opened `/metrics`** with `extraSettings.general.open_metrics`, create the opaque secret from [Prerequisites](#prerequisites) holding that password, set `metrics.secretName` to its name, and remove `open_metrics` from `extraSettings`.
+
+The new version of a workload can wait several minutes with `is not allowed to reveal the secret` in `get-deployments` while access to a newly named secret propagates; the previous version keeps serving meanwhile, and it clears by itself (or run `cpln workload force-redeployment` on that workload to retry).
+
 ### Scaling and Availability
 
 - `replicas` scales the SearXNG tier horizontally. Instances share nothing on disk and there is no server-side session to pin, so any replica can serve any request; with `redis.enabled: true` the limiter's counters are shared across replicas.
@@ -362,7 +399,7 @@ cpln workload force-redeployment RELEASE_NAME-searxng --gvc GVC_NAME
 
     **Cause:** the start-up script could not reach the bundled datastore within its wait window, and with the limiter on it refuses to serve an instance that believes it is rate-limited and is not.
 
-    **Fix:** check `RELEASE_NAME-redis` with `cpln workload get-deployments RELEASE_NAME-redis --gvc GVC_NAME -o yaml` and its logs. If `redis.redis.auth.password.enabled` is on, make sure `redis.redis.auth.password.value` is set. Once the datastore is healthy, SearXNG starts on its next restart.
+    **Fix:** check `RELEASE_NAME-redis` with `cpln workload get-deployments RELEASE_NAME-redis --gvc GVC_NAME -o yaml` and its logs. If `redis.redis.auth.fromSecret.enabled` is on, make sure the secret named by `redis.redis.auth.fromSecret.name` exists and holds the key `password`. Once the datastore is healthy, SearXNG starts on its next restart.
   </Accordion>
   <Accordion title="Install refused with limiter.enabled requires redis.enabled">
     **Symptom:** `cpln helm install` or `cpln helm upgrade` stops before touching any resource:
@@ -406,7 +443,9 @@ cpln workload force-redeployment RELEASE_NAME-searxng --gvc GVC_NAME
 - **The limiter blocks the JSON API for non-browser clients.** Pick one of the two shapes in [Choosing an Access Shape](#choosing-an-access-shape) deliberately; never run public with the limiter off.
 - **Settings changes need a forced redeployment.** `settings.yml` is a mounted secret and running replicas do not re-read it — see [Changing Settings](#changing-settings).
 - **`redis.redis.replicas` must stay `1`, and `limiter.enabled` requires `redis.enabled`.** Both are enforced at render time, so a bad combination fails the install rather than shipping a silently unlimited instance.
-- **`/metrics` is off as shipped and needs a password to open.** Upstream gates it on `general.open_metrics`, which is empty by default; setting it through `extraSettings` enables the route behind HTTP basic auth with that password. `extraSettings: {general: {enable_metrics: false}}` stops collecting the data behind `/stats`.
+- **`/metrics` is off as shipped and needs a password to open.** It returns 404 unless `metrics.secretName` names a password secret, after which it requires that password via HTTP basic auth; see [Metrics Password](#metrics-password). With `limiter.enabled`, non-browser scrapers are rate-limited on `/metrics` too. `extraSettings: {general: {enable_metrics: false}}` stops collecting the data behind `/stats`.
+- **Changing the `/metrics` password secret does not reach a running workload.** Run `cpln workload force-redeployment RELEASE_NAME-searxng --gvc GVC_NAME` afterwards; until then the old password keeps working.
+- **Do not change the Redis password in place.** The Redis node, the Sentinel and SearXNG each read it only when they start, and the Sentinel keeps the one it started with. Redis holds nothing durable here, so to change it uninstall and reinstall the release with a new secret (reuse the same signing-key secret and nothing else is lost).
 - **Uninstalling removes everything the template created** — workloads, secrets, identities and policies, with no volume sets left behind. Your own signing-key secret is yours and is left alone.
 
 ## External References

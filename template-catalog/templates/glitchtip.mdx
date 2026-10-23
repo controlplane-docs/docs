@@ -1,7 +1,7 @@
 ---
 title: GlitchTip
 icon: /template-catalog/templates/icons/glitchtip.png
-description: Deploy GlitchTip, open-source Sentry-compatible error tracking, on Control Plane. A stateless web tier and a background worker on bundled Redis Sentinel and PostgreSQL — highly available by default, single-instance by one flag. Needs an existing GVC and a pre-created auth dictionary secret.
+description: Deploy GlitchTip, open-source Sentry-compatible error tracking. A stateless web tier and a background worker on bundled Redis Sentinel and PostgreSQL — highly available by default, single-instance by one flag. Needs an existing GVC and pre-created auth, database and Redis dictionary secrets.
 keywords: ['error tracking', 'error monitoring', 'exception tracking', 'sentry alternative', 'self-hosted sentry', 'crash reporting', 'application monitoring', 'observability', 'mit licensed', 'dsn', 'event ingest', 'django secret key', 'uptime monitoring']
 ---
 
@@ -30,20 +30,40 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Volume set | `RELEASE_NAME-postgres-ha-vs`, `RELEASE_NAME-etcd-vs` | HA database and etcd data, 10 GiB per replica; takes no scheduled snapshots; a final snapshot is taken when the volume set is deleted and kept 7 days | `postgresHA.enabled: true` (default) |
 | Volume set | `RELEASE_NAME-pg-vs` | Single-instance database data, 10 GiB; takes no scheduled snapshots; a final snapshot is taken when the volume set is deleted and kept 7 days | `postgres.enabled: true` |
 | Volume set | `RELEASE_NAME-redis-vs`, `RELEASE_NAME-sentinel-vs` | Redis and Sentinel persistence, 10 GiB each with 7-day snapshots | `redis.enabled: true` (default) |
-| Secret | the name in `postgresHA.config.credentialsSecretName` (HA) or `postgres.config.credentialsSecretName` (single) | Dictionary secret the chart creates from `postgres.credentials.*` (`username`, `password`, `database`) and hands to whichever database is enabled | — |
 | Secret | `RELEASE_NAME-glitchtip-web-start`, `RELEASE_NAME-glitchtip-worker-start` | Start scripts that finalize the public URL and the Sentinel connection URL at boot | — |
-| Secret | `RELEASE_NAME-redis-auth-password` | Redis password, created by the redis subchart from `redis.redis.auth.password.value` | `redis.enabled: true` (default) |
 | Identity | `RELEASE_NAME-glitchtip-identity` | Shared by the web and worker workloads | — |
-| Policy | `RELEASE_NAME-glitchtip-policy` | Grants that identity `reveal` on exactly the secrets it reads: the start scripts, the database and Redis secrets, your auth secret, and your email secret when configured | — |
+| Policy | `RELEASE_NAME-glitchtip-policy` | Grants that identity `reveal` on exactly the secrets it reads: the start scripts, your database credentials, Redis password and auth secrets, and your email secret when configured | — |
 | Identity / Policy | `RELEASE_NAME-postgres-ha-identity`, `RELEASE_NAME-etcd-identity`, `RELEASE_NAME-pg-identity`, `RELEASE_NAME-redis-identity`, `RELEASE_NAME-sentinel-identity` and their matching `-policy` | Per-component identities and least-privilege policies from the bundled templates | Follow the component |
 
-The web and worker tiers have no volumes of their own: every issue, event, and user lives in PostgreSQL. Your auth secret is **not** created by the template — see [Prerequisites](#prerequisites).
+The web and worker tiers have no volumes of their own: every issue, event, and user lives in PostgreSQL. Your auth, database credentials and Redis password secrets are **not** created by the template — see [Prerequisites](#prerequisites).
 
 ## Prerequisites
 
-The Django signing key and the initial superuser login guard a login form on a public endpoint, so they are a [dictionary secret](/guides/create-secret/dictionary) you create **before** installing rather than Helm values. Secrets are org-level, so no GVC flag is involved.
+The database credentials, the Redis password, and the Django signing key and initial superuser login (which guard a login form on a public endpoint) are [dictionary secrets](/guides/create-secret/dictionary) you create **before** installing rather than Helm values. Secrets are org-level, so no GVC flag is involved.
 
 <Steps>
+  <Step title="Create the database credentials secret">
+    The bundled PostgreSQL initializes with these values and GlitchTip connects with them, in either database mode:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=glitchtip \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=glitchtip
+    ```
+
+    Set its name in the key of the database mode you use: `postgresHA.config.credentialsSecretName` (HA, the default) or `postgres.config.credentialsSecretName` (single-instance). Secret names are org-wide, so give each GlitchTip release its own. PostgreSQL reads the secret only when its data is first initialized — see [Rotating the Database Password](#rotating-the-database-password).
+  </Step>
+  <Step title="Create the Redis password secret">
+    Required while Redis is enabled (the default). Redis requires the password, and Sentinel and GlitchTip connect with it. No spaces, backslashes or double quotes: Redis writes it into its config file and will not start on them (the hex value below is safe):
+
+    ```bash
+    cpln secret create-dictionary --name REDIS_SECRET_NAME \
+      --entry password="$(openssl rand -hex 24)"
+    ```
+
+    Set `redis.redis.auth.fromSecret.name` to this name. To change the password later, see [Rotating the Redis Password](#rotating-the-redis-password).
+  </Step>
   <Step title="Create the auth secret">
     A dictionary secret holding exactly three keys:
 
@@ -78,28 +98,28 @@ The Django signing key and the initial superuser login guard a login form on a p
 </Steps>
 
 <Warning>
-Create the auth secret **before** installing. Installing without it reports success, but **both** workloads then wedge silently — `cpln logs` returns nothing because no container ever starts, and the only place the missing secret is named is `status.versions[].message`:
+Create the secrets **before** installing. Installing without one reports success, but **both** workloads then wedge silently — `cpln logs` returns nothing because no container ever starts, and the only place the missing secret is named is `status.versions[].message`:
 
 ```bash
 cpln workload get-deployments RELEASE_NAME-glitchtip --gvc GVC_NAME -o yaml
 ```
 
-The message reads `The secret AUTH_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` The command is `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the secret lets the deployment recover on its own; `cpln workload force-redeployment RELEASE_NAME-glitchtip --gvc GVC_NAME` skips the wait, and the worker needs the same treatment.
+The message reads `The secret AUTH_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` The command is `get-deployments` — plain `cpln workload get` has no `versions` key. Creating the secret lets the deployment recover on its own; `cpln workload force-redeployment RELEASE_NAME-glitchtip --gvc GVC_NAME` skips the wait, and the worker needs the same treatment. A missing Redis password secret also wedges `RELEASE_NAME-redis` and `RELEASE_NAME-sentinel`.
 </Warning>
 
 ## Installation
 
-Once the auth secret exists, install from the marketplace registry, pointing `auth.secretName` at it and replacing both bundled-component passwords:
+Once the three secrets exist, install from the marketplace registry, pointing the secret-name keys at them:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/glitchtip \
-  --version 1.3.1 --gvc GVC_NAME \
+  --version 1.4.0 --gvc GVC_NAME \
   --set auth.secretName=AUTH_SECRET_NAME \
-  --set postgres.credentials.password='YOUR-DB-PASSWORD' \
-  --set redis.redis.auth.password.value='YOUR-REDIS-PASSWORD'
+  --set postgresHA.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
+  --set redis.redis.auth.fromSecret.name=REDIS_SECRET_NAME
 ```
 
-`postgres.credentials.password` seeds the bundled database in **both** database modes. Installing a second GlitchTip release in the same org? Also set `postgresHA.config.credentialsSecretName` (or `postgres.config.credentialsSecretName` in single-instance mode) to a name no other release uses — secret names are org-wide.
+In single-instance mode set `postgres.config.credentialsSecretName` instead of `postgresHA.config.credentialsSecretName`.
 
 Other ways to install and manage the template:
 
@@ -206,9 +226,9 @@ redis:
   redis:
     replicas: 2
     auth:
-      password:
-        enabled: true
-        value: change-me-glitchtip-redis # change before installing (any characters OK — the boot script percent-encodes it)
+      fromSecret:
+        enabled: true # required when redis is enabled (the chart enforces this)
+        name: my-glitchtip-redis # PREREQUISITE dictionary secret (key: password) — must exist BEFORE install
     firewall:
       internal_inboundAllowType: same-gvc
     persistence:
@@ -221,19 +241,11 @@ redis:
       enabled: true
 ```
 
-When Redis is enabled the chart requires `redis.redis.auth.password.enabled: true` with a value, and requires Sentinel authentication to stay off — GlitchTip does not send a Sentinel password, so the same-GVC firewall is the boundary there. Every other knob of the redis template is available under `redis.*`.
+When Redis is enabled the chart requires `redis.redis.auth.fromSecret.enabled: true` with `redis.redis.auth.fromSecret.name` naming your Redis password secret, and requires Sentinel authentication to stay off — GlitchTip does not send a Sentinel password, so the same-GVC firewall is the boundary there. Every other knob of the redis template is available under `redis.*`.
 
 ### Database
 
-Enable exactly one database — the chart refuses to render with both or neither. The highly available cluster is the default; the single-instance template is one flag away for development and lightweight installs. In both modes the chart builds the database credentials secret from `postgres.credentials.*` — there is nothing for you to create — and GlitchTip is wired to the active database automatically: the HAProxy leader endpoint in HA mode, the single instance directly otherwise.
-
-```yaml
-postgres:
-  credentials: # used in BOTH database modes — the chart writes these into the credentials secret
-    username: glitchtip
-    password: change-me-glitchtip-db # change before installing
-    database: glitchtip
-```
+Enable exactly one database — the chart refuses to render with both or neither. The highly available cluster is the default; the single-instance template is one flag away for development and lightweight installs. In both modes the database credentials come from your prerequisite dictionary secret (`username`, `password` and `database` — see [Prerequisites](#prerequisites)), and GlitchTip is wired to the active database automatically: the HAProxy leader endpoint in HA mode, the single instance directly otherwise.
 
 <Tabs>
   <Tab title="Highly available (default)">
@@ -243,7 +255,7 @@ postgres:
     postgresHA:
       enabled: true
       config:
-        credentialsSecretName: my-glitchtip-db-credentials # chart-created from postgres.credentials.*; secret names are org-wide, so give each release its own
+        credentialsSecretName: my-glitchtip-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
       replicas: 3
       volumeset:
         capacity: 10 # initial capacity in GiB per replica (minimum is 10)
@@ -263,7 +275,7 @@ postgres:
     postgres:
       enabled: true
       config:
-        credentialsSecretName: my-glitchtip-db-credentials # chart-created from postgres.credentials.*; secret names are org-wide, so give each release its own
+        credentialsSecretName: my-glitchtip-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
       volumeset:
         capacity: 10 # initial capacity in GiB (minimum is 10)
 
@@ -275,7 +287,7 @@ postgres:
 </Tabs>
 
 <Note>
-`postgres.credentials.password` and `redis.redis.auth.password.value` seed their component on first boot and are used as-is — change both before installing. Later value edits do not update a database that has already initialized; uninstalling the release deletes the volume sets, and a reinstall starts fresh.
+PostgreSQL reads its credentials secret only when its data is first initialized, and the Sentinels keep the Redis password they started with, so editing a secret alone changes neither — follow [Rotating the Database Password](#rotating-the-database-password) or [Rotating the Redis Password](#rotating-the-redis-password). Uninstalling the release deletes the volume sets, and a reinstall starts fresh.
 </Note>
 
 ## Connecting
@@ -290,7 +302,7 @@ postgres:
 | Internal (same GVC) | `http://RELEASE_NAME-glitchtip.GVC_NAME.cpln.local:8000` | Reachable per `internalAccess.type`; in-GVC SDKs can report here. |
 | PostgreSQL (HA mode) | `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432` | `username` / `password` / `database` from `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `postgresHA.config.credentialsSecretName`. |
 | PostgreSQL (single mode) | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432` | Same keys, from the secret named by `postgres.config.credentialsSecretName`. |
-| Redis Sentinel | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Master name `mymaster`; password in `cpln secret reveal RELEASE_NAME-redis-auth-password -o yaml`. |
+| Redis Sentinel | `RELEASE_NAME-sentinel.GVC_NAME.cpln.local:26379` | Master name `mymaster`; password in the `password` key of `cpln secret reveal SECRET_NAME -o yaml`, where `SECRET_NAME` is your `redis.redis.auth.fromSecret.name`. |
 
 With `publicAccess.enabled: false` there is no public endpoint; reach the UI from your machine through a tunnel instead and open `http://localhost:8000`:
 
@@ -479,31 +491,131 @@ Template version 1.1.0 moved the Django signing key and the superuser login out 
 If your install still carries the published 1.0.x default signing key, its sessions and tokens are signed with a value printed in a public repository. Rotating it is the fix, and the cost is exactly that one forced sign-out — plan the upgrade for a quiet window rather than skipping it, and change the admin password in the UI at the same time.
 </Warning>
 
+### Rotating the Database Password
+
+PostgreSQL keeps the password it was initialized with, and a running workload keeps the values it started with, so in single-instance mode a rotation takes three steps in order (in HA mode follow [Rotating the Database Password in HA Mode](#rotating-the-database-password-in-ha-mode) instead):
+
+1. Change it in the database: `ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD';` (`DB_USERNAME` is the secret's `username`; connect as that user from inside the GVC).
+2. Update the secret — export it, change only `password`, and apply it:
+
+   ```bash
+   cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+   # edit only the password key in secret.yaml
+   cpln apply -f secret.yaml
+   ```
+
+3. Right away, redeploy GlitchTip:
+
+   ```bash
+   cpln workload force-redeployment RELEASE_NAME-glitchtip --gvc GVC_NAME
+   cpln workload force-redeployment RELEASE_NAME-glitchtip-worker --gvc GVC_NAME
+   ```
+
+Do not redeploy the database: PostgreSQL reads the secret only when it is first initialized, so restarting it only adds downtime. Connections the app already has open keep working after `ALTER ROLE`; new ones fail until its redeploy finishes, so rotate in a quiet window.
+
+### Rotating the Database Password in HA Mode
+
+The HA database (`postgresHA`) needs its own order. The replication role `repl` shares the password, and a member that restarts with the old password can be promoted to leader, which splits the cluster. Move the leader to member `-0` first, so it restarts last, after every other member already has the new password. `pgx` runs a command in one member (`LOCATION` is your GVC's location, `DB_USERNAME` the secret's `username`):
+
+```bash
+pgx() { cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --location LOCATION \
+  --container patroni-postgres --replica "RELEASE_NAME-postgres-ha-$1" -- "${@:2}"; }
+# 1. Find the leader ("role": "leader"); the other two must be "streaming" on the same "timeline"
+pgx 0 curl -s localhost:8008/cluster
+# 2. If the leader is not RELEASE_NAME-postgres-ha-0, move it there (N = current leader), then repeat step 1
+pgx 0 curl -s -XPOST -d '{"leader":"RELEASE_NAME-postgres-ha-N","candidate":"RELEASE_NAME-postgres-ha-0"}' localhost:8008/switchover
+# 3. Change BOTH roles on -0
+pgx 0 psql -h 127.0.0.1 -d postgres -c "ALTER ROLE DB_USERNAME PASSWORD 'NEW_PASSWORD'; ALTER ROLE repl PASSWORD 'NEW_PASSWORD';"
+# 4. Right after, put the same password in the secret (edit only the password key in secret.yaml)
+cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+cpln apply -f secret.yaml
+# 5. Restart the members
+cpln workload force-redeployment RELEASE_NAME-postgres-ha --gvc GVC_NAME
+# 6. Once the restart completes, confirm one leader and two "streaming" replicas on one timeline (repeat step 1)
+# 7. Optional: remove the install-time password Patroni keeps in its cluster config
+pgx 0 curl -s -XPATCH -d '{"postgresql":{"authentication":null}}' localhost:8008/config
+```
+
+Then force-redeploy `RELEASE_NAME-glitchtip-worker` and `RELEASE_NAME-glitchtip`, which keep the old password until they restart. The database drops connections briefly at each switchover, and the app cannot open new connections from the `ALTER ROLE` until its own redeploy finishes, so rotate in a quiet window. If a member stays `starting`, or `running` without `streaming`, re-copy it from the leader. This copies the whole database, so it costs network traffic in proportion to its size:
+
+```bash
+pgx N curl -s -XPOST -d '{"force": true}' localhost:8008/reinitialize
+```
+
+### Rotating the Redis Password
+
+Redis keeps no password on disk, but the Sentinels do, so a new password is applied live in three places before anything restarts. Each Redis node first accepts both passwords, which keeps replication and every connected client working throughout. `rx` and `sx` run a command on one Redis node or Sentinel (`LOCATION` is your GVC's location; nodes and Sentinels are numbered from 0 up to `redis.redis.replicas` and `redis.sentinel.replicas` minus one):
+
+```bash
+rx() { cpln workload exec RELEASE_NAME-redis --gvc GVC_NAME --location LOCATION \
+  --container redis --replica "RELEASE_NAME-redis-$1" -- "${@:2}"; }
+sx() { cpln workload exec RELEASE_NAME-sentinel --gvc GVC_NAME --location LOCATION \
+  --container sentinel --replica "RELEASE_NAME-sentinel-$1" -- "${@:2}"; }
+# 1. On EVERY Redis node: accept the new password alongside the old one, and replicate with it
+rx 0 redis-cli --no-auth-warning -a OLD_PASSWORD ACL SETUSER default ">NEW_PASSWORD"
+rx 0 redis-cli --no-auth-warning -a OLD_PASSWORD CONFIG SET masterauth NEW_PASSWORD
+# 2. On EVERY Sentinel
+sx 0 redis-cli -p 26379 SENTINEL SET mymaster auth-pass NEW_PASSWORD
+# 3. Put the new password in the secret (edit only the password key in secret.yaml) and read it back
+cpln secret reveal SECRET_NAME -o yaml > secret.yaml
+cpln apply -f secret.yaml
+cpln secret reveal SECRET_NAME -o yaml
+# 4. Restart GlitchTip, which keeps the old password until it restarts
+cpln workload force-redeployment RELEASE_NAME-glitchtip --gvc GVC_NAME
+cpln workload force-redeployment RELEASE_NAME-glitchtip-worker --gvc GVC_NAME
+# 5. Once get-deployments shows a higher version, alone and ready, for both: retire the old password on EVERY Redis node
+rx 0 redis-cli --no-auth-warning -a NEW_PASSWORD ACL SETUSER default "<OLD_PASSWORD"
+```
+
+GlitchTip is briefly unavailable while it restarts. Redis and Sentinel need no restart: when they next start they read the new password from the secret.
+
 ### Upgrading from 1.1.0
 
-Version 1.2.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. GlitchTip absorbed that change — the chart now creates the credentials secret itself — so there is **no new prerequisite**, only a rename of three keys in single-instance mode:
+Version 1.2.0 adopted the `postgres` 3.4.1 template, which stopped taking database credentials as values. In single-instance mode these keys were removed:
 
-| Removed key (1.1.0) | Replacement (1.2.0 and later) |
+| Removed key (1.1.0) | Replacement |
 |---|---|
-| `postgres.config.username` | `postgres.credentials.username` |
-| `postgres.config.password` | `postgres.credentials.password` |
-| `postgres.config.database` | `postgres.credentials.database` |
+| `postgres.config.username` / `postgres.config.password` / `postgres.config.database` | the `username`, `password` and `database` keys of the database credentials secret named by `postgres.config.credentialsSecretName` |
 | `postgres.backup.minio.accessKey` / `postgres.backup.minio.secretKey` | a dictionary secret named by `postgres.backup.minio.credentialsSecretName` |
 
-Move the keys, keep the same values so the running database still matches, and upgrade in place. A values file that still carries an old key fails the render with the **postgres template's** message, which tells you to create a dictionary secret yourself — ignore that advice here; this template creates it.
+Put the values your database was initialized with into the database credentials secret under [Prerequisites](#prerequisites), set `postgres.config.credentialsSecretName` to its name, and remove the old keys. A values file that still carries one fails the render with `config.username was REMOVED in postgres 3.4.0`. Then move the Redis password as described in [Upgrading from 1.3.1](#upgrading-from-1-3-1).
 
 ### Upgrading from 1.2.x
 
-Version 1.3.0 adopted the `postgres-highly-available` 2.5.0 template, which made the same change on the HA path, and 1.3.1 did the same for its MinIO backup keys. The HA database credentials now come from the same `postgres.credentials.*` block as the single-instance ones, and the chart creates the secret named by `postgresHA.config.credentialsSecretName` for both stores.
+Version 1.3.0 adopted the `postgres-highly-available` 2.5.0 template, which made the same change on the HA path, and 1.3.1 did the same for its MinIO backup keys.
 
-| Removed key (1.2.x) | Replacement (1.3.x) |
+| Removed key (1.2.x) | Replacement |
 |---|---|
-| `postgresHA.postgres.username` | `postgres.credentials.username` |
-| `postgresHA.postgres.password` | `postgres.credentials.password` |
-| `postgresHA.postgres.database` | `postgres.credentials.database` |
+| `postgresHA.postgres.username` / `postgresHA.postgres.password` / `postgresHA.postgres.database` | the `username`, `password` and `database` keys of the database credentials secret named by `postgresHA.config.credentialsSecretName` |
 | `postgresHA.backup.minio.accessKey` / `postgresHA.backup.minio.secretKey` | a dictionary secret named by `postgresHA.backup.minio.credentialsSecretName` |
 
-Move the three credential values **unchanged** into `postgres.credentials.*` — the running cluster was initialized with them — and delete the `postgresHA.postgres` block entirely; a values file that still carries it fails the render with the postgres-highly-available template's `the postgres block was REMOVED in 2.5.0` message. If you back up to an S3-compatible server, create the credentials secret described under [Backing Up](#backing-up) before upgrading. The upgrade re-points the web and worker workloads at the new secret, so expect them to redeploy; the database data is untouched. The details of the subchart change are under [Upgrading From 2.4.x](/template-catalog/templates/postgres-highly-available#upgrading-from-2-4-x) on the postgres-highly-available page.
+Put the three credential values **unchanged** into the database credentials secret under [Prerequisites](#prerequisites) — the running cluster was initialized with them — set `postgresHA.config.credentialsSecretName` to its name, and delete the `postgresHA.postgres` block entirely; a values file that still carries it fails the render with the postgres-highly-available template's `the postgres block was REMOVED in 2.5.0` message. If you back up to an S3-compatible server, create the credentials secret described under [Backing Up](#backing-up) before upgrading. The upgrade re-points the web and worker workloads at the new secret, so expect them to redeploy; the database data is untouched. The details of the subchart change are under [Upgrading From 2.4.x](/template-catalog/templates/postgres-highly-available#upgrading-from-2-4-x) on the postgres-highly-available page. Then move the Redis password as described in [Upgrading from 1.3.1](#upgrading-from-1-3-1).
+
+### Upgrading from 1.3.1
+
+`postgres.credentials` was removed in 1.4.0: the database credentials are now a prerequisite secret, the same one the database templates require on their own. Carrying the old key forward fails the render. This applies to 1.3.0 as well.
+
+1.3.x created the database secret itself, so **this upgrade deletes it**. Before upgrading, create a secret under a **new** name holding the values your database was initialized with — not new ones, or GlitchTip loses its database connection:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-glitchtip-db \
+  --entry username=glitchtip \
+  --entry password='YOUR_CURRENT_PASSWORD' \
+  --entry database=glitchtip
+```
+
+Then upgrade with `postgresHA.config.credentialsSecretName` (HA mode) or `postgres.config.credentialsSecretName` (single-instance mode) set to that name, and `postgres.credentials` removed. Your current values are in `postgres.credentials` of the 1.3.x release, and also in the old secret (`cpln secret reveal SECRET_NAME -o yaml`, the name in `credentialsSecretName`, `my-glitchtip-db-credentials` by default) until the upgrade deletes it.
+
+`redis.redis.auth.password` was removed the same way (Redis enabled only): the Redis password is now a prerequisite secret too, and this upgrade deletes the `RELEASE_NAME-redis-auth-password` secret 1.3.x had the redis chart create. Create one under a **new** name holding your **current** Redis password — a new one would leave the Sentinels, which keep the password they started with on their volume, unable to reach Redis:
+
+```bash
+cpln secret create-dictionary --name RELEASE_NAME-glitchtip-redis \
+  --entry password='YOUR_CURRENT_REDIS_PASSWORD'
+```
+
+Your current password is `redis.redis.auth.password.value` of the 1.3.x release, and also in `cpln secret reveal RELEASE_NAME-redis-auth-password -o yaml` until the upgrade deletes it. Upgrade with `redis.redis.auth.fromSecret.name` set to the new name and the whole `redis.redis.auth.password` block removed.
+
+The upgrade restarts the bundled PostgreSQL and Redis too (they now read the new secrets), so GlitchTip can briefly lose its database and task queue; it reconnects by itself. The new version of a workload can also wait several minutes with `is not allowed to reveal the secret` in `get-deployments` while access to the new secret propagates; the previous version keeps serving meanwhile, and it clears by itself.
 
 <Note>
 The first Helm upgrade after an install can restart the bundled database and Redis even when their values are unchanged, so expect a brief interruption.
@@ -527,7 +639,7 @@ The default database is the 3-replica Patroni cluster with automatic leader fail
   <Accordion title="Neither workload becomes ready and the logs are empty">
     **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing for either workload, and `cpln workload get-deployments RELEASE_NAME-glitchtip --gvc GVC_NAME -o yaml` shows `The secret AUTH_SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
 
-    **Cause:** The prerequisite auth secret named by `auth.secretName` does not exist (or the optional email secret named by `email.secretName` does not).
+    **Cause:** A prerequisite secret does not exist — the auth secret named by `auth.secretName`, the database credentials secret named by `*.config.credentialsSecretName`, the Redis password secret named by `redis.redis.auth.fromSecret.name`, or the optional email secret named by `email.secretName`. The message names the missing one.
 
     **Fix:** Create it (see [Prerequisites](#prerequisites)). The deployment recovers on its own once the secret exists; `cpln workload force-redeployment RELEASE_NAME-glitchtip --gvc GVC_NAME` skips the wait — run it for `RELEASE_NAME-glitchtip-worker` too.
   </Accordion>
@@ -546,25 +658,18 @@ The default database is the 3-replica Patroni cluster with automatic leader fail
     **Fix:** Set exactly one of them to `true` — see [Database](#database).
   </Accordion>
   <Accordion title="Render fails because the redis password is required">
-    **Symptom:** `glitchtip: redis.redis.auth.password.enabled must be true with a value` or `redis.redis.auth.password.value is required when redis is enabled`.
+    **Symptom:** `glitchtip: redis.redis.auth.fromSecret.enabled must be true when redis is enabled` or `redis.redis.auth.fromSecret.name is required when redis is enabled`.
 
-    **Cause:** Redis is enabled without a password value. GlitchTip's Sentinel connection URL embeds the password, so the chart requires one; the redis template's `fromSecret` method is not supported here.
+    **Cause:** Redis is enabled without the Redis password secret. GlitchTip's Sentinel connection URL carries the password, read from the prerequisite secret named by `redis.redis.auth.fromSecret.name`.
 
-    **Fix:** Set `redis.redis.auth.password.enabled: true` and `redis.redis.auth.password.value`, or set `redis.enabled: false` to run the queue on PostgreSQL.
-  </Accordion>
-  <Accordion title="Second install refused as managed by a different release">
-    **Symptom:** Installing a second GlitchTip release fails with `cannot be updated because it is being managed by a different release` and creates nothing.
-
-    **Cause:** Both releases use the same credentials secret name (`postgresHA.config.credentialsSecretName` or `postgres.config.credentialsSecretName`). Secret names are org-wide, and the first release owns that one. Nothing is shared, overwritten, or deleted.
-
-    **Fix:** Set a distinct secret name for the second release and install again.
+    **Fix:** Create the Redis password secret (see [Prerequisites](#prerequisites)) and set `redis.redis.auth.fromSecret.enabled: true` and `redis.redis.auth.fromSecret.name`, or set `redis.enabled: false` to run the queue on PostgreSQL.
   </Accordion>
   <Accordion title="Upgrade fails with a removed-key message">
-    **Symptom:** The render fails with `glitchtip: ... was removed in 1.1.0`, `config.username was REMOVED in postgres 3.4.0`, or `postgres-highly-available: the postgres block was REMOVED in 2.5.0`.
+    **Symptom:** The render fails with `glitchtip: ... was removed in 1.1.0`, `config.username was REMOVED in postgres 3.4.0`, `postgres-highly-available: the postgres block was REMOVED in 2.5.0`, `postgres.credentials was REMOVED in 1.4.0`, or `redis.redis.auth.password was REMOVED in 1.4.0`.
 
     **Cause:** Your values file still carries a key from an earlier template version.
 
-    **Fix:** Follow the table for your version under [Upgrading from 1.0.x](#upgrading-from-1-0-x), [Upgrading from 1.1.0](#upgrading-from-1-1-0), or [Upgrading from 1.2.x](#upgrading-from-1-2-x). Do not create a database credentials secret yourself — this template creates it.
+    **Fix:** Follow the section for your version under [Upgrading from 1.0.x](#upgrading-from-1-0-x), [Upgrading from 1.1.0](#upgrading-from-1-1-0), [Upgrading from 1.2.x](#upgrading-from-1-2-x), or [Upgrading from 1.3.1](#upgrading-from-1-3-1).
   </Accordion>
   <Accordion title="Invite, alert, or password-reset emails never arrive">
     **Symptom:** An invite or alert is created in the UI and no email is delivered.
@@ -584,17 +689,17 @@ The default database is the 3-replica Patroni cluster with automatic leader fail
 
 ## Important Notes
 
-- **Create the auth secret before installing** — `auth.secretName` must name an existing dictionary secret with `secretKey`, `adminEmail`, and `adminPassword`. A missing secret wedges both workloads silently.
+- **Create the prerequisite secrets before installing** — `auth.secretName` must name an existing dictionary secret with `secretKey`, `adminEmail`, and `adminPassword`, plus the database credentials secret and, with Redis enabled, the Redis password secret. A missing secret wedges the workloads silently; `status.versions[].message` from `cpln workload get-deployments RELEASE_NAME-glitchtip --gvc GVC_NAME -o yaml` names it.
 - **Keep `secretKey` for the life of the install** — rotating it logs every user out and invalidates password-reset links in flight. Nothing is corrupted.
 - **The auth secret seeds the superuser once** — editing it after first boot does not change the existing account. Change the password in the UI.
 - **Set `domain` to the URL your users actually open** — DSNs and emailed links embed it; after a change, upgrade and update the DSNs in your applications.
-- **Change `postgres.credentials.password` and `redis.redis.auth.password.value` before installing** — both seed their component on first boot and are used as-is.
-- **Give each release its own credentials secret name** — secret names are org-wide, and a second release on the same name is refused at install.
+- **Changing a password takes more than a secret edit** — the database password needs `ALTER ROLE` (and a leader switchover first in HA mode), the Redis password must be applied live on Redis and the Sentinels, and both need a forced redeployment of GlitchTip; see [Rotating the Database Password](#rotating-the-database-password) and [Rotating the Redis Password](#rotating-the-redis-password).
+- **Give each release its own database credentials secret** — secret names are org-wide.
 - **Do not expect to scale the worker** — it is a fixed singleton; `replicas` scales the web tier. Ingest keeps accepting events while the worker is down.
 - **With registration closed, invites only work for existing accounts** — create them at `/admin/` first; invite and alert emails require `email.secretName`.
 - **Pick the database mode before the first install** — there is no in-place switch between `postgresHA` and `postgres`.
 - **Source-map and artifact uploads are ephemeral** — kept on local disk, lost on restart, and not shared across web replicas. Error ingest itself is unaffected.
-- **Uninstalling deletes the volume sets** and every issue, event, and user in them; your auth secret survives. Enable backups if the data matters.
+- **Uninstalling deletes the volume sets** and every issue, event, and user in them; your prerequisite secrets survive. Enable backups if the data matters.
 
 ## External References
 
