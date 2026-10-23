@@ -22,7 +22,7 @@ Control Plane is a hybrid platform for deploying and managing containerized work
 - Console: https://console.cpln.io
 - API: https://api.cpln.io
 - AI Plugin: `controlplane-com/ai-plugin` (recommended for Claude Code, Codex, Antigravity CLI — bundles MCP Server with skills, agents, slash commands, and guardrails)
-- MCP Server: `https://mcp.cpln.io/mcp` (98 tools for any MCP-compatible AI client; OAuth + per-org consent)
+- MCP Server: `https://mcp.cpln.io/mcp` (95 tools for any MCP-compatible AI client; OAuth + per-org consent)
 - Docs: https://docs.controlplane.com (page index for AI agents: https://docs.controlplane.com/llms.txt)
 - Full CLI conventions and hallucination traps: https://docs.controlplane.com/public/cli-conventions.md
 
@@ -67,7 +67,7 @@ Org (Organization) — top-level isolation boundary, globally unique name
 | **External Logging** | Ship logs to S3, CloudWatch, Coralogix, Datadog, Logz.io, Stackdriver | Compliance, long-term retention, or external log analysis |
 | **Domains** | Custom domain routing with auto-TLS, geo-routing, path-based routing | Expose workloads on your own domain with CNAME or NS delegation |
 | **AI Plugin** | Plugin for Claude Code, Codex, and Antigravity CLI — bundles the MCP Server plus skills, agents, slash commands, and guardrails | Recommended path for AI-assisted infrastructure management when your tool supports plugins |
-| **MCP Server** | 98 tools for AI agents to manage infrastructure programmatically, including job tools that do a whole task in one call; OAuth + per-org consent | Any MCP-compatible AI client (Cursor, Claude Web, Claude Desktop, ChatGPT, VS Code, Antigravity, Amp, OpenCode) |
+| **MCP Server** | 95 tools for AI agents to manage infrastructure programmatically, including job tools that do a whole task in one call; OAuth + per-org consent | Any MCP-compatible AI client (Cursor, Claude Web, Claude Desktop, ChatGPT, VS Code, Antigravity, Amp, OpenCode) |
 
 ## Guardrails — read these first
 
