@@ -259,6 +259,8 @@ Reference syntax in env vars / volumes:
 
 **Injection methods**: env var (`cpln://secret/NAME...`), volume mount (large/multi-file/GCP JSON), or **pull secret at GVC level** (`spec.pullSecretLinks` — `docker`, `ecr`, `gcp` types only).
 
+**Updating a secret value**: only a `dictionary` secret mounted as a directory (`uri: cpln://secret/NAME`, no `.KEY`) refreshes in the running container (within about 10 minutes, and the app must re-read the files). Everything else needs `cpln workload force-redeployment`.
+
 ## CLI essentials
 
 ### Setup
