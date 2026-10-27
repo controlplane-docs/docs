@@ -521,7 +521,7 @@ Provider sections each have XOR rules (e.g. AWS `roleName` ⊻ `policyRefs`; GCP
 | --- | --- |
 | `dnsMode` | `cname` or `ns`. **Apex domains MUST use `cname`** — NS doesn't support apex. |
 | `certChallengeType` | `http01` or `dns01`. **NS mode requires `dns01`** (`http01` rejected). |
-| `certificateGeneratorLink` | Custom ACME CA via a [certificate generator](https://docs.controlplane.com/reference/certificategenerator). **Must not** be combined with `certChallengeType` or `tls.serverCertificate`; an `http01` generator is rejected with `dnsMode: ns`, `gvcLink`, or `workloadLink`. |
+| `certificateGeneratorLink` | Custom ACME CA via a [certificate generator](https://docs.controlplane.com/reference/certificategenerator). **Must not** be combined with `certChallengeType` or `tls.serverCertificate`; an `http01` generator is rejected with `dnsMode: ns`, `gvcLink`, or `workloadLink`. A `dns01` generator with provider `cpln` (the default, `dns01: {}`) needs the `_acme-challenge` CNAME like built-in `dns01`; credentialed providers need none. |
 | `gvcLink` ⊻ `workloadLink` ⊻ `ports.routes` | Mutually exclusive. `workloadLink` (replica-direct) is Stateful only. |
 | `acceptAllHosts` ⊻ `acceptAllSubdomains` | Mutually exclusive; both require dedicated LB. |
 | `ports[].protocol` | `http`, `http2` (default), `tcp` (`tcp` requires dedicated LB). |
