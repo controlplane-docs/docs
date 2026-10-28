@@ -22,7 +22,7 @@ Control Plane is a hybrid platform for deploying and managing containerized work
 - Console: https://console.cpln.io
 - API: https://api.cpln.io
 - AI Plugin: `controlplane-com/ai-plugin` (recommended for Claude Code, Codex, Antigravity CLI — bundles MCP Server with skills, agents, slash commands, and guardrails)
-- MCP Server: `https://mcp.cpln.io/mcp` (over 100 tools for any MCP-compatible AI client; OAuth + per-org consent)
+- MCP Server: `https://mcp.cpln.io/mcp` (95 tools for any MCP-compatible AI client; OAuth + per-org consent)
 - Docs: https://docs.controlplane.com (page index for AI agents: https://docs.controlplane.com/llms.txt)
 - Full CLI conventions and hallucination traps: https://docs.controlplane.com/public/cli-conventions.md
 
@@ -56,18 +56,18 @@ Org (Organization) — top-level isolation boundary, globally unique name
 
 ## Platform capabilities
 
-| Capability | What it is | When to use |
-| --- | --- | --- |
-| **Workloads** | Deploy containers as serverless, standard, cron, or stateful | Primary deployment unit — most users start here |
-| **Template Catalog** | 30+ production-ready templates (Postgres, Redis, Kafka, MongoDB, etc.) | Need a database, queue, or common service — install instead of building from scratch |
-| **Managed Kubernetes (mk8s)** | Provision Kubernetes clusters across AWS, GCP, Azure, Hetzner, and more | Need a full Kubernetes cluster (teams deploy INTO mk8s clusters) |
-| **CPLN BYOK** | Register existing Kubernetes clusters as Control Plane locations | Already have Kubernetes — want Control Plane workload management on top |
-| **Kubernetes Operator** | Manage Control Plane resources as Kubernetes CRDs (ArgoCD/GitOps) | Want Kubernetes-native GitOps for Control Plane infrastructure |
-| **Agents** | Secure tunnels to private networks (VPCs, on-prem, data centers) | Workloads need to reach private TCP endpoints behind firewalls |
-| **External Logging** | Ship logs to S3, CloudWatch, Coralogix, Datadog, Logz.io, Stackdriver | Compliance, long-term retention, or external log analysis |
-| **Domains** | Custom domain routing with auto-TLS, geo-routing, path-based routing | Expose workloads on your own domain with CNAME or NS delegation |
-| **AI Plugin** | Plugin for Claude Code, Codex, and Antigravity CLI — bundles the MCP Server plus skills, agents, slash commands, and guardrails | Recommended path for AI-assisted infrastructure management when your tool supports plugins |
-| **MCP Server** | Over 100 tools for AI agents to manage infrastructure programmatically, including job tools that do a whole task in one call; OAuth + per-org consent | Any MCP-compatible AI client (Cursor, Claude Web, Claude Desktop, ChatGPT, VS Code, Antigravity, Amp, OpenCode) |
+| Capability                    | What it is                                                                                                                                      | When to use                                                                                                     |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **Workloads**                 | Deploy containers as serverless, standard, cron, or stateful                                                                                    | Primary deployment unit — most users start here                                                                 |
+| **Template Catalog**          | 30+ production-ready templates (Postgres, Redis, Kafka, MongoDB, etc.)                                                                          | Need a database, queue, or common service — install instead of building from scratch                            |
+| **Managed Kubernetes (mk8s)** | Provision Kubernetes clusters across AWS, GCP, Azure, Hetzner, and more                                                                         | Need a full Kubernetes cluster (teams deploy INTO mk8s clusters)                                                |
+| **CPLN BYOK**                 | Register existing Kubernetes clusters as Control Plane locations                                                                                | Already have Kubernetes — want Control Plane workload management on top                                         |
+| **Kubernetes Operator**       | Manage Control Plane resources as Kubernetes CRDs (ArgoCD/GitOps)                                                                               | Want Kubernetes-native GitOps for Control Plane infrastructure                                                  |
+| **Agents**                    | Secure tunnels to private networks (VPCs, on-prem, data centers)                                                                                | Workloads need to reach private TCP endpoints behind firewalls                                                  |
+| **External Logging**          | Ship logs to S3, CloudWatch, Coralogix, Datadog, Logz.io, Stackdriver                                                                           | Compliance, long-term retention, or external log analysis                                                       |
+| **Domains**                   | Custom domain routing with auto-TLS, geo-routing, path-based routing                                                                            | Expose workloads on your own domain with CNAME or NS delegation                                                 |
+| **AI Plugin**                 | Plugin for Claude Code, Codex, and Antigravity CLI — bundles the MCP Server plus skills, agents, slash commands, and guardrails                 | Recommended path for AI-assisted infrastructure management when your tool supports plugins                      |
+| **MCP Server**                | 95 tools for AI agents to manage infrastructure programmatically, including job tools that do a whole task in one call; OAuth + per-org consent | Any MCP-compatible AI client (Cursor, Claude Web, Claude Desktop, ChatGPT, VS Code, Antigravity, Amp, OpenCode) |
 
 ## Guardrails — read these first
 
@@ -81,7 +81,7 @@ Context is established only when: the user named it in the current request, name
 
 > Before I run this, I want to confirm the target. Your active profile appears to be `<name>` (org: `<org>`, GVC: `<gvc>`). Should I use that, or a different org / profile / GVC?
 
-For **read-only** commands (`get`, `query`, `audit`, `logs`, `permissions`, `access-report`, `eventlog`), defaulting is acceptable — but **announce the target first**: *"Using profile `<name>` → org `<org>`, GVC `<gvc>`…"*
+For **read-only** commands (`get`, `query`, `audit`, `logs`, `permissions`, `access-report`, `eventlog`), defaulting is acceptable — but **announce the target first**: _"Using profile `<name>` → org `<org>`, GVC `<gvc>`…"_
 
 ### 2. Secret access — 3 mandatory steps
 
@@ -111,18 +111,18 @@ A workload without firewall config cannot reach its database, be reached by user
 
 ### 5. Workload type constraints (immutable after creation)
 
-| Feature | serverless | standard | stateful | cron |
-| --- | --- | --- | --- | --- |
-| Scale to zero | `rps` or `concurrency` | KEDA only | KEDA only | No |
-| Ports | Exactly 1 container × 1 port (required) | 0 or more | 0 or more | Must NOT expose any |
-| Capacity AI | Yes (default) | Yes (default) | Yes (API default off; Terraform and Pulumi default on) | Yes (default), applied at the next run |
-| Persistent volumes | No | No | Yes (volume sets) | No |
-| `replicaDirect` LB | No | No | **Only this type** | No |
-| `spec.job` | Forbidden | Forbidden | Forbidden | Required |
-| Multi-metric autoscaling | No | Yes (cpu/memory/rps) | Yes (cpu/memory/rps) | N/A |
-| `maxConcurrency` | Used | Ignored | Ignored | N/A |
-| `timeoutSeconds` max | 600 | 3600 | 3600 | N/A |
-| Max containers per workload | 8 | 8 | 8 | 8 |
+| Feature                     | serverless                              | standard             | stateful                                               | cron                                   |
+| --------------------------- | --------------------------------------- | -------------------- | ------------------------------------------------------ | -------------------------------------- |
+| Scale to zero               | `rps` or `concurrency`                  | KEDA only            | KEDA only                                              | No                                     |
+| Ports                       | Exactly 1 container × 1 port (required) | 0 or more            | 0 or more                                              | Must NOT expose any                    |
+| Capacity AI                 | Yes (default)                           | Yes (default)        | Yes (API default off; Terraform and Pulumi default on) | Yes (default), applied at the next run |
+| Persistent volumes          | No                                      | No                   | Yes (volume sets)                                      | No                                     |
+| `replicaDirect` LB          | No                                      | No                   | **Only this type**                                     | No                                     |
+| `spec.job`                  | Forbidden                               | Forbidden            | Forbidden                                              | Required                               |
+| Multi-metric autoscaling    | No                                      | Yes (cpu/memory/rps) | Yes (cpu/memory/rps)                                   | N/A                                    |
+| `maxConcurrency`            | Used                                    | Ignored              | Ignored                                                | N/A                                    |
+| `timeoutSeconds` max        | 600                                     | 3600                 | 3600                                                   | N/A                                    |
+| Max containers per workload | 8                                       | 8                    | 8                                                      | 8                                      |
 
 - **Workload type is immutable.** Changing type requires delete + recreate. Capture state first: `cpln workload get NAME --gvc GVC -o yaml-slim > NAME.bak.yaml`.
 - **Capacity AI** works on every workload type (on by default for Standard, Serverless, and Cron; Stateful and VM default off through the API but on through Terraform and Pulumi). It is incompatible with: CPU autoscaling, multi-metric autoscaling, GPUs.
@@ -138,7 +138,7 @@ Before any destructive operation, present a structured summary AND wait for expl
 - **Service-disrupting**: `policy remove-binding` (breaks runtime access), `serviceaccount remove-key` (breaks CI/CD), `group remove-member` (locks users out), `gvc remove-location` (forces redeployment).
 - **Implicit destructive (immutability traps)**: org delete impossible; workload type/name immutable (rename via `cpln workload clone OLD --name NEW --gvc GVC`); volume set `fileSystemType` and `performanceClass` immutable; `cpln apply` of a renamed resource creates a new one (old must be deleted with `cpln delete --file ...`).
 
-When delete + recreate is the only path: (1) capture state with `-o yaml-slim`, (2) reuse the same name to preserve URL/internal DNS/domain routes/policy targetLinks/identity bindings, (3) confirm — the user authorized the *goal*, not the *technique*.
+When delete + recreate is the only path: (1) capture state with `-o yaml-slim`, (2) reuse the same name to preserve URL/internal DNS/domain routes/policy targetLinks/identity bindings, (3) confirm — the user authorized the _goal_, not the _technique_.
 
 **Required confirmation shape:**
 
@@ -194,48 +194,48 @@ Stateful provisioning, large image pushes, mk8s creation, GVC location adds — 
 
 ## Workload types — choosing one
 
-| Need | Use |
-| --- | --- |
-| Web app that should scale to zero when idle | `serverless` |
-| Service that must always be running, multiple ports, or non-HTTP | `standard` |
-| Background job on a schedule | `cron` |
-| Database or stateful app needing persistent storage | `stateful` |
+| Need                                                             | Use          |
+| ---------------------------------------------------------------- | ------------ |
+| Web app that should scale to zero when idle                      | `serverless` |
+| Service that must always be running, multiple ports, or non-HTTP | `standard`   |
+| Background job on a schedule                                     | `cron`       |
+| Database or stateful app needing persistent storage              | `stateful`   |
 
 ## Autoscaling strategies
 
-| Strategy | Serverless | Standard | Stateful | Cron |
-| --- | :-: | :-: | :-: | :-: |
-| Concurrent Requests | Yes | No | No | No |
-| Requests Per Second | Yes | Yes | Yes | No |
-| CPU Utilization | Yes | Yes | Yes | No |
-| Memory Utilization | Yes | Yes | Yes | No |
-| Request Latency | No | Yes | Yes | No |
-| Multi-metric (cpu/memory/rps) | No | Yes | Yes | No |
-| KEDA (custom metrics) | No | Yes | Yes | No |
+| Strategy                      | Serverless | Standard | Stateful | Cron |
+| ----------------------------- | :--------: | :------: | :------: | :--: |
+| Concurrent Requests           |    Yes     |    No    |    No    |  No  |
+| Requests Per Second           |    Yes     |   Yes    |   Yes    |  No  |
+| CPU Utilization               |    Yes     |   Yes    |   Yes    |  No  |
+| Memory Utilization            |    Yes     |   Yes    |   Yes    |  No  |
+| Request Latency               |     No     |   Yes    |   Yes    |  No  |
+| Multi-metric (cpu/memory/rps) |     No     |   Yes    |   Yes    |  No  |
+| KEDA (custom metrics)         |     No     |   Yes    |   Yes    |  No  |
 
 **Scale to zero**: Serverless supports it with any of its metrics. Standard and Stateful reach it only via KEDA. Cron and VM cannot scale to zero; they require minScale ≥ 1.
 
-| Strategy | Best for |
-| --- | --- |
-| Concurrent Requests | Request-driven services, APIs with variable concurrency |
-| Requests Per Second | High-throughput APIs with predictable patterns |
-| CPU Utilization | Compute-heavy workloads (image processing, ML inference) |
-| Memory Utilization | Memory-intensive applications (caches, data processing) |
-| Request Latency | Latency-sensitive services (real-time, interactive) |
-| KEDA | Event-driven scaling (queue depth, external metrics) |
-| Disabled | Fixed replica count, manually managed scaling |
+| Strategy            | Best for                                                 |
+| ------------------- | -------------------------------------------------------- |
+| Concurrent Requests | Request-driven services, APIs with variable concurrency  |
+| Requests Per Second | High-throughput APIs with predictable patterns           |
+| CPU Utilization     | Compute-heavy workloads (image processing, ML inference) |
+| Memory Utilization  | Memory-intensive applications (caches, data processing)  |
+| Request Latency     | Latency-sensitive services (real-time, interactive)      |
+| KEDA                | Event-driven scaling (queue depth, external metrics)     |
+| Disabled            | Fixed replica count, manually managed scaling            |
 
 ## Workload resource validation — must-know constraints
 
-| Constraint | Rule |
-| --- | --- |
-| CPU / memory minimum | 25 millicores / 32 MiB |
-| Memory-to-CPU ratio | `memory(MiB) / cpu(millicores)` ≤ 8 (relax to 32 with tag `cpln/relaxMemoryToCpuRatio`) |
-| `port` vs `ports` | Mutually exclusive on the same container; port numbers unique across all containers |
-| Volumes | Max 15, unique paths, no path can be a parent of another |
-| `target` ceiling | ≤ 100 with cpu/memory metrics; not allowed with KEDA |
+| Constraint                | Rule                                                                                     |
+| ------------------------- | ---------------------------------------------------------------------------------------- |
+| CPU / memory minimum      | 25 millicores / 32 MiB                                                                   |
+| Memory-to-CPU ratio       | `memory(MiB) / cpu(millicores)` ≤ 8 (relax to 32 with tag `cpln/relaxMemoryToCpuRatio`)  |
+| `port` vs `ports`         | Mutually exclusive on the same container; port numbers unique across all containers      |
+| Volumes                   | Max 15, unique paths, no path can be a parent of another                                 |
+| `target` ceiling          | ≤ 100 with cpu/memory metrics; not allowed with KEDA                                     |
 | `metric`/`multi`/`target` | `metric` and `multi` are mutually exclusive; `target` is mutually exclusive with `multi` |
-| `replicaDirect` LB | Stateful only |
+| `replicaDirect` LB        | Stateful only                                                                            |
 
 **Defaults**: `type=serverless`, `cpu=50m`, `memory=128Mi`, `autoscaling.target=95`, `minScale=1`, `maxScale=5`, `scaleToZeroDelay=300s`, `terminationGracePeriodSeconds=90`, `firewallConfig.internal.inboundAllowType=none`.
 
@@ -247,15 +247,15 @@ For full validation (Stateful min/max ratios, GPU constraints — nvidia t4/a10g
 
 Reference syntax in env vars / volumes:
 
-| Type | Form |
-| --- | --- |
-| `opaque` | `cpln://secret/NAME.payload` |
+| Type         | Form                                                                    |
+| ------------ | ----------------------------------------------------------------------- |
+| `opaque`     | `cpln://secret/NAME.payload`                                            |
 | `dictionary` | `cpln://secret/NAME.KEY` (one env var per key, or mount as a directory) |
-| `userpass` | `cpln://secret/NAME.username` / `.password` |
-| `tls` | `cpln://secret/NAME.cert` / `.key` |
-| `keypair` | `cpln://secret/NAME.publicKey` / `.privateKey` |
-| `aws` | `cpln://secret/NAME.accessKey` / `.secretKey` / `.roleArn` |
-| `gcp` | `cpln://secret/NAME` (typically a volume mount — JSON file) |
+| `userpass`   | `cpln://secret/NAME.username` / `.password`                             |
+| `tls`        | `cpln://secret/NAME.cert` / `.key`                                      |
+| `keypair`    | `cpln://secret/NAME.publicKey` / `.privateKey`                          |
+| `aws`        | `cpln://secret/NAME.accessKey` / `.secretKey` / `.roleArn`              |
+| `gcp`        | `cpln://secret/NAME` (typically a volume mount — JSON file)             |
 
 **Injection methods**: env var (`cpln://secret/NAME...`), volume mount (large/multi-file/GCP JSON), or **pull secret at GVC level** (`spec.pullSecretLinks` — `docker`, `ecr`, `gcp` types only).
 
@@ -272,12 +272,12 @@ cpln profile update default --org my-org --gvc my-gvc       # set default org/GV
 
 For CI/CD, set environment variables through your platform's secrets management (never `--token`, which leaks into logs):
 
-| Variable | Purpose |
-| --- | --- |
-| `CPLN_TOKEN` | Service account key (`cpln serviceaccount add-key`) |
-| `CPLN_ORG` | Default organization |
-| `CPLN_GVC` | Default GVC |
-| `CPLN_PROFILE` | Profile override |
+| Variable                 | Purpose                                                              |
+| ------------------------ | -------------------------------------------------------------------- |
+| `CPLN_TOKEN`             | Service account key (`cpln serviceaccount add-key`)                  |
+| `CPLN_ORG`               | Default organization                                                 |
+| `CPLN_GVC`               | Default GVC                                                          |
+| `CPLN_PROFILE`           | Profile override                                                     |
 | `CPLN_SKIP_UPDATE_CHECK` | Any non-empty value skips the daily new-version check and its notice |
 
 Override per command: `--org`, `--gvc`, `--profile`.
@@ -301,30 +301,30 @@ Resource commands: `cpln <resource> <action> [REF] [--flags]`. Standalone comman
 
 ### Resource command map
 
-| Resource | Scope | CRUD | Non-standard subcommands |
-| --- | --- | --- | --- |
-| **workload** | gvc | Full | `connect`, `exec`, `run`, `cron` (get/run/start/stop), `replica` (get/stop), `force-redeployment`, `get-deployments`, `open`, `start`, `stop` |
-| **gvc** | org | Full | `add-location`, `remove-location`, `delete-all-workloads` |
-| **secret** | org | **No generic create** | 12 type-specific create commands, `reveal` |
-| **policy** | org | Full | `add-binding`, `remove-binding` |
-| **identity** | gvc | Full | — |
-| **volumeset** | gvc | Full | `expand`, `shrink`, `snapshot` (create/delete/get/restore), `volume` (delete/get) |
-| **domain** | org | Full (no clone) | — |
-| **cloudaccount** | org | **No generic create** | `create-aws`, `create-azure`, `create-gcp`, `create-ngs` |
-| **image** | org | No create | `build`, `copy`, `docker-login` |
-| **agent** | org | Full (no clone) | `info`, `manifest`, `up` |
-| **group** | org | Full | `add-member`, `remove-member` |
-| **ipset** | org | Full | `add-location`, `remove-location`, `update-location` |
-| **serviceaccount** | org | Full (no update) | `add-key`, `remove-key` |
-| **mk8s** | org | **No create** | `dashboard`, `join`, `kubeconfig` |
-| **user** | org | No create | `invite` |
-| **org** | — | **No delete** (immutable) | — |
-| **profile** | local | get, delete, update | `create`, `login`, `set-default`, `token` |
-| **helm** | gvc | get | `install`, `upgrade`, `template`, `rollback`, `uninstall`, `list`, `history` |
-| **stack** | gvc | — | `deploy`, `manifest`, `rm` |
-| **location** | org | Partial | `install`, `uninstall` |
-| **auditctx** | org | Full (no delete) | — |
-| **quota** | org | get, edit, patch | — |
+| Resource           | Scope | CRUD                      | Non-standard subcommands                                                                                                                      |
+| ------------------ | ----- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **workload**       | gvc   | Full                      | `connect`, `exec`, `run`, `cron` (get/run/start/stop), `replica` (get/stop), `force-redeployment`, `get-deployments`, `open`, `start`, `stop` |
+| **gvc**            | org   | Full                      | `add-location`, `remove-location`, `delete-all-workloads`                                                                                     |
+| **secret**         | org   | **No generic create**     | 12 type-specific create commands, `reveal`                                                                                                    |
+| **policy**         | org   | Full                      | `add-binding`, `remove-binding`                                                                                                               |
+| **identity**       | gvc   | Full                      | —                                                                                                                                             |
+| **volumeset**      | gvc   | Full                      | `expand`, `shrink`, `snapshot` (create/delete/get/restore), `volume` (delete/get)                                                             |
+| **domain**         | org   | Full (no clone)           | —                                                                                                                                             |
+| **cloudaccount**   | org   | **No generic create**     | `create-aws`, `create-azure`, `create-gcp`, `create-ngs`                                                                                      |
+| **image**          | org   | No create                 | `build`, `copy`, `docker-login`                                                                                                               |
+| **agent**          | org   | Full (no clone)           | `info`, `manifest`, `up`                                                                                                                      |
+| **group**          | org   | Full                      | `add-member`, `remove-member`                                                                                                                 |
+| **ipset**          | org   | Full                      | `add-location`, `remove-location`, `update-location`                                                                                          |
+| **serviceaccount** | org   | Full (no update)          | `add-key`, `remove-key`                                                                                                                       |
+| **mk8s**           | org   | **No create**             | `dashboard`, `join`, `kubeconfig`                                                                                                             |
+| **user**           | org   | No create                 | `invite`                                                                                                                                      |
+| **org**            | —     | **No delete** (immutable) | —                                                                                                                                             |
+| **profile**        | local | get, delete, update       | `create`, `login`, `set-default`, `token`                                                                                                     |
+| **helm**           | gvc   | get                       | `install`, `upgrade`, `template`, `rollback`, `uninstall`, `list`, `history`                                                                  |
+| **stack**          | gvc   | —                         | `deploy`, `manifest`, `rm`                                                                                                                    |
+| **location**       | org   | Partial                   | `install`, `uninstall`                                                                                                                        |
+| **auditctx**       | org   | Full (no delete)          | —                                                                                                                                             |
+| **quota**          | org   | get, edit, patch          | —                                                                                                                                             |
 
 ### Standard CRUD verbs
 
@@ -332,41 +332,41 @@ Resource commands: `cpln <resource> <action> [REF] [--flags]`. Standalone comman
 
 ### Commands that DON'T exist
 
-| Wrong | Correct |
-| --- | --- |
-| `cpln secret create` | `cpln secret create-opaque`, `create-aws`, etc. (12 type-specific variants) |
-| `cpln <resource> list` | `cpln <resource> get` (no args = list all) |
-| `cpln mk8s create` | `cpln apply --file mk8s-manifest.yaml` |
-| `cpln logs --follow` | `cpln logs --tail` (or `-t` or `-f`) |
-| `cpln workload log` | `cpln logs '{gvc="GVC", workload="WORKLOAD"}'` |
-| `cpln cloudaccount create` | `cpln cloudaccount create-aws`, `create-azure`, `create-gcp`, `create-ngs` |
-| `cpln apply` (no `--file`) | `cpln apply --file manifest.yaml` |
-| `cpln workload update --identity X` | `cpln workload update REF --set spec.identityLink=//identity/X` |
-| `cpln secret update --data '{}'` | `cpln secret edit REF` or `cpln apply --file ...` |
-| `cpln gvc update --location LOC` | `cpln gvc update REF --set 'spec.staticPlacement.locationLinks+=//location/LOC'` |
-| `cpln image push` / `cpln image pull` | `cpln image build --push` (build+push) or `docker push` after `cpln image docker-login` |
-| `cpln image tag` for version tags | Use Docker version tags directly via `cpln image build --name NAME:TAG`. `cpln image tag` exists but manages **metadata** key=value tags only, NOT Docker version tags. |
-| `cpln workload create --type stateful/cron` | `cpln apply --file workload.yaml` — CLI flags only support serverless/standard create |
+| Wrong                                       | Correct                                                                                                                                                                 |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cpln secret create`                        | `cpln secret create-opaque`, `create-aws`, etc. (12 type-specific variants)                                                                                             |
+| `cpln <resource> list`                      | `cpln <resource> get` (no args = list all)                                                                                                                              |
+| `cpln mk8s create`                          | `cpln apply --file mk8s-manifest.yaml`                                                                                                                                  |
+| `cpln logs --follow`                        | `cpln logs --tail` (or `-t` or `-f`)                                                                                                                                    |
+| `cpln workload log`                         | `cpln logs '{gvc="GVC", workload="WORKLOAD"}'`                                                                                                                          |
+| `cpln cloudaccount create`                  | `cpln cloudaccount create-aws`, `create-azure`, `create-gcp`, `create-ngs`                                                                                              |
+| `cpln apply` (no `--file`)                  | `cpln apply --file manifest.yaml`                                                                                                                                       |
+| `cpln workload update --identity X`         | `cpln workload update REF --set spec.identityLink=//identity/X`                                                                                                         |
+| `cpln secret update --data '{}'`            | `cpln secret edit REF` or `cpln apply --file ...`                                                                                                                       |
+| `cpln gvc update --location LOC`            | `cpln gvc update REF --set 'spec.staticPlacement.locationLinks+=//location/LOC'`                                                                                        |
+| `cpln image push` / `cpln image pull`       | `cpln image build --push` (build+push) or `docker push` after `cpln image docker-login`                                                                                 |
+| `cpln image tag` for version tags           | Use Docker version tags directly via `cpln image build --name NAME:TAG`. `cpln image tag` exists but manages **metadata** key=value tags only, NOT Docker version tags. |
+| `cpln workload create --type stateful/cron` | `cpln apply --file workload.yaml` — CLI flags only support serverless/standard create                                                                                   |
 
 ### High-value command shapes
 
 The resource command map + Standard CRUD verbs cover most cases. These are the syntax-sensitive ones worth memorizing:
 
-| Task | Command |
-| --- | --- |
-| Apply / delete bundle | `cpln apply --file ./manifests/ --gvc GVC --ready` &nbsp;·&nbsp; `cpln delete --file manifest.yaml` |
-| Create workload (cron/stateful via apply, not CLI flags) | `cpln workload create --name APP --gvc GVC --image IMAGE --port PORT` |
-| Create opaque secret | `cpln secret create-opaque --name SECRET --file data.txt` (use `--file -` for stdin) |
-| Bind permission | `cpln policy add-binding POLICY --permission reveal --identity //gvc/GVC/identity/ID` |
-| Assign identity to workload | `cpln workload update WL --gvc GVC --set spec.identityLink=//identity/ID` |
-| View logs | `cpln logs '{gvc="GVC", workload="WL"}' --org ORG --tail` |
-| Exec in container (note `--` separator) | `cpln workload exec WL --gvc GVC -- COMMAND` |
-| Port forward | `cpln port-forward WL 8080:8080 --gvc GVC` |
-| Export for re-apply | `cpln workload get WL --gvc GVC -o yaml-slim > wl.yaml` |
-| Rename (preferred over get/edit/apply) | `cpln workload clone OLD --name NEW --gvc GVC` |
-| Build & push image | `cpln image build --name IMAGE:TAG --push` |
-| Build & push without local Docker | `cpln image build --name IMAGE:TAG --remote` (add `--repo <https-url>` to build a GitHub/GitLab repo) |
-| Convert K8s manifests | `cpln convert --file k8s-manifest.yaml` |
+| Task                                                     | Command                                                                                               |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Apply / delete bundle                                    | `cpln apply --file ./manifests/ --gvc GVC --ready` &nbsp;·&nbsp; `cpln delete --file manifest.yaml`   |
+| Create workload (cron/stateful via apply, not CLI flags) | `cpln workload create --name APP --gvc GVC --image IMAGE --port PORT`                                 |
+| Create opaque secret                                     | `cpln secret create-opaque --name SECRET --file data.txt` (use `--file -` for stdin)                  |
+| Bind permission                                          | `cpln policy add-binding POLICY --permission reveal --identity //gvc/GVC/identity/ID`                 |
+| Assign identity to workload                              | `cpln workload update WL --gvc GVC --set spec.identityLink=//identity/ID`                             |
+| View logs                                                | `cpln logs '{gvc="GVC", workload="WL"}' --org ORG --tail`                                             |
+| Exec in container (note `--` separator)                  | `cpln workload exec WL --gvc GVC -- COMMAND`                                                          |
+| Port forward                                             | `cpln port-forward WL 8080:8080 --gvc GVC`                                                            |
+| Export for re-apply                                      | `cpln workload get WL --gvc GVC -o yaml-slim > wl.yaml`                                               |
+| Rename (preferred over get/edit/apply)                   | `cpln workload clone OLD --name NEW --gvc GVC`                                                        |
+| Build & push image                                       | `cpln image build --name IMAGE:TAG --push`                                                            |
+| Build & push without local Docker                        | `cpln image build --name IMAGE:TAG --remote` (add `--repo <https-url>` to build a GitHub/GitLab repo) |
+| Convert K8s manifests                                    | `cpln convert --file k8s-manifest.yaml`                                                               |
 
 ## Manifest patterns
 
@@ -381,19 +381,19 @@ spec:
   type: serverless
   containers:
     - name: main
-      image: nginx:latest                              # exact ref, NO docker.io/ prefix
+      image: nginx:latest # exact ref, NO docker.io/ prefix
       port: 80
       memory: 256Mi
       cpu: 250m
       env:
         - name: DB_PASSWORD
-          value: cpln://secret/db-password.payload     # opaque → .payload
+          value: cpln://secret/db-password.payload # opaque → .payload
   defaultOptions:
     autoscaling: { minScale: 1, maxScale: 5, metric: rps, target: 100 }
   firewallConfig:
     external:
-      inboundAllowCIDR: ["0.0.0.0/0"]
-      outboundAllowCIDR: ["0.0.0.0/0"]
+      inboundAllowCIDR: ['0.0.0.0/0']
+      outboundAllowCIDR: ['0.0.0.0/0']
 ---
 kind: secret
 name: db-password
@@ -402,11 +402,11 @@ data: { encoding: plain, payload: my-secret-value }
 ---
 kind: policy
 name: secret-access
-targetKind: secret                                     # singular, lowercase
+targetKind: secret # singular, lowercase
 targetLinks: [//secret/db-password]
 bindings:
   - permissions: [reveal]
-    principalLinks: [//gvc/my-gvc/identity/my-app-identity]    # GVC-scoped principal link
+    principalLinks: [//gvc/my-gvc/identity/my-app-identity] # GVC-scoped principal link
 ---
 kind: identity
 name: my-app-identity
@@ -490,12 +490,12 @@ For Terraform / Pulumi / Kubernetes Operator deployment patterns, fetch the rele
 
 **Load balancers:**
 
-| Type | Scope | Custom ports | Static IPs | Workload type |
-| --- | --- | :-: | :-: | --- |
-| Default (shared) | All workloads | No | No | All |
-| Direct | Per-workload | Yes (TCP/UDP) | Via IP Sets | All |
-| Dedicated (GVC) | Per-GVC | Yes | Via IP Sets | All |
-| Replica Direct (`spec.loadBalancer.replicaDirect`) | Per-replica | Configurable | Via IP Sets | **Stateful only** |
+| Type                                               | Scope         | Custom ports  | Static IPs  | Workload type     |
+| -------------------------------------------------- | ------------- | :-----------: | :---------: | ----------------- |
+| Default (shared)                                   | All workloads |      No       |     No      | All               |
+| Direct                                             | Per-workload  | Yes (TCP/UDP) | Via IP Sets | All               |
+| Dedicated (GVC)                                    | Per-GVC       |      Yes      | Via IP Sets | All               |
+| Replica Direct (`spec.loadBalancer.replicaDirect`) | Per-replica   | Configurable  | Via IP Sets | **Stateful only** |
 
 Dedicated LB on the GVC (`spec.loadBalancer.dedicated: true`) unlocks: domain ports outside 443/80, wildcard hostnames, `redirect.class.status5xx`/`status401` rules, and `tcp` protocol on domains. `trustedProxies`: `0` (source IP), `1` (last `X-Forwarded-For`), `2` (second-to-last).
 
@@ -509,7 +509,7 @@ Bind principals to permissions on resources. Wrong target kind, link format, or 
 - **Principal links**: user `//user/EMAIL`, service account `//serviceaccount/NAME`, group `//group/NAME`, **identity `//gvc/GVC/identity/NAME`** (NEVER `//identity/NAME` — silent ignore).
 - Max 50 bindings per policy, 200 principal links per binding. Permissions in each binding must be sorted alphabetically and unique. Built-in policies (`origin: builtin`) cannot be modified or deleted.
 
-For full per-kind permissions table (and what `reveal`, `use`, `manage`, etc. actually grant), use `cpln policy permissions`, the MCP `get_permissions` tool, or fetch [/reference/policy](https://docs.controlplane.com/reference/policy).
+For full per-kind permissions table (and what `reveal`, `use`, `manage`, etc. actually grant), use `cpln policy permissions`, the MCP `get_permissions` tool (`full` or `readonly` profile), or fetch [/reference/policy](https://docs.controlplane.com/reference/policy).
 
 ## Identities
 
@@ -519,15 +519,15 @@ Provider sections each have XOR rules (e.g. AWS `roleName` ⊻ `policyRefs`; GCP
 
 ## Domains
 
-| Field | Rule |
-| --- | --- |
-| `dnsMode` | `cname` or `ns`. **Apex domains MUST use `cname`** — NS doesn't support apex. |
-| `certChallengeType` | `http01` or `dns01`. **NS mode requires `dns01`** (`http01` rejected). |
-| `certificateGeneratorLink` | Custom ACME CA via a [certificate generator](https://docs.controlplane.com/reference/certificategenerator). **Must not** be combined with `certChallengeType` or `tls.serverCertificate`; an `http01` generator is rejected with `dnsMode: ns`, `gvcLink`, or `workloadLink`. A `dns01` generator with provider `cpln` (the default, `dns01: {}`) needs the `_acme-challenge` CNAME like built-in `dns01`; credentialed providers need none. |
-| `gvcLink` ⊻ `workloadLink` ⊻ `ports.routes` | Mutually exclusive. `workloadLink` (replica-direct) is Stateful only. |
-| `acceptAllHosts` ⊻ `acceptAllSubdomains` | Mutually exclusive; both require dedicated LB. |
-| `ports[].protocol` | `http`, `http2` (default), `tcp` (`tcp` requires dedicated LB). |
-| Route scope | All routes in a domain must target workloads in the **same GVC**. |
+| Field                                       | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dnsMode`                                   | `cname` or `ns`. **Apex domains MUST use `cname`** — NS doesn't support apex.                                                                                                                                                                                                                                                                                                                                                                |
+| `certChallengeType`                         | `http01` or `dns01`. **NS mode requires `dns01`** (`http01` rejected).                                                                                                                                                                                                                                                                                                                                                                       |
+| `certificateGeneratorLink`                  | Custom ACME CA via a [certificate generator](https://docs.controlplane.com/reference/certificategenerator). **Must not** be combined with `certChallengeType` or `tls.serverCertificate`; an `http01` generator is rejected with `dnsMode: ns`, `gvcLink`, or `workloadLink`. A `dns01` generator with provider `cpln` (the default, `dns01: {}`) needs the `_acme-challenge` CNAME like built-in `dns01`; credentialed providers need none. |
+| `gvcLink` ⊻ `workloadLink` ⊻ `ports.routes` | Mutually exclusive. `workloadLink` (replica-direct) is Stateful only.                                                                                                                                                                                                                                                                                                                                                                        |
+| `acceptAllHosts` ⊻ `acceptAllSubdomains`    | Mutually exclusive; both require dedicated LB.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `ports[].protocol`                          | `http`, `http2` (default), `tcp` (`tcp` requires dedicated LB).                                                                                                                                                                                                                                                                                                                                                                              |
+| Route scope                                 | All routes in a domain must target workloads in the **same GVC**.                                                                                                                                                                                                                                                                                                                                                                            |
 
 CNAME records → `cpln.app`. NS records → `ns1.cpln.cloud`, `ns2.cpln.cloud`, `ns1.cpln.live`, `ns2.cpln.live`. Auto-TLS = Let's Encrypt (or a linked certificate generator's CA), valid 90 days, auto-renewed every 60. Custom certs use the `keypair` secret type with PEM content. For CORS, header wildcards, route limits, and full route schema, fetch [/reference/domain](https://docs.controlplane.com/reference/domain).
 
@@ -535,16 +535,16 @@ CNAME records → `cpln.app`. NS records → `ns1.cpln.cloud`, `ns2.cpln.cloud`,
 
 Stateful only. Mount via `cpln://volumeset/NAME` with `recoveryPolicy: retain` (default) or `recycle`.
 
-| Filesystem | Access | Binding | Snapshots / shrink / delete / restore |
-| --- | --- | --- | :-: |
-| `ext4` | RWO | 1 stateful workload | Yes |
-| `xfs` | RWO | 1 stateful workload | Yes |
-| `shared` | RWX | Any number of workloads | **No** |
+| Filesystem | Access | Binding                 | Snapshots / shrink / delete / restore |
+| ---------- | ------ | ----------------------- | :-----------------------------------: |
+| `ext4`     | RWO    | 1 stateful workload     |                  Yes                  |
+| `xfs`      | RWO    | 1 stateful workload     |                  Yes                  |
+| `shared`   | RWX    | Any number of workloads |                **No**                 |
 
 Performance classes: `general-purpose-ssd` (min 10 GB), `high-throughput-ssd` (**min 200 GB**), `shared` (auto-set when `fileSystemType: shared`). Max capacity 65,536 GB for all.
 
 - **Both `fileSystemType` AND `performanceClass` are immutable.** Changing either = delete + recreate (data loss — guardrail #6).
-- `shrinkVolume` destroys data; volumes can be expanded only once every 6 hours.
+- `shrinkVolume` copies the data to a smaller volume (never below `initialCapacity` or the used bytes plus 5%) and keeps the old one if the copy fails; a volume can be expanded at most 4 times in a rolling 24 hours.
 - `copyVolume` replaces the destination volume and deletes its storage device; it needs `acknowledgeDestinationVolumeDeletion: true` and `exec.copyVolume` (not in `exec`).
 - `createFinalSnapshot: true` (default) auto-snapshots before any volume deletion — leave on.
 
@@ -603,7 +603,7 @@ Before submitting:
 
 - [/guides/cpln-apply](https://docs.controlplane.com/guides/cpln-apply) — GitOps, multi-resource apply, the patience-windowed safety-net pattern
 - [/cli-reference/overview](https://docs.controlplane.com/cli-reference/overview) — all CLI commands and flags
-- [/ai/overview](https://docs.controlplane.com/ai/overview), [/ai/mcp](https://docs.controlplane.com/ai/mcp), [/ai/plugin](https://docs.controlplane.com/ai/plugin): AI Tools overview (choose-your-path), MCP Server (over 100 tools, OAuth + per-org consent), and full AI plugin (skills + agents + commands + guardrails)
+- [/ai/overview](https://docs.controlplane.com/ai/overview), [/ai/mcp](https://docs.controlplane.com/ai/mcp), [/ai/plugin](https://docs.controlplane.com/ai/plugin): AI Tools overview (choose-your-path), MCP Server (95 tools, OAuth + per-org consent), and full AI plugin (skills + agents + commands + guardrails)
 - [/template-catalog/overview](https://docs.controlplane.com/template-catalog/overview) — 30+ production-ready templates
 - [/mk8s/overview](https://docs.controlplane.com/mk8s/overview), [/byok/overview](https://docs.controlplane.com/byok/overview), [/core/kubernetes-operator](https://docs.controlplane.com/core/kubernetes-operator)
 - Terraform: [registry.terraform.io/providers/controlplane-com/cpln](https://registry.terraform.io/providers/controlplane-com/cpln/latest/docs)
