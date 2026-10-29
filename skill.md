@@ -479,6 +479,7 @@ For Terraform / Pulumi / Kubernetes Operator deployment patterns, fetch the rele
 **Endpoints:**
 
 - Internal DNS (same-GVC): `WORKLOAD.GVC.cpln.local:PORT`
+  - `spec.networking.internal.routing` on the target: `locationEndpoint` (caller's location only) or `gvcEndpoint` (prefer local replicas, fail over to the location the canonical endpoint selects as local replicas become unavailable; billed as egress). New workloads default to `gvcEndpoint`; older workloads have no value, which means `locationEndpoint`.
 - Public canonical (set by GVC `endpointNamingFormat`):
   - `org` (default for new GVCs): `{workload}-{gvcAlias}.{orgEndpointPrefix}.cpln.app`
   - `default`: `{workload}-{gvcAlias}.cpln.app`

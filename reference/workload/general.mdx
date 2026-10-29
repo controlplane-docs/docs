@@ -182,6 +182,49 @@ Typically, the workload endpoint is used. For stateful workloads with `replicaDi
 - workload: `$workloadName.$gvcName.cpln.local:$port`
 - replica-direct:  `replica-$replicaIndex.$workloadName.$locationName.$gvcName.cpln.local:$port`
 
+#### Internal Routing and Location Failover
+
+`spec.networking.internal.routing` controls where requests to `$workloadName.$gvcName.cpln.local` go when they come from a workload in the **same** [GVC](/reference/gvc). Set it on the workload being called.
+
+| Value | Behavior |
+| :-- | :-- |
+| `locationEndpoint` | Requests are served only by replicas in the caller's location. If no local replica can serve them, the request fails. This is also the behavior when the field is not set. |
+| `gvcEndpoint` | Requests are served by local replicas while they are healthy. As local replicas become unavailable, requests fail over to the workload's [canonical endpoint](#canonical-endpoint-global), which routes to another location that passes its health check. |
+
+```yaml Workload manifest
+kind: workload
+name: WORKLOAD
+spec:
+  networking:
+    internal:
+      routing: gvcEndpoint
+```
+
+**Defaults:**
+
+- New workloads default to `gvcEndpoint`.
+- Workloads created before this field was introduced have no value, which behaves as `locationEndpoint`. They are not changed automatically. Set `gvcEndpoint` to opt in.
+- To see a workload's current setting, run `cpln workload get WORKLOAD --gvc GVC -o json` and check `spec.networking.internal.routing`.
+- An explicit value is always kept. Re-applying a manifest that omits the field with `cpln apply` keeps the stored value.
+
+**When failover happens:** local replicas are preferred.
+
+- **Full failover:** all requests go to another location when the workload has no ready replicas in the caller's location, for example when it is suspended there with [`spec.localOptions`](#location-specific-options).
+- **Partial failover:** when only some local replicas are unhealthy (not ready, or temporarily removed from load balancing after returning errors), a share of requests can go to another location while the rest stay local.
+- **Recovery:** traffic returns to local replicas once they are healthy again. A replica removed after returning errors is retried after about 30 seconds.
+
+Failover traffic stays on the service mesh and uses mutual TLS, just like calls between GVCs. The target's [internal firewall](/reference/workload/firewall#internal) still applies in the remote location, so a caller that is not allowed is rejected there with `403 Forbidden`.
+
+**Requirements and limits:**
+
+- The setting only takes effect when the GVC has more than one location and the workload is deployed in at least one other location.
+- Callers in a **different** GVC already reach the workload through its canonical endpoint, so this setting does not change their routing.
+- Outbound ports that the caller excludes from the service mesh with `cpln/disableServiceMeshOutboundPort` bypass mesh routing, so requests on those ports never fail over.
+- Requests can fail for a brief period before failover completes, while the failure is being detected.
+- For workloads that only expose TCP ports, location health is checked at the TCP level. A location that has no ready replicas but is not suspended can still be selected.
+
+<Warning>Requests that fail over leave the caller's location and are billed as egress. New workloads default to `gvcEndpoint`, so set `locationEndpoint` if a workload's internal traffic must stay in one location.</Warning>
+
 ### Finding Replica Hostnames
 
 When `replicaDirect` is enabled on a stateful workload, each replica is reachable at its own stable hostname, letting you target a specific replica instead of load-balancing across all of them:
