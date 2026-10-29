@@ -521,12 +521,53 @@ The server startup script writes the `password` key of your credentials secret i
 This procedure follows from how the chart's startup script applies the secret; it has not been exercised end to end on this template. Confirm the new password with the verify snippet under [Connecting](#connecting) after the redeployment completes.
 </Note>
 
+### Upgrading In Place from 2.8.0
+
+Template versions through 2.8.0 created their own GVC, and 3.0.0 deploys into an existing one. A plain `cpln helm upgrade` across that change deletes the GVC the 2.x release created, with every workload, volume set and identity inside it. These steps mark that GVC "keep" first, so the upgrade leaves it and everything in it in place. It covers a 2.8.0 release (upgrade an older 2.x to 2.8.0 first) whose locations all have at least 1 replica; if one has `replicas: 0`, use [Upgrading from 2.x](#upgrading-from-2-x) instead.
+
+```bash
+cpln helm get values RELEASE_NAME -o yaml > values-old.yaml
+curl -fsSLO https://raw.githubusercontent.com/controlplane-com/templates/main/scripts/keep-gvc.py
+python3 keep-gvc.py RELEASE_NAME            # shows what it will change
+python3 keep-gvc.py RELEASE_NAME --apply
+# write values-new.yaml from values-old.yaml (see below)
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/clickhouse --version 3.0.0 --gvc OLD_GVC_NAME -f values-new.yaml
+```
+
+- `OLD_GVC_NAME` is the GVC the 2.x release created (its `gvc.name`), not the GVC you ran the original install against.
+- The upgrade output must include `Skipped deletion of /org/ORG_NAME/gvc/OLD_GVC_NAME`. If it does not, stop: the GVC was not protected.
+
+`values-new.yaml` is `values-old.yaml` with these changes:
+
+```yaml
+# gvc: delete the whole block
+locations:                     # the old gvc.locations: same entries, SAME ORDER (it sets shard numbers and Keeper members)
+  - name: aws-us-east-2
+    replicas: 1
+server:
+  internalAccess:              # renamed from server.internal_access, same content
+    type: same-gvc
+    workloads: []
+keeper:
+  internalAccess:              # renamed from keeper.internal_access, same content
+    type: same-gvc
+    workloads: []
+```
+
+- If `values-old.yaml` has no `gvc` key, the release ran on 2.8.0's defaults: `OLD_GVC_NAME` is `clickhouse-gvc`, and `locations` is `aws-us-east-2`, `aws-us-west-2`, `aws-us-east-1` in that order, 1 replica each.
+- Keep your storage settings exactly as they are. If `values-old.yaml` has no `aws` block, 2.8.0 used `bucket: clickhouse-s3-bucket`, `cloudAccountName: clickhouse-s3-cloudaccount` and `policyName: clickhouse-s3-policy`; write those out, because 3.0.0's defaults name a different bucket.
+- With `type: workload-list`, `workloads` is now enforced (2.x ignored it): list every client that connects. This release's own workloads are added for you.
+
+Every server and Keeper restarts, in every location at once, so queries fail for a few minutes.
+
+Afterwards the GVC belongs to you, not the release: `cpln helm uninstall` leaves it in place, and you delete it with `cpln gvc delete OLD_GVC_NAME`. Details: [the keep-gvc script documentation](https://github.com/controlplane-com/templates/blob/main/scripts/README.md).
+
 ### Upgrading from 2.x
 
 Template versions through 2.8.0 created their own GVC, so that GVC is part of a 2.x release's manifest. Version 3.0.0 does not declare a GVC, and Helm deletes what a chart stops declaring.
 
 <Warning>
-**An in-place `helm upgrade` from any 2.x release to 3.0.0 is not supported and destroys the deployment.** The upgrade would delete the GVC the 2.x chart created and every workload, volume set and identity inside it — including your ClickHouse metadata and Keeper state — while reporting success.
+**A plain `helm upgrade` from any 2.x release to 3.0.0 destroys the deployment.** To keep the GVC, follow [Upgrading In Place from 2.8.0](#upgrading-in-place-from-2-8-0) instead. The upgrade would delete the GVC the 2.x chart created and every workload, volume set and identity inside it — including your ClickHouse metadata and Keeper state — while reporting success.
 
 The chart refuses to render when your values still carry the 2.x `gvc` key, so an upgrade that passes your old values file stops before a single resource is touched:
 
@@ -540,7 +581,7 @@ against an existing GVC, reload your data, then uninstall the old release. See `
 in the README.
 ```
 
-**The guard cannot cover an upgrade run with no values at all.** A 2.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires. Do not run `cpln helm upgrade` on a 2.x release against the 3.0.0 chart under any circumstances. The only supported path is a new release against an existing GVC, reloading the data, then removing the old release.
+**The guard cannot cover an upgrade run with no values at all.** A 2.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires. Never run a plain `cpln helm upgrade` on a 2.x release against the 3.0.0 chart. The alternatives are the in-place steps above, or a new release against an existing GVC, reloading the data, then removing the old release.
 </Warning>
 
 What changed between 2.x and 3.0.0:
@@ -663,7 +704,7 @@ Any removed key still present in your values is refused at render with a message
 
     **Cause:** your values still carry the 2.x `gvc` key. The refusal is deliberate — the upgrade it blocks would delete the GVC the 2.x chart created.
 
-    **Fix:** do not retry the upgrade with the key removed. Install 3.0.0 as a new release against an existing GVC, reload the data, and remove the old release as described in [Upgrading from 2.x](#upgrading-from-2-x).
+    **Fix:** do not retry the upgrade with the key removed. Follow [Upgrading In Place from 2.8.0](#upgrading-in-place-from-2-8-0), or install 3.0.0 as a new release against an existing GVC, reload the data, and remove the old release as described in [Upgrading from 2.x](#upgrading-from-2-x).
   </Accordion>
   <Accordion title="Bootstrap fails with FATAL: Keeper quorum was not reachable within 300s">
     **Symptom:** in a cluster mode, the first server replica in the first location exits with:
@@ -695,7 +736,7 @@ Any removed key still present in your values is refused at render with a message
 
 ## Important Notes
 
-- **Never run `cpln helm upgrade` on a 2.x release against 3.0.0** — it deletes the GVC the 2.x chart created and everything in it. Install a new release: [Upgrading from 2.x](#upgrading-from-2-x).
+- **Never run a plain `cpln helm upgrade` on a 2.x release against 3.0.0** — it deletes the GVC the 2.x chart created and everything in it. See [Upgrading In Place from 2.8.0](#upgrading-in-place-from-2-8-0) or [Upgrading from 2.x](#upgrading-from-2-x).
 - **Create the credentials secret before installing.** A missing one wedges the deployment with no log output; `cpln workload get-deployments` is the one command that names it.
 - **The GVC must contain every location you list**, and may contain more. Undeclared GVC locations run nothing.
 - **Two locations is not supported.** Use one (single-node or single-shard) or three or more.
