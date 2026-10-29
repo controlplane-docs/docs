@@ -7,7 +7,7 @@ keywords: ['http proxy', 'reverse proxy', 'path based routing', 'load balancer t
 
 ## Overview
 
-Nginx is a high-performance web server and reverse proxy. This template deploys Nginx as a stateless reverse proxy that routes incoming requests by path to other workloads in the same GVC, so several internal services can share one public endpoint. The `nginx.conf` is generated from your `locations` values and mounted into the container from a secret.
+Nginx is a high-performance web server and reverse proxy. This template deploys Nginx as a stateless reverse proxy that routes incoming requests by path to other workloads in the same GVC, so several internal services can share one public endpoint. The `nginx.conf` is generated from your `locations` values (or supplied whole through `nginxConf`) and mounted into the container from a secret.
 
 A default install also deploys a small example backend and routes every request to it, so you can confirm the proxy works before pointing it at your own services.
 
@@ -20,7 +20,7 @@ This template does not create a GVC. It deploys into an existing GVC that you al
 | Resource | Name | Purpose | Optional |
 |---|---|---|---|
 | Workload | `RELEASE_NAME-nginx` | Nginx reverse proxy on port `80` (serverless, autoscaling), open to the internet | — |
-| Secret | `RELEASE_NAME-nginx-config` | Opaque secret holding the generated `nginx.conf`, mounted at `/etc/nginx/nginx.conf` | — |
+| Secret | `RELEASE_NAME-nginx-config` | Opaque secret holding the `nginx.conf` (generated from your values, or your own from `nginxConf`), mounted at `/etc/nginx/nginx.conf` | — |
 | Identity | `RELEASE_NAME-nginx-identity` | Identity bound to the proxy workload | — |
 | Policy | `RELEASE_NAME-nginx-policy` | Grants the identity `reveal` on the configuration secret only | — |
 | Workload | `RELEASE_NAME-example` | Example backend that receives all `/` traffic; reachable only from the proxy | `enableExample: true` (the default) |
@@ -37,7 +37,7 @@ Install the template into an existing GVC. No `--set` values are required:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/nginx \
-  --version 1.1.2 --gvc GVC_NAME
+  --version 1.1.3 --gvc GVC_NAME
 ```
 
 To install using another method, follow the instructions for your preferred tool:
@@ -70,15 +70,13 @@ To install using another method, follow the instructions for your preferred tool
 
 ```yaml
 proxyWorkload:
-  image: nginx:1.31.4 # pinned: `latest` makes installs non-reproducible
+  image: nginx:1.31.7 # pinned: `latest` makes installs non-reproducible
   port: 80
-  capacityAI: false
   timeoutSeconds: 5
 ```
 
 - `proxyWorkload.image` — the Nginx container image.
 - `proxyWorkload.port` — the container port exposed by the workload. Leave it at `80`: the generated `nginx.conf` listens on `80` and the health probes check port `80`, neither of which follows this value.
-- `proxyWorkload.capacityAI` — enables Control Plane CapacityAI on the proxy workload.
 - `proxyWorkload.timeoutSeconds` — the workload request timeout in seconds.
 
 ### Resources
@@ -108,10 +106,10 @@ The scaling metric is fixed in the chart: CPU, with a 50 percent target.
 ### Example Backend
 
 ```yaml
-enableExample: true # set to true to deploy an example backend workload and route all traffic to it
+enableExample: true # deploy an example backend that answers every path none of your locations match
 ```
 
-When `true`, the chart deploys `RELEASE_NAME-example` and routes every `/` request to it. Set it to `false` before routing to your own services; otherwise the example keeps the `/` route.
+When `true`, the chart deploys `RELEASE_NAME-example`, a demo backend that answers every request none of your `locations` match. Set it to `false` to route `/` to your own service; a `/` location while it is on stops the proxy from starting.
 
 ### Locations
 
@@ -150,6 +148,14 @@ locations:
     regexModifier: ""
 ```
 
+### Custom nginx.conf
+
+To run your own configuration instead of the generated one, put the whole file in `nginxConf`. Helm template syntax in it is rendered, so it can still use `.Values.locations` and `.Values.global.cpln.gvc`. Keep `listen 80` and a `location /health` that returns 200, because the health probes check them:
+
+```yaml
+nginxConf: "" # a full nginx.conf replacing the generated one (Helm template syntax is rendered); empty = generated from the settings above
+```
+
 ### Built-in Routes
 
 Two routes are always present, whatever `locations` contains:
@@ -159,7 +165,7 @@ Two routes are always present, whatever `locations` contains:
 | `/health` | `200` with `{"success":true,"message":"OK"}`; used by the liveness and readiness probes |
 | `/fail` | `500` with `{"success":false,"message":"Error"}` |
 
-Any `500`, `502`, `503` or `504` from an upstream workload is replaced with the `/fail` response, so the client sees the JSON error body rather than the upstream page.
+A `500`, `502`, `503` or `504` from an upstream workload is answered with the `/fail` body; the status code is kept.
 
 ## Connecting
 
@@ -192,25 +198,23 @@ The `nginx.conf` lives in the `RELEASE_NAME-nginx-config` secret and is rebuilt 
 
 ```bash
 cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/nginx \
-  --version 1.1.2 --gvc GVC_NAME \
+  --version 1.1.3 --gvc GVC_NAME \
   -f values.yaml
 ```
 
 The values file must use the chart's nesting, exactly as the blocks in [Configuration](#configuration) show. A flat dotted key is accepted without error and silently changes nothing.
 
-The configuration is mounted as a file, and a running replica keeps the file it started with. Force a redeployment so every replica starts with the new `nginx.conf`:
+A routing change rolls the proxy onto the new configuration by itself after the upgrade. With one replica, requests may fail for a few seconds during the swap. Confirm a route you changed answers on the public endpoint.
 
-```bash
-cpln workload force-redeployment RELEASE_NAME-nginx --gvc GVC_NAME
-```
-
-Then confirm a route you changed answers on the public endpoint. Whether the upgrade alone restarts the proxy has not been verified on this template, so run the redeployment every time.
-
-Edit routing through Helm values only. Whether a later upgrade overwrites a hand edit to the secret has not been verified, so keep your routing in your values file and re-check the secret after every upgrade.
+Edit routing through Helm values only, and keep your routing in your values file.
 
 ### Upgrading From 1.1.1 or Earlier
 
 Versions 1.1.1 and earlier defaulted `proxyWorkload.image` to `nginx:latest`. Version 1.1.2 pins it to `nginx:1.31.4`, so an upgrade that does not set the image restarts the proxy on the pinned version. The proxy holds no data, so nothing needs to be migrated. To keep a specific image, set `proxyWorkload.image` explicitly.
+
+### Upgrading From 1.1.2
+
+Version `1.1.3` moves the proxy to nginx 1.31.7, adds `nginxConf`, and removes `proxyWorkload.capacityAI`, which never had any effect (CapacityAI is always off for this template). Delete the key from your values file if you set it; the proxy holds no data, so nothing needs to be migrated.
 
 ### Scaling and Availability
 
@@ -222,9 +226,9 @@ The proxy is stateless, so it scales horizontally. The shipped default runs exac
   <Accordion title="Every request returns the example page">
     **Symptom:** You added `locations`, but requests to `/` still return the example greeting page.
 
-    **Cause:** `enableExample` is still `true`, so the example backend keeps the `/` route.
+    **Cause:** `enableExample` is still `true`, so the example backend answers every request your `locations` do not match, including `/`.
 
-    **Fix:** Set `enableExample: false`, run a Helm upgrade, then force a redeployment as described in [Changing the Routing](#changing-the-routing).
+    **Fix:** Set `enableExample: false` and run a Helm upgrade as described in [Changing the Routing](#changing-the-routing).
   </Accordion>
   <Accordion title="A route returns the JSON error body">
     **Symptom:** Requests to one of your paths return `500` with `{"success":false,"message":"Error"}`.
@@ -252,27 +256,16 @@ The proxy is stateless, so it scales horizontally. The shipped default runs exac
     cpln workload get-deployments RELEASE_NAME-nginx --gvc GVC_NAME -o yaml
     ```
   </Accordion>
-  <Accordion title="A routing change has no effect">
-    **Symptom:** The upgrade succeeded, but the proxy still routes the old way.
-
-    **Cause:** The running replicas are still using the `nginx.conf` they started with.
-
-    **Fix:** Force a redeployment:
-
-    ```bash
-    cpln workload force-redeployment RELEASE_NAME-nginx --gvc GVC_NAME
-    ```
-  </Accordion>
 </AccordionGroup>
 
 ## Important Notes
 
-- Set `enableExample: false` before routing to your own services; the default sends all `/` traffic to the example backend.
+- Set `enableExample: false` before routing to your own services; the default example backend answers every request none of your `locations` match, and a `/` location while it is on stops the proxy from starting.
 - Put only the bare workload name in `locations[].workload`; the chart appends `.GVC_NAME.cpln.local` itself.
 - Each target workload's internal firewall must allow `RELEASE_NAME-nginx`, or its route returns the JSON error body.
 - The proxy is always open to the internet; there is no value to make it private.
 - Leave `proxyWorkload.port` at `80`; Nginx and its health probes are fixed to that port.
-- After changing routing, force a redeployment so the replicas load the new `nginx.conf`.
+- A routing change rolls the proxy onto the new config after `helm upgrade`; with one replica, requests may fail for a few seconds during the swap.
 - The example backend image, `gcr.io/knative-samples/helloworld-go`, publishes only `:latest` and cannot be pinned; it does not affect the proxy.
 
 ## External References
