@@ -342,7 +342,7 @@ The stream backup command above follows the upstream guide but has not been exer
 Template versions through 2.0.0 created their own GVC; 3.0.0 deploys into one you already have.
 
 <Warning>
-**Do not `cpln helm upgrade` a 2.x release onto 3.0.0.** A 2.x release owns the GVC it created, and Helm deletes what a chart stops declaring — the upgrade destroys that GVC and **every workload, volume set and identity inside it**, including your JetStream data. The chart refuses to render when your values still carry the 2.x `gvc` key, so a values-carrying upgrade fails safely before any resource is touched:
+**Do not run a plain `cpln helm upgrade` on a 2.x release.** [Upgrading in Place from 2.0.0](#upgrading-in-place-from-2-0-0) is the one supported in-place path. A 2.x release owns the GVC it created, and Helm deletes what a chart stops declaring — the upgrade destroys that GVC and **every workload, volume set and identity inside it**, including your JetStream data. The chart refuses to render when your values still carry the 2.x `gvc` key, so a values-carrying upgrade fails safely before any resource is touched:
 
 ```text
 Error: execution error at (nats/templates/workloads.yaml:3:4): nats 3.0.0: the `gvc` values key was
@@ -350,10 +350,10 @@ REMOVED. This chart no longer creates a GVC -- it deploys into the GVC you insta
 `gvc.locations` moved to the top-level `locations`. DO NOT `helm upgrade` a 2.x release onto 3.0.0 ...
 ```
 
-That guard cannot fire on an upgrade run with **no values at all** — a 2.x release installed on pure defaults has no `gvc` key for the chart to see. The procedure below is the safety; the render guard is only a backstop.
+That guard cannot fire on an upgrade run with **no values at all** — a 2.x release installed on pure defaults has no `gvc` key for the chart to see. Without the in-place steps, the safe alternative is the procedure below; the render guard is only a backstop.
 </Warning>
 
-Install 3.0.0 as a **new release against an existing GVC**, move the traffic, then remove the old release.
+To keep the old GVC and its streams, follow [Upgrading in Place from 2.0.0](#upgrading-in-place-from-2-0-0). Otherwise install 3.0.0 as a **new release against an existing GVC**, move the traffic, then remove the old release.
 
 <Steps>
   <Step title="Choose the target GVC">
@@ -386,6 +386,46 @@ Values that moved or were removed in 3.0.0. The chart names each one at render t
 | `allowCIDR: [0.0.0.0/0]` | Default is now `[]` (no public access) |
 | `volumeset.autoscaling` | Gone. `volumeset.capacity` is the only storage knob |
 | `locations[].replicas: 0` | Not allowed. Remove the location instead |
+
+### Upgrading in Place from 2.0.0
+
+A plain `cpln helm upgrade` from 2.x deletes the GVC the old release created, with everything in it, including your JetStream data. These steps keep the GVC, the servers and their streams:
+
+```bash
+cpln helm get values RELEASE_NAME > values-old.yaml
+curl -fsSLO https://raw.githubusercontent.com/controlplane-com/templates/main/scripts/keep-gvc.py
+python3 keep-gvc.py RELEASE_NAME            # shows what it will change
+python3 keep-gvc.py RELEASE_NAME --apply
+# write values-new.yaml from values-old.yaml (below)
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/nats --version 3.1.0 --gvc OLD_GVC_NAME -f values-new.yaml
+```
+
+- **`--gvc` is the GVC the old release created** (`gvc.name` in `values-old.yaml`, `nats-gvc` if you never set it), not the GVC you ran the original install against. A different `--gvc` starts an empty install there instead of upgrading the one that holds your data.
+- **The upgrade output must include `Skipped deletion of /org/ORG_NAME/gvc/OLD_GVC_NAME`.** If it does not, stop: the GVC was not protected.
+
+Write `values-new.yaml` from `values-old.yaml`. `cpln helm get values` returns only what you set, so also write in any 2.x default you relied on:
+
+```yaml
+locations:            # was gvc.locations: same names and replicas (2.x default shown)
+  - name: aws-us-east-1
+    replicas: 2
+  - name: aws-us-west-2
+    replicas: 2
+  - name: aws-eu-central-1
+    replicas: 2
+allowCIDR:            # the 2.x default was 0.0.0.0/0; 3.x defaults to [] (no public access)
+  - 0.0.0.0/0         # keep only if clients use the public WebSocket endpoint
+# delete: gvc, nats_defaults.cluster.listen, nats_defaults.gateway.listen,
+#   nats_defaults.cluster.noAdvertise (the chart refuses them), volumeset.autoscaling (no longer used)
+```
+
+- **With JetStream on, 3.x refuses a total of exactly 2 servers.** A 2.x release with one location and `replicas: 2` must change it to `replicas: 3`, which adds one server.
+- Remove any location with `replicas: 0`; the chart refuses it.
+- Keep `image`, `resources`, `jetstream`, `volumeset.capacity`, `internalAccess` and `nats_extra_config` as they are.
+
+The servers restart one at a time.
+
+Afterwards the GVC belongs to you rather than to the release: `cpln helm uninstall` leaves it in place, and you delete it with `cpln gvc delete OLD_GVC_NAME` when you no longer need it. Details: [the keep-gvc script documentation](https://github.com/controlplane-com/templates/blob/main/scripts/README.md).
 
 ### Rotating the Credentials
 
@@ -494,7 +534,7 @@ cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-nats"} |= "[nats]"' --limit 5
 
 ## Important Notes
 
-- **Do not `cpln helm upgrade` a 2.x release onto this version.** It deletes the GVC the old release created and everything inside it. Follow [Migrating from 2.x](#migrating-from-2-x).
+- **Never run a plain `cpln helm upgrade` on a 2.x release.** It deletes the GVC the old release created and everything inside it. Follow [Upgrading in Place from 2.0.0](#upgrading-in-place-from-2-0-0) or [Migrating from 2.x](#migrating-from-2-x).
 - **`locations` must match the GVC's locations.** A declared location the GVC lacks is not caught at install; a fresh JetStream server refuses to start on it, and every other server warns. Read the GVC's list with `cpln gvc get GVC_NAME -o yaml` before installing.
 - **A GVC location you did not list runs nothing.** Its deployment reads `This workload location is deactivated because maxScale is set to 0`; that is expected.
 - **No public access by default, and no authentication.** Opening `allowCIDR` without `auth.credentialsSecretName` publishes an unauthenticated message bus. Turn authentication on before adding ranges. Never pin a single `/32`.
