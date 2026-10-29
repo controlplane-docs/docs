@@ -429,12 +429,44 @@ cpln workload exec RELEASE_NAME-cockroach --gvc GVC_NAME \
 
 Running the second statement without the first fails with `full cluster restore can only be run on a cluster with no tables or databases`. Follow progress with `SHOW JOBS` the same way, and verify afterwards with `SHOW DATABASES`.
 
+### Upgrading In Place from 1.5.0
+
+Template versions through 1.5.0 created their own GVC, and 2.0.0 deploys into an existing one. A plain `cpln helm upgrade` across that change deletes the GVC the 1.x release created, with every workload, volume set and identity inside it. These steps mark that GVC "keep" first, so the upgrade leaves it and everything in it in place. It covers a 1.5.0 release (upgrade an older 1.x to 1.5.0 first) whose locations all have at least 1 replica; if one has `replicas: 0`, use [Upgrading from 1.x](#upgrading-from-1-x) instead.
+
+```bash
+cpln helm get values RELEASE_NAME -o yaml > values-old.yaml
+curl -fsSLO https://raw.githubusercontent.com/controlplane-com/templates/main/scripts/keep-gvc.py
+python3 keep-gvc.py RELEASE_NAME            # shows what it will change
+python3 keep-gvc.py RELEASE_NAME --apply
+# write values-new.yaml from values-old.yaml (see below)
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/cockroach --version 2.0.0 --gvc OLD_GVC_NAME -f values-new.yaml
+```
+
+- `OLD_GVC_NAME` is the GVC the 1.x release created (its `gvc.name`), not the GVC you ran the original install against.
+- The upgrade output must include `Skipped deletion of /org/ORG_NAME/gvc/OLD_GVC_NAME`. If it does not, stop: the GVC was not protected.
+
+`values-new.yaml` is `values-old.yaml` with one change:
+
+```yaml
+# gvc: delete the whole block
+locations:                     # the old gvc.locations: same entries, same order, same replicas
+  - name: aws-us-east-1
+    replicas: 3
+```
+
+- If `values-old.yaml` has no `gvc` key, the release ran on 1.5.0's defaults: `OLD_GVC_NAME` is `cockroach-gvc`, and `locations` is `aws-us-east-1`, `aws-eu-central-1`, `aws-us-west-2` in that order, 3 replicas each.
+- With `backup.enabled: true`, `backup.location` must be one of `locations`.
+
+Every CockroachDB node and PgBouncer replica restarts, and the platform does not serialize the restart across locations, so expect retried or failed queries for a few minutes (see [Application Retry Logic](#application-retry-logic)).
+
+Afterwards the GVC belongs to you, not the release: `cpln helm uninstall` leaves it in place, and you delete it with `cpln gvc delete OLD_GVC_NAME`. Details: [the keep-gvc script documentation](https://github.com/controlplane-com/templates/blob/main/scripts/README.md).
+
 ### Upgrading from 1.x
 
 Template versions through 1.5.0 created their own GVC, so that GVC is part of a 1.x release's manifest. Version 2.0.0 does not declare a GVC — and Helm deletes what a chart stops declaring.
 
 <Warning>
-**Never `cpln helm upgrade` a 1.x release onto 2.0.0.** The upgrade would delete the GVC the 1.x release created and every workload, volume set and identity inside it — including your data — while reporting success. The only supported path is a **new** release against an existing GVC, a restore of the data, and removal of the old release.
+**Never run a plain `cpln helm upgrade` on a 1.x release onto 2.0.0.** To keep the GVC, follow [Upgrading In Place from 1.5.0](#upgrading-in-place-from-1-5-0). The upgrade would otherwise delete the GVC the 1.x release created and every workload, volume set and identity inside it — including your data — while reporting success. The alternative is a **new** release against an existing GVC, a restore of the data, and removal of the old release.
 
 The chart refuses to render when your values still carry the 1.x `gvc` key, so an upgrade that passes your old values file stops before any API call is made:
 
@@ -444,7 +476,7 @@ key was REMOVED. This chart no longer creates a GVC -- it deploys into the GVC y
 `gvc.locations` moved to the top-level `locations`. DO NOT `helm upgrade` a 1.x release onto 2.0.0 ...
 ```
 
-**The guard cannot cover an upgrade run with no values file at all.** A 1.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires. Do not run an upgrade of a 1.x release against the 2.0.0 chart under any circumstances.
+**The guard cannot cover an upgrade run with no values file at all.** A 1.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires. Never run a plain upgrade of a 1.x release against the 2.0.0 chart.
 </Warning>
 
 <Steps>
@@ -561,7 +593,7 @@ Values keys that changed in 2.0.0, for the new release's values file:
 ## Important Notes
 
 - **Every location in `locations` must already exist in the GVC.** A missing one is accepted at install and refused by the nodes at boot; a GVC location you did not list runs nothing.
-- **Never `helm upgrade` a 1.x release onto 2.0.0.** It deletes the GVC the 1.x release created and everything in it. Install a new release and move the data — see [Upgrading from 1.x](#upgrading-from-1-x).
+- **Never run a plain `helm upgrade` on a 1.x release onto 2.0.0.** It deletes the GVC the 1.x release created and everything in it. See [Upgrading In Place from 1.5.0](#upgrading-in-place-from-1-5-0), or install a new release and move the data: [Upgrading from 1.x](#upgrading-from-1-x).
 - **Surviving a region loss needs at least three locations.** The default single location survives a node failure, not a location failure.
 - **The cluster runs in insecure mode.** There are no SQL credentials; `internal_access`, `pgbouncer.internal_access` and the GVC boundary are the only access control.
 - **Confirm multi-zone support in every GVC location before setting `multiZone: true`.** An unsupported location wedges the deployment with no log output.

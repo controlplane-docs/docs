@@ -575,12 +575,12 @@ Two Grafana-specific rules apply to any restore:
 Every release before 2.0.0 created its own GVC. 2.0.0 creates none and deploys into the GVC you install it into.
 
 <Warning>
-**Never `helm upgrade` a 1.x release onto 2.0.0.** Once the chart stops declaring a GVC, Helm prunes the one the old release created — and deleting a GVC deletes every workload, volume set and identity inside it: both Grafana tiers, the whole database cluster and its data volumes, the consensus store and the Redis coordination tier, while the command reports success. The chart refuses to render if your values still carry the 1.x `global.gvc` key, but that guard **cannot** fire on an upgrade run with no values at all. The procedure below is the safety; the guard is only a backstop.
+**Never run a plain `helm upgrade` on a 1.x release onto 2.0.0.** To keep the GVC, follow [Upgrading In Place From 1.1.1](#upgrading-in-place-from-1-1-1) instead. Otherwise, once the chart stops declaring a GVC, Helm prunes the one the old release created — and deleting a GVC deletes every workload, volume set and identity inside it: both Grafana tiers, the whole database cluster and its data volumes, the consensus store and the Redis coordination tier, while the command reports success. The chart refuses to render if your values still carry the 1.x `global.gvc` key, but that guard **cannot** fire on an upgrade run with no values at all. The in-place steps and the procedure below are the safety; the guard is only a backstop.
 </Warning>
 
 The refusal message usually names `etcd-multi-location` or `postgres-multi-location` rather than this chart, because every chart in the stack carries the same guard on the same key and a subchart's copy aborts the render first. The remedy is identical.
 
-Install 2.0.0 as a **new release against an existing GVC**, restore the database into it, then remove the old release:
+To migrate instead of upgrading in place, install 2.0.0 as a **new release against an existing GVC**, restore the database into it, then remove the old release:
 
 <Steps>
   <Step title="Back up the 1.x database">
@@ -608,6 +608,40 @@ Values that changed:
 | `global.gvc.locations` | `global.locations` |
 | `postgresML` pinned at 1.x | Pinned at **2.0.0**, which creates no GVC of its own |
 | `redisML` pinned at 2.x | Pinned at **3.0.0**, which creates no GVC of its own and adds `redisML.engine` |
+
+### Upgrading In Place From 1.1.1
+
+Template versions through 1.1.1 created their own GVC, and 2.0.0 deploys into an existing one. A plain `cpln helm upgrade` across that change deletes the GVC the 1.x release created, with every workload, volume set and identity inside it. These steps mark that GVC "keep" first, so the upgrade leaves it and everything in it in place. It keeps the release's database (dashboards, users, datasources, alert rules), its etcd store and its Redis tier, and covers a 1.1.1 release; upgrade an older 1.x to 1.1.1 first.
+
+```bash
+cpln helm get values RELEASE_NAME -o yaml > values-old.yaml
+curl -fsSLO https://raw.githubusercontent.com/controlplane-com/templates/main/scripts/keep-gvc.py
+python3 keep-gvc.py RELEASE_NAME            # shows what it will change
+python3 keep-gvc.py RELEASE_NAME --apply
+# write values-new.yaml from values-old.yaml (see below)
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/grafana-multi-location --version 2.0.0 --gvc OLD_GVC_NAME -f values-new.yaml
+```
+
+- `OLD_GVC_NAME` is the GVC the 1.x release created (its `global.gvc.name`), not the GVC you ran the original install against.
+- The upgrade output must include `Skipped deletion of /org/ORG_NAME/gvc/OLD_GVC_NAME`. If it does not, stop: the GVC was not protected.
+
+`values-new.yaml` is `values-old.yaml` with one change:
+
+```yaml
+global:
+  # gvc: delete the whole block (name and locations)
+  locations:                   # the old global.gvc.locations: same entries, same order, same replicas
+    - name: aws-us-east-1
+      replicas: 1
+```
+
+- If `values-old.yaml` has no `global.gvc` key, the release ran on 1.1.1's defaults: `OLD_GVC_NAME` is `grafana-multi-location-gvc`, and `global.locations` is `aws-us-east-1`, `aws-eu-central-1`, `aws-us-west-2` in that order, 1 replica each.
+- Leave `redisML.engine` unset (`redis`): the Redis data cannot move to `valkey` in place.
+- Nothing else changes. The bundled database, etcd and Redis tiers move to their own converted versions with the same resource names and secrets.
+
+Every tier restarts, the database in every location included, so Grafana is unavailable for a few minutes.
+
+Afterwards the GVC belongs to you, not the release: `cpln helm uninstall` leaves it in place, and you delete it with `cpln gvc delete OLD_GVC_NAME`. Details: [the keep-gvc script documentation](https://github.com/controlplane-com/templates/blob/main/scripts/README.md).
 
 ### Alert Evaluation
 
@@ -724,7 +758,7 @@ Turning HA on or off changes which workloads exist: enabling it deletes `RELEASE
 
     **Cause:** Your values file is from 1.x, which named a GVC under `global.gvc`.
 
-    **Fix:** Do not retry as an upgrade. Follow [Migrating From Version 1](#migrating-from-version-1).
+    **Fix:** Do not retry as a plain upgrade. Follow [Upgrading In Place From 1.1.1](#upgrading-in-place-from-1-1-1) or [Migrating From Version 1](#migrating-from-version-1).
   </Accordion>
   <Accordion title="Render fails because the database connection budget is exceeded">
     **Symptom:** The install refuses with `the database connection budget is exceeded — N Grafana instances ... above the 80-connection ceiling`.
@@ -745,7 +779,7 @@ Turning HA on or off changes which workloads exist: enabling it deletes `RELEASE
 ## Important Notes
 
 - **Create the admin password, encryption key and database credentials secrets before installing.** Without them the deployment waits silently on secrets that do not exist while `helm install` reports success.
-- **There is no upgrade path from 1.x.** A `helm upgrade` across the 2.0.0 boundary deletes the old GVC and everything in it. Follow [Migrating From Version 1](#migrating-from-version-1).
+- **Never run a plain `helm upgrade` on a 1.x release onto 2.0.0.** It deletes the old GVC and everything in it. Follow [Upgrading In Place From 1.1.1](#upgrading-in-place-from-1-1-1) or [Migrating From Version 1](#migrating-from-version-1).
 - **Every location in `global.locations` must already exist in the GVC you install into**, and `alerting.location` and `postgresML.primaryLocation` must be among them. GVC locations you do not list run nothing.
 - **Never rotate or delete the encryption key.** Every stored datasource credential becomes unreadable in every location, and alert rules that query them fail.
 - **Treat every `helm upgrade` that touches the database tier as a planned outage**, and expect the first upgrade after any install to re-apply every tier.

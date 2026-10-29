@@ -490,7 +490,7 @@ Template version 1.5.0 removed the credentials that 1.4.x took as plain Helm val
 Template versions through 1.5.0 created their own GVC. Version 2.0.0 deploys into an existing GVC and does not declare one — and Helm deletes what a chart stops declaring.
 
 <Warning>
-**Never `helm upgrade` a 1.x release onto 2.0.0.** The upgrade drops the GVC from the manifest and deletes it, with every workload, volume set and identity inside — your metadata database and your DAGs — while reporting success. The chart refuses to render when your values still carry the `gvc` key, and the refusal leaves the running release untouched:
+**Never run a plain `helm upgrade` on a 1.x release onto 2.0.0.** The upgrade drops the GVC from the manifest and deletes it, with every workload, volume set and identity inside — your metadata database and your DAGs — while reporting success. The chart refuses to render when your values still carry the `gvc` key, and the refusal leaves the running release untouched:
 
 ```text
 Error: execution error at (airflow/templates/workload-webserver.yaml:1:4): airflow 2.0.0: the `gvc`
@@ -499,7 +499,7 @@ into, and `gvc.locations` became the single top-level `location`. DO NOT `helm u
 release onto 2.0.0 ...
 ```
 
-An upgrade run with no values at all has no `gvc` key to catch and proceeds, so the rule matters more than the guard. The only supported path is a **new release** against an existing GVC.
+An upgrade run with no values at all has no `gvc` key to catch and proceeds, so the rule matters more than the guard. To keep the GVC, follow [Upgrading In Place from 1.5.0](#upgrading-in-place-from-1-5-0). The alternative is a **new release** against an existing GVC, as below.
 </Warning>
 
 <Steps>
@@ -552,6 +552,50 @@ Values that moved or were removed in 2.0.0:
 | `keda.enabled: true` by default | `false` by default, and it requires KEDA enabled on your GVC |
 | — | `airflow.celeryWorker.replicas`, the fixed worker count used when KEDA is off |
 | — | `internalAccess.type` / `internalAccess.workloads` |
+
+### Upgrading In Place from 1.5.0
+
+Template versions through 1.5.0 created their own GVC, and 2.1.0 deploys into an existing one. A plain `cpln helm upgrade` across that change deletes the GVC the 1.x release created, with every workload, volume set and identity inside it. These steps mark that GVC "keep" first, so the upgrade leaves it and everything in it in place. It covers a 1.5.0 release (upgrade an older 1.x to 1.5.0 first) that runs in one location; with more than one entry in `gvc.locations`, use [Migrating from 1.x](#migrating-from-1-x) instead.
+
+Create the database credentials secret under a **new** name first, holding the values the database runs with today. 1.5.0 keeps them in `RELEASE_NAME-airflow-config`, and the upgrade deletes that secret:
+
+```bash
+cpln secret reveal RELEASE_NAME-airflow-config -o yaml   # username and password in use today
+cpln secret create-dictionary --name RELEASE_NAME-airflow-db \
+  --entry username='YOUR_CURRENT_USERNAME' --entry password='YOUR_CURRENT_PASSWORD' --entry database='YOUR_CURRENT_DATABASE'
+```
+
+`YOUR_CURRENT_DATABASE` is `postgres.config.database` of the 1.5.0 release, `airflow` unless you changed it. Then mark the GVC and upgrade:
+
+```bash
+cpln helm get values RELEASE_NAME -o yaml > values-old.yaml
+curl -fsSLO https://raw.githubusercontent.com/controlplane-com/templates/main/scripts/keep-gvc.py
+python3 keep-gvc.py RELEASE_NAME            # shows what it will change
+python3 keep-gvc.py RELEASE_NAME --apply
+# write values-new.yaml from values-old.yaml (see below)
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/airflow --version 2.1.0 --gvc OLD_GVC_NAME -f values-new.yaml
+```
+
+- `OLD_GVC_NAME` is the GVC the 1.x release created (its `gvc.name`), not the GVC you ran the original install against.
+- The upgrade output must include `Skipped deletion of /org/ORG_NAME/gvc/OLD_GVC_NAME`. If it does not, stop: the GVC was not protected.
+
+`values-new.yaml` is `values-old.yaml` with these changes:
+
+```yaml
+# gvc: delete the whole block
+location: aws-eu-central-1     # the one entry of the old gvc.locations
+postgres:
+  config:                      # delete username, password and database
+    credentialsSecretName: RELEASE_NAME-airflow-db   # the secret created above
+keda:
+  enabled: true                # what 1.5.0 ran with (its default was true)
+```
+
+If `values-old.yaml` has no `gvc` key, the release ran on 1.5.0's defaults: `OLD_GVC_NAME` is `airflow` and `location` is `aws-eu-central-1`. Keep `keda.enabled` as 1.5.0 had it: the GVC it created has KEDA on exactly when that was `true`, and `true` against a GVC with KEDA off stops the webserver from starting.
+
+The upgrade restarts PostgreSQL, Redis, the webserver and the workers, so Airflow is unavailable for a few minutes. A workload can wait with `is not allowed to reveal the secret` in `get-deployments` while access to the new secrets propagates; it clears by itself (see [Upgrading from 2.0.0](#upgrading-from-2-0-0)).
+
+Afterwards the GVC belongs to you, not the release: `cpln helm uninstall` leaves it in place, and you delete it with `cpln gvc delete OLD_GVC_NAME`. Details: [the keep-gvc script documentation](https://github.com/controlplane-com/templates/blob/main/scripts/README.md).
 
 ### Upgrading from 2.0.0
 
@@ -627,9 +671,9 @@ The upgrade restarts PostgreSQL, the webserver and the workers (they now read th
   <Accordion title="helm upgrade prints the gvc values key was REMOVED">
     **Symptom:** upgrading a 1.x release to 2.0.0 fails at render with the message quoted in [Migrating from 1.x](#migrating-from-1-x).
 
-    **Cause:** your values still carry the 1.x `gvc` key. The refusal is deliberate; the in-place upgrade would delete the GVC the 1.x chart created.
+    **Cause:** your values still carry the 1.x `gvc` key. The refusal is deliberate; a plain upgrade would delete the GVC the 1.x chart created.
 
-    **Fix:** do not remove the key and retry. Install 2.0.0 as a new release and move the data as described in [Migrating from 1.x](#migrating-from-1-x).
+    **Fix:** do not remove the key and retry. Follow [Upgrading In Place from 1.5.0](#upgrading-in-place-from-1-5-0), or install 2.0.0 as a new release and move the data as described in [Migrating from 1.x](#migrating-from-1-x).
   </Accordion>
   <Accordion title="The canonical endpoint returns 403">
     **Symptom:** the webserver is ready but its public URL returns `403`.
@@ -658,7 +702,7 @@ The upgrade restarts PostgreSQL, the webserver and the workers (they now read th
 
 - **Create the auth and database credentials secrets before installing.** Without either the deployment wedges with no log output; `cpln workload get-deployments` is the one place the missing secret is named.
 - **The Fernet key can never be rotated.** Generate it once, keep it, and back it up with the auth secret.
-- **Never upgrade a 1.x release onto 2.0.0 in place** — it deletes the GVC the 1.x chart created and everything in it. See [Migrating from 1.x](#migrating-from-1-x).
+- **Never run a plain `helm upgrade` on a 1.x release onto 2.0.0** — it deletes the GVC the 1.x chart created and everything in it. See [Upgrading In Place from 1.5.0](#upgrading-in-place-from-1-5-0) or [Migrating from 1.x](#migrating-from-1-x).
 - **`location` must be a location of your GVC.** Otherwise the install succeeds and nothing starts anywhere.
 - **Enable KEDA on the GVC before setting `keda.enabled: true`**, or the workers sit at `keda.minScale` forever with no error.
 - **Rotating the database password needs `ALTER ROLE` plus a forced redeployment of the webserver and workers** — editing the secret alone changes nothing; see [Rotating the Database Password](#rotating-the-database-password).
