@@ -80,7 +80,7 @@ Install the chart from the marketplace registry, pointing it at the secret you c
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/timescaledb-highly-available \
-  --version 1.2.0 --gvc GVC_NAME \
+  --version 1.2.1 --gvc GVC_NAME \
   --set postgres.credentialsSecretName=CREDENTIALS_SECRET_NAME
 ```
 
@@ -123,7 +123,7 @@ resources:
   maxCpu: 1
   maxMemory: 2Gi
 
-image: timescale/timescaledb-ha:pg18.4-ts2.28.3  # PostgreSQL 18 + TimescaleDB 2.28.3 Community, Patroni bundled
+image: timescale/timescaledb-ha:pg18.6-ts2.31.0 # PostgreSQL 18.6 + TimescaleDB 2.31.0 Community (pgvector 0.8.7), Patroni bundled
 
 multiZone: false        # spread replicas across zones in the location
 ```
@@ -257,7 +257,7 @@ pgbouncer:
   poolMode: transaction   # options: session, transaction, statement
   defaultPoolSize: 25      # real Postgres connections PgBouncer maintains per pod
   maxClientConn: 1000      # maximum client connections PgBouncer accepts per pod
-  maxDbConnections: 100    # hard cap on total Postgres connections across all pods
+  maxDbConnections: 100    # cap on Postgres connections per PgBouncer pod (pods do not coordinate)
   minReplicas: 2
   maxReplicas: 4
   resources:
@@ -616,6 +616,28 @@ Template version `1.2.0` changes how new clusters are initialized, and an upgrad
 - **Riding out an etcd outage.** Clusters created from `1.2.0` have Patroni's `failsafe_mode` on: when the leader loses etcd but every member still answers its REST API, it keeps serving instead of demoting. A cluster created earlier gains it only through `edit-config -s failsafe_mode=true`.
 
 Also in `1.2.0`: `backup.resources.memory` rose from `128Mi` to `512Mi` because the smaller value OOM-killed the dump; passwords containing quotes or backslashes now work on both Patroni and PgBouncer. Before upgrading, confirm a recent backup actually completed — see [Backing Up](#backing-up).
+
+### Upgrading From a Version Before 1.2.1
+
+Version 1.2.1 moves the default image from `pg18.4-ts2.28.3` to `pg18.6-ts2.31.0`: PostgreSQL 18.6, TimescaleDB 2.31.0 and pgvector 0.8.7, which fixes CVE-2026-103484 (a database user who can build an IVFFlat index could run code as the server). An upgrade whose values still pin a `timescale/timescaledb-ha` tag with an older pgvector is refused at render; if you set `image` yourself, move it to the new tag.
+
+- The members restart onto the new image during the upgrade. PostgreSQL 18.4 to 18.6 needs no dump or restore.
+- The pgvector fix is in the server library, so it applies on that restart; existing data and indexes need nothing. `\dx` keeps reporting the old `vector` version until you run `ALTER EXTENSION vector UPDATE;` in each database that has it, which only updates that record.
+- **TimescaleDB stays at 2.28.3 in each existing database until you update it.** The image ships the new version, but nothing breaks meanwhile. Update it on the leader, in each database where `\dx timescaledb` lists it, soon after the upgrade (the nightly backup records the extension version, and a restore needs the same one). Find the leader, then update the extension in the app database:
+
+```bash
+cpln workload exec RELEASE_NAME-timescaledb-ha --gvc GVC_NAME --container patroni-timescaledb \
+  -- patronictl -c /tmp/patroni_config.yml list
+```
+
+```bash
+# -X and -c make it the first command of a fresh session
+cpln workload exec RELEASE_NAME-timescaledb-ha --gvc GVC_NAME --replica LEADER_MEMBER --container patroni-timescaledb \
+  -- sh -c 'psql -X -h 127.0.0.1 -d "$APP_DATABASE" -c "ALTER EXTENSION timescaledb UPDATE;"'
+```
+
+- If you set `timescaledb.enable_columnarscan` (now `timescaledb.debug_enable_columnarscan`) or a granular refresh setting (now `timescaledb.cagg_granular_refresh_*`), move it to the new name.
+- PostgreSQL 18.6 allows only the `pgoutput` and `test_decoding` logical decoding plugins by default; a consumer using another plugin needs it added to `output_plugin_libraries` (see the [18.6 release notes](https://www.postgresql.org/docs/release/18.6/)).
 
 ### Scaling and Availability
 
