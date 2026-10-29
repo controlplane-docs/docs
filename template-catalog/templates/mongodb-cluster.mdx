@@ -470,7 +470,7 @@ The password in the secret creates the root user on first boot; afterwards the m
 
 ### Migrating from 1.x
 
-Template versions through 1.1.1 created their own GVC. Version 2.0.0 does not — and Helm deletes what a chart stops declaring, so **an in-place upgrade of a 1.x release onto 2.0.0 deletes the GVC the 1.x release created, with every workload, volume set and identity in it, including your data.** The chart refuses to render when your values still carry the 1.x `gvc` key, so the usual path fails safely:
+Template versions through 1.1.1 created their own GVC. Version 2.0.0 does not — and Helm deletes what a chart stops declaring, so **a plain upgrade of a 1.x release onto 2.0.0 deletes the GVC the 1.x release created, with every workload, volume set and identity in it, including your data.** The chart refuses to render when your values still carry the 1.x `gvc` key, so the usual path fails safely:
 
 ```text
 Error: execution error at (mongodb-cluster/templates/identity.yaml:1:4): mongodb-cluster 2.0.0: the
@@ -480,7 +480,7 @@ release onto 2.0.0 ...
 ```
 
 <Warning>
-**Do not run `cpln helm upgrade` on a 1.x release with the 2.0.0 chart under any circumstances**, including with no values at all — the guard can only see values you pass. Migrate to a new release instead.
+**Never run a plain `cpln helm upgrade` on a 1.x release with the 2.0.0 chart**, including with no values at all — the guard can only see values you pass. To keep the GVC, follow [Upgrading In Place from 1.1.1](#upgrading-in-place-from-1-1-1); otherwise migrate to a new release as below.
 </Warning>
 
 <Steps>
@@ -514,6 +514,38 @@ Values that moved or were removed in 2.0.0. Each is named at render time rather 
 ```bash
 cpln secret reveal RELEASE_NAME-mongo-config -o yaml
 ```
+
+### Upgrading In Place from 1.1.1
+
+Template versions through 1.1.1 created their own GVC, and 2.0.0 deploys into an existing one. A plain `cpln helm upgrade` across that change deletes the GVC the 1.x release created, with every workload, volume set and identity inside it. These steps mark that GVC "keep" first, so the upgrade leaves it and everything in it in place. It covers a 1.1.1 release (upgrade an older 1.x to 1.1.1 first) with **at most 7 members in total, never exactly 2, and at least 1 in every location**. The 1.x default of 3 locations × 3 is 9 members, which 2.0.0 refuses; for that shape, use [Migrating from 1.x](#migrating-from-1-x) instead.
+
+```bash
+cpln helm get values RELEASE_NAME -o yaml > values-old.yaml
+curl -fsSLO https://raw.githubusercontent.com/controlplane-com/templates/main/scripts/keep-gvc.py
+python3 keep-gvc.py RELEASE_NAME            # shows what it will change
+python3 keep-gvc.py RELEASE_NAME --apply
+# write values-new.yaml from values-old.yaml (see below)
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/mongodb-cluster --version 2.0.0 --gvc OLD_GVC_NAME -f values-new.yaml
+```
+
+- `OLD_GVC_NAME` is the GVC the 1.x release created (its `gvc.name`), not the GVC you ran the original install against.
+- The upgrade output must include `Skipped deletion of /org/ORG_NAME/gvc/OLD_GVC_NAME`. If it does not, stop: the GVC was not protected.
+
+`values-new.yaml` is `values-old.yaml` with these changes:
+
+```yaml
+# gvc: delete the whole block
+locations:                     # the old gvc.locations: same entries, same order, same replicas
+  - name: aws-us-east-1
+    replicas: 3
+backup:
+  mode: logical                # 2.0.0 refuses physical
+  location: aws-us-east-1      # with backup.enabled: true, the location the job ran in (where your bucket is); must be one of locations
+```
+
+The credentials and keyfile secrets stay as they are. Every member and HAProxy replica restarts, so expect a primary election and failed writes for a few minutes.
+
+Afterwards the GVC belongs to you, not the release: `cpln helm uninstall` leaves it in place, and you delete it with `cpln gvc delete OLD_GVC_NAME`. Details: [the keep-gvc script documentation](https://github.com/controlplane-com/templates/blob/main/scripts/README.md).
 
 ### Scaling and Availability
 
@@ -579,9 +611,9 @@ Then upgrade the release with the lower count. To stop running in a location ent
   <Accordion title="Render fails with the gvc values key was REMOVED or backup.mode physical was REMOVED">
     **Symptom:** `cpln helm install` or `cpln helm upgrade` exits with a `mongodb-cluster 2.0.0:` render error naming the `gvc` key or `backup.mode 'physical'`, and nothing is changed.
 
-    **Cause:** Your values file is from a 1.x release. The `gvc` block and physical backups were removed in 2.0.0, and an in-place upgrade from 1.x is refused deliberately.
+    **Cause:** Your values file is from a 1.x release. The `gvc` block and physical backups were removed in 2.0.0, and a plain upgrade from 1.x is refused deliberately.
 
-    **Fix:** Follow [Migrating from 1.x](#migrating-from-1-x). For a 2.0.0 values file, remove the `gvc` block and set `backup.mode: logical`.
+    **Fix:** Follow [Upgrading In Place from 1.1.1](#upgrading-in-place-from-1-1-1) or [Migrating from 1.x](#migrating-from-1-x). For a 2.0.0 values file, remove the `gvc` block and set `backup.mode: logical`.
   </Accordion>
 </AccordionGroup>
 
@@ -589,7 +621,7 @@ Then upgrade the release with the lower count. To stop running in a location ent
 
 - **Create both prerequisite secrets before installing.** A missing secret wedges the deployment with no log output; the only diagnostic is `status.versions[].message` from `cpln workload get-deployments`.
 - **Generate the keyfile with `openssl rand -base64 756`**, never a passphrase, and never change it after the cluster is initialized.
-- **Never `helm upgrade` a 1.x release onto 2.0.0.** It deletes the GVC the 1.x chart created and everything in it. Migrate to a new release.
+- **Never run a plain `helm upgrade` on a 1.x release onto 2.0.0.** It deletes the GVC the 1.x chart created and everything in it. See [Upgrading In Place from 1.1.1](#upgrading-in-place-from-1-1-1) or migrate to a new release.
 - **The GVC must already have every location you list**, and may have more; unlisted locations run nothing. Never reorder `locations` after install — only append.
 - **At most 7 members in total and 6 in one location.** A 2-member set is refused; 3 is the usual minimum.
 - **Connection strings need `authSource=admin`**, and clients should use the proxy address so failover needs no client change.

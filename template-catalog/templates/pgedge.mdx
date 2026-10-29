@@ -498,7 +498,7 @@ Each node's volume is also snapshotted on `volumeset.snapshots.schedule`. Restor
 Template versions through 1.1.1 created their own GVC, so that GVC is part of a 1.x release's manifest. Version 2.0.0 and later do not declare one — and Helm deletes what a chart stops declaring.
 
 <Warning>
-**An in-place `helm upgrade` from 1.x to any later version is not supported and destroys the cluster.** The upgrade would delete the GVC the 1.x chart created together with every workload, volume set and identity inside it — including your data. The only supported path is the migration below: install the current version as a new release into an existing GVC, move the data, then remove the old release.
+**A plain `helm upgrade` from 1.x to any later version destroys the cluster.** The upgrade would delete the GVC the 1.x chart created together with every workload, volume set and identity inside it — including your data. The supported paths are [Upgrading in Place from 1.1.1](#upgrading-in-place-from-1-1-1), which keeps the GVC, or the migration below: install the current version as a new release into an existing GVC, move the data, then remove the old release.
 
 The chart refuses to render when your values still carry the 1.x `gvc` key, so an upgrade that passes your old values file stops before a single API call is made:
 
@@ -506,7 +506,7 @@ The chart refuses to render when your values still carry the 1.x `gvc` key, so a
 Error: execution error at (pgedge/templates/identity.yaml:2:4): pgedge 2.0.0: the `gvc` values key was REMOVED. This chart no longer creates a GVC -- it deploys into the GVC you install into, and `gvc.locations` moved to the top-level `locations`. DO NOT `helm upgrade` a 1.x release onto 2.0.0: the upgrade drops `kind: gvc` from the manifest and Helm deletes what a chart no longer declares, which DESTROYS that GVC and every workload, volumeset and identity inside it. Install 2.0.0 as a NEW release against an existing GVC, move your data, then uninstall the old release. See `Migrating from 1.x` in the README.
 ```
 
-**The guard cannot cover an upgrade run with no values at all.** A 1.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires. Do not run `helm upgrade` on a 1.x release against any later chart under any circumstances.
+**The guard cannot cover an upgrade run with no values at all.** A 1.x release installed on pure defaults has no `gvc` key for the chart to see, so nothing fires. Do not run a plain `helm upgrade` on a 1.x release against any later chart.
 </Warning>
 
 The 1.0.x credential values (`postgres.username`, `postgres.password`, `postgres.database`) are refused at render as well, with their own message, so pasting an old values file into a new install produces an error rather than a silent misconfiguration.
@@ -556,6 +556,47 @@ Subscriptions move to `replicating` shortly after the reload. Check on every nod
 ```sql
 SELECT subscription_name, status FROM spock.sub_show_status();
 ```
+
+### Upgrading in Place from 1.1.1
+
+A plain `cpln helm upgrade` from 1.x deletes the GVC the old release created, with everything in it. These steps keep the GVC, the nodes and their data, and go straight from 1.x to 3.0.0 (no 2.x step needed):
+
+```bash
+cpln helm get values RELEASE_NAME > values-old.yaml
+curl -fsSLO https://raw.githubusercontent.com/controlplane-com/templates/main/scripts/keep-gvc.py
+python3 keep-gvc.py RELEASE_NAME            # shows what it will change
+python3 keep-gvc.py RELEASE_NAME --apply
+# write values-new.yaml from values-old.yaml (below)
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/pgedge --version 3.0.0 --gvc OLD_GVC_NAME -f values-new.yaml
+```
+
+- **`--gvc` is the GVC the old release created** (`gvc.name` in `values-old.yaml`, `pgedge-gvc` if you never set it), not the GVC you ran the original install against. A different `--gvc` starts an empty install there instead of upgrading the one that holds your data.
+- **The upgrade output must include `Skipped deletion of /org/ORG_NAME/gvc/OLD_GVC_NAME`.** If it does not, stop: the GVC was not protected.
+
+Write `values-new.yaml` from `values-old.yaml`. `cpln helm get values` returns only what you set, so write out the 1.x defaults you relied on too (the 1.1.1 default is shown):
+
+```yaml
+locations:              # was gvc.locations; same names and replicas
+  - name: aws-us-west-2
+    replicas: 3
+  - name: aws-us-east-2
+    replicas: 3
+  - name: aws-eu-central-1
+    replicas: 3
+pgbouncer:              # was pgcat; keep poolMode, defaultPoolSize, maxClientConn, resources,
+  poolMode: transaction #   minReplicas, maxReplicas; delete pgcat.image
+# delete: gvc, pgcat (the chart refuses them)
+```
+
+- If `values-old.yaml` still has `postgres.username`, `password` and `database` (1.0.x), create the credentials secret (see [Prerequisites](#prerequisites)) with exactly those values first, set `postgres.credentialsSecretName` to it and delete the three keys. If the nodes are still waiting on the new secret after the upgrade, run `cpln workload force-redeployment RELEASE_NAME-pgedge --gvc OLD_GVC_NAME`.
+- Keep `image`, `resources`, `postgres.credentialsSecretName`, `multiZone`, `volumeset`, `internal_access` and `backup` as they are. Volume snapshots now run daily by default; set `volumeset.snapshots.schedule: ""` to keep them off.
+
+Every pgEdge node restarts once, one at a time within each location (with one node per location, writes pause briefly). The `-pgcat` workload is replaced by `-pgbouncer`, so **point applications at `RELEASE_NAME-pgbouncer.OLD_GVC_NAME.cpln.local:5432`** (port unchanged). Then:
+
+- Check replication: `SELECT subscription_name, status FROM spock.sub_show_status();` on each node must show every row `replicating`. If not, apply [Switching Replication On for an Existing 1.x Cluster](#switching-replication-on-for-an-existing-1-x-cluster).
+- Run a backup: the backup format changed in 3.0.0 and the restore job reads only the new one (see [Backing Up](#backing-up)).
+
+Afterwards the GVC belongs to you rather than to the release: `cpln helm uninstall` leaves it in place, and you delete it with `cpln gvc delete OLD_GVC_NAME` when you no longer need it. Details: [the keep-gvc script documentation](https://github.com/controlplane-com/templates/blob/main/scripts/README.md).
 
 ### Upgrading from 2.x
 
@@ -733,7 +774,7 @@ Then open `http://localhost:8405/stats` in a browser.
 
 - **Your application must retry failed connections and statements** — without it, every upgrade and replica restart shows up as errors in your app. Retry with a short backoff for 10–15 seconds and make retried writes idempotent; see [Scaling and Availability](#scaling-and-availability).
 - **3.0.0 changes the client endpoint** to `RELEASE_NAME-pgbouncer`, and backups change format — take a backup right after upgrading. See [Upgrading from 2.x](#upgrading-from-2-x).
-- **Never run `helm upgrade` on a 1.x release against any later version** — it deletes the GVC the 1.x chart created and everything in it. Migrate to a new release instead: [Upgrading from 1.x](#upgrading-from-1-x).
+- **Never run a plain `helm upgrade` on a 1.x release against any later version** — it deletes the GVC the 1.x chart created and everything in it. Follow [Upgrading in Place from 1.1.1](#upgrading-in-place-from-1-1-1), or migrate to a new release: [Upgrading from 1.x](#upgrading-from-1-x).
 - **The GVC must already contain every location you list**, and may contain more. A missing location is not caught at install — the nodes exit with `[pgedge] FATAL: locations declared in values are not in GVC ...`. Locations you do not list start nothing.
 - **DDL does not replicate** — create every table on every node (or broadcast it and add it to the replication set on the others), and give every table a `PRIMARY KEY` or `CREATE TABLE` fails outright.
 - **Use at least 3 nodes per location in production**, and at least 2 for upgrades without a write interruption.
