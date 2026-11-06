@@ -1,0 +1,337 @@
+---
+title: WordPress
+icon: /template-catalog/templates/icons/wordpress.png
+description: Deploy WordPress, the open-source CMS for websites and blogs, on Control Plane with a bundled MariaDB and a shared content volume. Runs in one location of an existing GVC, with 1 or more replicas. Needs admin, database and database root password secrets first.
+keywords: ['wordpress', 'cms', 'blog', 'website builder', 'content management system', 'wordpress hosting', 'self-hosted wordpress', 'wordpress alternative', 'wp-admin', 'woocommerce', 'mariadb', 'php']
+---
+
+## Overview
+
+WordPress is the open-source content management system for websites and blogs. This template deploys Apache with PHP, a bundled MariaDB database, and a shared volume holding WordPress core, plugins, themes and the media library. The administrator account is created before the site accepts its first request. WordPress runs in exactly one location of your GVC, and `wordpress.replicas` adds interchangeable replicas that share the same volume and database.
+
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have — it does not create or manage a GVC. The `location` you set must already be one of that GVC's locations; if it is not, WordPress starts nothing in the GVC.
+</Note>
+
+### What Gets Created
+
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-wordpress` | Site and `/wp-admin` on HTTP port `80` (standard, `wordpress.replicas` replicas, pinned to `location`) | — |
+| Volume set | `RELEASE_NAME-wordpress-vs` | Shared volume at `/var/www/html`: core, plugins, themes, uploads and `wp-config.php` | — |
+| Identity | `RELEASE_NAME-wordpress-identity` | Bound to the WordPress workload | — |
+| Policy | `RELEASE_NAME-wordpress-policy` | Grants that identity `reveal` on exactly the administrator and database credentials secrets | — |
+| Policy | `RELEASE_NAME-wordpress-gvc-policy` | Grants that identity `view` on the install GVC only, for a location check at boot | — |
+| Workload | `RELEASE_NAME-maria` | Bundled MariaDB from the [mariadb](/template-catalog/templates/mariadb) template (stateful, 1 replica) on TCP `3306` | — |
+| Volume set | `RELEASE_NAME-maria-vs` | MariaDB data directory | — |
+| Identity | `RELEASE_NAME-maria-identity` | Bound to the MariaDB workload and its backup job | — |
+| Policy | `RELEASE_NAME-maria-policy` | Grants the MariaDB identity `reveal` on its two credential secrets | — |
+| Workload | `RELEASE_NAME-phpmyadmin` | phpMyAdmin console (serverless) on HTTP `80`, reachable inside the GVC only by default | `mariadb.phpMyAdmin.enabled: true` |
+| Workload | `RELEASE_NAME-maria-backup` | Scheduled database dump to S3 or GCS (cron) | `mariadb.backup.enabled: true` |
+
+Your administrator, database and root password secrets are **not** created by the template — see [Prerequisites](#prerequisites).
+
+## Prerequisites
+
+Three secrets must exist **before** you install, and the GVC should have **one location** (see the last step). Secrets are org-level, so no `--gvc` flag is involved, and their values never pass through Helm values.
+
+<Steps>
+  <Step title="Create the administrator secret">
+    A [dictionary secret](/guides/create-secret/dictionary) with `username`, `password` and `email`. WordPress creates its administrator account from it on first boot.
+
+    ```bash
+    cpln secret create-dictionary --name ADMIN_SECRET_NAME \
+      --entry username=wpadmin \
+      --entry password="$(openssl rand -base64 18)" \
+      --entry email=admin@example.com
+    ```
+
+    Set `admin.secretName` to this name.
+  </Step>
+  <Step title="Create the database credentials secret">
+    A dictionary secret the bundled MariaDB initializes with and WordPress connects with:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=wordpress \
+      --entry password="$(openssl rand -hex 24)" \
+      --entry database=wordpress
+    ```
+
+    Set `mariadb.credentialsSecretName` to this name. Secret names are org-wide, so give each release its own secrets.
+  </Step>
+  <Step title="Create the MariaDB root password secret">
+    An [opaque secret](/guides/create-secret/opaque) holding the MariaDB root password. WordPress never reads it.
+
+    ```bash
+    printf '%s' "$(openssl rand -hex 32)" | cpln secret create-opaque --name DB_ROOT_SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `mariadb.rootPasswordSecretName` to this name.
+  </Step>
+  <Step title="Use a GVC with one location">
+    WordPress runs only in the location named by `location`, which must already be a location of your GVC. The bundled MariaDB starts in every location of the GVC, and each extra location would hold its own separate database. A fresh install on a GVC with more than one location is refused; do not add or remove GVC locations under a live release.
+  </Step>
+</Steps>
+
+<Warning>
+Create all three secrets **before** installing. Installing without one reports success, but the deployment never becomes ready and `cpln logs` stays empty; `status.versions[].message` from the command below names the missing secret:
+
+```bash
+cpln workload get-deployments RELEASE_NAME-wordpress --gvc GVC_NAME -o yaml
+```
+
+Creating the secret afterwards does not unblock the deployment. Run `cpln workload force-redeployment` on `RELEASE_NAME-maria` and on `RELEASE_NAME-wordpress`; see [Troubleshooting](#troubleshooting).
+</Warning>
+
+Scheduled database backups need a bucket and a cloud account first; see [Backing Up](#backing-up).
+
+## Installation
+
+Once your three secrets exist, install from the marketplace registry, pointing the keys at them and `location` at a location of your GVC:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/wordpress \
+  --version 1.0.0 --gvc GVC_NAME \
+  --set location=LOCATION_NAME \
+  --set admin.secretName=ADMIN_SECRET_NAME \
+  --set mariadb.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
+  --set mariadb.rootPasswordSecretName=DB_ROOT_SECRET_NAME
+```
+
+Other ways to install and manage the template:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+### Location
+
+```yaml
+# The ONE location of your GVC that WordPress runs in; it must be a location the GVC has.
+location: aws-us-east-1
+```
+
+Use a bare location name such as `aws-us-east-1`.
+
+### WordPress
+
+```yaml
+wordpress:
+  image: wordpress:7.1.4-php8.4-apache # seeds the docroot on first boot only; later bumps change PHP and Apache, not core
+  replicas: 1 # 2+ share one docroot volume and one database
+  siteTitle: My WordPress Site # first boot only; change it later in Settings > General
+  siteUrl: "" # public base URL, e.g. https://www.example.com; empty = the canonical *.cpln.app endpoint
+  tablePrefix: wp_ # first boot only; change only when importing an existing database
+  debug: false # WP_DEBUG: PHP notices to the container log
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 1Gi
+```
+
+### PHP Limits
+
+```yaml
+php:
+  uploadMaxSize: 64M # upload_max_filesize and post_max_size (stock PHP caps uploads at 2M)
+  memoryLimit: 256M # memory_limit
+```
+
+### Administrator Account
+
+```yaml
+admin:
+  secretName: my-wordpress-admin # MUST EXIST BEFORE INSTALL: dictionary with username, password, email (first boot only)
+```
+
+### Content Storage
+
+```yaml
+volumeset:
+  capacity: 10 # GiB (minimum 10): core, plugins, themes, uploads and wp-config.php
+```
+
+### Access
+
+```yaml
+publicAccess:
+  enabled: true # HTTPS site and wp-admin on the canonical *.cpln.app endpoint
+internalAccess:
+  type: same-gvc # none | same-gvc | same-org | workload-list
+  workloads: [] # used only with workload-list, e.g. //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
+
+With `workload-list`, include `RELEASE_NAME-wordpress` in the list. `none` isolates WordPress only together with `publicAccess.enabled: false`.
+
+### MariaDB
+
+```yaml
+mariadb:
+  image: mariadb:11.8.9
+  credentialsSecretName: my-wordpress-db-credentials # MUST EXIST BEFORE INSTALL: dictionary with username, password, database
+  rootPasswordSecretName: my-wordpress-db-root-password # MUST EXIST BEFORE INSTALL: opaque (encoding plain), the root password
+  resources:
+    minCpu: 150m # keeps cpu:minCpu under the stateful 4:1 cap
+    maxCpu: 500m
+    minMemory: 256Mi
+    maxMemory: 1Gi
+  volumeset:
+    capacity: 10 # GiB (minimum 10)
+  internalAccess:
+    type: same-gvc # WordPress connects like any workload: never none
+  # Optional scheduled database backups to AWS S3 or GCS (see "Storage setup" in the README).
+  backup:
+    enabled: false
+    provider: aws # aws | gcp
+    aws:
+      bucket: my-backup-bucket
+      region: us-east-1
+      cloudAccountName: my-backup-cloudaccount
+      policyName: my-backup-policy
+      prefix: wordpress/backups
+    gcp:
+      bucket: my-backup-bucket
+      cloudAccountName: my-backup-cloudaccount
+      prefix: wordpress/backups
+```
+
+Every knob of the [mariadb](/template-catalog/templates/mariadb) template is available under `mariadb`, including the phpMyAdmin console (`mariadb.phpMyAdmin.enabled: true`). `mariadb.internalAccess.type` may not be `none`, and a `workload-list` must include `RELEASE_NAME-wordpress`.
+
+## Connecting
+
+| What | Address | Notes |
+|---|---|---|
+| Public site | `status.canonicalEndpoint` from `cpln workload get RELEASE_NAME-wordpress --gvc GVC_NAME -o yaml` | The `*.cpln.app` endpoint |
+| Admin dashboard | `SITE_URL/wp-admin` | `username` and `password` from the administrator secret (`cpln secret reveal ADMIN_SECRET_NAME -o yaml`) |
+| Internal | `http://RELEASE_NAME-wordpress.GVC_NAME.cpln.local` (port `80`) | From other workloads in the GVC |
+| Health | `GET /cpln-health.php` | Answers `ok` when PHP, the database and the install all work |
+| MariaDB | `RELEASE_NAME-maria.GVC_NAME.cpln.local:3306` | Internal only; values from the database credentials secret (`cpln secret reveal DB_CREDENTIALS_SECRET_NAME -o yaml`) |
+
+Verify the site through a tunnel:
+
+```bash
+cpln port-forward RELEASE_NAME-wordpress 8080:80 --gvc GVC_NAME
+curl -s http://localhost:8080/cpln-health.php
+```
+
+The response must be `ok`. The first boot seeds the content volume and runs the installer, so the workload takes several minutes to become ready.
+
+### First Run
+
+The administrator account already exists from your administrator secret; sign in at `/wp-admin`. Set `wordpress.siteUrl` to your own domain once DNS points at the endpoint.
+
+With `publicAccess.enabled: false`, reach the site through a tunnel. WordPress builds every link from its site URL, so set `wordpress.siteUrl` to the tunnel address (`http://localhost:8080`), run `cpln helm upgrade`, open the tunnel above and browse `http://localhost:8080/wp-admin/`. Set `wordpress.siteUrl` back to `""` (or your custom domain) before turning the public endpoint on again.
+
+## Operations
+
+### Backing Up
+
+Database backups are off by default. Enable `mariadb.backup.enabled: true` and choose a `provider` of `aws` or `gcp`; the bucket, cloud account and IAM setup are described in [Backing Up](/template-catalog/templates/mariadb#backing-up), and the `backup` block above uses the same keys. A backup is a database dump: it does not include the media library, and the template takes no snapshot of the content volume. Keep your own copy of `wp-content/uploads`, because uninstalling the release deletes the volume.
+
+### Restoring a Backup
+
+Restore steps for the database belong to the underlying template: [Restoring a Backup](/template-catalog/templates/mariadb#restoring-a-backup). Restoring the media library is manual; copy your own copy of `wp-content/uploads` back onto the content volume.
+
+### Resetting the Administrator Password
+
+The administrator secret is read on first boot only. To reset the password, run this in the container; user `1` is the administrator created at install:
+
+```bash
+cpln workload exec RELEASE_NAME-wordpress --gvc GVC_NAME --container wordpress -- \
+  php -r '$_SERVER["HTTP_HOST"]="localhost"; require "/var/www/html/wp-load.php"; wp_set_password("YOUR-NEW-PASSWORD", 1);'
+```
+
+### Changing the Database Password
+
+The database secrets are read when MariaDB first initializes. Run `ALTER USER` in MariaDB first, then update the secret and redeploy both workloads:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-maria --gvc GVC_NAME
+cpln workload force-redeployment RELEASE_NAME-wordpress --gvc GVC_NAME
+```
+
+### Updating WordPress
+
+Changing `wordpress.image` does not update WordPress core: the image seeds the content volume only while it is empty, and afterwards a new image changes PHP and Apache only. Update core, plugins and themes from the dashboard.
+
+### Scaling and Availability
+
+`wordpress.replicas: 2` or more keeps the site up while a WordPress replica restarts, because every replica mounts the same volume and database. The bundled MariaDB is a single instance and bounds availability: the site is down while it restarts. With one replica, a change that restarts the workload, such as `wordpress.siteUrl` or `publicAccess.enabled`, briefly takes the site down.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Deployment never becomes ready and the logs are empty">
+    **Symptom:** `cpln helm install` reported success, `cpln logs` returns nothing, and `cpln workload get-deployments RELEASE_NAME-wordpress --gvc GVC_NAME -o yaml` shows `The secret SECRET_NAME no longer exists. Workload updates are paused until the secret is added or the reference to the secret removed.` under `status.versions[].message`.
+    **Cause:** A prerequisite secret does not exist. The message names the missing one.
+    **Fix:** Create it (see [Prerequisites](#prerequisites)), then run `cpln workload force-redeployment RELEASE_NAME-maria --gvc GVC_NAME` and `cpln workload force-redeployment RELEASE_NAME-wordpress --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="WordPress starts nothing and reports it is deactivated">
+    **Symptom:** The deployment message reads `This workload location is deactivated because maxScale is set to 0.`
+    **Cause:** `location` is not one of the GVC's locations. The default is `aws-us-east-1`.
+    **Fix:** Set `location` to a location your GVC already has, and run `cpln helm upgrade`.
+  </Accordion>
+  <Accordion title="Redirect loops or broken links through a tunnel">
+    **Symptom:** The browser loops or links point at the public endpoint while you use `cpln port-forward`.
+    **Cause:** WordPress builds every link from `wordpress.siteUrl`.
+    **Fix:** Set `wordpress.siteUrl` to the tunnel address, such as `http://localhost:8080`, and run `cpln helm upgrade`; see [First Run](#first-run).
+  </Accordion>
+  <Accordion title="Password reset and invitation emails never arrive">
+    **Symptom:** WordPress reports success but no email is delivered.
+    **Cause:** The container has no mail transport.
+    **Fix:** Install an SMTP plugin from the dashboard.
+  </Accordion>
+  <Accordion title="Render refuses the install">
+    **Symptom:** `cpln helm install` fails with a message beginning `wordpress:`, such as `wordpress: location is required` or `wordpress.replicas must be at least 1`.
+    **Cause:** A required value is missing or invalid.
+    **Fix:** Set the value the message names and install again.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- Install into a single-location GVC and set `location` to that location; do not add or remove GVC locations under a live release.
+- A `location` the GVC does not have runs nothing; set it to one the GVC lists.
+- The media library is not backed up and uninstalling deletes it; keep your own copy of `wp-content/uploads`.
+- `wordpress.siteTitle`, `wordpress.tablePrefix` and the three secrets apply on first boot only; change the title in Settings > General.
+- Outbound email does not work until you install an SMTP plugin.
+- A firewall change after changing `publicAccess.enabled` or `internalAccess` takes from 30 seconds to a few minutes to apply.
+
+## External References
+
+<CardGroup cols={2}>
+  <Card title="WordPress Documentation" href="https://wordpress.org/documentation/" icon="book">
+    Official user documentation
+  </Card>
+  <Card title="Advanced Administration Handbook" href="https://developer.wordpress.org/advanced-administration/" icon="gear">
+    Security, performance and server configuration
+  </Card>
+  <Card title="wp-config.php Reference" href="https://developer.wordpress.org/apis/wp-config-php/" icon="file-code">
+    Every setting WordPress reads
+  </Card>
+  <Card title="Official WordPress Docker Image" href="https://hub.docker.com/_/wordpress" icon="docker">
+    Image variants and environment variables
+  </Card>
+</CardGroup>
