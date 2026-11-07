@@ -1,0 +1,363 @@
+---
+title: Aegra
+icon: /template-catalog/templates/icons/aegra.png
+description: Aegra open-source agent server compatible with the LangGraph Agent Server API, running your own LangGraph agents on bundled PostgreSQL with pgvector and Redis. Single by default, optional HA PostgreSQL and replicas. Deploys into an existing GVC; one database credentials secret must exist first.
+keywords: ['aegra', 'langgraph', 'langgraph server', 'langgraph platform alternative', 'langsmith deployment alternative', 'agent server', 'ai agents', 'langchain', 'assistants api', 'background runs', 'streaming', 'checkpoints', 'langfuse', 'pgvector']
+---
+
+## Overview
+
+Aegra is an open-source agent server that implements the LangGraph Agent Server API: assistants, threads, background runs, streaming, the store and crons for the LangGraph agents in your image. This template runs your agent image on a bundled PostgreSQL with pgvector, which holds threads, runs, checkpoints and the store, and a bundled single-node Redis for the job queue and run event streams. It works with the LangGraph SDK and with frontends such as Agent Chat UI.
+
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have, and that GVC should have exactly one location, because the bundled database and Redis run in one location.
+</Note>
+
+### What Gets Created
+
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-aegra` | Aegra API and background workers (standard, 1 replica by default, up to 10) on port `2026` | — |
+| Identity | `RELEASE_NAME-aegra-identity` | Workload identity for Aegra | — |
+| Policy | `RELEASE_NAME-aegra-policy` | Grants the identity `reveal` on exactly the secrets you name | — |
+| Workload | `RELEASE_NAME-postgres` | PostgreSQL with pgvector (stateful, 1 replica) | `postgres.enabled: true` (default) |
+| Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data volume | `postgres.enabled: true` (default) |
+| Identity | `RELEASE_NAME-pg-identity` | Workload identity for PostgreSQL | `postgres.enabled: true` (default) |
+| Policy | `RELEASE_NAME-pg-policy` | Grants the PostgreSQL identity `reveal` on the database credentials secret | `postgres.enabled: true` (default) |
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL (stateful, 3 replicas by default) | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-etcd` | etcd cluster for Patroni | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy endpoint that always points at the PostgreSQL leader | `postgresHA.enabled: true` |
+| Volume set | `RELEASE_NAME-postgres-ha-vs` | PostgreSQL data volume, one per replica | `postgresHA.enabled: true` |
+| Volume set | `RELEASE_NAME-etcd-vs` | etcd data volume | `postgresHA.enabled: true` |
+| Identity | `RELEASE_NAME-postgres-ha-identity` | Workload identity for Patroni PostgreSQL | `postgresHA.enabled: true` |
+| Policy | `RELEASE_NAME-postgres-ha-policy` | Grants the Patroni identity `reveal` on its startup secrets and the database credentials secret | `postgresHA.enabled: true` |
+| Identity | `RELEASE_NAME-etcd-identity` | Workload identity for etcd | `postgresHA.enabled: true` |
+| Policy | `RELEASE_NAME-etcd-policy` | Grants the etcd identity `reveal` on its startup secret | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-patroni-startup` | Patroni startup script | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-etcd-startup` | etcd startup script | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-postgres-proxy-startup` | HAProxy startup script | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-wal-g-backup-script` | Backup script used when backups are enabled | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-redis` | Redis job queue and run event streams (single node) | — |
+| Identity | `RELEASE_NAME-redis-identity` | Workload identity for Redis | — |
+| Policy | `RELEASE_NAME-redis-policy` | Grants the Redis identity access to its configuration secret | — |
+| Secret | `RELEASE_NAME-redis-config` | Redis configuration | — |
+
+The template creates no credentials. The API is reachable only from inside the GVC until you set `publicAccess.enabled: true`.
+
+## Prerequisites
+
+<Steps>
+  <Step title="Create the database credentials secret">
+    The bundled PostgreSQL initializes with this **dictionary** secret and Aegra connects with it. It holds exactly three keys: `username` and `database` (letters, digits and `_`) and `password` (any characters):
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=aegra \
+      --entry password="$(openssl rand -hex 32)" \
+      --entry database=aegra
+    ```
+
+    Set `postgres.config.credentialsSecretName` to this name (or `postgresHA.config.credentialsSecretName` when you use the HA database). Secret names are org-wide, so give each release its own secret.
+  </Step>
+  <Step title="Create the optional secrets">
+    Each is a **dictionary** secret created the same way. Agent secrets hold any keys your agent reads, such as `OPENAI_API_KEY`. Langfuse tracing needs the keys `publicKey` and `secretKey`. A Redis password needs the key `password`, URL-safe (letters, digits, `-`, `_`, `.`). See [Agent secrets](#agent-secrets), [Langfuse tracing](#langfuse-tracing) and [Redis](#redis).
+  </Step>
+  <Step title="Choose your agent image">
+    The default image runs Aegra's example agents. To serve your own graphs, build an image as described in [Bring Your Own Agent](#bring-your-own-agent).
+  </Step>
+</Steps>
+
+<Warning>
+Every secret your release names must exist **before** you install. If one does not, the deployment waits silently: `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message` in `cpln workload get-deployments RELEASE_NAME-aegra --gvc GVC_NAME -o yaml`. Create the secret and the deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-aegra --gvc GVC_NAME` to skip the wait.
+</Warning>
+
+Optional database backups need a bucket and a Control Plane cloud account; see [Backing Up](#backing-up).
+
+## Installation
+
+The only required value is the name of the database credentials secret from [Prerequisites](#prerequisites):
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/aegra \
+  --version 1.0.0 --gvc GVC_NAME \
+  --set postgres.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME
+```
+
+To install with the highly available database, add `--set postgres.enabled=false --set postgresHA.enabled=true --set postgresHA.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME`.
+
+To install with the CLI, UI, Terraform or Pulumi, follow the instructions for your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+### Aegra
+
+```yaml
+aegra:
+  image: upstreamyard/aegra:0.11.0   # your agent image (see Bring Your Own Agent)
+  # set aegra.replicas: 2 and postgresHA.enabled: true for near-zero-downtime upgrades and failover
+  replicas: 1                   # 1-10
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 1Gi
+  requestTimeoutSeconds: 600    # longest /runs/wait or /runs/stream request on the public URL before it is cut (1-3600)
+  extraEnv: []                  # plain settings, e.g. [{name: LOG_LEVEL, value: DEBUG}]
+```
+
+### Agent secrets
+
+```yaml
+agentSecrets:
+  secretName: ""                # e.g. my-aegra-agent-secrets
+  keys: []                      # each listed key becomes an env var, e.g. [OPENAI_API_KEY]
+```
+
+### Access
+
+```yaml
+publicAccess:
+  enabled: false                # true = public *.cpln.app URL. Aegra has NO auth unless your image adds a handler
+internalAccess:
+  type: same-gvc                # none | same-gvc | same-org | workload-list
+  workloads: []                 # used only with workload-list
+```
+
+### Langfuse tracing
+
+```yaml
+langfuse:
+  secretName: ""                # dictionary with publicKey and secretKey; "" = tracing off
+  baseUrl: http://my-langfuse-langfuse-web.my-gvc.cpln.local:3000   # or https://cloud.langfuse.com
+```
+
+### Database
+
+```yaml
+postgres:                       # every knob of the postgres template
+  enabled: true
+  image: pgvector/pgvector:0.8.7-pg18
+  config:
+    credentialsSecretName: my-aegra-db-credentials   # REQUIRED, create before install
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 1Gi
+  volumeset:
+    capacity: 10                # GiB (minimum 10)
+  backup:                       # scheduled backups to object storage (postgres template)
+    enabled: false
+    image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0
+    schedule: "0 2 * * *"       # daily at 2am UTC
+    resources:
+      cpu: 100m
+      memory: 128Mi
+    provider: aws               # aws, gcp or minio
+    aws:
+      bucket: my-aegra-backup-bucket
+      region: us-east-1
+      cloudAccountName: my-aegra-backup-cloudaccount
+      policyName: my-aegra-backup-policy
+      prefix: postgres/backups
+    gcp:
+      bucket: my-aegra-backup-bucket
+      cloudAccountName: my-aegra-backup-cloudaccount
+      prefix: postgres/backups
+    minio:                      # any S3-compatible endpoint
+      endpoint: http://my-minio-workload:9000
+      bucket: my-aegra-backup-bucket
+      credentialsSecretName: my-aegra-minio-credentials   # dictionary: accessKey, secretKey
+      prefix: postgres/backups
+
+postgresHA:                     # every knob of the postgres-highly-available template
+  enabled: false                # enable exactly one of postgres / postgresHA
+  image: controlplanecorporation/patroni-postgres:0.8
+  config:
+    credentialsSecretName: my-aegra-db-credentials
+  replicas: 3
+  resources:                    # per Patroni replica
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 2Gi
+  volumeset:
+    capacity: 10                # GiB per replica (minimum 10)
+  backup:                       # provider, aws, gcp, minio: same keys and defaults as postgres.backup
+    enabled: false
+    mode: logical               # logical or wal-g
+    resources:
+      cpu: 100m
+      memory: 512Mi             # 128Mi OOM-kills wal-g mid-backup
+    logical:
+      image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
+      schedule: "0 2 * * *"     # daily at 2am UTC
+    walg:
+      intervalSeconds: 21600    # every 6 hours
+```
+
+### Redis
+
+```yaml
+redis:
+  mode: dev                     # required: one node; Aegra cannot use Sentinel
+  redis:
+    image: redis:8
+    resources:
+      maxCpu: 200m
+      maxMemory: 256Mi
+      minCpu: 80m
+      minMemory: 128Mi
+    auth:
+      fromSecret:
+        enabled: false          # true = Redis requires the password in the secret below
+        name: ""                # e.g. my-aegra-redis
+        passwordKey: password
+```
+
+### Bring Your Own Agent
+
+The default image is a community build of Aegra 0.11.0 with Aegra's example agents: the graph `stress_test` runs with no model key, and `agent` needs `OPENAI_API_KEY` in the agent secrets. To serve your own graphs, build an image from it with your code and an `aegra.json`:
+
+```dockerfile
+FROM upstreamyard/aegra:0.11.0
+USER root
+COPY requirements.txt /app/agents/requirements.txt
+RUN pip install --no-cache-dir -r /app/agents/requirements.txt
+COPY . /app/agents
+USER 10001
+ENV AEGRA_CONFIG=/app/agents/aegra.json
+```
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": { "my_agent": "./my_agent/graph.py:graph" }
+}
+```
+
+Build and push the image to your org's private registry, then set `aegra.image` to the pushed image, for example `ORG_NAME.registry.cpln.io/my-agent:1`:
+
+```bash
+cpln image build --name my-agent:1 --dockerfile Dockerfile --push
+```
+
+Only your graphs are served; the example agents of the default image are not registered. Each graph is listed in `/assistants/search` with a generated id, and its `graph_id` is the name you listed in `aegra.json`. Run it by passing that name as `"assistant_id": "my_agent"`.
+
+## Connecting
+
+| What | Address | Notes |
+|---|---|---|
+| Internal API | `http://RELEASE_NAME-aegra.GVC_NAME.cpln.local:2026` | Reachable per `internalAccess` |
+| From your machine | `cpln port-forward RELEASE_NAME-aegra 2026:2026 --gvc GVC_NAME`, then `http://localhost:2026` | Works with the public URL off |
+| Public URL | `status.canonicalEndpoint` of `cpln workload get RELEASE_NAME-aegra --gvc GVC_NAME -o yaml` | Only with `publicAccess.enabled: true`; has no authentication unless your image adds a handler |
+| API reference | `/docs` on any of the addresses above | Interactive OpenAPI page |
+
+Point the LangGraph SDK (`langgraph_sdk.get_client(url=...)`) at the URL and use the graph name as the assistant id.
+
+To check the server, forward the port and read its version:
+
+```bash
+cpln port-forward RELEASE_NAME-aegra 2026:2026 --gvc GVC_NAME
+curl http://localhost:2026/info
+```
+
+### Chat With an Agent in a Browser
+
+Aegra has no UI of its own. To chat with an agent, open the hosted [Agent Chat UI](https://agentchat.vercel.app) with your public URL and a graph name:
+
+```text
+https://agentchat.vercel.app/?apiUrl=PUBLIC_URL&assistantId=stress_test
+```
+
+The browser calls Aegra directly, so this needs `publicAccess.enabled: true`. Anyone with the public URL can call your agents unless your image adds an auth handler.
+
+## Operations
+
+### Backing Up
+
+All state lives in PostgreSQL, so backing up the database backs up every thread, run, checkpoint and store entry. Enable `postgres.backup.enabled` (or `postgresHA.backup.enabled` with the HA database) and fill in the provider block. The bucket, cloud account and IAM policy are set up as described in the [postgres](/template-catalog/templates/postgres) or [postgres-highly-available](/template-catalog/templates/postgres-highly-available) template, and a MinIO provider needs a dictionary secret with the keys `accessKey` and `secretKey`. Restore steps are in those templates' pages.
+
+### Scaling and Availability
+
+Aegra replicas share PostgreSQL and Redis, so they are interchangeable. Set `aegra.replicas` up to 10 to spread background runs across them. A run on a replica that stops or hangs is picked up again by a live replica and retried from its last checkpoint; Aegra does not drain runs on shutdown.
+
+For near-zero-downtime upgrades and failover, set `aegra.replicas: 2` and enable `postgresHA`. Redis stays a single node, because Aegra takes one Redis URL and cannot follow Sentinel; runs are recovered from PostgreSQL if Redis restarts.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The deployment is stuck and cpln logs returns nothing">
+    A secret named in the values does not exist. Read `status.versions[].message` with `cpln workload get-deployments RELEASE_NAME-aegra --gvc GVC_NAME -o yaml`, create the secret, then run `cpln workload force-redeployment RELEASE_NAME-aegra --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Aegra restarts a few times on first install">
+    Aegra exits when PostgreSQL or Redis is not up yet and the platform restarts it. It settles once both are ready; no action is needed.
+  </Accordion>
+  <Accordion title="Streams or /runs/wait calls are cut off on the public URL">
+    The public endpoint cuts requests after `aegra.requestTimeoutSeconds` (default 600, maximum 3600). Raise it for longer calls. Calls from inside the GVC over `cpln.local` are not subject to it.
+  </Accordion>
+  <Accordion title="A run ends in error with couldn't get a connection after 30.00 sec">
+    The database was unreachable for more than 30 seconds, for example during a PostgreSQL failover. Aegra keeps restarting until the database answers, and the API returns 500 or 503 meanwhile. Submit the run again.
+  </Accordion>
+  <Accordion title="Assistant 'stress_test' not found">
+    Your own image serves only your graphs; the example agents of the default image are not registered. Call your graph by the name listed in `aegra.json`.
+  </Accordion>
+  <Accordion title="A secret was rotated but Aegra still uses the old value">
+    Rotating a secret does not restart Aegra. Run `cpln workload force-redeployment RELEASE_NAME-aegra --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="The chart refuses to render">
+    The template rejects `redis.mode` other than `dev`, `extraEnv` or `agentSecrets.keys` names that it sets itself (such as `DATABASE_URL`, `REDIS_URL`, `RUN_MIGRATIONS_ON_STARTUP`, `LANGFUSE_*` and `CPLN_*`), duplicate or invalid env names, `agentSecrets.keys` without `agentSecrets.secretName`, `aegra.replicas` above 10, `aegra.requestTimeoutSeconds` above 3600, and enabling both or neither database. The error names the offending value.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- Aegra has no authentication unless your image configures an auth handler in `aegra.json`. Keep `publicAccess` off without one: anyone with the URL could run your agents and read every thread.
+- Langfuse in another GVC: set that Langfuse release's `internalAccess` to `same-org`, or Aegra cannot reach it.
+- After rotating any secret the release uses, run `cpln workload force-redeployment RELEASE_NAME-aegra --gvc GVC_NAME`.
+- Firewall changes (`publicAccess`, `internalAccess`) take from 30 seconds to several minutes to take effect.
+- The first `helm upgrade` after an install can restart the bundled database and Redis, which briefly interrupts the API.
+- Use a single-location GVC: the bundled database and Redis run in one location.
+- Uninstalling deletes the database volume, and with it every thread, run and checkpoint.
+
+## External References
+
+<CardGroup cols={2}>
+  <Card title="Aegra documentation" icon="book" href="https://docs.aegra.dev">
+    Concepts, configuration and API
+  </Card>
+  <Card title="Aegra deployment guide" icon="rocket" href="https://docs.aegra.dev/guides/deployment">
+    Deploying Aegra
+  </Card>
+  <Card title="Aegra authentication" icon="lock" href="https://docs.aegra.dev/guides/authentication">
+    Adding an auth handler
+  </Card>
+  <Card title="Aegra on GitHub" icon="github" href="https://github.com/aegra/aegra">
+    Source and issues
+  </Card>
+  <Card title="Agent Chat UI" icon="comments" href="https://github.com/langchain-ai/agent-chat-ui">
+    Browser chat frontend for LangGraph servers
+  </Card>
+</CardGroup>
