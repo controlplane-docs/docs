@@ -1,0 +1,364 @@
+---
+title: Langflow
+icon: /template-catalog/templates/icons/langflow.png
+description: Langflow visual low-code builder for AI agents, RAG pipelines and MCP servers, on bundled PostgreSQL. Login always required. Single by default, optional HA PostgreSQL and up to 4 replicas with Redis. Deploys into an existing GVC; three secrets must exist first.
+keywords: ['langflow', 'ai agents', 'low-code', 'visual builder', 'rag', 'mcp server', 'flowise alternative', 'n8n alternative', 'langchain', 'llm workflows', 'agent builder', 'control plane mcp']
+---
+
+## Overview
+
+Langflow is a visual low-code builder for AI agents, RAG pipelines and MCP servers. You build a flow on a canvas, test it in the editor, then call it through the REST API or as MCP tools. This template runs Langflow on a bundled PostgreSQL that holds users, flows, messages and stored credentials, with a shared data volume for uploaded files and knowledge bases. A login is always required.
+
+<Note>
+This template does not create a GVC. It deploys into an existing GVC that you already have, and that GVC should have exactly one location, because the database, the data volume and Redis run in one location.
+</Note>
+
+### What Gets Created
+
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-langflow` | Editor, API and MCP on port `7860` (standard, 1 replica by default, up to 4) | — |
+| Volume set | `RELEASE_NAME-langflow-data` | Shared data volume mounted by every replica (uploads, knowledge bases) | — |
+| Identity | `RELEASE_NAME-langflow-identity` | Workload identity for Langflow | — |
+| Policy | `RELEASE_NAME-langflow-policy` | Grants the identity `reveal` on exactly the secrets you name | — |
+| Workload | `RELEASE_NAME-postgres` | PostgreSQL (stateful, 1 replica) | `postgres.enabled: true` (default) |
+| Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data volume | `postgres.enabled: true` (default) |
+| Identity | `RELEASE_NAME-pg-identity` | Workload identity for PostgreSQL | `postgres.enabled: true` (default) |
+| Policy | `RELEASE_NAME-pg-policy` | Grants the PostgreSQL identity `reveal` on the database credentials secret | `postgres.enabled: true` (default) |
+| Workload | `RELEASE_NAME-postgres-backup` | Scheduled backups of PostgreSQL to object storage | `postgres.backup.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL (stateful, 3 replicas by default) | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-etcd` | etcd cluster for Patroni | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy endpoint that always points at the PostgreSQL leader | `postgresHA.enabled: true` |
+| Volume set | `RELEASE_NAME-postgres-ha-vs` | PostgreSQL data volume, one per replica | `postgresHA.enabled: true` |
+| Volume set | `RELEASE_NAME-etcd-vs` | etcd data volume | `postgresHA.enabled: true` |
+| Identity | `RELEASE_NAME-postgres-ha-identity` | Workload identity for Patroni PostgreSQL | `postgresHA.enabled: true` |
+| Policy | `RELEASE_NAME-postgres-ha-policy` | Grants the Patroni identity `reveal` on its startup secrets and the database credentials secret | `postgresHA.enabled: true` |
+| Identity | `RELEASE_NAME-etcd-identity` | Workload identity for etcd | `postgresHA.enabled: true` |
+| Policy | `RELEASE_NAME-etcd-policy` | Grants the etcd identity `reveal` on its startup secret | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-patroni-startup` | Patroni startup script | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-etcd-startup` | etcd startup script | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-postgres-proxy-startup` | HAProxy startup script | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-wal-g-backup-script` | Backup script used when backups are enabled | `postgresHA.enabled: true` |
+| Secret | `RELEASE_NAME-postgres-config` | Patroni PostgreSQL configuration | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha-backup` | Scheduled backups of the Patroni PostgreSQL | `postgresHA.backup.enabled: true` |
+| Workload | `RELEASE_NAME-redis` | Shared editor build queue and login rate limits (single node) | `redis.enabled: true` |
+| Identity | `RELEASE_NAME-redis-identity` | Workload identity for Redis | `redis.enabled: true` |
+| Policy | `RELEASE_NAME-redis-policy` | Grants the Redis identity access to its configuration secret | `redis.enabled: true` |
+| Secret | `RELEASE_NAME-redis-config` | Redis configuration | `redis.enabled: true` |
+
+The template creates no credentials. The public `*.cpln.app` URL is on by default and every request needs a Langflow login.
+
+## Prerequisites
+
+<Steps>
+  <Step title="Create the database credentials secret">
+    A **dictionary** secret with exactly `username`, `password` and `database`. Langflow receives them inside a connection URL, so use only letters, digits, `-`, `_`, `.` and `~`:
+
+    ```bash
+    cpln secret create-dictionary --name DB_CREDENTIALS_SECRET_NAME \
+      --entry username=langflow \
+      --entry password="$(openssl rand -hex 32)" \
+      --entry database=langflow
+    ```
+
+    Set `postgres.config.credentialsSecretName` to this name (or `postgresHA.config.credentialsSecretName` with the HA database).
+  </Step>
+  <Step title="Create the admin login secret">
+    A **dictionary** secret with the superuser that Langflow creates on first start:
+
+    ```bash
+    cpln secret create-dictionary --name ADMIN_SECRET_NAME \
+      --entry username=admin \
+      --entry password="$(openssl rand -base64 24)"
+    ```
+
+    Set `admin.secretName` to this name.
+  </Step>
+  <Step title="Create the encryption key secret">
+    An **opaque** secret holding a 44-character Fernet key. It encrypts every API key saved in Langflow and signs logins:
+
+    ```bash
+    printf '%s' "$(openssl rand -base64 32 | tr '+/' '-_')" | \
+      cpln secret create-opaque --name FERNET_KEY_SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `secretKey.secretName` to this name. Langflow refuses to start with a key that is not a valid Fernet key.
+  </Step>
+  <Step title="Create the optional secrets">
+    Provider keys: a **dictionary** secret whose keys (such as `OPENAI_API_KEY`) you list in `variableSecrets.keys`. A Redis password: a **dictionary** secret with a URL-safe `password` key. The Control Plane MCP server needs a service-account key, see [Control Plane MCP Server](#control-plane-mcp-server). Backups need a bucket and a Control Plane cloud account, see [Backing Up](#backing-up).
+  </Step>
+</Steps>
+
+Secret names are org-wide, so give each release its own secrets.
+
+<Warning>
+Every secret your release names must exist **before** you install. If one does not, the deployment waits silently: `cpln logs` returns nothing, and the only place the missing secret is named is `status.versions[].message` in `cpln workload get-deployments RELEASE_NAME-langflow --gvc GVC_NAME -o yaml`. Create the secret and the deployment recovers on its own after several minutes, or run `cpln workload force-redeployment RELEASE_NAME-langflow --gvc GVC_NAME` to skip the wait.
+</Warning>
+
+## Installation
+
+The required values are the names of the three secrets from [Prerequisites](#prerequisites):
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/langflow \
+  --version 1.0.0 --gvc GVC_NAME \
+  --set postgres.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
+  --set admin.secretName=ADMIN_SECRET_NAME \
+  --set secretKey.secretName=FERNET_KEY_SECRET_NAME
+```
+
+To install with the highly available database, add `--set postgres.enabled=false --set postgresHA.enabled=true --set postgresHA.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME`.
+
+To install with the CLI, UI, Terraform or Pulumi, follow the instructions for your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+### Langflow
+
+```yaml
+langflow:
+  image: langflowai/langflow:1.13.1   # build FROM it to add custom components
+  # set langflow.replicas: 2, redis.enabled: true and postgresHA.enabled: true for near-zero-downtime upgrades and failover
+  replicas: 1                   # 1-4; above 1 requires redis.enabled: true
+  resources:
+    minCpu: 500m
+    maxCpu: 2000m
+    minMemory: 1Gi
+    maxMemory: 3Gi
+  requestTimeoutSeconds: 600    # longest request on the public URL (flow runs, editor builds) before it is cut (1-3600)
+  volumeset:
+    capacity: 10                # GiB (minimum 10), shared by all replicas
+  extraEnv: []                  # plain settings, e.g. [{name: LANGFLOW_SSRF_ALLOWED_HOSTS, value: "*.cpln.local"}]
+```
+
+### Login and Keys
+
+```yaml
+admin:
+  secretName: my-langflow-admin          # REQUIRED dictionary: username, password (used on first start only)
+secretKey:
+  secretName: my-langflow-secret-key     # REQUIRED opaque: 44-character Fernet key; never rotate it
+variableSecrets:
+  secretName: ""                # dictionary; each listed key becomes an env var and a Langflow global variable
+  keys: []                      # e.g. [OPENAI_API_KEY, ANTHROPIC_API_KEY]
+```
+
+### Access
+
+```yaml
+publicAccess:
+  enabled: true                 # public *.cpln.app URL; login is always required
+internalAccess:
+  type: same-gvc                # none | same-gvc | same-org | workload-list
+  workloads: []                 # used only with workload-list
+```
+
+### Database
+
+```yaml
+postgres:                       # every knob of the postgres template
+  enabled: true
+  image: postgres:18
+  config:
+    credentialsSecretName: my-langflow-db-credentials   # REQUIRED, create before install
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 1Gi
+  volumeset:
+    capacity: 10                # GiB (minimum 10)
+  backup:
+    enabled: false              # scheduled backups to object storage; provider aws, gcp or minio (postgres template)
+
+postgresHA:                     # every knob of the postgres-highly-available template
+  enabled: false                # enable exactly one of postgres / postgresHA
+  config:
+    credentialsSecretName: my-langflow-db-credentials
+  replicas: 3
+  resources:                    # per Patroni replica
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 2Gi
+  volumeset:
+    capacity: 10                # GiB per replica (minimum 10)
+  backup:
+    enabled: false              # logical or wal-g backups (postgres-highly-available template)
+```
+
+### Redis
+
+```yaml
+redis:
+  enabled: false                # required for langflow.replicas above 1
+  mode: dev                     # required: one node; Langflow cannot use Sentinel
+  redis:
+    image: redis:8
+    resources:
+      maxCpu: 200m
+      maxMemory: 256Mi
+      minCpu: 80m
+      minMemory: 128Mi
+    auth:
+      fromSecret:
+        enabled: false          # true = Redis requires the password in the secret below
+        name: ""                # e.g. my-langflow-redis
+        passwordKey: password
+```
+
+### Control Plane MCP Server
+
+```yaml
+cplnMcp:
+  keySecretName: ""             # opaque: a service-account key; "" = no Control Plane MCP server
+  url: https://mcp.cpln.io/mcp?toolsets=readonly  # read-only tools (no create, update or delete); https://mcp.cpln.io/mcp = every tool
+```
+
+With `cplnMcp.keySecretName` set, Langflow registers the Control Plane MCP server as the MCP server `cpln` of the superuser at boot, so an MCP Tools component can see and manage your org. Langflow's MCP client cannot sign in with OAuth, so it authenticates with a service-account key, and every flow that uses the server acts as that service account. Give the service account only what your flows need. This example lets it view one GVC:
+
+```bash
+cpln serviceaccount create --name SERVICE_ACCOUNT_NAME --description DESCRIPTION
+cpln policy create --name POLICY_NAME --target-kind gvc --resource GVC_NAME
+cpln policy add-binding POLICY_NAME --permission view --serviceaccount SERVICE_ACCOUNT_NAME
+cpln serviceaccount add-key SERVICE_ACCOUNT_NAME --description DESCRIPTION -o json | jq -j .key | \
+  cpln secret create-opaque --name CPLN_MCP_KEY_SECRET_NAME --encoding plain -f -
+```
+
+Add a policy for each further resource kind the flows should see or change, such as `workload` with `view`. Then install or upgrade with `--set cplnMcp.keySecretName=CPLN_MCP_KEY_SECRET_NAME`.
+
+The default `cplnMcp.url` offers the read-only tools: none can create, update or delete. Set it to `https://mcp.cpln.io/mcp` to offer every tool, and bound the service account's policies accordingly.
+
+Registration runs in the background after boot and never delays startup. The log line starting `cpln-mcp:` says whether it worked, and a key the server refuses is reported there and not registered. A server that is already registered is left unchanged, so edits users make under Settings → MCP Servers are kept.
+
+## Connecting
+
+| What | Address | Notes |
+|---|---|---|
+| Editor and API (public) | `status.canonicalEndpoint` of `cpln workload get RELEASE_NAME-langflow --gvc GVC_NAME -o yaml` | Log in with the admin login secret |
+| From your machine | `cpln port-forward RELEASE_NAME-langflow 7860:7860 --gvc GVC_NAME`, then `http://localhost:7860` | Works with the public URL off |
+| Internal API | `http://RELEASE_NAME-langflow.GVC_NAME.cpln.local:7860` | Reachable per `internalAccess` |
+| Run a flow | `POST /api/v1/run/FLOW_ID` with the header `x-api-key: API_KEY` | Create API keys under Settings |
+| MCP server | `/api/v1/mcp/project/PROJECT_ID/streamable` (Streamable HTTP) | The project's MCP Server tab shows the full URL |
+| Control Plane MCP server | Log in as the superuser, add an MCP Tools component to a flow and pick the `cpln` server | Its tools act as the service account in `cplnMcp.keySecretName` |
+| API reference | `/docs` on any of the addresses above | Interactive OpenAPI page |
+
+Read the admin login with `cpln secret reveal ADMIN_SECRET_NAME -o yaml`. To check the server, forward the port and read its health:
+
+```bash
+cpln port-forward RELEASE_NAME-langflow 7860:7860 --gvc GVC_NAME
+curl http://localhost:7860/health_check
+```
+
+Langflow blocks requests to private addresses by default, which includes services in your GVC (`*.cpln.local`). To let flows call one, such as an Ollama or Qdrant release, add `{name: LANGFLOW_SSRF_ALLOWED_HOSTS, value: "*.cpln.local"}` to `langflow.extraEnv`.
+
+## Operations
+
+### Backing Up
+
+All state lives in PostgreSQL and the data volume. Enable `postgres.backup.enabled` (or `postgresHA.backup.enabled` with the HA database) and fill in the provider block; the keys and defaults are in the chart's `values.yaml`. The bucket, cloud account and IAM policy are set up as described in the [postgres](/template-catalog/templates/postgres) or [postgres-highly-available](/template-catalog/templates/postgres-highly-available) template, and a MinIO provider needs a dictionary secret with the keys `accessKey` and `secretKey`. Restore steps are in those templates' pages. The backup covers the database only; uploaded files and knowledge bases on the data volume are not included.
+
+### Scaling and Availability
+
+Set `langflow.replicas` from 1 to 4. Replicas share PostgreSQL, the data volume and Redis, so they are interchangeable, and more than one requires `redis.enabled: true`. Redis stays a single node, because Langflow takes one Redis URL and cannot follow Sentinel.
+
+For near-zero-downtime upgrades and failover, set `langflow.replicas: 2`, `redis.enabled: true` and `postgresHA.enabled: true`. Above one replica, use the Streamable HTTP MCP URL; the legacy SSE URL (`/sse`) works with one replica only.
+
+After turning on `redis.enabled` or Redis auth on a running release, redeploy so every replica picks up the change:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-langflow --gvc GVC_NAME
+```
+
+### Rotating the Control Plane MCP Key
+
+Rotating the service-account key does not update a server that is already registered. Either edit its `Authorization` header under Settings → MCP Servers, or delete the `cpln` server there and redeploy so it is registered again with the new key:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-langflow --gvc GVC_NAME
+```
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="The deployment is stuck and cpln logs returns nothing">
+    A secret named in the values does not exist. Read `status.versions[].message` with `cpln workload get-deployments RELEASE_NAME-langflow --gvc GVC_NAME -o yaml`, create the secret, then run `cpln workload force-redeployment RELEASE_NAME-langflow --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Langflow does not start and the log says the secret key is not valid">
+    The encryption key secret is not a valid 44-character Fernet key. On a new release, create a key as shown in Prerequisites. On an existing release, do not replace the key: API keys already saved could no longer be decrypted.
+  </Accordion>
+  <Accordion title="Login returns 400 Waiting for approval">
+    A self sign-up account stays inactive until an admin activates it in Langflow. Log in as the superuser and activate it, or add `{name: LANGFLOW_ENABLE_SIGNUP, value: "false"}` to `langflow.extraEnv` to turn sign-up off.
+  </Accordion>
+  <Accordion title="A flow cannot reach a service in my GVC">
+    Langflow blocks private addresses, including `*.cpln.local`. Add `{name: LANGFLOW_SSRF_ALLOWED_HOSTS, value: "*.cpln.local"}` to `langflow.extraEnv`.
+  </Accordion>
+  <Accordion title="The log shows cpln-mcp: not registered">
+    The Control Plane MCP server refused the service-account key. Check the key secret and the service account's policies, then run `cpln workload force-redeployment RELEASE_NAME-langflow --gvc GVC_NAME`. If the log says `login-failed`, the superuser's password was changed in the UI after install, and registration cannot log in; add the `cpln` server under Settings → MCP Servers instead.
+  </Accordion>
+  <Accordion title="A secret was rotated but Langflow still uses the old value">
+    Rotating a provider-keys secret does not restart Langflow. Run `cpln workload force-redeployment RELEASE_NAME-langflow --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="Long flow runs are cut off on the public URL">
+    The public endpoint cuts requests after `langflow.requestTimeoutSeconds` (default 600, maximum 3600). Raise it for longer calls. Calls from inside the GVC over `cpln.local` are not subject to it.
+  </Accordion>
+  <Accordion title="The chart refuses to render">
+    The error names the offending value. The template rejects `langflow.replicas` outside 1-4, more than one replica without `redis.enabled`, `redis.mode` other than `dev`, enabling both or neither database, and `extraEnv` names that the chart sets itself.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- Auth is always on and the public URL is on by default. Anyone who reaches it can sign up, but new accounts stay inactive until an admin activates them; add `{name: LANGFLOW_ENABLE_SIGNUP, value: "false"}` to `langflow.extraEnv` to turn sign-up off.
+- Any user who can log in can run Python on the server through custom components. Give accounts only to people you trust.
+- Never rotate or delete the encryption key secret: API keys already saved in Langflow could no longer be decrypted.
+- The admin secret is read on first start only. Change the password in the Langflow UI, since later changes to the secret are ignored.
+- MCP clients authenticate with a Langflow API key in the `x-api-key` header (create one under Settings → API Keys), even when the MCP Server tab shows no auth.
+- The Control Plane MCP server is registered for the superuser only; other users add their own under Settings → MCP Servers.
+- Any logged-in user can read the service-account key through Python, so grant that service account only what flows need.
+- After rotating a provider-keys secret, run `cpln workload force-redeployment RELEASE_NAME-langflow --gvc GVC_NAME`.
+- The first `helm upgrade` after an install can restart the bundled database, which briefly interrupts the editor and the API.
+- Use a single-location GVC: the database, the data volume and Redis run in one location.
+- Uninstalling deletes the database and the data volume, and with them every flow, user and uploaded file.
+
+## External References
+
+<CardGroup cols={2}>
+  <Card title="Langflow documentation" icon="book" href="https://docs.langflow.org">
+    Concepts, components and deployment
+  </Card>
+  <Card title="Environment variables" icon="gear" href="https://docs.langflow.org/environment-variables">
+    Langflow settings
+  </Card>
+  <Card title="Langflow as an MCP server" icon="plug" href="https://docs.langflow.org/mcp-server">
+    Exposing flows as MCP tools
+  </Card>
+  <Card title="API keys and authentication" icon="lock" href="https://docs.langflow.org/api-keys-and-authentication">
+    Logins and API keys
+  </Card>
+  <Card title="Langflow on GitHub" icon="github" href="https://github.com/langflow-ai/langflow">
+    Source and issues
+  </Card>
+</CardGroup>
