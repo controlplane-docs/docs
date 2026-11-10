@@ -96,7 +96,7 @@ Once the secret exists, install from the marketplace registry with its name:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/ess \
-  --version 2.1.1 --gvc GVC_NAME \
+  --version 2.2.0 --gvc GVC_NAME \
   --set configSecretName=SECRET_NAME
 ```
 
@@ -129,7 +129,7 @@ Or follow the instructions for your preferred method:
 ### Image and Resources
 
 ```yaml
-image: ghcr.io/controlplane-com/cpln-build/external-secret-syncer:v2.0.2
+image: ghcr.io/controlplane-com/cpln-build/external-secret-syncer:v2.1.0
 
 resources:
   cpu: 200m
@@ -147,7 +147,23 @@ allowedIp:
   - 1.2.3.4 # Replace with your IP
 ```
 
-`port` is the ESS admin API, used by the `/about` health check. `allowedIp` lists the CIDRs that may reach the admin API on its public endpoint; the shipped `1.2.3.4` is a placeholder that admits nobody. Other workloads in the GVC cannot reach the admin API.
+`port` is the ESS admin API, used by the `/about` health check. `allowedIp` lists the CIDRs that may reach the admin API on its public endpoint; the shipped `1.2.3.4` is a placeholder that admits only the host `1.2.3.4`, not you. Replace it with your CIDR, or set `[]` to close the admin API to the internet. Other workloads in the GVC cannot reach the admin API.
+
+<Warning>
+**The admin API has no authentication.** Anyone `allowedIp` admits can read the running configuration and trigger syncs, so keep it to the addresses that need it, or set `allowedIp: []` and use `cpln port-forward`.
+</Warning>
+
+The admin API serves:
+
+| Endpoint | What it does |
+|---|---|
+| `GET /about` | Health check |
+| `GET /config` | Your `sync.yaml` as ESS parsed it, with every provider credential and every secret `default` value masked as `***********` |
+| `GET /provider` | The `providers` list, masked the same way |
+| `POST /provider/PROVIDER_NAME/-check` | Fetches each secret of that provider and reports `OK`, `DEFAULT` or `ERROR: …` per key, never the values |
+| `POST /provider/PROVIDER_NAME/-sync` | Syncs each secret of that provider immediately |
+
+The masked fields are the Vault `token`, the AWS Secrets Manager and AWS Parameter Store `accessKeyId` and `secretAccessKey`, the 1Password `serviceAccountToken`, the 1Password Connect `token`, the Doppler `accessToken`, the GCP `credentials.privateKey`, and the Infisical `clientId` and `clientSecret`. A credential you did not set stays empty or absent, so you can tell which ones are configured.
 
 ### Sync Configuration Secret
 
@@ -328,7 +344,7 @@ ESS has no client endpoint of its own. Workloads consume the secrets it writes b
 |---|---|---|
 | Synced secrets | `cpln secret reveal SYNCED_SECRET_NAME -o yaml` | The `syncer.cpln.io/lastError` tag is empty after a successful sync and holds the error message after a failed one |
 | Admin API (public) | `status.canonicalEndpoint` from `cpln workload get RELEASE_NAME-ess --gvc GVC_NAME -o yaml` | Reachable only from the CIDRs in `allowedIp` |
-| Admin API (private) | `cpln port-forward RELEASE_NAME-ess 3004:3004 --gvc GVC_NAME` | Health check `GET /about` |
+| Admin API (private) | `cpln port-forward RELEASE_NAME-ess 3004:3004 --gvc GVC_NAME` | Health check `GET /about`; see [Admin API Access](#admin-api-access) for the other endpoints |
 | Provider credentials | `cpln secret reveal SECRET_NAME -o yaml` | Your `sync.yaml` |
 
 To confirm a sync happened, read the secret back and check its tags and data:
@@ -378,6 +394,20 @@ cpln workload force-redeployment RELEASE_NAME-ess --gvc GVC_NAME
 
 Removing an entry from `sync.yaml` stops syncing it but leaves the Control Plane secret it created in place.
 
+### Upgrading From 2.1.x
+
+Version 2.2.0 moves to syncer image `v2.1.0` and changes no configuration, so upgrade in place:
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/ess \
+  --version 2.2.0 --gvc GVC_NAME \
+  --set configSecretName=SECRET_NAME
+```
+
+<Warning>
+**Earlier images exposed credentials through the admin API.** Before `v2.1.0`, `GET /config` and `GET /provider` returned the AWS Parameter Store `accessKeyId` and `secretAccessKey`, the 1Password `serviceAccountToken` (including one read from `OP_SERVICE_ACCOUNT_TOKEN`) and secret `default` values in plaintext. If `allowedIp` ever admitted addresses you do not trust, rotate those credentials and update `sync.yaml` as described in [Updating the Sync Configuration](#updating-the-sync-configuration).
+</Warning>
+
 ### Upgrading From 2.0.x
 
 Version 2.1.0 removes the `essConfig` values block. The **schema is unchanged**: migrating is a verbatim lift of that block into `sync.yaml`, minus the top-level `essConfig:` wrapper. Version 2.0.x does not create a GVC, so this is an ordinary in-place upgrade of the same release.
@@ -409,7 +439,7 @@ values. See Prerequisites in the README.
 
     ```bash
     cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/ess \
-      --version 2.1.1 --gvc GVC_NAME \
+      --version 2.2.0 --gvc GVC_NAME \
       --set configSecretName=SECRET_NAME
     ```
   </Step>
@@ -446,6 +476,11 @@ values. See Prerequisites in the README.
 
     **Fix:** set `allowedIp` to your CIDR and upgrade, or reach the API privately with `cpln port-forward RELEASE_NAME-ess 3004:3004 --gvc GVC_NAME`.
   </Accordion>
+  <Accordion title="GET /config shows *********** instead of a credential">
+    **Cause:** this is intended. The admin API masks every provider credential and every secret `default` value, so the plaintext never leaves the workload.
+
+    **Fix:** none needed. To see the real values, reveal the secret that holds your `sync.yaml` with `cpln secret reveal SECRET_NAME -o yaml`.
+  </Accordion>
 </AccordionGroup>
 
 ## Important Notes
@@ -454,6 +489,7 @@ values. See Prerequisites in the README.
 - Two ESS instances cannot manage the same secret; give each release its own target secret names.
 - ESS never deletes a secret when its entry or upstream source is removed. Removing an entry from `sync.yaml`, or deleting the source upstream, leaves the Control Plane secret in place; delete it yourself.
 - Changing a secret between `opaque` and `dictionary` makes ESS delete and recreate it, so it briefly does not exist.
+- The admin API has no authentication; `allowedIp` is the only thing that limits who can reach it. Upgrade releases older than 2.2.0, whose images exposed some provider credentials through `GET /config` and `GET /provider` (see [Upgrading From 2.1.x](#upgrading-from-2-1-x)).
 - Version 2.1.0 removed `essConfig`; follow [Upgrading From 2.0.x](#upgrading-from-2-0-x) before upgrading an older release.
 
 ## External References
