@@ -1,0 +1,384 @@
+---
+title: Directus
+icon: /template-catalog/templates/icons/directus.png
+description: Deploy Directus on Control Plane. Headless CMS with instant REST and GraphQL APIs and the Data Studio admin app over PostgreSQL. Single-location Directus with bundled PostgreSQL (HA optional), local or S3 file storage and optional Redis for multiple replicas. Needs an existing GVC and two secrets.
+keywords: ['headless cms', 'directus', 'rest api', 'graphql', 'data studio', 'strapi alternative', 'contentful alternative', 'content management', 'postgresql', 'asset library', 'admin panel', 'self-hosted cms']
+---
+
+## Overview
+
+Directus is a headless CMS and data platform. It puts an instant REST and GraphQL API and the Data Studio admin app on top of PostgreSQL, so editors manage content in a web UI and your sites and apps read it over the API. This template deploys Directus 12 with a bundled PostgreSQL (single instance by default, highly available behind one flag), file storage on a shared volume or an S3 bucket, and optional Redis for running multiple replicas.
+
+Directus 12 is licensed MSCL-1.0-GPL. Without a license key it runs on the free Core tier: 3 Data Studio users, 25 collections and 5 flows. Going over a cap starts a grace period, after which the project is downgraded until you get back under the caps or add a key. A key is free on registration for small organizations and paid otherwise. Directus also sends usage telemetry to Directus by default, and the template leaves that default in place.
+
+<Note>
+This template deploys into an existing [GVC](/reference/gvc) that you already have — it does not create one. Directus runs in the one location named by `location`, which must already be a location of that GVC; a location the GVC does not have simply starts nothing. The bundled PostgreSQL and Redis start in every location the GVC has, so use a GVC with a single location.
+</Note>
+
+### What Gets Created
+
+| Resource | Name | Purpose | Optional |
+|---|---|---|---|
+| Workload | `RELEASE_NAME-directus` | API and Data Studio on port `8055` (standard, 1-10 replicas, container `directus`) | — |
+| Volume Set | `RELEASE_NAME-directus-uploads` | Shared read-write volume at `/directus/uploads` that every replica mounts | — |
+| Identity & Policy | `RELEASE_NAME-directus-identity`, `RELEASE_NAME-directus-policy` | `reveal` on exactly the secrets Directus reads | — |
+| Policy | `RELEASE_NAME-directus-gvc-policy` | `view` on its own GVC, for a boot-time check that reports GVC locations Directus does not use | — |
+| Workload | `RELEASE_NAME-postgres` | Bundled PostgreSQL (stateful, 1 replica, container `postgresql`, port `5432`) from the [postgres](/template-catalog/templates/postgres) template | `postgres.enabled: true` (default) |
+| Volume Set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory | `postgres.enabled: true` (default) |
+| Identity & Policy | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-pg-policy` | `reveal` on the database credentials secret | `postgres.enabled: true` (default) |
+| Workload | `RELEASE_NAME-postgres-ha`, `RELEASE_NAME-etcd`, `RELEASE_NAME-postgres-ha-proxy` | Highly available PostgreSQL: Patroni replicas, etcd and an HAProxy leader endpoint, from the [postgres-highly-available](/template-catalog/templates/postgres-highly-available) template | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-redis` | One Redis node for shared cache, locks, message bus, rate limits and the scheduled-flow clock; holds no data of record | `redis.enabled: true` |
+
+## Prerequisites
+
+Two secrets must exist **before** you install, in a GVC with one location. Secrets are org-level, so no GVC flag is involved. They hold credentials, so they are prerequisite secrets rather than values.
+
+<Steps>
+  <Step title="Directus secret">
+    A [dictionary secret](/guides/create-secret/dictionary) with the token signing secret and the first administrator. `adminEmail` and `adminPassword` are read on the first boot only:
+
+    ```bash
+    cpln secret create-dictionary --name DIRECTUS_SECRET_NAME \
+      --entry secret="$(openssl rand -hex 32)" \
+      --entry adminEmail=admin@example.com \
+      --entry adminPassword="$(openssl rand -hex 16)"
+    ```
+
+    Set `secrets.name` to this name.
+  </Step>
+  <Step title="Database credentials">
+    A dictionary secret with keys `username`, `password` and `database`. PostgreSQL is initialized with it and Directus connects with it:
+
+    ```bash
+    cpln secret create-dictionary --name DB_SECRET_NAME \
+      --entry username=directus --entry password="$(openssl rand -hex 24)" --entry database=directus
+    ```
+
+    Set `postgres.config.credentialsSecretName` to this name, or `postgresHA.config.credentialsSecretName` in HA mode.
+  </Step>
+</Steps>
+
+<Warning>
+If either secret is missing, the install reports success and then waits silently: `cpln logs` shows nothing, and the missing secret is named only in `status.versions[].message` of `cpln workload get-deployments RELEASE_NAME-directus --gvc GVC_NAME -o yaml`. A secret created after installing is not picked up on its own; run `cpln workload force-redeployment RELEASE_NAME-directus --gvc GVC_NAME`.
+</Warning>
+
+Optional features need setup before you install:
+
+<Steps>
+  <Step title="License key (optional)">
+    An [opaque secret](/guides/create-secret/opaque) holding your Directus license key:
+
+    ```bash
+    printf '%s' 'YOUR_LICENSE_KEY' | cpln secret create-opaque --name LICENSE_SECRET_NAME --encoding plain -f -
+    ```
+
+    Set `license.secretName` to this name. With a key set this way the license can no longer be changed in the Data Studio; without one you can enter a key under Settings, License. Activation is bound to the public URL, so check Settings, License after changing `directus.publicUrl`.
+  </Step>
+  <Step title="Redis password and SMTP login (optional)">
+    Dictionary secrets: one with the key `password` for `redis.redis.auth.fromSecret.name`, one with the keys `username` and `password` for `email.auth.secretName`:
+
+    ```bash
+    cpln secret create-dictionary --name REDIS_SECRET_NAME --entry password="$(openssl rand -hex 24)"
+    cpln secret create-dictionary --name SMTP_SECRET_NAME --entry username=SMTP_USERNAME --entry password=SMTP_PASSWORD
+    ```
+  </Step>
+  <Step title="S3 bucket and backup bucket (optional)">
+    File storage in S3 needs a bucket and, on AWS, a Control Plane cloud account and IAM policy. See [Storage Setup](#storage-setup). Database backups are covered under [Backing Up](#backing-up).
+  </Step>
+</Steps>
+
+## Installation
+
+A default install needs only the names of the two secrets:
+
+```bash
+cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/directus \
+  --version 1.0.0 --gvc GVC_NAME \
+  --set secrets.name=DIRECTUS_SECRET_NAME \
+  --set postgres.config.credentialsSecretName=DB_SECRET_NAME
+```
+
+Or install using your preferred method:
+
+<CardGroup cols={2}>
+    <Card title="UI" href="/template-catalog/install-manage/ui" icon="laptop">
+    Browse, install, and manage templates visually
+    </Card>
+    <Card title="CLI" href="/template-catalog/install-manage/cli" icon="terminal">
+    Manage templates from your terminal
+    </Card>
+    <Card title="Terraform" href="/template-catalog/install-manage/terraform" icon={<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><g fill-rule="evenodd"><path d="M77.941 44.5v36.836L46.324 62.918V26.082zm0 0" fill="#5c4ee5"/><path d="M81.41 81.336l31.633-18.418V26.082L81.41 44.5zm0 0" fill="#4040b2"/><path d="M11.242 42.36L42.86 60.776V23.941L11.242 5.523zm0 0M77.941 85.375L46.324 66.957v36.82l31.617 18.418zm0 0" fill="#5c4ee5"/></g></svg>}>
+    Declare templates in your Terraform configurations
+    </Card>
+    <Card title="Pulumi" href="/template-catalog/install-manage/pulumi" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" id="Pulumi-Icon--Streamline-Svg-Logos" height="24" width="24">
+        <desc>
+            Pulumi Icon Streamline Icon: https://streamlinehq.com
+        </desc>
+        <path fill="#f26e7e" d="M4.683025 13.3318c0.869125 -0.5018 0.870575 -2.1264 0.003225 -3.62865s-2.27504 -2.313275 -3.1441725 -1.811475C0.672945 8.3935 0.6715 10.0181 1.53885 11.52035c0.86735 1.502275 2.27505 2.313275 3.144175 1.81145Zm0.0052 3.2167c0.86735 1.502275 0.865925 3.126875 -0.003225 3.628675 -0.86915 0.5018 -2.2768275 -0.309225 -3.144175 -1.81145 -0.8673525 -1.50225 -0.8659075 -3.126875 0.003225 -3.628675 0.8691325 -0.5018 2.276825 0.309225 3.144175 1.81145Zm5.922875 3.4243c0.86735 1.50225 0.8659 3.126775 -0.003225 3.62875 -0.869125 0.501775 -2.27685 -0.309325 -3.1442 -1.81155 -0.867325 -1.50225 -0.865875 -3.12685 0.00325 -3.628675 0.869125 -0.5018 2.276825 0.309225 3.144175 1.811475Zm-0.001925 -6.845275c0.86735 1.50225 0.8659 3.12685 -0.003225 3.628675 -0.869125 0.5018 -2.276825 -0.309225 -3.144175 -1.811475 -0.86735 -1.50225 -0.8659 -3.12685 0.003225 -3.62865 0.869125 -0.501825 2.276825 0.3092 3.144175 1.81145Z" stroke-width="0.25"></path>
+        <path fill="#8a3391" d="M22.45775 11.524125c0.86725 -1.502225 0.865925 -3.12685 -0.003225 -3.62865 -0.869125 -0.501825 -2.276825 0.3092 -3.144175 1.811475 -0.86735 1.50225 -0.8659 3.126825 0.003225 3.62865 0.869125 0.501825 2.276825 -0.3092 3.144175 -1.811475Zm0.000175 3.2151c0.869075 0.5018 0.870625 2.1264 0.003225 3.62865 -0.86735 1.50225 -2.27505 2.313275 -3.144175 1.81145 -0.869125 -0.5018 -0.870575 -2.126425 -0.003225 -3.62865 0.86735 -1.50225 2.27505 -2.313275 3.144175 -1.81145ZM16.536225 18.157875c0.86915 0.501825 0.8706 2.126425 0.00325 3.628675 -0.86735 1.502125 -2.275075 2.313225 -3.1442 1.81145 -0.869125 -0.50175 -0.870575 -2.126425 -0.003225 -3.62865 0.867375 -1.502275 2.27505 -2.3133 3.144175 -1.811475Zm-0.003325 -6.843775c0.869125 0.5018 0.870575 2.126425 0.003225 3.628675s-2.27505 2.313275 -3.1442 1.811475c-0.869125 -0.501825 -0.870575 -2.126425 -0.003225 -3.628675 0.86735 -1.502275 2.27505 -2.313275 3.1442 -1.811475Z" stroke-width="0.25"></path>
+        <path fill="#f7bf2a" d="M15.138225 2.06721c0 1.003615 -1.40625 1.817215 -3.14095 1.817215 -1.7347 0 -3.14095 -0.8136 -3.14095 -1.817215C8.856325 1.06359 10.262575 0.25 11.997275 0.25c1.7347 0 3.14095 0.81359 3.14095 1.81721ZM9.2166 5.482375c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172s1.40625 -1.817225 3.14095 -1.817225c1.7347 0 3.14095 0.8136 3.14095 1.817225Zm8.71005 1.8172c1.7347 0 3.14095 -0.813575 3.14095 -1.8172s-1.40625 -1.817225 -3.14095 -1.817225c-1.7347 0 -3.14095 0.8136 -3.14095 1.817225s1.40625 1.8172 3.14095 1.8172Zm-2.788425 1.605625c0 1.003625 -1.40625 1.8172 -3.14095 1.8172 -1.7347 0 -3.14095 -0.813575 -3.14095 -1.8172 0 -1.0036 1.40625 -1.8172 3.14095 -1.8172 1.7347 0 3.14095 0.8136 3.14095 1.8172Z" stroke-width="0.25"></path>
+        </svg>}>
+    Declare templates in your Pulumi programs
+    </Card>
+</CardGroup>
+
+## Configuration
+
+### Directus
+
+```yaml
+# The ONE location of your GVC that Directus runs in; it must already be a GVC location.
+location: aws-us-east-1
+
+directus:
+  image: directus/directus:12.6.1
+  # 1-10 interchangeable replicas; 2+ needs redis.enabled: true (shared cache, locks, scheduled flows)
+  # set directus.replicas: 2, redis.enabled: true and postgresHA.enabled: true for near-zero-downtime upgrades and failover
+  replicas: 1
+  publicUrl: ""          # empty = canonical endpoint (http://localhost:8055 when private); custom domain with scheme, e.g. https://cms.example.com
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 2Gi       # headroom for image transformations
+
+secrets:
+  name: my-directus-secrets
+
+license:
+  secretName: ""         # optional `opaque` secret (encoding plain) holding your license key, e.g. my-directus-license
+```
+
+Extensions are not persisted. To use them, build your own image `FROM` the pinned one and set `directus.image`.
+
+### File Storage
+
+```yaml
+storage:
+  type: local            # local (shared volume, deleted on uninstall) | s3
+  local:
+    capacity: 10         # GiB (minimum 10)
+  s3:
+    bucket: my-directus-bucket
+    region: us-east-1
+    endpoint: ""         # S3-compatible servers only, e.g. http://my-minio.GVC.cpln.local:9000
+    forcePathStyle: false   # true for most S3-compatible servers (MinIO)
+    cloudAccountName: my-directus-cloud-account   # AWS keyless auth (used when auth.secretName is empty)
+    policyName: my-directus-s3-policy             # your bucket-scoped IAM policy (README Storage setup)
+    auth:
+      secretName: ""     # S3-compatible servers only: dictionary with accessKeyId + secretAccessKey, e.g. my-directus-s3-keys
+```
+
+#### Storage Setup
+
+Only for `storage.type: s3`. Both paths set `storage.s3.bucket` and `storage.s3.region`.
+
+**AWS S3 (keyless)** — create the bucket and a Control Plane [cloud account](https://docs.controlplane.com/guides/create-cloud-account) for the AWS account, and set `storage.s3.cloudAccountName`. Create this IAM policy (replace `YOUR_BUCKET_NAME`), set `storage.s3.policyName` to its name, and leave `storage.s3.auth.secretName` empty.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+               "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+    "Resource": ["arn:aws:s3:::YOUR_BUCKET_NAME", "arn:aws:s3:::YOUR_BUCKET_NAME/*"]
+  }]
+}
+```
+
+**S3-compatible (MinIO and others)** — create the bucket, set `storage.s3.endpoint` with its scheme and fully qualified host (for example `http://MINIO_WORKLOAD_NAME.GVC_NAME.cpln.local:9000`), set `storage.s3.forcePathStyle: true`, then create the keys secret and set `storage.s3.auth.secretName` to it:
+
+```bash
+cpln secret create-dictionary --name S3_KEYS_SECRET_NAME \
+  --entry accessKeyId=ACCESS_KEY --entry secretAccessKey=SECRET_KEY
+```
+
+### Cache and Email
+
+```yaml
+cache:
+  enabled: false         # cache API reads (in Redis when redis.enabled, else per replica); purged on every write
+
+email:
+  enabled: false         # off = no user invites or password-reset mail
+  fromAddress: no-reply@example.com
+  host: smtp.example.com
+  port: 587
+  secure: false          # false = STARTTLS/plain (587); true = implicit TLS (465)
+  auth:
+    secretName: ""       # optional dictionary with username + password, e.g. my-directus-smtp
+```
+
+### Access
+
+```yaml
+publicAccess:
+  enabled: true          # the API and Studio on the canonical *.cpln.app endpoint
+internalAccess:
+  type: same-gvc         # none | same-gvc | same-org | workload-list
+  workloads: []          # workload-list only; this release's own workloads are always added
+  # workloads:
+  #   - //gvc/GVC_NAME/workload/WORKLOAD_NAME
+```
+
+### Database
+
+```yaml
+# set postgresHA.enabled: true (and postgres.enabled: false) for near-zero-downtime upgrades and failover
+postgres:
+  enabled: true
+  image: postgres:18
+  config:
+    credentialsSecretName: my-directus-db-credentials
+  resources:
+    minCpu: 250m
+    maxCpu: 1000m
+    minMemory: 512Mi
+    maxMemory: 1Gi
+  volumeset:
+    capacity: 10         # GiB (minimum 10)
+
+# 3 Patroni replicas, 3 etcd and an HAProxy leader endpoint; enable exactly one of postgres / postgresHA.
+postgresHA:
+  enabled: false
+  config:
+    credentialsSecretName: my-directus-db-credentials
+  replicas: 3
+  resources:
+    minCpu: 500m
+    maxCpu: 1000m
+    minMemory: 1Gi
+    maxMemory: 2Gi
+  volumeset:
+    capacity: 10         # GiB per replica (minimum 10)
+```
+
+Enable exactly one of `postgres` and `postgresHA`. Backup settings for both are covered under [Backing Up](#backing-up).
+
+### Redis
+
+```yaml
+redis:
+  enabled: false
+  mode: dev              # required — the chart refuses production (Sentinel) mode
+  redis:
+    image: redis:8
+    resources:
+      maxCpu: 200m
+      maxMemory: 256Mi
+      minCpu: 80m
+      minMemory: 128Mi
+    auth:
+      fromSecret:
+        enabled: false
+        name: ""         # e.g. my-directus-redis
+        passwordKey: password
+```
+
+Redis is required for 2 or more Directus replicas and stays a single node. To require a password, create the secret from Prerequisites, then set `redis.redis.auth.fromSecret.enabled: true` and its `name`.
+
+## Connecting
+
+| Target | Address | Credentials |
+|---|---|---|
+| Public API and Data Studio | `status.canonicalEndpoint` of `cpln workload get RELEASE_NAME-directus --gvc GVC_NAME -o yaml` | `adminEmail` and `adminPassword` from the Directus secret |
+| Private | `cpln port-forward RELEASE_NAME-directus 8055:8055 --gvc GVC_NAME`, then `http://localhost:8055` | same |
+| Internal | `http://RELEASE_NAME-directus.GVC_NAME.cpln.local:8055` | an access token |
+| Health | `GET /server/ping` (process) and `GET /server/info` (database) need no credentials; `GET /server/health` (database, storage, Redis) | an admin token for `/server/health` |
+| PostgreSQL | `RELEASE_NAME-postgres.GVC_NAME.cpln.local:5432`, or `RELEASE_NAME-postgres-ha-proxy.GVC_NAME.cpln.local:5432` in HA mode | the database credentials secret |
+
+Read credentials back with `cpln secret reveal SECRET_NAME -o yaml`. To verify the install, request the anonymous info endpoint through the public endpoint:
+
+```bash
+curl -s https://YOUR_ENDPOINT/server/info
+```
+
+### First Run
+
+Sign in to the Data Studio at the endpoint with the admin email and password. On first sign-in Directus asks for a license key (choose **I'm using Core plan** or **Skip** without one) and to register a project owner (**Remind Later** skips it); both dialogs return until answered.
+
+The API takes a token from `POST /auth/login`, or a static token you set on a user in the Data Studio:
+
+```bash
+curl -s -X POST https://YOUR_ENDPOINT/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"admin@example.com","password":"YOUR_ADMIN_PASSWORD"}'
+```
+
+`adminPassword` is read on the first boot only. Change the password in the Data Studio, or reset a forgotten one in the container (`read` keeps it out of your shell history):
+
+```bash
+read -rs NEW_PASSWORD
+cpln workload exec RELEASE_NAME-directus --gvc GVC_NAME --container directus -- \
+  node /directus/cli.js users passwd --email admin@example.com --password "$NEW_PASSWORD"
+```
+
+## Operations
+
+### Backing Up
+
+Database backups are scheduled by the bundled database template and write to your bucket. Set `postgres.backup.enabled: true` (single instance, a scheduled `pg_dump`; `provider` is `aws`, `gcp` or `minio`, default schedule `0 2 * * *`) or `postgresHA.backup.enabled: true` (HA; `mode` is `logical` or `wal-g`). The full `backup` blocks are in the shipped `values.yaml` and pass straight through; the bucket, cloud account and IAM policy setup are on the [postgres](/template-catalog/templates/postgres) and [postgres-highly-available](/template-catalog/templates/postgres-highly-available) pages.
+
+A database backup does not include uploaded files. With `storage.type: s3`, protect the bucket as well with versioning or replication. Local uploads are not snapshotted.
+
+### Restoring a Backup
+
+Restore the database by following the restore steps on the [postgres](/template-catalog/templates/postgres) or [postgres-highly-available](/template-catalog/templates/postgres-highly-available) page for the mode you installed. Restoring uploaded files is not covered by this template; with `storage.type: s3` they live in your bucket.
+
+### Scaling and Availability
+
+Set `directus.replicas` between 1 and 10. Replicas are interchangeable and roll one at a time with no unavailable replica. Two or more replicas need `redis.enabled: true`; the chart refuses to render otherwise. For near-zero-downtime upgrades and failover, combine `directus.replicas: 2`, `redis.enabled: true` and `postgresHA.enabled: true`.
+
+Directus runs in one location only. To change it, set `location` to another location of the same GVC.
+
+### Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Deployment never starts and cpln logs is empty">
+    A prerequisite secret does not exist. Read `status.versions[].message` from `cpln workload get-deployments RELEASE_NAME-directus --gvc GVC_NAME -o yaml`, create the secret, then run `cpln workload force-redeployment RELEASE_NAME-directus --gvc GVC_NAME`.
+  </Accordion>
+  <Accordion title="deactivated because maxScale is set to 0">
+    The GVC does not have the location named by `location`, so Directus runs nothing. Set `location` to a location the GVC already has, and install into a GVC with one location.
+  </Accordion>
+  <Accordion title="Render refuses with a directus.replicas error">
+    Two or more replicas need `redis.enabled: true`. Without Redis each replica would keep its own cache, rate limits and scheduled-flow clock. Enable Redis or set `directus.replicas: 1`.
+  </Accordion>
+  <Accordion title="Uploads fail with S3 storage">
+    The IAM policy or keys usually do not cover the bucket. `GET /server/health` with an admin token (`-H 'Authorization: Bearer TOKEN'`) writes a test file and names the failing check.
+  </Accordion>
+  <Accordion title="API requests return 503 for a moment">
+    The single Redis node is restarting. Requests recover when Directus reconnects.
+  </Accordion>
+  <Accordion title="Sign-in shows license or project-owner dialogs again">
+    Both dialogs return until answered. Enter a key or choose the Core plan, and register or choose Remind Later.
+  </Accordion>
+</AccordionGroup>
+
+## Important Notes
+
+- **Never change `secret` after installing.** It signs every session and token, so all of them stop working. Rotating any other secret needs `cpln workload force-redeployment RELEASE_NAME-directus --gvc GVC_NAME`.
+- **Local files are deleted on uninstall and are not snapshotted.** Use `storage.type: s3` for files that must outlive the release; switching `storage.type` later does not move existing files.
+- **Install into a GVC with one location** and set `location` to it; the bundled PostgreSQL and Redis start in every GVC location.
+- **The first `helm upgrade` can briefly restart the single-instance PostgreSQL**, and Directus with it; use `postgresHA` when that matters.
+- **A replica restart empties the shared data cache** in Redis; Directus rebuilds it on demand.
+- **Changing the public URL** (`directus.publicUrl`) changes where a license key is activated; recheck Settings, License.
+
+## External References
+
+<CardGroup cols={2}>
+  <Card title="Directus Documentation" href="https://directus.com/docs" icon="book">
+    Official Directus product documentation
+  </Card>
+  <Card title="Configuration Reference" href="https://directus.com/docs/configuration/general" icon="sliders">
+    The environment options this template sets
+  </Card>
+  <Card title="Licensing and the Core Tier" href="https://directus.com/docs/licensing/overview" icon="key">
+    License tiers, caps and the free registration key
+  </Card>
+  <Card title="Directus on GitHub" href="https://github.com/directus/directus" icon="github">
+    Source code and release notes
+  </Card>
+  <Card title="Directus Template" href="https://github.com/controlplane-com/templates/tree/main/directus" icon="github">
+    View the source files, default values, and chart definition
+  </Card>
+</CardGroup>
