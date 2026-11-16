@@ -1,0 +1,163 @@
+---
+title: 'Header Mutation'
+description: "Remove, add, or overwrite HTTP request and response headers in a workload's sidecar with the Envoy header_mutation filter, set at the workload or GVC level."
+keywords: ['envoy header_mutation', 'strip headers', 'remove header', 'set header', 'overwrite header', 'spoofed headers', 'request_mutations', 'response_mutations', 'sidecar filter', 'append_action']
+---
+
+## Header Mutation Overview
+
+The Envoy [header mutation](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/filters/http/header_mutation/v3/header_mutation.proto) filter changes the HTTP headers on requests that reach a workload and on the responses it sends back. It can:
+
+- Remove a header that a client sent, so the client cannot forge headers that your application or a later filter trusts.
+- Add a header, or overwrite one that is already there.
+
+The filter runs in the workload's inbound sidecar. It only changes traffic that enters the workload, never traffic the workload sends out.
+
+## Header Mutation Configuration
+
+Header mutation is configured in the Workload or GVC `spec.sidecar.envoy.http` filters array. When it is configured on the GVC, it applies to every workload in the GVC.
+
+| Parameter | Type | Description |
+| :-------- | :--- | :---------- |
+| `name` | string | Must be `envoy.filters.http.header_mutation`. |
+| `priority` | number | Sets the order of the filters defined on the GVC and the workload, from `0` to `100`. Lower values run first. See [filter ordering](#header-mutation-filter-ordering). |
+| `excludedWorkloads` | string[] | Names of workloads the filter is not applied to. Use it on a GVC-level filter. |
+| `typed_config."@type"` | string | Must be `type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation`. |
+| `typed_config.mutations.request_mutations` | object[] | Changes made to the request before it continues to later filters and to the workload. Applied in order. |
+| `typed_config.mutations.response_mutations` | object[] | Changes made to the response before it is returned to the client. Applied in order. |
+
+### Header Mutation Rules
+
+Each item in `request_mutations` or `response_mutations` sets exactly one of `remove` or `append`.
+
+| Parameter | Type | Description |
+| :-------- | :--- | :---------- |
+| `remove` | string | The name of a header to remove. |
+| `append.header.key` | string | The name of the header to add or overwrite. |
+| `append.header.value` | string | The header value. It cannot be an empty string. |
+| `append.append_action` | string | What to do when the header already exists. See the table below. |
+| `append.keep_empty_value` | boolean | Add the header even though it has no value. To add a header with an empty value, leave out `value` and set this to `true`. Otherwise a header without a value is not added. |
+
+| `append_action` | Behavior |
+| :-------------- | :------- |
+| `APPEND_IF_EXISTS_OR_ADD` (default) | Add the value to the header if it exists; otherwise add the header. |
+| `ADD_IF_ABSENT` | Add the header only if it does not exist yet. |
+| `OVERWRITE_IF_EXISTS_OR_ADD` | Replace any existing value; otherwise add the header. Use this to set a header to a fixed value. |
+| `OVERWRITE_IF_EXISTS` | Replace the value only if the header exists; otherwise do nothing. |
+
+### Header Name Validation
+
+A header name the sidecar cannot load would break all inbound traffic to the workload, so the API rejects these when you save the spec:
+
+- Names that are not lowercase, or that contain characters not allowed in an HTTP header name, such as spaces.
+- Pseudo-headers such as `:path` or `:authority`.
+- `host`.
+- In `append.header.value`, an empty string, line breaks (CR or LF), and NUL characters.
+
+The API also rejects a rule that sets both `remove` and `append`, or neither, and a rule that sets both the deprecated `append` boolean and `append_action` inside `append`.
+
+When a spec is rejected, the error names the filter's position in the `http` array and says it `does not match any of the allowed types`, for example `"http[0]" does not match any of the allowed types`.
+
+<Info>
+  Only `remove` and `append` rules are supported. The other `HeaderMutation` options (`remove_on_match`, `query_parameter_mutations`, trailer mutations, `most_specific_header_mutations_wins`, and per-route configuration) are not available.
+</Info>
+
+## Header Mutation Filter Ordering
+
+The sidecar collects the `http` filters defined on the GVC and on the workload, sorts them by `priority` from lowest to highest, and runs them in that order. To strip a header before another filter reads it, give the header mutation filter the lower `priority`.
+
+<Warning>
+  Always set `priority` on both filters. When two filters have the same `priority`, or neither has one, their order depends on the order they are listed in, which can change when GVC and workload filters are merged.
+</Warning>
+
+Filters you add always run after the platform's built-in external authorization (configured through the workload's firewall). A header mutation filter can therefore run before an `ext_authz` filter that you define in `sidecar.envoy.http`, but never before the platform's own one.
+
+## Header Mutation Examples
+
+### Strip Client-Supplied Headers Before Your Own ext_authz
+
+An `ext_authz` filter with `failure_mode_allow: true` lets requests through when the authorization service cannot be reached. With `failure_mode_allow_header_add: true`, it adds the `x-envoy-auth-failure-mode-allowed` header to those requests, so the application knows that authorization was skipped.
+
+A client can send that header itself, or any other header your application trusts. The header mutation filter below runs first (`priority: 10`) and removes those headers. Only the `ext_authz` filter (`priority: 20`) can then add them. This matters on the success path too: when authorization succeeds, `ext_authz` does not touch `x-envoy-auth-failure-mode-allowed`, so a copy the client sent would otherwise reach the application.
+
+```yaml
+spec:
+  sidecar:
+    envoy:
+      http:
+        - name: envoy.filters.http.header_mutation
+          priority: 10
+          typed_config:
+            '@type': type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+            mutations:
+              request_mutations:
+                - remove: x-envoy-auth-failure-mode-allowed
+                - remove: x-example-auth-context
+        - name: envoy.filters.http.ext_authz
+          priority: 20
+          typed_config:
+            '@type': type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+            failure_mode_allow: true
+            failure_mode_allow_header_add: true
+            http_service:
+              server_uri:
+                uri: auth.example-gvc.cpln.local:8080
+                cluster: external.auth
+                timeout: 0.5s
+```
+
+### Set and Remove Request and Response Headers
+
+This filter sets `x-request-source` to `edge` on every request, replacing any value the client sent. It also removes the `server` header from responses and adds `x-frame-options` to a response that does not already have it.
+
+```yaml
+spec:
+  sidecar:
+    envoy:
+      http:
+        - name: envoy.filters.http.header_mutation
+          priority: 10
+          typed_config:
+            '@type': type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+            mutations:
+              request_mutations:
+                - append:
+                    header:
+                      key: x-request-source
+                      value: edge
+                    append_action: OVERWRITE_IF_EXISTS_OR_ADD
+              response_mutations:
+                - remove: server
+                - append:
+                    header:
+                      key: x-frame-options
+                      value: DENY
+                    append_action: ADD_IF_ABSENT
+```
+
+### Apply Header Mutation to a Whole GVC
+
+Set the same filter on the GVC to apply it to every workload in the GVC. Use `excludedWorkloads` to leave out specific workloads.
+
+```yaml
+kind: gvc
+name: example-gvc
+spec:
+  sidecar:
+    envoy:
+      http:
+        - name: envoy.filters.http.header_mutation
+          priority: 10
+          excludedWorkloads:
+            - legacy-api
+          typed_config:
+            '@type': type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+            mutations:
+              request_mutations:
+                - remove: x-internal-user
+```
+
+## Related Header Settings
+
+- To accept or reject requests based on their headers, without changing them, use the [inbound HTTP header filter](/reference/workload/firewall#inbound-http-header-filter).
+- To validate JWTs and copy their claims into request headers, see [JWT Authentication](/reference/workload/jwt-auth).
