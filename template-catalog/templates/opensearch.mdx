@@ -1,31 +1,33 @@
 ---
 title: OpenSearch
 icon: /template-catalog/templates/icons/opensearch.png
-description: OpenSearch search and analytics cluster on Control Plane. An odd-numbered multi-node cluster on persistent volumes, with a Dashboards UI (on by default), an optional demo log pipeline, and scheduled snapshots to AWS S3 or GCS. Deploys into an existing GVC; a default install needs no prerequisites.
-keywords: ['elasticsearch fork', 'log search', 'lucene', 'elk alternative', 'kibana alternative', 'es alternative', 'analytics db', 'aws opensearch', 'snapshot repository', 'index lifecycle', 'fluent bit', 'full-text search']
+description: OpenSearch cluster with the security plugin on (TLS and login) and Security Analytics for Sigma-rule threat detection. An odd-numbered multi-node cluster on persistent volumes with Dashboards, optional demo logs and S3 or GCS snapshots. Deploys into an existing GVC; needs two prerequisite secrets.
+keywords: ['elasticsearch fork', 'log search', 'lucene', 'elk alternative', 'kibana alternative', 'es alternative', 'siem', 'security analytics', 'sigma rules', 'threat detection', 'snapshot repository', 'full-text search']
 ---
 
 ## Overview
 
-OpenSearch is an open-source distributed search and analytics engine for logs, metrics, and full-text search. This template deploys a multi-node OpenSearch cluster with persistent storage per node, an OpenSearch Dashboards UI (on by default), an optional demo log pipeline that ships sample logs into the cluster, and optional scheduled snapshots to AWS S3 or Google Cloud Storage.
+OpenSearch is an open-source distributed search and analytics engine for full-text search, log analytics and security monitoring. This template deploys a multi-node OpenSearch cluster with the security plugin always on: a login, TLS on every connection, and a security audit log. Security Analytics (Sigma-rule detectors, findings and alerts) is included, so the cluster doubles as a self-hosted SIEM; see also the [Wazuh](/template-catalog/templates/wazuh) template for endpoint security. Dashboards is on by default, with an optional public login page, an optional demo log pipeline with a sample detector, and optional snapshots to AWS S3 or GCS.
 
 <Note>
-This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create one.
+This template deploys into an existing [GVC](/reference/gvc) that you already have. It does not create one, and it runs in the locations that GVC already has.
 </Note>
 
 ### What Gets Created
 
 | Resource | Name | Purpose | Optional |
 |---|---|---|---|
-| Workload | `RELEASE_NAME-opensearch` | OpenSearch nodes (stateful, `replicas` replicas); HTTP on `9200`, transport on `9300` | — |
+| Workload | `RELEASE_NAME-opensearch` | OpenSearch nodes (stateful, `replicas` replicas); HTTPS on `9200`, TLS transport on `9300` | — |
 | Volume Set | `RELEASE_NAME-opensearch-vs` | Persistent data directory per node, with optional autoscaling | — |
-| Secret | `RELEASE_NAME-opensearch-startup` | Node startup script; installs the snapshot repository plugin when backups are enabled | — |
-| Identity | `RELEASE_NAME-opensearch-identity` | Identity for the OpenSearch and Dashboards workloads; carries the cloud account binding when backups are enabled | — |
-| Policy | `RELEASE_NAME-opensearch-policy` | Grants the identity `reveal` on the startup secret | — |
+| Secret | `RELEASE_NAME-opensearch-startup` | Node startup script: issues node certificates from your CA, writes the security configuration, installs the snapshot repository plugin when backups are enabled | — |
+| Identity | `RELEASE_NAME-opensearch-identity` | Node identity; carries the cloud account binding when backups are enabled | — |
+| Policy | `RELEASE_NAME-opensearch-policy` | Grants the node identity `reveal` on the startup, credentials and CA secrets | — |
+| Identity | `RELEASE_NAME-opensearch-client-identity` | Identity for Dashboards and the setup jobs | — |
+| Policy | `RELEASE_NAME-opensearch-client-policy` | Grants the client identity `reveal` on the credentials secret only | — |
 | Workload | `RELEASE_NAME-opensearch-dashboard` | OpenSearch Dashboards UI on port `5601` | `dashboard.enabled: true` (default) |
 | Workload | `RELEASE_NAME-backup-setup` | One-time job that registers the `backup-repo` snapshot repository and the snapshot policy | `backup.enabled: true` |
 | Workload | `RELEASE_NAME-demo-log-generator` | Sample log generator with a Fluent Bit sidecar shipping into the `demo-logs` index | `demoLogs.enabled: true` |
-| Workload | `RELEASE_NAME-demo-log-setup` | One-time job that creates the demo index template and the `demo-logs*` index pattern in Dashboards | `demoLogs.enabled: true` |
+| Workload | `RELEASE_NAME-demo-log-setup` | One-time job that creates the demo index template, the `demo-logs*` index pattern and the sample detector | `demoLogs.enabled: true` |
 | Volume Set | `RELEASE_NAME-demo-logs-vs` | Shared log directory between the generator and Fluent Bit | `demoLogs.enabled: true` |
 | Secret | `RELEASE_NAME-fluent-bit-demo-config` | Fluent Bit configuration for the demo pipeline | `demoLogs.enabled: true` |
 | Identity | `RELEASE_NAME-demo-logs-identity` | Identity for the demo pipeline workload | `demoLogs.enabled: true` |
@@ -33,17 +35,52 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 
 ## Prerequisites
 
-None for a default install.
+Two dictionary secrets must exist before you install.
 
-Scheduled snapshots need a bucket and a Control Plane Cloud Account before `backup.enabled` can be turned on. See [Backing Up](#backing-up) for the per-provider steps.
+<Steps>
+  <Step title="Create the credentials secret">
+    It holds the `admin` password, the password Dashboards uses to reach OpenSearch, and the Dashboards session-cookie key (32 or more characters).
+
+    ```bash
+    cpln secret create-dictionary --name CREDENTIALS_SECRET_NAME \
+      --entry password="$(openssl rand -hex 16)" \
+      --entry dashboardsPassword="$(openssl rand -hex 16)" \
+      --entry cookieSecret="$(openssl rand -hex 32)"
+    ```
+
+    Set `security.credentialsSecretName` to this name. Read the admin password back with `cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml`.
+  </Step>
+  <Step title="Create the certificate authority secret">
+    The nodes sign their own certificates from a CA you provide, stored as a base64 PKCS#12 plus its passphrase.
+
+    ```bash
+    openssl req -x509 -newkey rsa:3072 -nodes -keyout ca.key -out ca.crt -days 3650 -subj "/CN=opensearch-ca" \
+      -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+    P="$(openssl rand -hex 16)"
+    openssl pkcs12 -export -inkey ca.key -in ca.crt -out ca.p12 -passout pass:"$P"
+    cpln secret create-dictionary --name CA_SECRET_NAME \
+      --entry keystore="$(base64 < ca.p12 | tr -d '\n')" --entry passphrase="$P"
+    ```
+
+    Set `security.caSecretName` to this name. Keep `ca.crt`: your applications use it to verify the cluster's certificate. Store `ca.key` safely or delete it; the secret already holds the key.
+  </Step>
+</Steps>
+
+<Warning>
+If either secret is missing, the deployment wedges silently: the nodes never start and `cpln logs` shows nothing. The missing secret is named only in `status.versions[].message`, which you read with `cpln workload get-deployments RELEASE_NAME-opensearch --gvc GVC_NAME -o yaml`.
+</Warning>
+
+Snapshot backups also need a bucket and a Control Plane Cloud Account. See [Backing Up](#backing-up).
 
 ## Installation
 
-Install the latest version into an existing GVC. A default install has no required `--set` values:
+Install the latest version into an existing GVC, naming your two secrets:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/opensearch \
-  --version 1.0.2 --gvc GVC_NAME
+  --version 2.0.0 --gvc GVC_NAME \
+  --set security.credentialsSecretName=CREDENTIALS_SECRET_NAME \
+  --set security.caSecretName=CA_SECRET_NAME
 ```
 
 To install using another method, follow the instructions for your preferred tool:
@@ -79,7 +116,7 @@ Each subsection shows the shipped defaults for one area of `values.yaml`.
 `replicas` must be odd so the cluster can form a quorum; an even value is rejected when the chart renders.
 
 ```yaml
-image: opensearchproject/opensearch:3.4.0
+image: opensearchproject/opensearch:3.8.0
 
 replicas: 3 # Must be odd
 
@@ -112,9 +149,19 @@ volumeset:
     scalingFactor: 1.2 # Scaling factor to determine how much to scale up when autoscaling is triggered
 ```
 
+### Security
+
+The two [prerequisite secrets](#prerequisites). Both are required; the chart refuses to render without them.
+
+```yaml
+security:
+  credentialsSecretName: my-opensearch-credentials # dictionary: password (admin), dashboardsPassword (kibanaserver), cookieSecret (32+ chars)
+  caSecretName: my-opensearch-ca # dictionary: keystore (base64 PKCS#12 with the CA certificate and key), passphrase
+```
+
 ### Internal Access
 
-Controls which workloads may reach OpenSearch on port `9200`. External inbound access is closed and is not configurable in this template. Because the security plugin is disabled, this setting is the only access control the cluster has.
+Controls which workloads may reach OpenSearch on port `9200`. External inbound access is closed and is not configurable. Every request still needs credentials.
 
 ```yaml
 internal_access:
@@ -128,28 +175,30 @@ internal_access:
 |---|---|
 | `same-gvc` | Every workload in the same GVC |
 | `same-org` | Every workload in the same org |
-| `workload-list` | Only the workloads listed under `workloads` |
+| `workload-list` | The workloads listed under `workloads`, plus the chart's own workloads |
+
+With `workload-list`, list your additional clients only; the chart always allows its own workloads (the nodes, Dashboards, the demo and backup jobs).
 
 ### Dashboards
 
-The OpenSearch Dashboards UI. It is not exposed to the internet; reach it with `cpln port-forward` as shown in [Connecting](#connecting).
+The OpenSearch Dashboards UI, with a login. It is private by default; reach it with `cpln port-forward` as shown in [Connecting](#connecting). Set `publicAccess.enabled: true` to publish the login page on an HTTPS `*.cpln.app` endpoint.
 
 ```yaml
-# Dashboard Configuration (recommended)
 dashboard:
   enabled: true
-  image: opensearchproject/opensearch-dashboards:3.4.0
+  image: opensearchproject/opensearch-dashboards:3.8.0
   resources:
-    cpu: 100m
-    memory: 512Mi
+    cpu: 250m
+    memory: 1Gi
+  publicAccess:
+    enabled: false # true publishes the login page on an HTTPS *.cpln.app endpoint
 ```
 
 ### Demo Logs
 
-A sample log generator with a Fluent Bit sidecar that ships JSON logs into a `demo-logs` index, plus a one-time setup job that creates the `demo-logs-template` index template and makes `demo-logs*` the default index pattern in Dashboards. The setup job needs `dashboard.enabled: true`.
+A sample log generator with a Fluent Bit sidecar that ships JSON logs into a `demo-logs` index, plus a one-time setup job that creates the index template, makes `demo-logs*` the default index pattern in Dashboards, and creates a sample Security Analytics detector. The setup job needs `dashboard.enabled: true`.
 
 ```yaml
-# Demo Logs Configuration (optional)
 demoLogs:
   enabled: false
   remove_setup_workload: false # Set to true after demo logs startup is no longer needed to reduce resource usage
@@ -160,7 +209,6 @@ demoLogs:
 Scheduled snapshots to AWS S3 or GCS. Complete the provider steps in [Backing Up](#backing-up) before setting `enabled: true`. When `provider` is `aws`, `aws.bucket`, `aws.region`, `aws.cloudAccountName` and `aws.policyName` are required; when it is `gcp`, `gcp.bucket` and `gcp.cloudAccountName` are required. Any other `provider` value is rejected when the chart renders.
 
 ```yaml
-# Backup Configuration (optional)
 backup:
   enabled: false      # Set to true to enable automated snapshots
   remove_setup_workload: false # Set to true after backup setup is no longer needed to reduce resource usage
@@ -193,37 +241,44 @@ backup:
 
 ## Connecting
 
-Neither workload has a public endpoint. Applications connect over the internal network; you reach the API and the UI from your machine with `cpln port-forward`.
-
 | What | Address | Notes |
 |---|---|---|
-| OpenSearch REST API (from workloads in the GVC) | `http://RELEASE_NAME-opensearch.GVC_NAME.cpln.local:9200` | Always use the fully-qualified hostname; subject to `internal_access` |
-| OpenSearch REST API (from your machine) | `cpln port-forward RELEASE_NAME-opensearch 9200:9200 --gvc GVC_NAME`, then `http://localhost:9200` | Works regardless of `internal_access` |
-| Dashboards UI | `cpln port-forward RELEASE_NAME-opensearch-dashboard 5601:5601 --gvc GVC_NAME`, then `http://localhost:5601` | Only when `dashboard.enabled: true` |
-| Credentials | None | The security plugin is disabled; there is no username or password |
+| OpenSearch API (from workloads in the GVC) | `https://RELEASE_NAME-opensearch.GVC_NAME.cpln.local:9200` | HTTPS only; plain HTTP is refused. Subject to `internal_access` |
+| Dashboards UI (private) | `cpln port-forward RELEASE_NAME-opensearch-dashboard 5601:5601 --gvc GVC_NAME`, then `http://localhost:5601` | Only when `dashboard.enabled: true` |
+| Dashboards UI (public) | `status.canonicalEndpoint` of `RELEASE_NAME-opensearch-dashboard` | Only with `dashboard.publicAccess.enabled: true`; read it with `cpln workload get RELEASE_NAME-opensearch-dashboard --gvc GVC_NAME -o yaml` |
+| Credentials | User `admin`, password from the `password` key of your credentials secret | `cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml` |
+| CA certificate | `ca.crt` from the prerequisite step | Clients pin it to verify the cluster certificate |
 
-Verify the cluster is healthy and all nodes have joined:
-
-```bash
-cpln port-forward RELEASE_NAME-opensearch 9200:9200 --gvc GVC_NAME
-```
-
-In a second terminal:
+Verify the cluster from any workload in the same GVC, with `ca.crt` available there:
 
 ```bash
-curl "http://localhost:9200/_cluster/health?pretty"
+curl --cacert ca.crt -u "admin:ADMIN_PASSWORD" "https://RELEASE_NAME-opensearch.GVC_NAME.cpln.local:9200/_cluster/health?pretty"
 ```
 
 A healthy default install reports `"status" : "green"` and `"number_of_nodes" : 3`.
+
+### First Run
+
+In Dashboards, log in as `admin` with the password from your credentials secret. Dashboards opens in the **Global** tenant, where saved objects are shared with other users; change the default under **Security > Tenants > Configure**.
+
+### Using Security Analytics
+
+Security Analytics runs Sigma rules over your log indices and records findings and alerts.
+
+1. Ship logs into an index (Fluent Bit, Logstash, OpenTelemetry or the bulk API).
+2. In Dashboards, open **Security Analytics > Detectors > Create detector**, choose the index and a log type (CloudTrail, VPC Flow, DNS, Windows and others ship with prepackaged rules), and map the fields it asks for.
+3. Findings appear under **Findings**; add a trigger with a notification channel to be alerted.
+
+With `demoLogs.enabled: true`, the detector `demo-auth-failures` watches the `demo-logs` index for `Invalid authentication token` messages and produces findings from the generated logs.
 
 ## Operations
 
 ### Backing Up
 
-The template takes snapshots with OpenSearch's own snapshot API. When `backup.enabled: true`, each node installs the `repository-s3` or `repository-gcs` plugin at startup, and the `RELEASE_NAME-backup-setup` job registers a snapshot repository named `backup-repo` plus a snapshot management policy named `automated-snapshots` that runs on `backup.schedule` and prunes snapshots daily according to `backup.retention`. Snapshots cover all indices (`"indices": "*"`) and exclude cluster global state.
+The template takes snapshots with OpenSearch's own snapshot API. When `backup.enabled: true`, each node installs the `repository-s3` or `repository-gcs` plugin at startup, and the `RELEASE_NAME-backup-setup` job registers a snapshot repository named `backup-repo` plus a snapshot policy that follows `backup.schedule` and `backup.retention`.
 
 <Tip>
-Enable backups at install time if you can. Turning them on later works, but every node has to restart to install the repository plugin before the repository can be registered — see [Troubleshooting](#troubleshooting).
+Enable backups at install time if you can. Turning them on later works, but every node has to restart to install the repository plugin before the repository can be registered. See [Troubleshooting](#troubleshooting).
 </Tip>
 
 Set up your provider first.
@@ -265,7 +320,7 @@ Set up your provider first.
         }
         ```
 
-        Both `Resource` ARNs are required. `s3:ListBucket` and `s3:GetBucketLocation` authorize against the bucket itself, while the object actions authorize against `YOUR_BUCKET_NAME/*`. A policy carrying only the `/*` ARN registers the repository and then fails when OpenSearch lists it.
+        Keep both `Resource` ARNs: listing authorizes against the bucket, object actions against `YOUR_BUCKET_NAME/*`.
       </Step>
       <Step title="Enable backups">
         Set `backup.enabled: true` and `backup.provider: aws`, then install or upgrade the release.
@@ -290,117 +345,147 @@ Set up your provider first.
   </Tab>
 </Tabs>
 
-Confirm the setup job finished by reading its logs; it ends with `Backup Configuration Complete!`:
+Check that the setup job finished by reading its logs:
 
 ```bash
 cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-backup-setup"}' --limit 50 --since 10m
 ```
 
-Once it has completed, set `backup.remove_setup_workload: true` and upgrade the release to remove the setup workload. The repository and policy live inside OpenSearch, so scheduled snapshots continue without it.
+Once it has completed, set `backup.remove_setup_workload: true` and upgrade the release to remove the setup workload. Scheduled snapshots continue without it.
 
-With a port-forward to `RELEASE_NAME-opensearch` open on `9200` (see [Connecting](#connecting)), take or inspect snapshots from your machine:
+From a workload in the same GVC, set `OS=https://RELEASE_NAME-opensearch.GVC_NAME.cpln.local:9200` and `AUTH="admin:ADMIN_PASSWORD"`, then take or inspect snapshots:
 
 ```bash
 # Take a manual snapshot
-curl -X PUT "http://localhost:9200/_snapshot/backup-repo/manual-$(date +%Y%m%d-%H%M%S)"
+curl --cacert ca.crt -u "$AUTH" -X PUT "$OS/_snapshot/backup-repo/manual-$(date +%Y%m%d-%H%M%S)"
 
-# List all snapshots in the repository
-curl "http://localhost:9200/_snapshot/backup-repo/_all?pretty"
-
-# Show the automated snapshot policy
-curl "http://localhost:9200/_plugins/_sm/policies/automated-snapshots?pretty"
+# List all snapshots
+curl --cacert ca.crt -u "$AUTH" "$OS/_snapshot/backup-repo/_all?pretty"
 ```
 
 ### Restoring a Backup
 
-OpenSearch snapshots are restored through the snapshot API, from the same `backup-repo` repository the template registers. The commands below assume a port-forward to `RELEASE_NAME-opensearch` on `9200` (see [Connecting](#connecting)).
-
-<Warning>
-These restore commands follow the OpenSearch snapshot API against the repository this template configures, but the template's test suite has not exercised a snapshot round trip against a live bucket. Rehearse a restore in a non-production cluster before you depend on it.
-</Warning>
+OpenSearch snapshots are raw index segment files, not dumps; restore them through the snapshot API from the `backup-repo` repository, using `OS` and `AUTH` as above. Always leave out `.opendistro_security`: it holds the live users and roles.
 
 **Into an empty cluster** — nothing to conflict with:
 
 ```bash
-curl -X POST "http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore" \
+curl --cacert ca.crt -u "$AUTH" -X POST "$OS/_snapshot/backup-repo/SNAPSHOT_NAME/_restore" \
   -H 'Content-Type: application/json' \
-  -d '{"indices": "*", "ignore_unavailable": true, "include_global_state": false}'
+  -d '{"indices": "*,-.opendistro_security", "ignore_unavailable": true, "include_global_state": false}'
 ```
 
-**Alongside existing indices** — restore under new names and leave live data untouched. This is the safest option on a cluster that is in use:
+**Over existing indices** — an open index cannot be restored into, so close the indices you restore first, restore, then reopen. Never close `_all`: that closes the security index and locks everyone out.
 
 ```bash
-curl -X POST "http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore" \
+curl --cacert ca.crt -u "$AUTH" -X POST "$OS/INDEX_NAME/_close"
+curl --cacert ca.crt -u "$AUTH" -X POST "$OS/_snapshot/backup-repo/SNAPSHOT_NAME/_restore" \
   -H 'Content-Type: application/json' \
-  -d '{"indices": "*", "rename_pattern": "(.+)", "rename_replacement": "restored-$1",
+  -d '{"indices": "INDEX_NAME", "ignore_unavailable": true, "include_global_state": false}'
+curl --cacert ca.crt -u "$AUTH" -X POST "$OS/INDEX_NAME/_open"
+```
+
+**Alongside existing indices** — restore under new names and leave live data untouched. This is the safest option on a cluster in use:
+
+```bash
+curl --cacert ca.crt -u "$AUTH" -X POST "$OS/_snapshot/backup-repo/SNAPSHOT_NAME/_restore" \
+  -H 'Content-Type: application/json' \
+  -d '{"indices": "*,-.opendistro_security", "rename_pattern": "(.+)", "rename_replacement": "restored-$1",
        "ignore_unavailable": true, "include_global_state": false}'
 ```
 
-**Over an existing index** — an open index cannot be restored into, so close it first, restore just that index, and reopen it:
+Watch progress with `curl --cacert ca.crt -u "$AUTH" "$OS/_cat/recovery?v&active_only=true"`.
 
-```bash
-curl -X POST "http://localhost:9200/INDEX_NAME/_close"
-curl -X POST "http://localhost:9200/_snapshot/backup-repo/SNAPSHOT_NAME/_restore" \
-  -H 'Content-Type: application/json' \
-  -d '{"indices": "INDEX_NAME", "ignore_unavailable": true, "include_global_state": false}'
-curl -X POST "http://localhost:9200/INDEX_NAME/_open"
-```
-
-Watch the restore progress and wait for the cluster to return to green:
-
-```bash
-curl "http://localhost:9200/_cat/recovery?v&active_only=true"
-curl "http://localhost:9200/_cluster/health?pretty"
-```
+To restore from Dashboards Snapshot Management, pick specific indices, choose a prefix or regex rename (**Do not rename** still adds `restored_`), and uncheck **Restore cluster state** under **Advanced options**; with security on, restoring cluster state or system indices is refused. **Take snapshot** snapshots every index whatever you select; use a snapshot policy to snapshot chosen indices.
 
 ### Upgrading from 1.0.x
 
-Version 1.0.2 fixes five defects, all present since 1.0.0. Two of them matter regardless of how you configured the template. Upgrade with `cpln helm upgrade` against version `1.0.2` using your existing values; the data on the volume sets is retained.
+Version 2.0.0 turns the security plugin on, so every client changes. Your indices are kept.
 
-**The identity links were hardcoded to `test-gvc`.** Both workloads' `identityLink` and both policies' `principalLinks` pointed at `//gvc/test-gvc/identity/...` rather than at your GVC, so an install of 1.0.0 or 1.0.1 into any GVC not literally named `test-gvc` could not start. There is nothing to migrate: upgrade to 1.0.2 and the links resolve correctly.
+1. Create both [prerequisite secrets](#prerequisites).
+2. Run `cpln helm upgrade` to 2.0.0 with `security.credentialsSecretName` and `security.caSecretName` set:
 
-**The demo-logs policy granted `reveal` on every secret in your org.** When `demoLogs.enabled: true`, the demo-logs policy carried a query that matched every secret in the organization alongside the one Fluent Bit config secret it needed, so the demo-logs identity could read all of them.
+   ```bash
+   cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/opensearch \
+     --version 2.0.0 --gvc GVC_NAME \
+     --set security.credentialsSecretName=CREDENTIALS_SECRET_NAME \
+     --set security.caSecretName=CA_SECRET_NAME
+   ```
 
-<Warning>
-**If you ran 1.0.0 or 1.0.1 with `demoLogs.enabled: true`, treat every secret in that organization as having been readable by that identity.** Upgrading to 1.0.2 narrows the policy to the single Fluent Bit config secret, but it does not undo past access. Review what that organization holds and rotate anything sensitive.
-</Warning>
+   The nodes restart one at a time. Old and new nodes cannot talk to each other, so the API is unavailable while the first nodes come up on TLS, and plain-HTTP clients fail from the first restart.
+3. Point every client at `https://`, log in as `admin` (or a user you create), and trust `ca.crt`.
+4. Saved objects from 1.0.x are in the **Global** tenant of Dashboards.
 
-**The remaining three:**
+If a node or Dashboards is still waiting several minutes after the upgrade, run `cpln workload force-redeployment WORKLOAD_NAME --gvc GVC_NAME`: new identities and grants can take a few minutes to apply.
 
-- A GCP backup also emitted an AWS identity binding pointing at a nonexistent cloud account. The provider conditions now render only the binding for the selected provider.
-- `aws::ReadOnlyAccess` is no longer attached to the identity. It granted read on every bucket in the account and carried none of the write actions a snapshot repository needs; backups work without it.
-- An unsupported `backup.provider` and an even `replicas` count now fail when the chart renders instead of installing cleanly and misbehaving later.
+### Rotating Passwords
+
+The `admin` and `kibanaserver` passwords come from the credentials secret at every node start. Change the value in the secret:
+
+```bash
+cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml > secret.yaml
+# edit only the key you are rotating in secret.yaml
+cpln apply -f secret.yaml
+cpln secret reveal CREDENTIALS_SECRET_NAME -o yaml
+```
+
+Then force a redeployment of every workload that uses it:
+
+```bash
+cpln workload force-redeployment RELEASE_NAME-opensearch --gvc GVC_NAME
+cpln workload force-redeployment RELEASE_NAME-opensearch-dashboard --gvc GVC_NAME
+```
+
+With the demo pipeline on, also redeploy `RELEASE_NAME-demo-log-generator`. The nodes restart one at a time; wait for the roll to finish before assuming every node has the new password.
 
 ### Scaling and Availability
 
-- **Cluster size.** `replicas` sets the number of OpenSearch nodes and must be odd. Three nodes is the smallest size that tolerates the loss of one node; use five or seven for larger clusters.
-- **Per-node resources.** `resources.maxMemory` is the first knob to raise as index volume grows; keep `minCpu`/`maxCpu` within the same proportions as the defaults.
+- **Cluster size.** `replicas` sets the number of OpenSearch nodes and must be odd. Three nodes is the smallest size that tolerates the loss of one node.
+- **Per-node resources.** `resources.maxMemory` is the first knob to raise as index volume grows.
 - **Storage.** Set `volumeset.capacity` for the data you expect, or enable `volumeset.autoscaling` so each node's volume grows as it fills. Volumes cannot shrink.
-- **Resizing a running cluster** was not exercised by this template's tests. Take a snapshot first, and follow the [OpenSearch cluster documentation](https://docs.opensearch.org/latest/tuning-your-cluster/) for adding or removing nodes safely.
+- **Rolling restarts.** The nodes restart one at a time, and reads and writes continue through a rolling restart of a three-node cluster.
+- **Audit and finding indices have no retention policy.** Add an Index State Management policy if volume is high.
 
 ### Troubleshooting
 
 <AccordionGroup>
+  <Accordion title="Nodes never start and the logs are empty">
+    **Cause:** A prerequisite secret is missing.
+
+    **Fix:** Read the reason from the deployment status, create the secret it names, then wait for the rollout:
+
+    ```bash
+    cpln workload get-deployments RELEASE_NAME-opensearch --gvc GVC_NAME -o yaml
+    ```
+  </Accordion>
+  <Accordion title="curl reports an empty reply or 'curl: (52)' against a plain HTTP URL">
+    **Cause:** The API only speaks HTTPS.
+
+    **Fix:** Use `https://` with `--cacert ca.crt` and the `admin` credentials.
+  </Accordion>
+  <Accordion title="curl reports 'SSL certificate problem' (curl: (60))">
+    **Cause:** The client does not trust the cluster's certificate authority.
+
+    **Fix:** Pass the `ca.crt` from the prerequisite step with `--cacert ca.crt`, or add it to the client's trust store.
+  </Accordion>
+  <Accordion title="A password changed in Dashboards stops working after a restart">
+    **Cause:** The credentials secret is the source of truth for `admin` and `kibanaserver` and is re-applied at every node start.
+
+    **Fix:** Change the password in the secret and redeploy, as in [Rotating Passwords](#rotating-passwords).
+  </Accordion>
   <Accordion title="Backup setup logs 'repository type [s3] does not exist' (or [gcs]) and restarts">
     **Cause:** `backup.enabled` was turned on for a cluster that was already running. The repository plugin is installed by each node's startup script, so the repository cannot be registered until every node has restarted with the plugin present. The setup job retries until that happens.
 
-    **Fix:** Wait. The job converges on its own once all nodes carry the plugin, and later runs skip the steps already completed. Check progress with:
+    **Fix:** Wait. The job converges on its own once all nodes carry the plugin. Check progress with:
 
     ```bash
     cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-backup-setup"}' --limit 50 --since 10m
     ```
-
-    Enabling backups at install time avoids this entirely.
   </Accordion>
   <Accordion title="Repository registers, but listing or taking snapshots fails with an S3 access-denied error">
-    **Cause:** The IAM policy grants object actions on `arn:aws:s3:::YOUR_BUCKET_NAME/*` only. `s3:ListBucket` and `s3:GetBucketLocation` authorize against the bucket ARN itself, so registration succeeds and the first operation that enumerates the repository is refused.
+    **Cause:** The IAM policy grants object actions on `arn:aws:s3:::YOUR_BUCKET_NAME/*` only. `s3:ListBucket` and `s3:GetBucketLocation` authorize against the bucket ARN itself.
 
     **Fix:** Add `arn:aws:s3:::YOUR_BUCKET_NAME` to the policy's `Resource` list, as shown in [Backing Up](#backing-up).
-  </Accordion>
-  <Accordion title="A 1.0.0 or 1.0.1 install never becomes ready">
-    **Cause:** Those versions referenced an identity in a GVC named `test-gvc` instead of the GVC you installed into, so the workloads could not start anywhere else.
-
-    **Fix:** Upgrade to 1.0.2. See [Upgrading from 1.0.x](#upgrading-from-1-0-x).
   </Accordion>
   <Accordion title="Applications report 'could not resolve host' for the OpenSearch workload">
     **Cause:** The application is using the bare workload name. The short name is not reliably resolvable.
@@ -412,15 +497,22 @@ Version 1.0.2 fixes five defects, all present since 1.0.0. Two of them matter re
 
     **Fix:** Set `dashboard.enabled: true` and upgrade the release, or disable the demo pipeline.
   </Accordion>
+  <Accordion title="Create correlation rule or Add threat intel source does nothing in Dashboards">
+    **Cause:** In OpenSearch 3.8.0 Dashboards the **Create correlation rule** form and **Add threat intel source** with a local file do nothing.
+
+    **Fix:** Create them through the API. Correlation rules: `POST _plugins/_security_analytics/correlation/rules`. Threat intel sources: `POST _plugins/_security_analytics/threat_intel/sources` with `"type": "IOC_UPLOAD"` and `"enabled": false` (an uploaded list is not refreshed on a schedule). Both then appear in Dashboards. An uploaded list matches nothing until a threat intel monitor scans for it: `POST _plugins/_security_analytics/threat_intel/monitors` with `per_ioc_type_scan_input_list` (for example `ioc_type: ipv4-addr` and `index_to_fields_map` from your index to its IP field) and a trigger whose `data_sources` names the source. Matches appear under **Findings > Threat intel**.
+  </Accordion>
 </AccordionGroup>
 
 ## Important Notes
 
-- **There is no authentication.** The security plugin is disabled, so any workload admitted by `internal_access` has full read/write admin access to every index. Keep `internal_access.type` as narrow as you can, and prefer `workload-list` over `same-org` for anything sensitive.
+- **Both prerequisite secrets must exist before install.** A missing one leaves the nodes waiting with nothing in the logs; `status.versions[].message` names it.
+- **Rotate passwords through the credentials secret**, then run `cpln workload force-redeployment` on the workloads that use it. See [Rotating Passwords](#rotating-passwords). Use a strong, generated password.
+- **Changing the CA restarts the whole cluster.** Old and new certificates do not trust each other, so the cluster is unavailable until every node has restarted with the new CA.
 - **`replicas` must be odd.** An even count cannot form a quorum and is rejected when the chart renders.
-- **Still on 1.0.0 or 1.0.1? Upgrade.** Both versions are broken outside a GVC named `test-gvc`, and the demo pipeline granted org-wide secret access. See [Upgrading from 1.0.x](#upgrading-from-1-0-x).
-- **Enable backups at install time** when you can; enabling them on a running cluster requires every node to restart before the repository can be registered.
-- **Switching `backup.provider` on an existing release leaves the previous provider's cloud binding attached to the identity.** To remove it you must uninstall and reinstall; take a snapshot first, because uninstall deletes the volume sets.
+- **Turn backups on at install time where you can.** On a running cluster, every node has to restart before the repository can be registered.
+- **Switching `backup.provider` on an existing release leaves the old cloud binding attached.** Uninstall and reinstall if you need it gone; take a snapshot first.
+- **Always leave `.opendistro_security` out of restores** and never close `_all`.
 - **Use the fully-qualified internal hostname** `RELEASE_NAME-opensearch.GVC_NAME.cpln.local:9200`; the bare workload name is not reliably resolvable.
 - **`cpln helm uninstall` deletes the volume sets.** Data survives a `cpln helm upgrade` but not an uninstall; enable snapshots to a bucket if the data matters.
 
@@ -430,14 +522,14 @@ Version 1.0.2 fixes five defects, all present since 1.0.0. Two of them matter re
     <Card title="OpenSearch Documentation" icon="book" href="https://docs.opensearch.org/latest/">
     Official OpenSearch documentation
     </Card>
-    <Card title="OpenSearch Dashboards" icon="chart-line" href="https://docs.opensearch.org/latest/dashboards/">
-    OpenSearch Dashboards documentation
+    <Card title="Security Plugin" icon="lock" href="https://docs.opensearch.org/latest/security/">
+    Users, roles, tenants and TLS
+    </Card>
+    <Card title="Security Analytics" icon="shield" href="https://docs.opensearch.org/latest/security-analytics/">
+    Detectors, Sigma rules, findings and alerts
     </Card>
     <Card title="Snapshot and Restore" icon="database" href="https://docs.opensearch.org/latest/tuning-your-cluster/availability-and-recovery/snapshots/snapshot-restore/">
     Taking and restoring snapshots through the API
-    </Card>
-    <Card title="Snapshot Management" icon="clock" href="https://docs.opensearch.org/latest/tuning-your-cluster/availability-and-recovery/snapshots/snapshot-management/">
-    Automated snapshot policies and retention
     </Card>
     <Card title="OpenSearch Template" icon="github" href="https://github.com/controlplane-com/templates/tree/main/opensearch">
     View the source files, default values, and chart definition
