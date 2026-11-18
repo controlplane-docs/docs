@@ -500,6 +500,8 @@ For Terraform / Pulumi / Kubernetes Operator deployment patterns, fetch the rele
 
 Dedicated LB on the GVC (`spec.loadBalancer.dedicated: true`) unlocks: domain ports outside 443/80, wildcard hostnames, `redirect.class.status5xx`/`status401` rules, and `tcp` protocol on domains. `trustedProxies`: `0` (source IP), `1` (last `X-Forwarded-For`), `2` (second-to-last).
 
+Direct and dedicated load balancers are billed at the dedicated load balancer rate on controlplane.com/pricing, on top of CPU, memory, and egress. A GVC is charged for only one load balancer per location: that one charge covers every direct load balancer on its workloads in that location, and the GVC's dedicated load balancer if it is enabled. Only Direct carries UDP.
+
 ## Policies
 
 Bind principals to permissions on resources. Wrong target kind, link format, or permission name all silently fail.
