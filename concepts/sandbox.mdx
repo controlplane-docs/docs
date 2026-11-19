@@ -1,0 +1,82 @@
+---
+title: 'Sandbox'
+description: 'What a Control Plane sandbox is: a stateful workload in its own microVM with a persistent home volume, as a dev sandbox with a browser IDE or an agent sandbox that runs isolated sessions for AI agents.'
+keywords: ['devbox', 'agent box', 'code execution', 'ai agent runtime', 'microvm', 'firecracker', 'gvisor', 'cloud ide', 'session', 'worker', 'scale to zero', 'code interpreter', 'sandbox gvc']
+---
+
+A sandbox is a [workload](/concepts/workload) that the platform configures for interactive or agent-driven work. You create one by adding a `sandbox` section to a stateful workload's spec. The server fills in everything else: the container, a home volume, the ports, the access model, and the tags that place the workload in its own Firecracker microVM. There are two types that share the primitive but serve different users: a dev sandbox (`type: dev`) is a cloud development environment for one person, and an agent sandbox (`type: worker`) hosts isolated sessions for AI agents. The reference says worker when it means the workload.
+
+## How It Fits
+
+Everything that applies to a stateful workload applies to a sandbox: policies, the event log, logs and metrics, the firewall, and the identity. What the platform adds maps onto objects you already know.
+
+| What you see | What it is |
+| :----------- | :--------- |
+| A sandbox | A stateful workload in the org's sandbox GVC with `spec.sandbox`, tagged `cpln/sandbox`, `cpln/kata`, and `cpln/scaleToZero` |
+| Its home | The volumeset `<sandbox>-state`, mounted at `/home/devuser` |
+| Its address | The workload endpoint, which proxies to the IDE (dev) or serves the agent API (worker) |
+| Its credential | `connect` permission on the workload (dev) or `spec.sandbox.token` (worker) |
+| A session | An entry under the worker's `-sessions` API route, not a separate platform object |
+| A sandbox image | The org-level `sandboximage` resource: a dev image builds the sandbox layer onto your base, an agent image copies the base alone into the org registry for sessions |
+
+### Dev sandbox
+
+A dev sandbox (`type: dev`) is a cloud development environment for one person. The workload endpoint serves a browser IDE at `/_ide/`, a browser terminal at `/_term/`, and your application at `/`. Desktop IDEs reach it over SSH through [`cpln sandbox connect`](/cli-reference/commands/sandbox).
+
+Access is a Control Plane permission, not a password. Opening the sandbox from the Console or the CLI signs you in with a one-time link that the platform obtains by running a command inside the sandbox, which only a caller with `connect` on the workload can do. No Control Plane token ever reaches the box.
+
+The standard image bundles git, Node.js, the `cpln` CLI, AI coding assistants, and the IDE stack. You can build your own [sandbox image](/reference/sandbox/image) from any base.
+
+See [Work in a dev sandbox](/guides/sandbox/dev-sandbox).
+
+### Agent sandbox
+
+An agent sandbox (`type: worker`) hosts code execution for AI agents. Instead of an IDE, the workload endpoint serves an HTTP API, provided by the agent API daemon, `devboxd`, secured by a token the server generates. Agents do not run on the box directly. They run in **sessions**.
+
+A session is an isolated slot on the worker: a nested container with its own workspace, its own network namespace and port space, its own access token, and optionally its own container image and resource limits. Sessions start in well under a second on a running worker because the microVM is already booted. Two runtimes are available per session:
+
+| Runtime | Isolation | Use it for |
+| :------ | :-------- | :--------- |
+| `runc` (default) | Kernel-shared container, near-native speed | Agents of the same trust domain |
+| `runsc` (gVisor) | User-space kernel per session, the strongest isolation inside one VM | Untrusted or mutually distrusting agent runs |
+
+`crun` is also accepted as a runtime value.
+
+Each session keeps a log and a resource series that outlive the session, so you can audit what an agent did after it is gone.
+
+See [Run agents in an agent sandbox](/guides/sandbox/agent-sandbox) and the [sessions reference](/reference/sandbox/sessions).
+
+## Key Behaviors
+
+- **One replica, one microVM.** A sandbox runs as a single replica in a dedicated microVM, which is the isolation boundary between tenants.
+- **The home volume is the sandbox's state.** `/home/devuser` is a server-owned [volumeset](/reference/volumeset) named `<sandbox>-state`, created with the sandbox and deleted with it.
+- **An idle sandbox scales to zero and resumes in place.** The API reports it as `suspended` (scaled to zero; the Console shows Scaled to Zero), and the next request wakes it. An explicit stop is different: `cpln sandbox stop <ref>` (Console: **Suspend**) holds the sandbox until `cpln sandbox start <ref>` (Console: **Unsuspend**).
+- **Every sandbox lives in the org's sandbox GVC.** That [GVC](/concepts/gvc) is tagged `cpln/sandboxGvc: "true"` and placed on the sandbox location only. In an org created with the built-in default GVC it is `default`; in older orgs it is `sandboxes` (fallback `cpln-sandboxes`), created with the first sandbox. `GET /org/{org}/gvc/-sandbox` answers `{ name, location, exists }`, and the `cpln sandbox` commands call it to find the GVC themselves.
+- **Access is a permission or a token.** A dev sandbox admits callers with `connect` on the workload through a one-time sign-in. An agent sandbox admits callers that present `spec.sandbox.token`, or a session's own token for that session.
+- **An agent sandbox is the unit of identity and placement.** Sessions inherit the worker's identity, firewall, and location. Because one worker holds a bounded number of sessions, the workers of the sandbox GVC that are bound to the same identity form a pool. Create a session for the identity and the platform places it on a worker with room, or adds another worker when every one is full. Idle server-added workers are removed again. This is configured with `spec.sandbox.scaling` on the worker. See [Scale agent sandboxes by identity](/guides/sandbox/scaling-workers).
+- **A sandbox can carry an identity.** An [identity](/concepts/identity) of the sandbox GVC lets it reach secrets, cloud resources, and private networks like any other workload.
+
+## Gotchas
+
+- **The firewall is open by default.** When the create carries no `firewallConfig`, the server sets one that is open in both directions; access is gated by the sign-in (dev) or the token (worker), not by the firewall. Restrict outbound on an agent sandbox when its agents must reach only known hosts. See [autoscaling and firewall](/reference/sandbox/general#autoscaling-and-firewall).
+- **`cpln workload exec` is not for agent sandboxes.** Run commands through a session instead: `cpln sandbox session exec <id> --sandbox <ref> -- <command>`.
+- **`spec.sandbox` cannot be removed from a workload.** A sandbox is not converted back into a plain workload. Delete the sandbox instead; its home volumeset is deleted with it.
+- **The first sandbox may need `create` on GVCs.** When the org's sandbox GVC does not exist yet, the server creates it as you with the first sandbox, in addition to the workload permissions.
+- **Do not pass `--gvc`.** The `cpln sandbox` and `cpln sandboximage` commands find the org's sandbox GVC themselves. A `--gvc` or a profile default GVC is used as given.
+
+## Learn More
+
+<CardGroup cols={2}>
+  <Card title="Get started" icon="rocket" href="/guides/sandbox/getting-started">
+    Create a dev or agent sandbox and connect to it.
+  </Card>
+  <Card title="Sandbox reference" icon="book" href="/reference/sandbox/general">
+    Every field of spec.sandbox and what the server fills in.
+  </Card>
+  <Card title="Sessions reference" icon="layer-group" href="/reference/sandbox/sessions">
+    The session API, runtimes, images, logs, and placement.
+  </Card>
+  <Card title="Agent API" icon="code" href="/reference/sandbox/agent-api">
+    The HTTP API an agent sandbox serves.
+  </Card>
+</CardGroup>

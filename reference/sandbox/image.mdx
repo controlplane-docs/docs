@@ -1,0 +1,168 @@
+---
+title: 'Sandbox image'
+sidebarTitle: 'Sandbox image'
+description: 'Reference for the sandboximage resource: build a custom dev sandbox image from your own base image plus the fixed sandbox layer, track the build status, and select the image on a sandbox.'
+keywords: ['sandboximage', 'custom image', 'base image', 'BYOI', 'toolbox', 'code-server', 'build service', 'buildlog', 'eventlog', 'image tag', 'org image', 'devuser', 'dev container']
+---
+
+A sandbox image is an org-level resource that builds a [dev sandbox](/reference/sandbox/general) image from a base image of your choice plus the fixed **sandbox layer**: the access and tooling layer every dev sandbox needs. Build it once, then select it as the container image of any dev sandbox. For the walkthrough see [Build a sandbox image](/guides/sandbox/sandbox-images).
+
+The resource lives at `/org/{org}/sandboximage/{name}`. It is managed from the Console or the API; the `cpln sandboximage` command group covers it: `create --name <n> [--base-image //image/<name>:<tag>] [--image-tag <tag>] [--type dev|agent]` (an agent image needs `--base-image`), `rebuild <ref...>`, `buildlog <ref> [-f] [--offset N]`, and `get`, `delete`, `edit`, `update` (`--set` accepts `description`, `tags.<k>`, `spec.base.image`, `spec.tag`, `spec.type`), `patch`, `tag`, `clone`, `query`, `eventlog`, `audit`, `access-report`, and `permissions`.
+
+## Sandbox image spec
+
+The recipe has one tenant-controlled input: the base image to build `FROM`. There is no runtime, package, or install-command surface, so no arbitrary build shell runs under your org.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `spec.base.image` | image link or reference | standard base | The image to supplement with the sandbox layer. A link to an org [image](/reference/image) such as `/org/my-org/image/app:1`, or a full registry reference. Omit the whole `base` object to build on the standard sandbox base. |
+| `spec.type` | `dev` or `agent` | `dev` | `dev` builds the sandbox layer onto the base, for dev sandboxes. `agent` copies the base alone into the org registry, for sessions. |
+| `spec.tag` | string, max 128, `^[a-zA-Z0-9_][a-zA-Z0-9_\-.]*$` | `latest` | The tag of the built image. |
+
+### What the sandbox layer adds
+
+The build takes your base (or the standard Ubuntu base) and layers the same components the standard dev image carries:
+
+| Component | Purpose |
+| :--- | :--- |
+| `devuser` (uid 1000) with passwordless `sudo` | The user the IDE, terminal, and SSH sessions run as; home at `/home/devuser` |
+| `openssh-server` (key auth only, no root login) | SSH for `cpln sandbox connect` and desktop IDEs |
+| code-server | Browser IDE on `127.0.0.1:8443`, served at `/_ide/` |
+| ttyd and tmux | Browser terminal on 7681, served at `/_term/`; tmux available for persistent shells |
+| git, curl, wget, vim, build-essential, and friends | Base tooling |
+| Node.js and npm | Runtime for the baked CLIs and for your projects |
+| `cpln` CLI, Claude Code, Codex CLI, `gh` | Baked command-line tools |
+| The `sandbox` helper and the gateway boot script | Runtime status, port detection, and the sign-in gateway |
+| `devboxd` in activity-only mode | Watches the box's CPU so a running build or agent keeps the sandbox awake |
+
+Persistent install paths (`~/.npm-global`, `~/.local`) are on `PATH` so packages you install inside the sandbox survive on the home volume.
+
+<Note>
+  If your base already has a uid 1000 user, it is renamed to `devuser` with its home moved to `/home/devuser`. Application code is not part of the image: clone repositories inside the running sandbox.
+</Note>
+
+## How a sandbox image build runs
+
+- Creating the object, or changing its recipe (`spec`, or a `cpln/` tag such as `cpln/restartedAt`), submits a build to the platform build service **under the caller's own token**. The caller needs image `create` in the org, the same right a registry push needs. Nothing holds the token past the call.
+- The built image lands in the org registry as an org [image](/reference/image); `status.imageLink` points at it.
+- The build status is refreshed whenever the object is read.
+- The object's event log at `.../sandboximage/{name}/-eventlog` records the build's life: submission, queued, running, pushed or failed with the reason, and any failure to reach the build service.
+- The build output itself is at `.../sandboximage/{name}/-buildlog`; page through it with `-buildlog?offset=N`.
+- Delete answers `202` and leaves the built org image in place.
+- The org quota `sandboximagesPerOrg` caps how many sandbox images an org holds.
+
+## Sandbox image status
+
+| Field | Description |
+| :--- | :--- |
+| `status.phase` | The observed state of the latest build: `pending` (submitting), `queued`, `building`, `ready`, `failed`. Refreshed on read. |
+| `status.imageLink` | The org image produced by the latest successful build. |
+| `status.imageRef` | The full registry reference of the built image. |
+| `status.buildId` | The build service id of the current or latest build. |
+| `status.builtFingerprint` | Fingerprint of the spec that produced the current image. |
+| `status.error` | Why the latest build failed: the build service reply with the endpoint, the step (plan context, upload context, submit build) and the HTTP status for a rejected submission, or the build log reason. Also on the event log. |
+| `status.buildDuration` | Duration in seconds of the latest successful build. |
+| `status.lastBuildAt` | When the latest successful build finished. |
+
+## Sandbox image API examples
+
+Create an image built on your own base:
+
+```bash
+curl -X POST "https://api.cpln.io/org/my-org/sandboximage" \
+  -H "Authorization: Bearer $CPLN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "python-tools",
+    "description": "Dev sandbox image on our Python base",
+    "spec": {
+      "base": { "image": "/org/my-org/image/python-base:3.12" },
+      "tag": "v1"
+    }
+  }'
+```
+
+Create an image on the standard base (no recipe):
+
+```json
+{
+  "name": "standard-plus",
+  "spec": {}
+}
+```
+
+Read it until the build is ready (the status refreshes on each read):
+
+```bash
+curl "https://api.cpln.io/org/my-org/sandboximage/python-tools" \
+  -H "Authorization: Bearer $CPLN_TOKEN"
+```
+
+```json
+{
+  "kind": "sandboximage",
+  "name": "python-tools",
+  "spec": {
+    "base": { "image": "/org/my-org/image/python-base:3.12" },
+    "tag": "v1"
+  },
+  "status": {
+    "phase": "ready",
+    "imageLink": "/org/my-org/image/python-tools:v1",
+    "imageRef": "my-org.registry.cpln.io/python-tools:v1",
+    "buildId": "…",
+    "builtFingerprint": "…",
+    "buildDuration": 184,
+    "lastBuildAt": "2026-10-26T14:02:11Z"
+  }
+}
+```
+
+Tail the build output and the event log:
+
+```bash
+curl "https://api.cpln.io/org/my-org/sandboximage/python-tools/-buildlog" \
+  -H "Authorization: Bearer $CPLN_TOKEN"
+
+curl "https://api.cpln.io/org/my-org/sandboximage/python-tools/-eventlog" \
+  -H "Authorization: Bearer $CPLN_TOKEN"
+```
+
+Rebuild without changing the recipe with `cpln sandboximage rebuild python-tools`, or by setting a `cpln/restartedAt` tag:
+
+```bash
+curl -X PATCH "https://api.cpln.io/org/my-org/sandboximage/python-tools" \
+  -H "Authorization: Bearer $CPLN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tags": {"cpln/restartedAt": "2026-10-26T15:00:00Z"}}'
+```
+
+## Using a sandbox image on a sandbox
+
+Set the built image as the dev container image of a dev sandbox. In the Console, the **Image** field of the sandbox form lists **Your Sandbox Images** next to **Standard**. Through the CLI, pass the sandbox image link and the CLI resolves it to the built reference:
+
+```bash
+cpln sandbox create alice-dev --image //sandboximage/python-tools --org my-org
+```
+
+The CLI refuses `--type worker`, an agent-type image, an image whose build is not ready or has failed (follow it with `cpln sandboximage buildlog python-tools -f`), and a gvc-scoped link; any other `--image` value passes through. Through the API, or as the alternative on the CLI, pass the registry reference from `status.imageRef`:
+
+```bash
+cpln sandbox create alice-dev --image my-org.registry.cpln.io/python-tools:v1 --org my-org
+```
+
+```json
+{
+  "name": "alice-dev",
+  "spec": {
+    "sandbox": { "type": "dev" },
+    "containers": [
+      { "name": "dev", "image": "my-org.registry.cpln.io/python-tools:v1" }
+    ]
+  }
+}
+```
+
+<Warning>
+  A sandbox image carries the dev stack (gateway, IDE, terminal) and runs devboxd only to track activity. Dev-type images are for dev sandboxes; agent-type images are for sessions. An agent sandbox needs an image that runs devboxd on port 49983, such as `build.cpln.io/public/agentbox-base:v1`; see [Sandbox](/reference/sandbox/general#standard-container). Sessions on an agent sandbox can run any OCI image of their own, which does not need the sandbox layer; see [Sandbox sessions](/reference/sandbox/sessions).
+</Warning>

@@ -1,0 +1,226 @@
+---
+title: 'Run agents in an agent sandbox'
+sidebarTitle: 'Agent sandbox'
+description: 'Give AI agents a place to run code: create an agent sandbox, run a task in a session, move files in and out, preview ports, read what happened, and clean up, from the CLI or the Console.'
+keywords: ['worker', 'devboxd', 'session', 'runsc', 'gvisor', 'runc', 'code execution', 'tool execution', 'ai agent', 'code interpreter', 'cpln sandbox session exec', 'cpln cp --session', 'preview url', 'session token']
+---
+
+An agent sandbox is a box where your agents run code. You create it once; then every task gets a **session**: its own workspace, its own container, its own token, gone when the task is done. One agent sandbox holds many sessions at once, and your agent talks to it over HTTP. This page goes from an empty org to a task running in a session, using the CLI and the Console; the API behind it is in the reference pages.
+
+<Info>
+  The `cpln sandbox` commands on this page need a current `cpln` CLI (`cpln sandbox --help` shows what yours supports); they find the org's sandbox GVC themselves, so do not pass `--gvc`.
+</Info>
+
+## Create an agent sandbox
+
+<Tabs>
+  <Tab title="Console UI">
+    Open **Sandboxes**, start a new sandbox, pick **Agent Sandbox**, adjust CPU and memory if the 4 CPU and 8 GiB default does not fit, and create. See [Sandboxes in the Console](/guides/sandbox/console).
+  </Tab>
+  <Tab title="CLI">
+    ```bash
+    cpln sandbox create my-agent --type worker --org my-org
+    ```
+
+    An agent sandbox is `type: worker` in the spec. You get the standard agent sandbox image at 4 CPU and 8 GiB, a generated token, and a home volume. Size it with `--cpu`, `--memory`, and `--max-sessions` when you know how many tasks will run at once.
+  </Tab>
+</Tabs>
+
+Sessions share the sandbox's memory, and one sandbox holds at most `maxSessions` of them (default 20). When either runs out, the next session is refused until one ends; when you need more, [scale by identity](/guides/sandbox/scaling-workers).
+
+## Get the endpoint and token
+
+Your agent needs two things: the sandbox's endpoint and its token.
+
+<Tabs>
+  <Tab title="Console UI">
+    On the **Overview**, choose **API** on the agent sandbox's row. The **Endpoint and Token** card shows the endpoint and the token; **Connect From Your Terminal** shows the first commands to run against it.
+  </Tab>
+  <Tab title="CLI">
+    ```bash
+    cpln sandbox get my-agent -o json --org my-org
+    ```
+
+    The endpoint is `status.endpoint`; the token is `spec.sandbox.token`.
+  </Tab>
+</Tabs>
+
+<Warning>
+  The sandbox token can do anything on the box, across all sessions. Keep it in the backend that creates sessions. Hand each agent the session's own token, which only works for that session.
+</Warning>
+
+## Give an agent a task
+
+A task is: open a session, put the inputs in, run the command, take the outputs out, close the session. Here it is end to end.
+
+<Tabs>
+  <Tab title="Console UI">
+    Open **Agent Sessions**, choose **New Session**, pick the sandbox, set an image, and create. The session's page has a **Connect** tab with the API calls that drive it filled in, a **Processes** tab, and its logs.
+  </Tab>
+  <Tab title="CLI">
+    ```bash
+    # 1. A session with its own Python image
+    cpln sandbox session create --sandbox my-agent --id task-1 --image python:3.12-slim --org my-org
+
+    # 2. Inputs in
+    cpln cp ./task.py my-agent:task.py --session task-1 --org my-org
+    cpln cp ./data/ my-agent:data --session task-1 --org my-org
+
+    # 3. Run it; output streams here and the exit code is the CLI's
+    cpln sandbox session exec task-1 --sandbox my-agent --org my-org -- python3 task.py
+
+    # 4. Outputs out
+    cpln cp my-agent:result.json ./result.json --session task-1 --org my-org
+
+    # 5. Done
+    cpln sandbox session delete task-1 --sandbox my-agent --org my-org
+    ```
+
+    With `--session`, the remote side of `cpln cp` is `<sandbox>:<path>`, resolved inside the session's workspace. Directories copy whole. `session exec` takes `--stdin` (`-i`) to forward your standard input to the command.
+  </Tab>
+</Tabs>
+
+A process keeps running if you disconnect; `cpln sandbox session processes task-1 --sandbox my-agent` lists what is still going, and `cpln sandbox session signal task-1 --sandbox my-agent --process <pid>` stops it (SIGTERM by default; `--signal SIGKILL` to force).
+
+### Pick what the task runs in
+
+| Option | What it does | When to use it |
+| :----- | :----------- | :------------- |
+| `image` | Runs the session on its own image, pulled from any registry (Docker Hub shorthand works). The image's `PATH` and env apply. Pulled once per digest, shared by later sessions. | Almost always: give each task the toolchain it needs instead of baking it into the sandbox. |
+| `runtime: runsc` | Runs the session under gVisor, a user-space kernel, instead of the default `runc`. | Untrusted code, or agents that must not see each other. Slower on installs and builds, near parity on compute. |
+| `limits` | `{"cpuMillis": 1000, "memoryMb": 1024, "pids": 256}` caps the session. | Keep one runaway task from starving the others. |
+| `ports` | Declares ports the task will serve; each gets a preview URL. | Dev servers, notebooks, anything you want to open in a browser. |
+| `logOutput: true` | Keeps every process's stdout and stderr in the session log. | When you want the transcript after the session is gone. |
+| `envs`, `user` | Environment for every command; who runs it (`"1000:1000"` on an image). | Config, non-root execution. |
+
+On the CLI these are `--image`, `--runtime`, `--memory`, `--port`, `--log`, `--env`, and `--user`; in the Console they are the fields of **New Session**. A private image in the org registry is pulled with a token scoped to it: the server checks `pull` on the image and mints a short-lived pull token for that one repository. Pass `--image-auth` (`imageAuth` in the [sessions reference](/reference/sandbox/sessions#session-images)) only to send your own token instead.
+
+<Warning>
+  Under `runsc`, exceeding the memory limit ends the whole session (the next command answers `409 session container is stopped`). Under `runc` only the offending process is killed. Size gVisor limits for the whole task.
+</Warning>
+
+## Open a shell in a session
+
+For a look around, or to let a person drive what the agent set up:
+
+```bash
+cpln sandbox session connect task-1 --sandbox my-agent --org my-org
+```
+
+You get `bash` when the session's image has it, `sh` otherwise. For a single command, use `cpln sandbox session exec`.
+
+## Preview a port
+
+A session that serves a port, say a dev server on 3000, has its own URL. Each session has its own port space, so two sessions can both use 3000.
+
+<Tabs>
+  <Tab title="Console UI">
+    The session's **Preview** tab opens a declared port, or any port you type, and mints the code for you.
+  </Tab>
+  <Tab title="CLI">
+    ```bash
+    cpln sandbox session preview task-1 --sandbox my-agent --port 3000 --org my-org
+    ```
+
+    Opens your browser. `--print-url` prints a link instead; it opens one browser once and expires in 60 seconds.
+  </Tab>
+</Tabs>
+
+To publish a session's ports to anyone with the URL, create it with `preview: public` (`--preview public`); that link does not expire.
+
+## See what happened
+
+<Tabs>
+  <Tab title="Console UI">
+    **Agent Sessions** lists every session with its status (Running, Idle, Paused while its sandbox is scaled to zero, Starting, Ended), sandbox, runtime, and image. Open one for its processes, log with filters, and CPU, memory, and disk charts. Ended sessions stay listed, with their logs and metrics readable even after the sandbox is gone.
+  </Tab>
+  <Tab title="CLI">
+    ```bash
+    cpln sandbox session get --sandbox my-agent --include-ended --org my-org
+    cpln sandbox session logs task-1 --sandbox my-agent --org my-org
+    cpln sandbox session logs task-1 --sandbox my-agent --follow --org my-org
+    cpln sandbox session logs task-1 --sandbox my-agent --source stderr --search Traceback --org my-org
+    cpln sandbox session processes task-1 --sandbox my-agent --org my-org
+    cpln sandbox session metrics task-1 --sandbox my-agent --points 60 --org my-org
+    ```
+
+    Without `--sandbox`, `session get --include-ended` asks every agent sandbox live and wakes scaled-to-zero ones.
+  </Tab>
+</Tabs>
+
+Every session's log records its lifecycle (created, each process started and exited with its exit code, deleted); with `--log` it also holds the processes' output. The log outlives the session, up to 7 days or the sandbox's caps. Metrics are sampled every 5 seconds and kept the same way.
+
+## Clean up
+
+```bash
+cpln sandbox session delete task-1 --sandbox my-agent --org my-org   # one task
+cpln sandbox delete my-agent --org my-org                            # the whole sandbox and its home volume
+```
+
+Deleting a session is idempotent. Deleting the sandbox takes its session logs with it; what the Console archived from the platform's stores stays readable. A sandbox you keep around suspends itself a few minutes after the last session goes quiet and wakes on the next call.
+
+## Drive it from your own code
+
+Everything above is an HTTP call: the platform's `-sessions` routes under the org's sandbox GVC create and list sessions with your Control Plane token, and the sandbox's own API runs commands, moves files, and serves previews with the session token. The [Agent API reference](/reference/sandbox/agent-api) documents the routes and ends with a complete Python orchestrator that creates a session per task, streams a command's output, collects the result, retries when the sandbox is full, and deletes the session. The [sessions reference](/reference/sandbox/sessions) has every create field and error code. The sandbox GVC is tagged `cpln/sandboxGvc`: `default` in orgs created with the built-in default GVC, otherwise `sandboxes`, created with your first sandbox; `GET /org/{org}/gvc/-sandbox` names it.
+
+## Lock down what agents can reach
+
+The sandbox's [firewall](/reference/workload/firewall) applies to every session's traffic, and a sandbox defaults to open in both directions. When agents must only reach specific hosts, restrict the sandbox:
+
+```yaml
+spec:
+  firewallConfig:
+    external:
+      outboundAllowHostname:
+        - api.github.com
+        - pypi.org
+        - files.pythonhosted.org
+```
+
+Sessions cannot reach the sandbox's own listeners or one another.
+
+### Lock down egress per session
+
+When one task needs its own rules, set them on the session through the GVC route (by identity, not `--sandbox`):
+
+```bash
+cpln sandbox session create --identity <name> --id <id> --set firewall.external.outboundAllowHostname=api.github.com,pypi.org --org my-org
+```
+
+The session lands on an agent sandbox pinned to exactly those rules, created on first use. Such sandboxes count toward `maxWorkers`, not `minWorkers`, and are removed when idle. `--set firewall={}` closes egress entirely.
+
+To give agents a [secret](/reference/secret) or private network access, assign an [identity](/reference/identity) of the org's sandbox GVC with `spec.identityLink` and reference the secret in the container's environment (`cpln://secret/<name>`). Every command in every session sees those values, so do this only when the agents need it. The same mechanism lets the agent loop itself run inside a sandbox: give the runner sandbox an identity that can reveal the model API key, start the loop in a session with the Control Plane token it needs as an `envs` entry, and poll its results with `/_files`.
+
+## How it works
+
+<AccordionGroup>
+  <Accordion title="Sessions and isolation">
+    Every sandbox is its own Firecracker microVM, which is the boundary between tenants. Inside one agent sandbox, each session is a nested OCI container with its own workspace, network namespace, and address. `runc` shares the kernel with the sandbox at near-native speed; `runsc` (gVisor) gives each session a user-space kernel, the strongest isolation inside one VM. A requested runtime is never downgraded: `422` if the sandbox lacks it, `424` if it could not start.
+  </Accordion>
+  <Accordion title="Per-session images">
+    An image is pulled straight from its registry, flattened once per digest into a store on the sandbox, and mounted read-only under a writable layer for each session. A `pip install` lands in the session, never in the store, and the next session on the same image skips the pull. The image must contain `/bin/sh`; distroless images are refused with `424`, and zstd-compressed layers are not supported. Commands run as the image's root unless you pass a numeric `user`.
+  </Accordion>
+  <Accordion title="Why cpln workload exec does not work here">
+    The sandbox runs privileged inside its microVM so it can nest containers, and it owns the cgroup tree to enforce session limits. The platform's exec path cannot attach to it. Use `cpln sandbox session exec`, `cpln sandbox session connect`, or `POST /_api/process/start` without a session for a command on the box itself.
+  </Accordion>
+  <Accordion title="When the sandbox scales to zero">
+    The sandbox watches its sessions. One is active while it has a running process, an attached client, a request in the last 10 seconds, or real CPU use; work on the box outside any session counts too. Listing sessions, health checks, and reading logs never count. Once everything is idle, the sandbox suspends after `scaleToZeroDelay` (default 300 seconds) and the next call wakes it; sessions and workspaces are still there, and the Console shows them as **Paused** meanwhile.
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Scale by identity" icon="layer-group" href="/guides/sandbox/scaling-workers">
+    Spread sessions of one identity across several sandboxes that the server adds and removes with demand.
+  </Card>
+  <Card title="Sessions reference" icon="book" href="/reference/sandbox/sessions">
+    Every session field, response, placement rule and error code.
+  </Card>
+  <Card title="Agent API reference" icon="code" href="/reference/sandbox/agent-api">
+    Every route for processes, PTYs, files and previews.
+  </Card>
+  <Card title="Sandbox images" icon="box" href="/guides/sandbox/sandbox-images">
+    Build a custom image or use per-session images.
+  </Card>
+</CardGroup>

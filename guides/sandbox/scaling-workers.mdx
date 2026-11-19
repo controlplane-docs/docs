@@ -1,0 +1,130 @@
+---
+title: 'Scale agent sandboxes by identity'
+sidebarTitle: 'Scale by identity'
+description: 'Run more agent sessions than one sandbox holds: create sessions for an identity and let Control Plane spread them over agent sandboxes it adds and removes with demand.'
+keywords: ['worker pool', 'maxSessions', 'minWorkers', 'maxWorkers', 'idleDeleteDelay', 'placement', 'Retry-After', 'cpln/sandbox-pool', 'cpln/sandbox-firewall', 'scale out', 'warm pool', 'capacity', 'identityLink', 'devboxd']
+---
+
+One agent sandbox holds a bounded number of sessions: at most `maxSessions` (default 20), and only while its memory has room. When your agents need more, stop naming a sandbox and name an [identity](/reference/identity) instead. The platform puts each session on a sandbox of that identity with room, adds sandboxes when all are full, and removes the ones it added once they sit empty. You change one line in your orchestrator.
+
+This page assumes you know how a single [agent sandbox](/guides/sandbox/agent-sandbox) works. An agent sandbox is `type: worker`; the reference says worker when it means the workload. The identity, the sandboxes, and the route all belong to the org's sandbox GVC.
+
+<Info>
+The `cpln sandbox` commands on this page need a current `cpln` CLI. Run `cpln sandbox --help` to see what your installed version supports. They find the org's sandbox GVC themselves; do not pass `--gvc`.
+</Info>
+
+## Create sessions by identity
+
+Create the identity in the sandbox GVC if it does not exist, then create sessions for it. You do not need to create a sandbox first: the first session for an identity with none gets one.
+
+<Tabs>
+  <Tab title="Console UI">
+    Open **Agent Sessions**, choose **New Session**, pick the **Identity**, and leave **Agent sandbox** on **Let the platform choose**.
+  </Tab>
+  <Tab title="CLI">
+    ```bash
+    cpln sandbox session create --identity bot --id task-1 --image python:3.12-slim --org my-org
+    ```
+
+    With neither `--sandbox` nor `--identity`, the session goes to the sandboxes bound to no identity. `--wait-timeout` caps how long to wait for a sandbox that is booting; `0` returns at once.
+  </Tab>
+</Tabs>
+
+The response is the session plus `worker` (the sandbox that holds it) and `endpoint`. The server appends `-<key>` to your id, 9 characters: a dash and 8 hex characters that name the sandbox:
+
+```json
+{ "id": "task-1-5f2a9c01", "worker": "bot-1", "endpoint": "https://...", "token": "..." }
+```
+
+Because the id names its sandbox, every later call can go through the GVC route without naming one:
+
+```bash
+cpln sandbox session get task-1-5f2a9c01 --org my-org
+cpln sandbox session logs task-1-5f2a9c01 --org my-org
+cpln sandbox session exec task-1-5f2a9c01 --org my-org -- python3 -c 'print(42)'
+cpln sandbox session connect task-1-5f2a9c01 --org my-org
+cpln sandbox session delete task-1-5f2a9c01 --org my-org
+```
+
+From your own code the change is the same: create through the GVC route with `identity` in the body (see the [sessions reference](/reference/sandbox/sessions#routes-across-the-sandbox-gvc)). An id you choose may be at most 55 characters, since the server appends the key.
+
+## Tune the pool
+
+The sandboxes of one identity form a pool, and the first sandbox in it is the template the server clones for the rest. Create that one yourself to choose its size, image, firewall, and scaling; otherwise the server's first one runs the standard image at 4 CPU and 8 GiB with the default scaling.
+
+```bash
+cpln sandbox create bot-1 --type worker --identity bot \
+  --max-sessions 20 --min-workers 1 --max-workers 5 --idle-delete-delay 3600 \
+  --org my-org
+```
+
+The four `spec.sandbox.scaling` fields, with their ranges and defaults, are in the [Scaling](/reference/sandbox/general#scaling) section of the sandbox reference: `maxSessions` is enforced by every sandbox, pool or not; `minWorkers`, `maxWorkers`, and `idleDeleteDelay` only matter on the template. `scaling` is for agent sandboxes; a dev sandbox is one box and rejects it.
+
+<Warning>
+Sandboxes are added under **your** permissions, as if you had created the workload. You need `create` on workloads in the sandbox GVC and `use` on the identity; otherwise the session create fails with `403` naming the sandbox it could not create.
+</Warning>
+
+## Handle a full pool
+
+When no sandbox can take the session right now, the create answers `429` with a `Retry-After` header. Wait that long and send the same create again; the orchestrator example in the [Agent API reference](/reference/sandbox/agent-api#agent-api-example-an-orchestrator) already does this.
+
+| Situation | Status | Retry-After |
+| :--- | :--- | :--- |
+| A sandbox is starting or waking and did not become ready within the wait | 429 | 15 seconds |
+| The pool is at `maxWorkers` and every sandbox is full | 429 | 30 seconds |
+
+The API gateway does not replay a `429`, so the retry is the client's.
+
+## Watch the pool
+
+<Tabs>
+  <Tab title="Console UI">
+    **Agent Sessions** is this list, filtered by identity if you like. Its **Active** tab reads the platform's records and wakes nothing; **Ended** and **All** probe every sandbox and wake the scaled-to-zero ones.
+  </Tab>
+  <Tab title="CLI">
+    ```bash
+    cpln sandbox session get --identity bot --org my-org
+    cpln sandbox session get --identity bot --include-ended --org my-org
+    ```
+
+    Without `--include-ended` nothing is woken. `--include-ended` without `--sandbox` asks every sandbox live, which wakes the scaled-to-zero ones.
+  </Tab>
+</Tabs>
+
+The list carries every session (`id`, `worker`, `endpoint`, `runtime`, `image`, `created`, `active`, `lastActive`) and every sandbox of the identity:
+
+```json
+{
+  "name": "bot-2", "key": "5f2a9c01", "identity": "bot", "created": "2026-10-26T09:11:30.000Z", "endpoint": "https://...",
+  "state": "ready", "sessions": 3, "activeSessions": 1, "stale": false,
+  "scaling": { "maxSessions": 20, "minWorkers": 1, "maxWorkers": 5, "idleDeleteDelay": 3600 }
+}
+```
+
+| `state` | Meaning |
+| :--- | :--- |
+| `deploying` | Still rolling out |
+| `suspended` | Scaled to zero (the Console shows Scaled to Zero); the next session create on it wakes it. Its sessions stay listed from its last report |
+| `ready` | Up, with fresh session counts |
+| `unknown` | Up, but no fresh counts; `stale: true` means the last report is too old to use |
+
+With `probe=true` on the API route each sandbox answers for itself: `ready`, `unreachable`, or `deploying`, its full session list, whether it has `room`, and a `capacity` block with its memory.
+
+## How it works
+
+Placement ranks the sandboxes of the identity you may use (`connect`) without calling any, calls only the top-ranked one to confirm room, and when every one is full adds `bot-<n>` as a clone of the template, tagged `cpln/sandbox-pool=bot`; the steps are in [How a GVC session create is placed](/reference/sandbox/sessions#how-a-gvc-session-create-is-placed). A reconciler on the server deletes a server-added sandbox that has sat empty longer than `idleDeleteDelay`, down to `minWorkers`, adds one when the pool is short, and never deletes a sandbox you created; see [Worker reconciliation](/reference/sandbox/sessions#worker-reconciliation).
+
+A session created with its own firewall (`--set firewall.external.outboundAllowHostname=...`) lands on a sandbox pinned to exactly those rules, tagged `cpln/sandbox-firewall`, created on first use and never ahead of demand. Such sandboxes are excluded from plain placement, count toward `maxWorkers` but not `minWorkers`, and are removed when idle regardless of `minWorkers`.
+
+Each sandbox scales to zero on its own once its sessions go idle, after its `scaleToZeroDelay`. Placement prefers ready sandboxes, so a wake is paid only when nothing else has room. The counts the server uses are the gauges each sandbox exports (`devboxd_active_sessions`, `devboxd_idle_since_seconds`, and per session `devboxd_session_active`), scraped into the org's metrics.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Sessions reference" icon="book" href="/reference/sandbox/sessions">
+    The GVC and workload session routes, placement rules and every error code.
+  </Card>
+  <Card title="Sandbox reference" icon="gear" href="/reference/sandbox/general">
+    Every field of spec.sandbox, including scaling.
+  </Card>
+</CardGroup>
