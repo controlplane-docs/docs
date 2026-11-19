@@ -1,0 +1,454 @@
+---
+title: 'Sessions'
+sidebarTitle: 'Sessions'
+description: 'Reference for agent sandbox sessions: the -sessions API routes, create fields, runtimes and isolation, networking and preview codes, logs, metrics, scale to zero, placement across identity pools, and error codes.'
+keywords: ['devboxd', 'worker', 'runc', 'runsc', 'gvisor', 'nested container', 'session token', 'preview URL', 'preview code', 'identity pool', 'maxSessions', 'pull token', 'session firewall', 'timeoutSeconds', 'Retry-After']
+---
+
+A session is an isolated slot on an [agent sandbox](/concepts/sandbox) (`type: worker`; this page says "worker" when it quotes the spec value or the API's worker objects). Each session runs in its own nested OCI container with its own workspace, its own access token, and its own network namespace. The agent sandbox paid the boot cost once; creating a session on a running worker takes well under a second, so a session is the unit an AI agent creates per task or per conversation.
+
+Sessions are created and managed through the platform API's `-sessions` routes, which proxy to the agent API daemon, `devboxd`, on the worker using the sandbox token stored in `spec.sandbox.token`. Clients never need the sandbox token to use these routes; they authenticate with their Control Plane token. The routes are also what [`cpln sandbox session`](#sessions-cli) and the [Console](/guides/sandbox/console) use.
+
+<Info>
+  The `cpln sandbox session` commands on this page need a current `cpln` CLI. Run `cpln sandbox session --help` to see which commands your installed version supports.
+</Info>
+
+For the daemon's own HTTP API (processes, files, PTY, previews), see the [Agent API](/reference/sandbox/agent-api) reference. For the sandbox fields of the workload, see the [sandbox reference](/reference/sandbox/general).
+
+## Session API routes
+
+All routes live under the org's sandbox GVC, written `<sandbox-gvc>` below; `GET /org/{org}/gvc/-sandbox` returns its name (see [the sandbox GVC](/reference/sandbox/general#the-sandbox-gvc)). A `-sessions` route on a workload that is not an agent sandbox answers `400` (`not an agent sandbox`).
+
+### Routes on one agent sandbox
+
+These routes address a specific worker by its workload name. Reads require `view` on the workload; writes require `connect`.
+
+| Method | Route | Purpose |
+| :----- | :---- | :------ |
+| `GET` | `/org/{org}/gvc/<sandbox-gvc>/workload/{workload}/-sessions[?include=ended][&metadata.<k>=<v>]` | List live sessions, plus ended ones with `include=ended`; `metadata.<k>=<v>` keeps only sessions whose metadata has that key and value |
+| `POST` | `/org/{org}/gvc/<sandbox-gvc>/workload/{workload}/-sessions` | Create a session (`201`; the session token is returned once, here) |
+| `GET` | `/org/{org}/gvc/<sandbox-gvc>/workload/{workload}/-sessions/{id}` | Show one session |
+| `PATCH` | `/org/{org}/gvc/<sandbox-gvc>/workload/{workload}/-sessions/{id}` | Body `{"timeoutSeconds": n}`: set the session's timeout, or clear it with `0` (at most `604800`) |
+| `DELETE` | `/org/{org}/gvc/<sandbox-gvc>/workload/{workload}/-sessions/{id}` | Delete a session (`204`) |
+| `GET` | `.../-sessions/{id}/-logs?since=&until=&limit=&direction=&source=&level=&search=` | The session log, live or ended |
+| `GET` | `.../-sessions/{id}/-metrics?since=&until=&points=` | The session's resource series, live or ended |
+| `GET` | `.../-sessions/{id}/-processes` | The processes running in the session |
+| `POST` | `.../-sessions/{id}/-processes` | Body `{"cmd": "...", "args": [], "envs": {}, "cwd": "...", "user": "...", "tag": "...", "wait": n}` (only `cmd` is required): run a command in the session and answer its `stdout`, `stderr`, and `exitCode`. `wait` is the seconds to wait for it, default 60, at most 600; each output channel is capped at 1 MiB |
+| `POST` | `.../-sessions/{id}/-signal` | Body `{"selector": "...", "signal": "SIGTERM" \| "SIGKILL"}` (`204`) |
+| `POST` | `.../-sessions/{id}/-preview-code` | A one-time code that opens the session's preview in a browser; see [Preview URLs](#preview-urls) |
+
+### Routes across the sandbox GVC
+
+These routes span every agent sandbox in the sandbox GVC. A session created here is placed on a worker by [identity](/reference/identity) (see [Placement and scaling](#session-placement-and-scaling)). The session id returned ends in `-<8 hex>`, a key derived from the worker's name, so later calls by id find the worker without a lookup.
+
+| Method | Route | Purpose |
+| :----- | :---- | :------ |
+| `GET` | `/org/{org}/gvc/<sandbox-gvc>/-sessions[?identity=<name>][&metadata.<k>=<v>]` | Every worker the caller may view, with its state and session counts from stored status and scraped gauges, and its sessions. No worker is called, so none is woken. |
+| `GET` | `/org/{org}/gvc/<sandbox-gvc>/-sessions?probe=true[&include=ended]` | Every worker asked live: full session lists and capacity. Calling a worker that is scaled to zero wakes it. |
+| `POST` | `/org/{org}/gvc/<sandbox-gvc>/-sessions[?wait=<seconds>]` | Create a session on a worker of the identity named in the body (or of none) with room, or on a worker the server adds (`201`). The only route that accepts a session `firewall`. |
+| `GET` / `PATCH` / `DELETE` | `/org/{org}/gvc/<sandbox-gvc>/-sessions/{id}` | By id; the id's trailing key names the worker |
+| `GET` / `POST` | `/org/{org}/gvc/<sandbox-gvc>/-sessions/{id}/-logs`, `/-metrics`, `/-processes`, `/-signal`, `/-preview-code` | Same as the per-workload sub-routes |
+
+Every session answer, on either route family, carries two platform-added fields: `worker` (the workload holding the session) and `endpoint` (that worker's `https` endpoint). Clients that talk to the [Agent API](/reference/sandbox/agent-api) directly use `endpoint`.
+
+A session's own token is included in answers only when the caller holds `connect` on the worker. A caller with only `view` sees the session without the token and without its `envs`.
+
+## Session create fields
+
+The create body is passed through to the daemon, with `identity` consumed by the GVC route. Every field is optional; an empty body `{}` creates a session on the worker's own root filesystem with the default runtime.
+
+| Field | Type | Description |
+| :---- | :--- | :---------- |
+| `id` | string | The session id. Must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`. Generated by the worker when empty. Through the GVC route the caller's id may be at most 55 characters, because the server appends `-<8 hex>` (the worker key). An id that already exists on the worker answers `409`. |
+| `identity` | string | GVC route only. The name of an identity in the sandbox GVC; the session lands on a worker bound to that identity. Omitted, the server uses its workers bound to no identity. |
+| `runtime` | string | The nested OCI runtime: empty (the worker's default, `runc`), `runc`, or `runsc` (alias `gvisor`); `crun` is also accepted. A named runtime is never downgraded: `422` when it is not installed or the worker is not privileged, `424` when it failed to start a container. |
+| `image` | string | An OCI image reference for the session's root filesystem, for example `python:3.12-slim` (Docker Hub shorthand is accepted). Empty runs the worker's own root filesystem. See [Session images](#session-images). |
+| `imageAuth` | object | Optional override for the pull of a private `image`, used once and then dropped. An image in the org registry needs none: the server mints a scoped pull token. See [Session images](#session-images). |
+| `user` | string | Who execs run as. Defaults to `devuser` on the worker's own root filesystem. For an image session, execs run as the image's root unless a numeric `"uid:gid"` (for example `"1000:1000"`) is given, because the worker's user names mean nothing in a foreign root filesystem. |
+| `envs` | object | Environment variables for the session, merged into every exec. |
+| `limits` | object | `{ "cpuMillis": n, "memoryMb": n, "pids": n }`. `memoryMb` defaults to the usable memory of the worker; a value above it answers `422`. See [Memory limits](#session-admission-and-memory-limits). |
+| `ports` | number[] | Up to 16 ports the session will serve. Each gets a preview URL in the response; any port routes through the preview path regardless. |
+| `preview` | string | Who may reach the session's ports through `/_s/<id>/<port>/`: `token` (default) or `public`. See [Networking and previews](#session-networking-and-previews). |
+| `logOutput` | boolean | Keep every process's stdout and stderr in the session log. Default `false`: only lifecycle lines are logged, and a single process can opt in with `log: true` at start. |
+| `base` | string | An absolute path of an existing directory on the worker to seed the session workspace from (copy-on-write when the kernel allows it, else a copy). `400` when it is not an absolute path or not a directory. |
+| `timeoutSeconds` | integer | Seconds until the session ends on its own; `0` clears it, at most `604800`. The deadline is reported as `expiresAt` and can be changed later with `PATCH .../-sessions/{id}`. |
+| `metadata` | object | String key-value pairs kept on the session: at most 32 keys, a key at most 64 bytes, a value at most 256 bytes. Lists filter on them with `?metadata.<k>=<v>`. |
+| `firewall` | object | GVC route only; on the per-worker route it is `400`. Egress rules for this session's worker: the `external` outbound keys `outboundAllowHostname`, `outboundAllowCIDR`, `outboundBlockedCIDR`, and `outboundAllowPort` only. An inbound, `http`, or `internal` key is refused with `400` naming the key; `{}` closes egress. The session lands on a worker pinned to exactly those rules; see [Placement](#session-placement-and-scaling). |
+
+### Session images
+
+A session may bring its own root filesystem with `image`:
+
+- The daemon pulls the image straight from its registry. Public images pull anonymously; Docker Hub shorthand (`node:22-slim`) is accepted; an image index is resolved for the worker's platform (`linux/amd64`).
+- The image is flattened once per manifest digest under the worker's image store and mounted read-only as the lower layer of the session's root filesystem, with a per-session writable upper layer. A `pip install` lands in the session, never in the shared store, and a second session on the same image skips the pull.
+- The store is a bounded cache: 30% of the worker's disk, or `DEVBOXD_IMAGE_CACHE_MB`. The least recently used image is evicted first, never an image a running session uses.
+- The image's config `Env` (for example `PATH` and `PYTHON_VERSION`) becomes the session's default environment. The session workspace is bound in at its usual path, and the worker's `/etc/resolv.conf` and `/etc/hosts` are lent read-only so installs resolve.
+- The image must contain `/bin/sh`; distroless images are refused with `424`. Layers compressed with zstd are not supported.
+- An image session needs a container runtime; on a worker that is not privileged the create answers `422`.
+
+An image in the org registry needs no credentials from you. When `image` names one, as a registry reference (`<org>.registry.cpln.io/<name>:<tag>`) or as an image link (`//image/<name>` or `/org/<org>/image/<name>`), and the body carries no `imageAuth`, the server checks that the caller holds `pull` on that image, mints a pull token scoped to that one repository, pull only and short-lived, and hands it to the worker for the pull. A caller without `pull` gets `403` `Image <name> cannot be pulled: pull is not granted on it`; a caller the server cannot identify gets `401`. The Console describes such an image as pulled with a token scoped to it.
+
+`imageAuth` is the override: credentials you supply for the pull of a private image. It is used once and never stored on the session, written to disk, or logged.
+
+| `kind` | Fields | Where it works |
+| :----- | :----- | :------------- |
+| `cpln` | `token` | Only this org's registry (`<org>.registry.cpln.io`). The token is the caller's own Control Plane token, sent in place of the server-minted pull token (`cpln sandbox session create --image-auth`); the registry asks the platform whether that token holds `pull` on the image, so the caller's permissions decide. The worker's own injected token cannot do this. |
+| `basic` | `username`, `password` | Any other registry, sent as HTTP basic auth to its token endpoint (a Docker Hub personal access token, a `ghcr.io` token). |
+
+`imageAuth` without an `image` is a `400`. Using `kind: cpln` for a registry other than the org's is refused before anything is pulled.
+
+### Session admission and memory limits
+
+A worker admits a session on two counts:
+
+- **Session count.** A worker holds at most `spec.sandbox.scaling.maxSessions` sessions (default 20, at most 500; injected as `DEVBOXD_MAX_SESSIONS`), and has 254 session network slots (one network namespace each), so the count stays below that. At the limit a create on that worker answers `429` with `Retry-After: 15` and `worker is full: <n> sessions on the box, the limit is <n>`. Through the GVC route the session lands on another worker instead.
+- **Memory headroom.** Sessions share the worker's memory. When the worker does not have enough free memory for the session's limit, the create answers `429` with `Retry-After: 15` and `worker is full: <n> MB free, the session needs <m> MB (<k> sessions on the box)`. `limits.memoryMb` above the worker's usable memory answers `422`. A create without `limits.memoryMb` needs `DEVBOXD_SESSION_MEMORY_RESERVE_MB` (default 256) free, and `DEVBOXD_MEMORY_RESERVE_MB` (default 128) is kept back for the worker itself.
+
+Memory limits behave differently per runtime:
+
+- Under `runc`, the kernel kills the process that exceeded the limit and the session lives on.
+- Under `runsc` (gVisor), the whole session is one host process, so exceeding the limit ends the session. Its next exec answers `409` with `session container is stopped: the sandbox exited (under gVisor a memory limit ends the whole session); create a new session`.
+
+Size gVisor limits for the whole task, or use `runc` where a runaway process must not end the session.
+
+## Session response fields
+
+A successful create answers `201` with the session. The `token` is returned only here.
+
+```json
+{
+  "id": "task-1",
+  "token": "…",
+  "workspace": "/var/lib/devboxd/sessions/task-1/workspace",
+  "isolation": "container",
+  "runtime": "runc",
+  "mechanism": "empty",
+  "image": "python:3.12-slim",
+  "imageDigest": "sha256:…",
+  "network": "netns",
+  "ip": "10.200.0.2",
+  "preview": {
+    "mode": "token",
+    "base": "https://<endpoint>/_s/task-1/",
+    "urls": { "3000": "https://<endpoint>/_s/task-1/3000/" }
+  },
+  "logOutput": false,
+  "metadata": { "task": "nightly" },
+  "expiresAt": "2026-10-20T11:00:00Z",
+  "worker": "my-worker",
+  "endpoint": "https://<endpoint>"
+}
+```
+
+| Field | Description |
+| :---- | :---------- |
+| `id` | The session id (with the worker key appended when created through the GVC route). |
+| `token` | The session's own access token. It authorizes Agent API calls carrying this session's id only. Returned once, at create. |
+| `workspace` | The session's working directory on the worker. Execs run there by default. |
+| `isolation` | The isolation tier the worker really provides: `container` (nested OCI container), `namespace`, or `user` (uid separation only). Reported as `gvisor` for `runsc` sessions. |
+| `runtime` | The OCI runtime in use. |
+| `mechanism` | How the workspace was made: `overlay` (copy-on-write over `base`), `copy`, or `empty`. |
+| `image`, `imageDigest` | Present for image sessions. |
+| `warning` | Present when the session was created with a caveat worth reading. |
+| `network` | The session's network mode: `netns` (its own namespace and address) or `host` (the worker's network, when a namespace is not available). |
+| `ip` | The session's address when it has its own network namespace. |
+| `preview` | `mode` (`token` or `public`), `base` (the preview path prefix), and `urls` keyed by declared port. |
+| `logOutput` | Whether every process's output is kept in the session log. |
+| `metadata` | The key-value pairs given at create. |
+| `expiresAt` | When the session ends on its own, when `timeoutSeconds` is set. |
+| `limits` | The `cpuMillis`, `memoryMb`, and `pids` limits in force. |
+| `user` | Who execs run as. |
+| `envs` | The session's environment variables. Omitted for a caller with only `view`. |
+| `imageConfig` | Present for image sessions: the image's config. |
+| `firewall` | A fingerprint of the session firewall the worker is pinned to; absent on a plain worker. |
+| `worker`, `endpoint` | Added by the platform: the workload holding the session and its endpoint. |
+
+A list (`GET .../-sessions`) returns the same per-session fields without `token`, plus `state` (the container state, for example `running` or `stopped`), `created`, `procCount`, `mechanism`, and the activity verdict `active` with `lastActive`. The list also carries a `capacity` block for the worker:
+
+| `capacity` field | Description |
+| :--------------- | :---------- |
+| `memoryLimitBytes`, `memoryUsedBytes`, `memoryAvailableBytes` | The worker's memory and what sessions may still take |
+| `sessions`, `maxSessions` | Live sessions on the worker and the most it admits |
+| `sessionReserveMb` | Memory a create without `limits.memoryMb` needs free (`DEVBOXD_SESSION_MEMORY_RESERVE_MB`, default 256) |
+| `full` | Whether another session would be refused right now |
+| `activeSessions`, `boxActive`, `idle`, `idleSince` | The worker's activity verdict (see [Scale to zero](#sessions-and-scale-to-zero)) |
+
+With `?include=ended`, the list adds `ended[]`, read from the session logs kept on the worker: `id`, `created`, `ended`, `endReason`, `runtime`, `isolation`, `image`, `network`, `ip`, `preview`, `logOutput`, and `logBytes`. Sessions a crashed or restarted daemon left open are listed as ended with the reason `daemon restarted`.
+
+## Session runtimes and isolation
+
+Tenants are isolated from each other by the microVM: every sandbox is its own Firecracker guest. Inside one agent sandbox, sessions are isolated from each other by a nested OCI container, and the `runtime` field picks which one:
+
+| Runtime | Isolation | Use it for |
+| :------ | :-------- | :--------- |
+| `runc` (default) | Container with a shared kernel, near-native speed | Agents of the same trust domain |
+| `runsc` (alias `gvisor`) | gVisor: a user-space kernel per session, the strongest isolation available inside one VM | Untrusted or mutually distrustful agent runs |
+
+gVisor pays a tax on syscall-, fork-, and small-file-heavy work (package installs, builds) and is near parity for compute- and LLM-bound agents.
+
+Both runtimes need the worker to run privileged inside its microVM. The `worker` type stamps the `cpln/kataPrivileged` tag for this; without it the daemon reports isolation tier `user` and refuses named runtimes with `422`. The price of a privileged worker is that `cpln workload exec` does not work on it (the daemon owns the cgroup tree). Run commands through sessions instead: [`cpln sandbox session exec`](#sessions-cli), `cpln sandbox session connect`, or the [Agent API](/reference/sandbox/agent-api).
+
+An interactive shell in a session (`cpln sandbox session connect`, or a PTY started without a command) is `bash` when the session's image has it and `sh` otherwise, started as an interactive shell rather than a login shell so the image's own `PATH` stands.
+
+## Session networking and previews
+
+A container-tier session gets its own network namespace: a veth pair into the worker, one `/30` out of the session range (default `10.200.0.0/16`, set by `DEVBOXD_SESSION_NET` on the worker), and a default route through the worker. Consequences: A worker has 254 of these session network slots, which is the practical ceiling below `maxSessions`.
+
+- Every session has its own port space. Two sessions can both serve `:3000`.
+- The worker's [firewall](/reference/workload/firewall) applies to session egress exactly as to the worker's own traffic: a worker allowing only `api.github.com` gives a session the same allow and refuse behavior. A session created through the GVC route with its own `firewall` runs on a worker pinned to those rules instead; see [Session create fields](#session-create-fields) and [Placement](#session-placement-and-scaling).
+- DNS inside a session goes through a relay on the session's gateway address.
+- Sessions cannot reach the worker's own listeners or one another.
+
+### Preview URLs
+
+Any port a session serves is reachable on the worker's endpoint at `/_s/<session id>/<port>/...`. This is the per-session counterpart of the box-wide `/_port/<n>/` route: an agent can run a dev server on `:3000` in every session and each gets a working URL. Declared `ports` are echoed back as ready-made URLs in `preview.urls`; undeclared ports route too.
+
+Access is chosen per session at create with `preview`:
+
+| `preview` | Who may open the session's ports |
+| :-------- | :------------------------------- |
+| `token` (default) | The sandbox token, or this session's own token, presented as `X-Access-Token`, as `Authorization: Bearer`, as the session's preview cookie, or as a one-time preview code in the URL. Another session's token is `403`; anything else `401`. |
+| `public` | Open to anyone with the URL. The creator opted this one session's ports onto the internet. |
+
+A browser cannot send a header, so it opens a `token` preview with a **one-time code**:
+
+1. Mint one with `POST .../-sessions/{id}/-preview-code` (needs `connect` on the worker) or, with the sandbox or session token, `POST /_api/sessions/{id}/preview-code` on the worker. The answer is `{ "code": "…", "param": "preview_code", "expiresInSeconds": 60 }`.
+2. Open `https://<endpoint>/_s/<id>/<port>/?preview_code=<code>` within 60 seconds. The daemon sets a cookie scoped to `/_s/<id>/`, spends the code, and redirects to the same URL without it, so WebSocket upgrades and later requests ride the cookie.
+
+A session holds at most 8 unspent codes; minting a ninth answers `429` until one is opened or expires. `cpln sandbox session preview <id>` and the Console's preview opener do all of this for you. A token placed in the URL (`?access_token=`) is refused with `401`, because URLs are logged.
+
+## Session logs
+
+Every session keeps a log on the worker's home volume under `/home/devuser/.devboxd/sessions/<id>/`. The log outlives the session and the daemon and goes away with the worker. The log root is root-only and masked inside every session, so no session can read another's log.
+
+| Source | When it is written |
+| :----- | :----------------- |
+| `system` | Always. The lifecycle as the daemon saw it: `session created` (runtime, image and pull time, limits, network), every `process started` (tag, command, args, cwd, user) and `process exited` (code, status), `session container stopped` (a gVisor memory kill), preview denials, warnings, and `session deleted`. The same lines go to the worker's stdout as JSON, so they also appear in `cpln logs` for the workload. |
+| `stdout`, `stderr` | Opt-in. A process's output when it was started with `"log": true`, or every process's when the session was created with `"logOutput": true`. PTY output is never logged. |
+
+Query parameters on `-logs` (and on the daemon's `GET /_api/sessions/{id}/logs`):
+
+| Parameter | Meaning |
+| :-------- | :------ |
+| `since`, `until` | Window bounds, as milliseconds since the epoch or RFC 3339 |
+| `limit` | Lines to return (default 1000) |
+| `direction` | `forward` returns the first `limit` matches after `since`; `backward` the last `limit` before `until`. Both in chronological order; `truncated` says more matched. |
+| `source` | Comma-separated subset of `system`, `stdout`, `stderr` |
+| `level` | `info`, `warn`, or `error` and above |
+| `search` | A substring of the message |
+| `follow=true` | On the daemon route only: the matches so far, then new lines, as server-sent events |
+
+```json
+{
+  "session": "task-1",
+  "live": true,
+  "truncated": false,
+  "lines": [
+    { "ts": "2026-10-20T10:00:01Z", "source": "stdout", "proc": "app", "pid": 412, "message": "…" },
+    { "ts": "2026-10-20T10:00:02Z", "source": "system", "level": "info", "message": "process exited", "fields": { "exitCode": 0 } }
+  ]
+}
+```
+
+A deleted session's log is still readable by id. The same id created again starts a fresh log.
+
+Caps, per worker, set as environment variables on the worker container: `DEVBOXD_SESSION_LOG_MAX_MB` (default 50) per session, past which one `log cap reached` line is written and further lines drop; `DEVBOXD_SESSION_LOG_TOTAL_MB` (default 2048) over all ended sessions, oldest ended pruned first; `DEVBOXD_SESSION_LOG_RETAIN_DAYS` (default 7) after a session ends. Live sessions are never pruned.
+
+## Session metrics
+
+The daemon samples each session's cgroup every 5 seconds into a series kept beside the session log, under the same caps, and surviving the session.
+
+`GET .../-sessions/{id}/-metrics?since=&until=&points=` answers:
+
+```json
+{
+  "session": "task-1",
+  "live": true,
+  "interval": 5,
+  "points": [
+    { "ts": "…", "cpuCount": 1, "cpuPct": 12.5, "cpuUsec": 812000, "memBytes": 73400320, "memLimit": 536870912, "cacheBytes": 4194304, "diskBytes": 1048576, "pids": 3 }
+  ]
+}
+```
+
+`cpuPct` is the share of the session's allotted cores used since the previous point (100 = every allotted core busy); `cpuUsec` is the cumulative counter. `points` downsamples the window to at most that many points (default 300, at most 2000). `points` defaults to 300 and is capped at 2000.
+
+The latest samples are also exposed in Prometheus text on the worker's port `49984` at `/metrics`. The standard worker container declares that port as its metrics port, so the series land in the org's metrics: per-session CPU seconds and share, memory with limit and cache, disk, processes, start time, deadline (`devboxd_session_expires_at_seconds`), and activity (`devboxd_session_active`, `devboxd_session_last_active_seconds`), plus the worker gauges `devboxd_active_sessions`, `devboxd_box_active`, and `devboxd_idle_since_seconds`. The Console reads these series for a session's charts, so they stay readable after the session, and the worker, are gone. A session with a deadline also exposes `devboxd_session_expires_at_seconds`.
+
+## Sessions and scale to zero
+
+An agent sandbox scales to zero like every sandbox (see [scale to zero](/reference/sandbox/general#scale-to-zero-wake-and-suspend)), and the daemon decides when the worker has work. A session is **active** while it has:
+
+- a running process started through the process API (an idle dev server counts, for as long as it lives),
+- a client attached to one of its processes,
+- a request addressed to it in the last 10 seconds, or
+- CPU use in its cgroup of at least 2 percent of a core over the last sample (0.1 s per 5 s).
+
+The worker's own CPU counts too: work outside any session (an agent or a build started from a shell) holds the worker up the same way. Box-level reads (`GET /_api/sessions`, `/_health`, `/metrics`, logs, metrics) never count. Reads addressed to a session (process lists, file reads, watches) keep the worker up, so a console polling them holds it, but are not the session's own use.
+
+While anything is active, the daemon holds a lock on `/home/devuser/.devboxd/activity.lock` on the home volume, which blocks the platform from suspending the microVM. Once the last session goes idle, the lock is released and the worker suspends after the sandbox's `scaleToZeroDelay`; its state is then `suspended` (scaled to zero; the Console shows **Scaled to Zero**). The next request to the endpoint, including a session create or a placement probe, wakes it; the sessions and their workspaces are still there. Sessions cannot reach the lock file.
+
+The verdict is visible in the `capacity` block of a session list (`activeSessions`, `boxActive`, `idle`, `idleSince`), per session as `active` and `lastActive`, and as the gauges above.
+
+## Session placement and scaling
+
+The agent sandboxes of the sandbox GVC that are bound to the same identity (`spec.identityLink`), or bound to none, form a pool. A session created through the GVC route names the pool with `identity` (or omits it for the pool without an identity) and the server picks the worker. You do not need to create a worker first: an identity with no worker yet gets `<identity>-1` on the standard worker image at the standard size.
+
+How many sessions one worker holds and how many workers the server keeps for an identity is set by `spec.sandbox.scaling` on the worker (`maxSessions`, `minWorkers`, `maxWorkers`, `idleDeleteDelay`); the fields, ranges, and defaults are in [Scaling](/reference/sandbox/general#scaling). The first worker of a pool is its template: the server clones it for the next ones.
+
+### How a GVC session create is placed
+
+1. The pool's members the caller may use (`connect`) are ranked without calling any of them, from deployment status and the daemon's scraped gauges: workers with a known session count and room, ready before suspended (a wake costs time), fewest sessions first.
+2. Only the chosen worker is called. A call wakes a suspended worker. If it reports room, the session is created there. Workers whose gauges are unknown (new, or just woken) and then suspended workers with unknown counts are tried next.
+3. When every worker is full, the server adds one: `<identity>-<n>` (or `sandbox-<n>` for the pool without an identity), cloned from the pool's template worker and tagged `cpln/sandbox-pool=<identity | sandbox>`. The worker is created through the public API under the caller's permissions, so the caller needs workload create in the sandbox GVC and `use` on the identity; otherwise the create answers `403`. Long identity names get a hash tail so the worker name fits.
+4. The create waits for the new (or already booting) worker to answer with room, up to `?wait=<seconds>` (at most 90, which is also the default), then answers `429` with `Retry-After: 15` and `worker <name> is starting or has no room yet; retry shortly`. Clients retry after the header's delay. A worker that has stayed without an endpoint for 15 minutes is no longer waited for.
+5. When the pool already has `maxWorkers` members and all are full, the create answers `429` with `Retry-After: 30`.
+
+The server also creates the next plain worker ahead of demand, off the request, when the chosen worker was the last one with room or the pool is under `minWorkers`.
+
+### Placement of a session with its own firewall
+
+A session created with a `firewall` is placed only on a worker pinned to the same rules: the worker's `firewall` fingerprint must match the session's. Pinned workers carry the tag `cpln/sandbox-firewall` and are excluded from the plain placement above. When no pinned worker with room exists, the server adds one on first use, cloned from the pool's template with the session's rules as its `firewallConfig`. Pinned workers count toward `maxWorkers` but not `minWorkers`, are never created ahead of demand, and are deleted when idle regardless of `minWorkers`.
+
+### Worker reconciliation
+
+A reconciler runs every 60 seconds across the sandbox GVC of every org. It deletes server-added workers (those tagged `cpln/sandbox-pool`) that have been empty for longer than `idleDeleteDelay`, down to `minWorkers`, and creates workers up to `minWorkers` when the pool is short. The `minWorkers` floor counts plain workers only; an idle pinned firewall worker is deleted regardless of it. It never deletes a worker the user created, never calls a worker (a call would wake it), and never writes to a worker (a write would roll its pod). Idle time comes from the deployment status and the daemon's last `idleSince` sample.
+
+### Worker state in a GVC list
+
+`GET .../gvc/<sandbox-gvc>/-sessions` without `probe=true` lists every worker and its sessions with what is known without calling it:
+
+| Field | Values |
+| :---- | :----- |
+| `workers[].state` | `deploying`, `suspended` (scaled to zero; the Console shows **Scaled to Zero**), `ready`, or `unknown` (no fresh gauges) |
+| `workers[].stale` | `true` when gauges exist but are older than 90 seconds and were not used |
+| `workers[].sessions`, `activeSessions`, `idleSince` | From the scraped gauges |
+| `workers[].created`, `identity`, `scaling` | When the worker was created, its identity, and the pool's scaling |
+| `workers[].firewall` | The fingerprint of the session firewall the worker is pinned to; absent on a plain worker |
+| `sessions[]` | Each session with `worker`, `endpoint`, `identity`, `workerState`, `runtime`, `isolation`, `image`, `firewall`, `created`, `active`, and `lastActive`, as last scraped. A scaled-to-zero worker's sessions stay listed from its last scrape. |
+
+With `probe=true`, every worker is called: `state` is `ready`, `unreachable` (it has an endpoint but did not answer), or `deploying` (no endpoint yet), and a ready worker carries `room` and `capacity`.
+
+## Session error codes
+
+| Code | Returned by | Meaning |
+| :--- | :---------- | :------ |
+| `400` | Daemon | Invalid session id, `runtime`, `base`, `ports`, `preview`, `image` reference, or `imageAuth` without an image |
+| `400` | Platform | `identity` is not a valid identity name, a GVC-route id is longer than 55 characters, or the workers of this identity are not in the sandbox GVC |
+| `400` | Platform | The workload is `not an agent sandbox`; a `firewall` on the per-worker route; a `firewall` key other than the external outbound ones (the answer names the key) |
+| `400` | Platform or daemon | `metadata` beyond 32 keys, a key over 64 bytes, or a value over 256 bytes; `timeoutSeconds` outside 0 to 604800 |
+| `401` | Platform | The caller could not be identified when minting the pull token for an org-registry image |
+| `403` | Platform | The caller lacks `connect` (writes) or `view` (reads), or the identity exists but the caller may not read it |
+| `403` | Platform | `Image <name> cannot be pulled: pull is not granted on it`: the caller lacks `pull` on an org-registry image |
+| `403` | Daemon | A session token used with another session's id |
+| `404` | Platform | The identity named in a GVC create does not exist in the sandbox GVC, or the session id names no worker |
+| `409` | Daemon | `session id already exists`; or an exec on a session whose container stopped (gVisor memory kill) |
+| `409` | Platform | The worker has no token or endpoint yet (`Retry-After: 15`) |
+| `422` | Daemon | `runtime "<name>" is not installed in this box`; the runtime cannot run containers because the worker is not privileged; an image session on a worker without a container runtime; `limits.memoryMb` above the worker |
+| `424` | Daemon | `image pull failed` (including a missing `/bin/sh`), `session network` setup failed, or `runtime <name> could not start the session container` |
+| `429` | Daemon | The worker is at `maxSessions` or has no memory headroom for the session (`Retry-After: 15`); or a session already holds 8 unspent preview codes |
+| `429` | Platform | A GVC create's worker is still starting (`Retry-After: 15`), or the pool is at `maxWorkers` and every worker is full (`Retry-After: 30`) |
+| `502` | Daemon | The image registry answered an error during the pull |
+| `502` | Platform | A read could not reach the worker (`agent sandbox '<name>' could not be reached`), or it answered something that is not JSON |
+| `424` | Platform | A write (create, delete, signal, preview code) could not reach the worker, so it is not replayed |
+| `503` | Platform | A GVC-route probe of a worker that is still being deployed or not yet answering as a sandbox (`Retry-After: 15`) |
+
+The daemon deliberately answers `422` and `424` rather than `503` for a runtime that is missing or failed, because the platform's gateway retries `503` responses, including `POST`s, and would eventually replace the daemon's message with its own.
+
+## Sessions CLI
+
+The `cpln sandbox session` commands wrap the routes above. The session id is the argument of every command, and `--sandbox <ref>` names the agent sandbox; leave `--sandbox` out to use the GVC route (with `--identity` on create to pick the pool). The commands find the org's sandbox GVC themselves; do not pass `--gvc`.
+
+```bash
+# Create a session on a named agent sandbox; the token is printed once, here
+cpln sandbox session create --sandbox my-worker --id task-1 --image python:3.12-slim --runtime runsc --org my-org
+
+# Create a session on a worker of an identity, or on one the server adds
+cpln sandbox session create --identity my-identity --id task-1 --org my-org
+
+# Create a session on the workers bound to no identity, with a port, a memory limit and output logging (logOutput in the API)
+cpln sandbox session create --id task-2 --port 3000 --memory 1Gi --log --org my-org
+
+# Create a session that may only reach two hosts: it lands on a worker pinned to exactly these rules (GVC route only)
+cpln sandbox session create --identity my-identity --id task-3 --set firewall.external.outboundAllowHostname=api.github.com,pypi.org --org my-org
+
+# List sessions on one worker, or across the sandbox GVC (optionally one identity); --include-ended without --sandbox asks every worker live and wakes scaled-to-zero ones
+cpln sandbox session get --sandbox my-worker --include-ended --org my-org
+cpln sandbox session get --identity my-identity --org my-org
+
+# Inspect, read logs and metrics, list and signal processes, delete
+cpln sandbox session get task-1 --sandbox my-worker --org my-org
+cpln sandbox session logs task-1 --sandbox my-worker --source stdout --search error --limit 200 --org my-org
+cpln sandbox session logs task-1 --sandbox my-worker --follow --org my-org
+cpln sandbox session metrics task-1 --sandbox my-worker --points 60 --org my-org
+cpln sandbox session processes task-1 --sandbox my-worker --org my-org
+cpln sandbox session signal task-1 --sandbox my-worker --process app --signal SIGKILL --org my-org
+cpln sandbox session delete task-1 --sandbox my-worker --org my-org
+
+# Run a command, open a shell, open a preview, copy files in and out
+cpln sandbox session exec task-1 --sandbox my-worker --org my-org -- python3 -c 'print(42)'
+cpln sandbox session connect task-1 --sandbox my-worker --org my-org
+cpln sandbox session preview task-1 --sandbox my-worker --port 3000 --org my-org
+cpln cp ./data.csv my-worker:data.csv --session task-1 --org my-org
+```
+
+| Command | Options |
+| :------ | :------ |
+| `session create` | `--sandbox <ref>` or `--identity <name>` (neither: the workers bound to no identity), `--id`, `--image`, `--image-auth` (send your own token for the org registry; normally unnecessary), `--runtime runc\|runsc`, `--env NAME=value` (repeatable), `--log`, `--user`, `--memory` (for example `512Mi`, `2Gi`), `--port` (repeatable), `--preview token\|public`, `--wait-timeout` (GVC route; `0` returns at once), `--set firewall...` (GVC route only; `firewall={}` closes egress). Through the GVC route the server appends `-<worker key>` to the id (55 characters at most) |
+| `session get [<id>...]` | `--sandbox`, `--identity`, `--include-ended` (without `--sandbox` it asks every worker live, waking scaled-to-zero ones) |
+| `session exec <id> -- <cmd>` | `--sandbox`, `--stdin` (`-i`); the command's exit code becomes the CLI's; a command a signal ended exits 128 plus the signal number |
+| `session connect <id>` | `--sandbox` when the id does not carry a worker key; opens a shell |
+| `session logs <id>` | `--sandbox`, `--since`, `--from`, `--to`, `--limit`, `--direction forward\|backward`, `--source`, `--level`, `--search`, `--follow` |
+| `session metrics <id>` | `--sandbox`, `--since`, `--from`, `--to`, `--points` |
+| `session processes <id>` | `--sandbox` |
+| `session signal <id>` | `--sandbox`, `--process <pid or tag>`, `--signal SIGTERM\|SIGKILL` (default `SIGTERM`) |
+| `session preview <id>` | `--sandbox`, `--port` (defaults to the one port the session declared), `--print-url` (a token link is short-lived; a `--preview public` session's link does not expire) |
+| `session delete <id>...` | `--sandbox` |
+| `cp <src> <dest> --session <id>` | The remote side is `<sandbox>:<path>` or `:<path>` and resolves inside the session workspace; `--replica` and `--container` are refused with `--session` |
+
+## Session API examples
+
+Create a session on a named agent sandbox:
+
+```bash
+curl -s -X POST "https://api.cpln.io/org/my-org/gvc/<sandbox-gvc>/workload/my-worker/-sessions" \
+  -H "Authorization: Bearer $CPLN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"id": "task-1", "image": "python:3.12-slim", "runtime": "runsc", "ports": [3000], "logOutput": true}'
+```
+
+Create a session for an identity through the GVC route, waiting up to 60 seconds for a booting worker:
+
+```bash
+curl -s -X POST "https://api.cpln.io/org/my-org/gvc/<sandbox-gvc>/-sessions?wait=60" \
+  -H "Authorization: Bearer $CPLN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"identity": "my-identity", "image": "node:22-slim"}'
+```
+
+Read the last 100 stdout lines of a session by its id:
+
+```bash
+curl -s "https://api.cpln.io/org/my-org/gvc/<sandbox-gvc>/-sessions/task-1-5f2a9c01/-logs?source=stdout&limit=100&direction=backward" \
+  -H "Authorization: Bearer $CPLN_TOKEN"
+```
+
+Mint a one-time code and open the session's port 3000 in a browser:
+
+```bash
+curl -s -X POST "https://api.cpln.io/org/my-org/gvc/<sandbox-gvc>/workload/my-worker/-sessions/task-1/-preview-code" \
+  -H "Authorization: Bearer $CPLN_TOKEN"
+# {"code":"…","param":"preview_code","expiresInSeconds":60}
+# open https://<endpoint>/_s/task-1/3000/?preview_code=<code> within 60 seconds
+```
+
+Send `SIGTERM` to a process in a session, then delete the session:
+
+```bash
+curl -s -X POST "https://api.cpln.io/org/my-org/gvc/<sandbox-gvc>/workload/my-worker/-sessions/task-1/-signal" \
+  -H "Authorization: Bearer $CPLN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"selector": "app", "signal": "SIGTERM"}'
+
+curl -s -X DELETE "https://api.cpln.io/org/my-org/gvc/<sandbox-gvc>/workload/my-worker/-sessions/task-1" \
+  -H "Authorization: Bearer $CPLN_TOKEN"
+```

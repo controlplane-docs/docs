@@ -1,0 +1,298 @@
+---
+title: 'Sandbox'
+sidebarTitle: 'General'
+description: 'Reference for spec.sandbox on a workload: the dev and worker types, the sandbox GVC, every field and default, what the server injects, reserved ports and paths, access, scale to zero, and update and delete rules.'
+keywords: ['spec.sandbox', 'devbox', 'agent box', 'worker', 'devboxd', 'kata', 'firecracker', 'microvm', 'home volume', 'scale to zero', 'suspend', 'connect permission', 'DEVBOXD_TOKEN', 'APP_PORT', 'sandbox gvc']
+---
+
+A sandbox is a [stateful workload](/reference/workload/types#stateful) that carries a `spec.sandbox` section. The section marks the workload as a sandbox and holds its settings; the server fills in everything else: the container, the home volume, the ports, the probes, the firewall, and the tags. Two types exist:
+
+| Type | Console label | What it runs | Who uses it |
+| :--- | :--- | :--- | :--- |
+| `dev` | Dev Sandbox | A browser IDE and terminal behind a Control Plane sign-in, plus SSH for desktop IDEs | One human developer |
+| `worker` | Agent Sandbox | The agent API daemon, `devboxd`, behind a token, hosting many isolated agent [sessions](/reference/sandbox/sessions) | AI agents and automation |
+
+Both types keep a home volume at `/home/devuser`, run as a single replica inside a Firecracker microVM, scale to zero when idle, and resume on the next request. For the model behind the two types see the [sandbox concept](/concepts/sandbox); for step-by-step instructions see [Getting started with sandboxes](/guides/sandbox/getting-started).
+
+## The sandbox GVC
+
+Every sandbox in an org lives in the org's sandbox GVC: one [GVC](/reference/gvc) tagged `cpln/sandboxGvc: "true"` and placed on the single location that runs the sandbox microVMs (currently `oci-us-ashburn-1`). Which GVC that is depends on the org:
+
+- An org created with the built-in default GVC uses `default`.
+- An older org uses `sandboxes`. You do not create that GVC: the server creates it, as you, with the org's first sandbox. If the name `sandboxes` is held by a GVC placed elsewhere, the server uses `cpln-sandboxes` instead; when both names are held by GVCs placed elsewhere, every sandbox create fails with `400` until one of them is placed on the sandbox location.
+
+`GET /org/{org}/gvc/-sandbox` answers `{ "name": "<sandbox-gvc>", "location": "oci-us-ashburn-1", "exists": true | false }`. The routes on these pages write that name as `gvc/<sandbox-gvc>`. From then on:
+
+- A sandbox created under any other GVC is refused with `400`: `Sandboxes are created in the '<sandbox-gvc>' GVC, placed on oci-us-ashburn-1 where they run: create this one under /org/<org>/gvc/<sandbox-gvc>/workload.`
+- Adding `spec.sandbox` to a workload in another GVC is refused the same way.
+- The `cpln sandbox` and `cpln sandboximage` commands find the org's sandbox GVC themselves; do not pass `--gvc`. (A `--gvc` or a profile default GVC is used as given.)
+- Identities a sandbox runs as, and the identity pools of agent sandboxes, are identities of the sandbox GVC.
+
+Creating the first sandbox needs `create` on GVCs in the org in addition to the workload permissions. When the caller lacks it, the create fails with the GVC's refusal and the hint `An org admin can create GVC '<sandbox-gvc>' placed on oci-us-ashburn-1 only.`
+
+## Sandbox creation in one call
+
+The smallest valid sandbox is a workload whose spec contains only the section. The server sets `spec.type` to `stateful` when it is omitted, injects the standard container for the type, creates the home volumeset, and (for a worker) generates the token.
+
+```json
+{
+  "name": "my-sandbox",
+  "spec": {
+    "sandbox": {}
+  }
+}
+```
+
+A `spec.type` other than `stateful` is rejected with a 400: a sandbox keeps a home volume, which only stateful workloads can mount.
+
+<Tabs>
+  <Tab title="Console">
+    Open **Sandboxes** in the org navigation, start a new sandbox, pick **Dev Sandbox** or **Agent Sandbox**, and create. The **GVC** field shows the sandbox GVC and cannot be changed. Every other field has a default. See [Sandboxes in the Console](/guides/sandbox/console).
+  </Tab>
+  <Tab title="CLI">
+    <Info>
+      The `cpln sandbox` commands below need a current `cpln` CLI. Run `cpln sandbox --help` to see what the installed version supports.
+    </Info>
+
+    ```bash
+    # A dev sandbox with every default
+    cpln sandbox create my-devbox --org my-org
+
+    # An agent sandbox (worker) sized for a few sessions
+    cpln sandbox create my-worker --type worker --cpu 2000m --memory 4Gi --org my-org
+    ```
+
+    The create prints the workload. A worker's `spec.sandbox.token` is in that output; copy it now if you call the devboxd API directly.
+  </Tab>
+  <Tab title="API">
+    ```bash
+    # <sandbox-gvc> is the name GET /org/my-org/gvc/-sandbox returns
+    curl -X POST "https://api.cpln.io/org/my-org/gvc/<sandbox-gvc>/workload" \
+      -H "Authorization: Bearer $CPLN_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"name": "my-worker", "spec": {"sandbox": {"type": "worker"}}}'
+    ```
+
+    A `GET` of the workload returns the filled-in spec. The worker token is included only when the caller holds `connect` on the workload.
+  </Tab>
+</Tabs>
+
+## Sandbox spec fields
+
+Every field has a default, so `spec.sandbox: {}` is a complete sandbox.
+
+| Field | Type | Applies to | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `type` | `dev` \| `worker` | both | `dev` | `dev` serves the IDE stack behind a Control Plane sign-in. `worker` runs devboxd as its only listener, secured by the token. |
+| `ide` | `vscode` \| `cursor` \| `ssh` \| `browser` | dev | `browser` | The IDE the owner connects with. Informational: clients use it to pick a default connect flow. Stripped from a worker. |
+| `token` | string, 16 to 512 chars | worker | generated | The bearer token for the devboxd API. Generated by the server when omitted on create and kept on later writes. Set it to choose your own. Injected into the container as `DEVBOXD_TOKEN`. |
+| `volume.initialCapacity` | integer GB, min 10 | both | `20` | Initial size of the home volumeset. Immutable after create. |
+| `appPort` | port | both | `8080` | The port the application inside the container listens on. On a dev sandbox the endpoint root proxies to it. A [reserved port](#reserved-ports-env-names-and-paths) is refused. |
+| `scaleToZeroDelay` | number of seconds, 30 to 3600 | both | `300` | Idle seconds before the sandbox scales to zero. The next request wakes it. |
+| `scaling` | object | worker | defaults apply | How many sessions one worker holds and how the workers bound to one identity scale. See [Scaling](#scaling). Setting it on a dev sandbox fails with `spec.sandbox.scaling: scaling is a worker feature; a dev sandbox is one box`. |
+| `password` | string | — | — | Deprecated and ignored. The IDE admits callers with `connect` on the workload; no password exists. Stripped on write. |
+| `ttl` | string | — | — | Deprecated and ignored. Stripped on write. |
+
+## Scaling
+
+`spec.sandbox.scaling` is read on an agent sandbox (`type: worker`). `maxSessions` is enforced by the worker itself, so it matters even for a single agent sandbox. The other three fields describe the pool: the workers of the sandbox GVC bound to the same [identity](/reference/identity) (or to none) share its sessions and scaling. The first worker of a pool is its template: the server clones it for the next ones. Session placement across workers is described in [Sessions](/reference/sandbox/sessions#session-placement-and-scaling) and [Scale agent sandboxes by identity](/guides/sandbox/scaling-workers).
+
+| Field | Range | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `maxSessions` | 1 to 500 | `20` | Sessions one worker holds at most. The worker refuses the next create with `429`; through the GVC route the session lands on another worker instead. Injected into the container as `DEVBOXD_MAX_SESSIONS`. A worker also has 254 session network slots. |
+| `minWorkers` | 1 to 100 | `1` | Workers kept for the identity, this one included. Counts plain workers only. |
+| `maxWorkers` | 1 to 100, at least `minWorkers` | `10` | Workers the identity grows to at most, this one included. Workers pinned to a session firewall count too. |
+| `idleDeleteDelay` | 300 to 604800 seconds | `3600` | Seconds a server-added worker above `minWorkers` stays empty before it is deleted. |
+
+A `maxWorkers` below `minWorkers` is rejected with `spec.sandbox.scaling.maxWorkers must be at least minWorkers`. Set the fields with `cpln sandbox update <ref> --set spec.sandbox.scaling.maxSessions=50` (and the same for `minWorkers`, `maxWorkers`, `idleDeleteDelay`), or at create with `--max-sessions`, `--min-workers`, `--max-workers`, and `--idle-delete-delay`.
+
+A worker the server created for sessions that carry their own `firewall` (tag `cpln/sandbox-firewall`) is deleted when idle regardless of `minWorkers`; see [session placement](/reference/sandbox/sessions#session-placement-and-scaling).
+
+## What the server injects into a sandbox
+
+The section is normalized into the workload spec at write time. The stored spec round-trips unchanged, so a `GET` shows everything below.
+
+### Standard container
+
+When `spec.containers` is omitted, the server injects one container named `dev`:
+
+| Type | Image | CPU | Memory | Extra |
+| :--- | :--- | :--- | :--- | :--- |
+| dev | `build.cpln.io/public/sandbox-base:v1` | `1000m` | `2Gi` | — |
+| worker | `build.cpln.io/public/agentbox-base:v1` | `4000m` | `8Gi` | `metrics: {port: 49984, path: /metrics}` so per-session metrics reach the org's metrics store |
+
+A container you supply keeps its image, but a missing `cpu` or `memory` is filled with the type's standard size above, not the platform's `50m` / `128Mi`. Size the sandbox on `spec.containers[0].cpu` and `memory`. A worker is sized for the sessions it holds: they share its memory, and the daemon admits a session only while there is headroom.
+
+<Warning>
+  A worker needs an image that runs devboxd on port 49983. The standard dev image does not, so a worker on `build.cpln.io/public/sandbox-base:v1` is refused:
+
+  ```text
+  spec.containers[0].image: the standard sandbox image runs the dev type only; a worker sandbox needs an image that runs devboxd on port 49983 - set spec.containers[0].image to one (for example build.cpln.io/public/agentbox-base:v1)
+  ```
+
+  Images must be `linux/amd64`.
+</Warning>
+
+### Ports, environment, and probes
+
+| Injected item | dev | worker |
+| :--- | :--- | :--- |
+| Port on the `dev` container | `8888` (http), the gateway | `49983` (http), the devboxd API |
+| Env on the `dev` container | `APP_PORT` (from `appPort`) | `APP_PORT`, `DEVBOXD_TOKEN` (from `token`), `DEVBOXD_MAX_SESSIONS` (from `scaling.maxSessions`) |
+| Readiness probe (when none is set) | `GET /healthz` on 8888 | `GET /_health` on 49983 |
+
+The default probe uses `initialDelaySeconds: 1`, `periodSeconds: 5`, `failureThreshold: 20`, `successThreshold: 1`, `timeoutSeconds: 1`. You may replace it.
+
+### Home volume
+
+The server creates and owns a [volumeset](/reference/volumeset) named `<workload>-state` (`performanceClass: shared`, `fileSystemType: shared`, size from `volume.initialCapacity`) and mounts it on the `dev` container at `/home/devuser` with `recoveryPolicy: retain`. The volumeset is tagged with the owning workload link and is deleted with the sandbox.
+
+If a volumeset named `<workload>-state` already exists and is not this sandbox's, the create fails with `409`: `volumeset '<name>' already exists. A sandbox creates and owns its home volumeset under this name (<workload>-state): delete or rename that volumeset, or pick another sandbox name.`
+
+### Autoscaling and firewall
+
+- `spec.defaultOptions.autoscaling` is pinned to `minScale: 1`, `maxScale: 1`, with `scaleToZeroDelay` from the section. A sandbox is one replica with one home volume.
+- When the caller sets no `firewallConfig`, the server sets one that is **open in both directions**: `inboundAllowCIDR: ["0.0.0.0/0"]` and `outboundAllowCIDR: ["0.0.0.0/0"]`, with the other allow and blocked lists set empty. Access is gated by the sign-in (dev) or the token (worker), not by the firewall. A `firewallConfig` you supply is kept as is.
+
+<Note>
+  This differs from the [firewall](/reference/workload/firewall) default of an ordinary workload, which is closed. Restrict `outboundAllowHostname` or `outboundAllowCIDR` on a worker when its agents must reach only known hosts; sessions inherit the worker's egress policy. A session created through the GVC route can carry its own `firewall` instead and lands on a worker pinned to those rules; see [Session create fields](/reference/sandbox/sessions#session-create-fields).
+</Note>
+
+### Tags the server stamps
+
+| Tag | On | Purpose |
+| :--- | :--- | :--- |
+| `cpln/sandbox: true` | every sandbox | Marker; present exactly when `spec.sandbox` is present |
+| `cpln/kata: true` | every sandbox | Runs the workload as a Firecracker microVM |
+| `cpln/scaleToZero: true` | every sandbox | Enables suspend in place when idle |
+| `cpln/kataPrivileged: true` | worker | Privileged root inside the microVM, which devboxd needs for nested session containers |
+| `cpln/disableServiceMeshInboundPort: 49984` | worker | Lets the platform scrape the metrics port outside the mesh, so the scrape never counts as activity |
+| `cpln/dev-type: devbox` | dev | Kept for older CLIs; `cpln sandbox connect` reads `spec.sandbox.type` |
+| `cpln/sandbox-pool: <identity>` or `sandbox` | server-added workers | Marks a worker the server added for an identity's pool (or for the pool without an identity). A worker you created never carries it. |
+| `cpln/sandbox-firewall` | server-added workers pinned to a session firewall | Marks a worker created for sessions that carry their own `firewall`. It is excluded from plain placement, counts toward `maxWorkers` but not `minWorkers`, is never created ahead of demand, and is deleted when idle regardless of `minWorkers`. |
+
+Do not set these tags yourself; the server maintains them. They count toward the 50-tag limit per object.
+
+## Reserved ports, env names, and paths
+
+| Reserved | Values | Rule |
+| :--- | :--- | :--- |
+| Ports | `22`, `7681`, `8443`, `8888`, `49983`, `49984` | Pod-wide. Only the injected entry on the `dev` container is allowed. Any other container, `appPort`, or a `port` field naming one is refused with an error that names the field, for example `spec.containers[1].ports: port 8888 is reserved by the sandbox runtime (reserved: 22, 7681, 8443, 8888, 49983, 49984)`. |
+| Env names | `APP_PORT`, `CODE_SERVER_PASSWORD`, `DEVBOXD_TOKEN`, `DEVBOXD_MAX_SESSIONS` | Derived from the section on the `dev` container only. On another container they are refused. A `DEVBOXD_TOKEN` whose value differs from `spec.sandbox.token` is refused: set the section field instead. |
+| Mount path | `/home/devuser` and anything below it | Owned by the home volume. A user volume there is rewritten, not kept. Mounting the home volumeset elsewhere is refused. |
+| `port` field | `spec.containers[0].port` | The `dev` container must declare ports through `ports[]`, since the injected port must coexist with yours. |
+
+## Endpoints by sandbox type
+
+The URL is `status.endpoint` of the workload. What it serves depends on the type.
+
+| Path | dev | worker |
+| :--- | :--- | :--- |
+| `/` | Your app on `appPort` (a waiting page until something listens) | The devboxd API |
+| `/_ide/` | Browser IDE (code-server), sign-in required | — |
+| `/_term/` | Browser terminal, sign-in required | — |
+| `/_port/<n>/` | Reverse proxy to local port `<n>`, sign-in required | Reverse proxy to local port `<n>`, token or one-time code required |
+| `/_callback/<n>/` | Reverse proxy without auth, for IDE and OAuth callbacks (IDE, terminal and SSH ports refused) | — |
+| `/_status`, `/_ports` | Runtime status and detected ports as JSON | — |
+| `/_livez`, `/healthz` | Liveness without sign-in; readiness | — |
+| `/_health` | — | Readiness, with `X-Devboxd-Version` |
+| `/_metrics` | — | The worker's CPU, memory, and disk as JSON, without a token |
+| `/_api/...`, `/_files`, `/_s/<session>/<port>/` | — | The [agent API](/reference/sandbox/agent-api) |
+
+The daemon's own listener ports are never proxyable through `/_port`.
+
+## Sandbox access and permissions
+
+| Surface | Who gets in |
+| :--- | :--- |
+| Dev sandbox IDE and terminal | A Control Plane account with `connect` on the workload. The sign-in is a one-time link that the Console or `cpln sandbox connect` obtains by running a command in the sandbox; no password and no Control Plane token ever reach the box. |
+| Dev sandbox over SSH (`cpln sandbox connect`) | The same `connect` permission. |
+| Agent sandbox (devboxd API) | The `spec.sandbox.token` as `X-Access-Token`, or a session's own token for that session. |
+| Platform session routes (`.../-sessions`) | `view` to list and read; `connect` to create, delete, signal, mint preview codes, and to see tokens. A `view`-only caller sees sessions without their `envs` and without the token. |
+| The worker token on `GET` of the workload | Returned only to a caller with `connect`; redacted otherwise and in every list. |
+
+Grant `connect` with a [policy](/reference/policy) on the workload, as you would for `cpln workload exec`.
+
+## Scale to zero, wake, and suspend
+
+Every sandbox runs as a Firecracker microVM that **suspends in place** when idle and resumes on demand. The home volume stays mounted; the next request continues where the box left off.
+
+- A sandbox is idle when no request has arrived on a declared port for `scaleToZeroDelay` seconds (default 300) and nothing inside it is working. Work means a running session process or CPU use above a small threshold: a build or an agent you left running in a dev sandbox terminal keeps the box up; an open but idle editor does not. On a worker, see [session activity](/reference/sandbox/sessions#sessions-and-scale-to-zero).
+- The next request to the endpoint wakes the sandbox. On a dev sandbox, `cpln sandbox connect`, `cpln workload exec`, and `cpln port-forward` also wake it before connecting. On a worker, a session create or any API call wakes it.
+- An idle sandbox reports the state `suspended` (scaled to zero; the Console shows **Scaled to Zero**).
+- **Suspend** is explicit: `cpln sandbox stop <ref>` sets `spec.defaultOptions.suspend: true` (and `suspend: true` on every `spec.localOptions[]` entry), which stops compute until `cpln sandbox start <ref>` clears it. The Console labels these **Suspend** and **Unsuspend** and shows a stopped sandbox as **Suspended**. A stopped sandbox does not wake on a request. The home volume is preserved either way.
+
+<Tip>
+  Use automatic scale to zero for day-to-day idle time and an explicit suspend for a sandbox you will not touch for a while.
+</Tip>
+
+## Updating and deleting a sandbox
+
+- **A sandbox stays a sandbox.** Removing `spec.sandbox` on a `PUT` fails with `spec.sandbox cannot be removed: a sandbox is not converted back into a plain workload. Delete the sandbox instead; its home volumeset is deleted with it.`
+- **A minimal `PUT` keeps the stored parts.** The stored token, container, and volume carry forward when the body omits them.
+- **`volume.initialCapacity` is immutable.** A different value fails with `spec.sandbox.volume.initialCapacity is the initial size and cannot be changed (it is 20 GB). Resize the home volumeset '<name>-state' instead`. Resize the [volumeset](/reference/volumeset) itself.
+- **Adding `spec.sandbox` to an existing stateful workload** in the sandbox GVC creates its home volumeset.
+- **Delete removes both objects.** Deleting the sandbox deletes `<name>-state`. If another workload also mounts that volumeset, the delete fails with `volumeset '<name>-state' is the sandbox's home volume but is also mounted by another workload; unmount it there first or delete that workload`.
+- **Workers in a pool.** Server-added workers (tag `cpln/sandbox-pool`) are deleted by the server when idle past `idleDeleteDelay`, down to `minWorkers`. A worker you created is never deleted by the server.
+
+## Exec into a sandbox
+
+`cpln workload exec` works on a dev sandbox. It does **not** work on an agent sandbox: the worker delegates its cgroup tree to session limits, so the platform cannot attach an exec process. Run commands on a worker through a session instead:
+
+```bash
+cpln sandbox session exec task-1 --sandbox my-worker --org my-org -- python3 -c "print(42)"
+cpln sandbox session connect task-1 --sandbox my-worker --org my-org
+```
+
+See [Run agents in an agent sandbox](/guides/sandbox/agent-sandbox).
+
+## Sandbox spec examples
+
+<CodeGroup>
+
+```yaml Dev sandbox
+kind: workload
+name: alice-dev
+spec:
+  type: stateful
+  sandbox:
+    type: dev
+    ide: vscode
+    appPort: 3000
+    scaleToZeroDelay: 900
+    volume:
+      initialCapacity: 50
+  containers:
+    - name: dev
+      image: build.cpln.io/public/sandbox-base:v1
+      cpu: 2000m
+      memory: 8Gi
+```
+
+```yaml Agent sandbox
+kind: workload
+name: agents
+spec:
+  type: stateful
+  identityLink: /org/my-org/gvc/<sandbox-gvc>/identity/agent-runner
+  sandbox:
+    type: worker
+    scaling:
+      maxSessions: 20
+      minWorkers: 1
+      maxWorkers: 5
+      idleDeleteDelay: 1800
+  containers:
+    - name: dev
+      image: build.cpln.io/public/agentbox-base:v1
+      cpu: 4000m
+      memory: 8Gi
+  firewallConfig:
+    external:
+      inboundAllowCIDR: ['0.0.0.0/0']
+      outboundAllowHostname: ['api.github.com', 'pypi.org', 'files.pythonhosted.org']
+```
+
+</CodeGroup>
+
+Assign `spec.identityLink` only when the sandbox needs it: secret access, cloud access, private network access, or to join an identity's worker pool. The identity must belong to the sandbox GVC.
