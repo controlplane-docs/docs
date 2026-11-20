@@ -94,6 +94,9 @@ This template deploys into an **existing** [GVC](/reference/gvc) — the one you
   <Step title="Create the REST Proxy JAAS secret (recommended)">
     The REST Proxy is on by default, and its JAAS file holds the client admin password. Put the whole file in an opaque secret named by `kafka_rest_proxy.jaas_conf_secret`; see [REST Proxy Credentials](#rest-proxy-credentials).
   </Step>
+  <Step title="Kafka Connect secrets (recommended when you enable Kafka Connect)">
+    Create an opaque secret with one `username: password` line per user for the Connect REST API (`rest_auth_secret`), and any secrets whose values your connectors read (`secrets`). Both must exist before install, and `rest_auth_secret` is required as soon as `secrets` is used. See [Kafka Connect REST API Authentication](#kafka-connect-rest-api-authentication) and [Connector Credentials](#connector-credentials).
+  </Step>
   <Step title="Public listener (optional)">
     Exposing brokers to clients outside the GVC needs a domain you control and a **dedicated load balancer** enabled on the GVC. Follow the [Configure Domain](/guides/configure-domain) guide first, then see [Public Listener](#public-listener) below.
   </Step>
@@ -105,7 +108,7 @@ Install into an existing GVC, naming the credentials secret from the prerequisit
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/kafka \
-  --version 4.4.0 --gvc GVC_NAME \
+  --version 4.5.1 --gvc GVC_NAME \
   --set kafka.secrets.kraft_cluster_id=KRAFT_CLUSTER_ID \
   --set kafka.credentialsSecretName=my-kafka-credentials
 ```
@@ -450,7 +453,7 @@ After changing either secret, run `cpln workload force-redeployment RELEASE_NAME
 
 ### Kafka Connect
 
-A connector worker's Kafka login and its plugins' passwords can come from secrets; see [Kafka Connect Credentials](#kafka-connect-credentials). `kafka_connectors` is a list; each entry deploys a Kafka Connect worker cluster named `RELEASE_NAME-connect-` plus the entry's `name`, with a volume set for plugins and a `plugins-downloader` container that fetches plugin artifacts into `plugins_folder` (see [Kafka Connect Plugins](#kafka-connect-plugins)). Connectors listed under `plugins` are created or updated through the Connect REST API when the worker starts; an entry with `enabled: false` is removed. The shipped `values.yaml` carries complete, commented examples for MirrorMaker 2, a Camel S3 sink, a ClickHouse sink and a Snowflake sink.
+The worker REST API can require basic auth ([Kafka Connect REST API Authentication](#kafka-connect-rest-api-authentication)), and a connector worker's Kafka login and its plugins' passwords can come from secrets ([Connector Credentials](#connector-credentials)). `kafka_connectors` is a list; each entry deploys a Kafka Connect worker cluster named `RELEASE_NAME-connect-` plus the entry's `name`, with a volume set for plugins and a `plugins-downloader` container that fetches plugin artifacts into `plugins_folder` (see [Kafka Connect Plugins](#kafka-connect-plugins)). Connectors listed under `plugins` are created or updated through the Connect REST API when the worker starts; an entry with `enabled: false` is removed. The shipped `values.yaml` carries complete, commented examples for MirrorMaker 2, a Camel S3 sink, a ClickHouse sink and a Snowflake sink.
 
 ```yaml
 kafka_connectors:
@@ -508,9 +511,103 @@ kafka_connectors:
           "topics": "your-topic"
 ```
 
-#### Kafka Connect Credentials
+#### Kafka Connect REST API Authentication
 
-Use Kafka's `env` config provider: add an `env` entry that references the secret (the chart grants the worker `reveal` on it) and use `${env:VAR}` in `connector_properties` or a plugin's `config`:
+Without authentication, any client that reaches a worker's port 8083 can read every connector's config, including the credentials in it, and create, change or delete connectors. To require basic auth, put one `username: password` line per user in an **opaque** secret and name it in `rest_auth_secret`:
+
+```bash
+cat > connect-rest-users.properties <<'EOF'
+admin: THE_ADMIN_PASSWORD
+kafka-ui: THE_KAFKA_UI_PASSWORD
+EOF
+cpln secret create-opaque --name my-connect-rest-users --encoding plain -f connect-rest-users.properties
+```
+
+```yaml
+kafka_connectors:
+  - name: cluster
+    rest_auth_secret: my-connect-rest-users # "" = no authentication; required when secrets is set
+```
+
+- The chart enables Kafka's `BasicAuthSecurityRestExtension`. Every request then needs basic auth, including `GET /`; a missing or wrong password gets `401`.
+- The chart's own connector setup logs in as the **first** user in the file. For every user: one line each, ASCII only (Kafka reads the file as ISO-8859-1), no spaces in the username, and no `\` (a trailing one joins the next line onto the password). Do not add roles: everything after `:` is the password.
+- Other REST clients need credentials too. For Kafbat UI, add `username` and `password` to the `kafkaConnect` entry in its configuration secret:
+
+  ```text
+  kafka:
+    clusters:
+      - name: my-cluster
+        kafkaConnect:
+          - name: cluster
+            address: http://RELEASE_NAME-connect-cluster.GVC_NAME.cpln.local:8083
+            username: kafka-ui
+            password: THE_KAFKA_UI_PASSWORD
+  ```
+
+- Workers read the users file once at start. After you change the secret, run `cpln workload force-redeployment RELEASE_NAME-connect-cluster --gvc GVC_NAME`.
+- Requests between workers keep working: a request forwarded to the leader carries the caller's credentials, and Kafka signs its internal task requests under the default `connect.protocol=sessioned`.
+- With `rest_auth_secret` set, the chart refuses these worker properties: `rest.extension.classes` (the secret sets it), a `connect.protocol` other than `sessioned` (the other protocols leave the workers' internal endpoints open), and a non-empty `admin.listeners` (the admin listener has no authentication). It also refuses `java.security.auth.login.config` in a `KAFKA_OPTS` environment variable: put the Kafka client login in `sasl.jaas.config`.
+
+#### Connector Credentials
+
+List Control Plane secrets under `secrets` and the chart mounts each one on the Kafka Connect workers under `/opt/kafka/secrets` and turns on Kafka's `dir` config provider. Worker properties and plugin configs then read a value with a placeholder, and the connector configs in the REST API, Kafbat UI and Connect's config topic show only the placeholder.
+
+| Secret type | Mounted as | Placeholder |
+|---|---|---|
+| dictionary | a directory, one file per key | `${dir:/opt/kafka/secrets/NAME:KEY}` |
+| opaque | one file | `${dir:/opt/kafka/secrets:NAME}` |
+
+```yaml
+kafka_connectors:
+  - name: cluster
+    rest_auth_secret: my-connect-rest-users # required with secrets
+    secrets:
+      - name: my-connector-credentials
+      - name: my-keystore-password
+    connector_properties:
+      sasl.jaas.config: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"${dir:/opt/kafka/secrets/my-connector-credentials:kafka-admin-password}\";"
+    plugins:
+      - name: clickhouse-sink
+        config:
+          "password": "${dir:/opt/kafka/secrets/my-connector-credentials:clickhouse-password}"
+          "ssl.truststore.password": "${dir:/opt/kafka/secrets:my-keystore-password}"
+```
+
+In a plugin's `config`, quote with single quotes (`username='admin' password='${dir:...}'`): plugin values are placed into the connector's JSON as they are, and a double quote breaks it.
+
+Create the secrets before you install. A value must not end with a newline, because Kafka passes it on as part of the value:
+
+```bash
+cpln secret create-dictionary --name my-connector-credentials \
+  --entry kafka-admin-password=THE_KAFKA_PASSWORD --entry clickhouse-password=THE_CLICKHOUSE_PASSWORD
+printf '%s' 'THE_KEYSTORE_PASSWORD' | cpln secret create-opaque --name my-keystore-password --encoding plain -f -
+```
+
+**From AWS Secrets Manager (or any provider of the [ESS template](/template-catalog/templates/ess)):** let ESS keep the Control Plane secret in sync. A JSON secret becomes a dictionary with `dictionaryFromJson`; nested JSON keys use dots (`db.host`), and a value that is not a JSON object lands under the key `__raw`:
+
+```yaml
+# ESS sync.yaml excerpt
+secrets:
+  - name: my-connector-credentials
+    provider: my-aws-secrets-manager
+    dictionaryFromJson: /prod/kafka-connect # {"kafka-admin-password": "...", "clickhouse-password": "..."}
+```
+
+- **Moving from literal values:** create the secret, add it to `secrets`, replace each literal with its placeholder, upgrade, then run `cpln workload force-redeployment RELEASE_NAME-connect-cluster --gvc GVC_NAME`. `GET /connectors/CONNECTOR/config` (with REST credentials) then shows `${dir:...}`. Rotate the old credential at its source: it stays in the Helm release history and in Connect's config topic.
+- **Changing a value:** update the secret (or let ESS sync it), then run `cpln workload force-redeployment RELEASE_NAME-connect-cluster --gvc GVC_NAME`. Running workers keep the value they read at start; the redeployment restarts them one at a time and they read the new one. A `helm upgrade` that changes the worker properties, the plugin configs or the plugin downloads restarts the workers by itself.
+- **Every reference is checked at start.** A key the secret does not have, or the wrong placeholder form (a dictionary read as opaque, or the reverse), would otherwise pass the placeholder text on as the value. A connector with a bad reference is not created or updated, and the `kafka-connect` log names the secret, the key and the keys the secret has (never a value). In a worker property it stops the worker with `FATAL`.
+- **A placeholder** naming a secret that is not in `secrets`, one without a key or secret name, or a path outside `/opt/kafka/secrets` is refused when you install or upgrade.
+- **A secret that does not exist** keeps the new replica from starting and `cpln logs` shows nothing; see [Troubleshooting](#troubleshooting).
+
+<Warning>
+`rest_auth_secret` is required with `secrets` and must not itself be listed in `secrets`. **Every REST API user can read every mounted secret**, for example by creating a connector or by validating a config. Give REST credentials only to people who may see all of them.
+</Warning>
+
+- **Kafka prints the resolved value of every setting that is not a password type in the worker log** (for example `client.id`, or a connector's own string settings), so anyone who can read the workload's logs sees it. Use placeholders only in password settings (`sasl.jaas.config`, `*.password`).
+- A connector that derives a value from a secret may store the derived value in its task config.
+- **Kafka 3.8 or later is required.** The `dir` provider's path limit needs it (`apache/kafka:3.9.1` qualifies). With `secrets`, an image whose tag shows an older version is refused at install or upgrade. Whatever the tag, a worker with `secrets` or a file or directory config provider reads its Kafka version at start and stops with `FATAL` if it is older than 3.8 or cannot be read.
+
+**The `${env:VAR}` alternative.** Add an `env` entry that references the secret (the chart grants the worker `reveal` on it) and use `${env:VAR}` in `connector_properties` or a plugin's `config`:
 
 ```yaml
 kafka_connectors:
@@ -524,7 +621,17 @@ kafka_connectors:
       sasl.jaas.config: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"${env:CONNECT_ADMIN_PASSWORD}\";"
 ```
 
-In a plugin's `config`, write values with single quotes instead (`username='admin' password='${env:VAR}'`): plugin values are placed into the connector's JSON as they are, and a double quote breaks it.
+The chart limits every `env` config provider of the worker with `allowlist.pattern=(?!CPLN_).*`, so `${env:CPLN_...}` never resolves (`CPLN_TOKEN` is the workload's Control Plane API token). Every other variable still resolves. Setting `config.providers.*.param.allowlist.pattern` yourself is refused, because a pattern can always be written to reopen `CPLN_`.
+
+#### Kafka Connect Hardening
+
+Every Kafka Connect group gets these limits, with or without `rest_auth_secret` and `secrets`:
+
+- **Connectors cannot load config providers of their own.** The workers start with `-Dorg.apache.kafka.automatic.config.providers=none`, so a connector config that declares `config.providers` for the clients it configures (`producer.override.*`, `consumer.override.*`, `admin.override.*`, or MirrorMaker's `source.*` and `target.*`) fails with `... is not allowed`. Declare providers in `connector_properties` instead; the worker's own providers (`dir`, and any you list there) keep working.
+- **File and directory providers are path-limited.** The `dir` provider reads only under `/opt/kafka/secrets` (`allowed.paths`); the chart sets it and refuses `config.providers.dir.*` in `connector_properties`. A `FileConfigProvider` or `DirectoryConfigProvider` you add yourself is limited to `/opt/kafka/secrets` and the `extraVolumes` paths, and `config.providers.*.param.allowed.paths` is refused.
+- **`key.converter` and `value.converter` are required** in `connector_properties`; the chart refuses a group without them, because its workers would not start.
+- **Some worker property syntax is refused.** Property names cannot hold spaces, `\`, `=` or `:`, and values cannot hold a line break, a `\u` escape, a `\` next to `${` (`$\{`, `\{`) or a trailing `\` (nor any `\` in a `config.providers*` value): the worker reads its properties file with Java's escape rules, so these would reach it as a different property.
+- **Config changes restart the workers.** A checksum tag on the Connect workload follows the worker properties, plugin configs and plugin downloads, so a `helm upgrade` that changes any of them restarts the workers by itself. A changed secret value still needs `cpln workload force-redeployment`.
 
 #### Kafka Connect Plugins
 
@@ -580,7 +687,7 @@ kafka_client: # Kafka CLI tools for testing from inside the GVC; set the whole b
 | Kafka public listener | `<replica>-<location>.<publicAddress>:<containerPort>` per broker (direct replica routing) or `<publicAddress>:3000`, `:3001`, … (multi-port) | `security.protocol=SASL_SSL`; users from the public listener's `sasl.users` |
 | Kafbat UI | `status.canonicalEndpoint` of `RELEASE_NAME-kafbat-ui`, or `kafbat_ui.domain` | Login from `spring.security.user` in your configuration secret |
 | REST Proxy | `status.canonicalEndpoint` of `RELEASE_NAME-rest-proxy`, `kafka_rest_proxy.domain`, or `RELEASE_NAME-rest-proxy.GVC_NAME.cpln.local:8082` inside the GVC | HTTP BASIC auth with a user from `kafka_rest_proxy.password_properties_secret` (or `password_properties`) |
-| Kafka Connect REST API | `RELEASE_NAME-connect-<name>.GVC_NAME.cpln.local:8083` inside the GVC | Standard Connect REST API |
+| Kafka Connect REST API | `RELEASE_NAME-connect-<name>.GVC_NAME.cpln.local:8083` inside the GVC | Standard Connect REST API; with `rest_auth_secret` set, every request needs basic auth with a user from that secret |
 | Stored credentials | `cpln secret reveal my-kafka-credentials -o yaml` | The passwords, when `kafka.credentialsSecretName` is set. With inline passwords, `cpln secret reveal RELEASE_NAME-secrets -o yaml` holds them and the KRaft cluster ID |
 
 Read a canonical endpoint from the workload:
@@ -682,6 +789,15 @@ Since 3.0.0 the chart only supports Apache Kafka images. A values file that stil
 
 4.4.0 adds the option to read every credential from a secret; inline passwords keep working unchanged, so nothing in your values has to change. To move a running cluster to the secret, put the passwords the cluster uses today in the credentials secret (see [Prerequisites](#prerequisites)), then upgrade with `kafka.credentialsSecretName` set. The brokers restart once. Move the REST Proxy JAAS file and BASIC-auth users the same way with `kafka_rest_proxy.jaas_conf_secret` and `password_properties_secret`.
 
+### Upgrading from 4.4.x
+
+4.5.0 adds `rest_auth_secret` (Kafka Connect REST API basic auth) and 4.5.1 adds `kafka_connectors[].secrets` (connector credentials from secrets). Both are off until you set them, so your values keep working unchanged. The bullets below also apply when upgrading from 4.5.0, since the hardening is new in 4.5.1.
+
+- The upgrade restarts every Kafka Connect replica once, and the brokers.
+- Without `secrets`, a worker is configured as before, except for the [hardening](#kafka-connect-hardening) every Connect group now gets: connectors cannot declare config providers of their own, and `key.converter` and `value.converter` must be set in `connector_properties`. If a connector config declares `config.providers` for its clients, move the provider into `connector_properties` before upgrading.
+- Earlier versions do not have this hardening; if you run Kafka Connect, use 4.5.1.
+- To turn on REST API authentication or connector secrets on a running release, create the secrets first (see [Prerequisites](#prerequisites)), add `rest_auth_secret` and `secrets` to your values, and upgrade. Move literal credentials as described under [Connector Credentials](#connector-credentials).
+
 ### Scaling and Availability
 
 - `kafka.replicas` accepts 1, 3, 4 or 5. Rendering fails with `Invalid value for kafka.replicas. It must be less than or equal to 5 and not equal to 2.` otherwise. Every broker is also a KRaft controller, so never shrink a running cluster below the number of controllers it was formed with — the quorum is lost and the cluster stops.
@@ -744,6 +860,21 @@ cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cluster"} |= "ERROR"' --limit
 
     **Fix:** fix any URL or checksum named in an `ERROR download failed` or `ERROR sha256 mismatch` line. For large artifacts, raise `downloader_cpu` to `250m` or raise `plugins_wait_timeout_seconds`; use `plugins_wait_timeout_action: restart` if Kafka Connect must never run without a plugin. Once the download succeeds, the downloader logs `all artifacts are now installed; Kafka Connect started without some of them, so restart the worker (cpln workload force-redeployment) to load them.` Then run `cpln workload force-redeployment RELEASE_NAME-connect-cluster --gvc GVC_NAME`. Restarting only the `kafka-connect` container does not wait again and does not clean up; a redeployment does both.
   </Accordion>
+  <Accordion title="A Kafka Connect replica never starts and cpln logs shows nothing">
+    **Cause:** a secret named in `rest_auth_secret` or `secrets` does not exist. The container never starts, so there is no log output.
+
+    **Fix:** read `status.versions[].message` from `cpln workload get-deployments RELEASE_NAME-connect-cluster --gvc GVC_NAME -o yaml`; it names the missing secret and says workload updates are paused until it is added. Create the secret and the deployment continues.
+  </Accordion>
+  <Accordion title="A connector is not created and the log names a secret and a key">
+    **Cause:** a `${dir:...}` placeholder names a key the secret does not have, or uses the wrong form (a dictionary read as opaque, or the reverse).
+
+    **Fix:** the `kafka-connect` log names the secret, the key and the keys the secret has (never a value). Use `${dir:/opt/kafka/secrets/NAME:KEY}` for a dictionary secret and `${dir:/opt/kafka/secrets:NAME}` for an opaque one, then upgrade.
+  </Accordion>
+  <Accordion title="A connector config is rejected with is not allowed">
+    **Cause:** the connector config declares `config.providers` for its own clients (`*.override.*`, MirrorMaker `source.*` or `target.*`); connectors cannot load providers of their own.
+
+    **Fix:** declare the provider in the group's `connector_properties` and reference it from the connector.
+  </Accordion>
   <Accordion title="A connector is FAILED with Failed to find any class">
     **Cause:** its plugin arrived after Kafka Connect scanned the plugins folder. Restarting the connector through the REST API does not rescan the folder.
 
@@ -770,6 +901,12 @@ cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cluster"} |= "ERROR"' --limit
 - Only set `KAFKA_LOG4J_ROOT_LOGLEVEL` in `kafka.env` on `apache/kafka:3.x` images; on a 4.x image it removes every output from the root logger, including `cpln logs`.
 - `kafka_ui` (Provectus Kafka UI) is deprecated and off by default; use `kafbat_ui`.
 - Changing broker values restarts the brokers; schedule upgrades accordingly.
+- Set `rest_auth_secret` on every Kafka Connect group: without it any client that reaches port 8083 can read connector configs and credentials. It is required when `secrets` is set.
+- Every Kafka Connect REST API user can read every mounted connector secret; give REST credentials only to people who may see all of them.
+- After changing a secret a connector or the REST API reads, run `cpln workload force-redeployment` on its Connect workload; running workers keep the value they read at start.
+- Connector secrets need a Kafka 3.8 or later image (`apache/kafka:3.9.1` is). Use placeholders only in password settings, because Kafka prints the resolved value of every other setting in the worker log.
+- Every Kafka Connect group must set `key.converter` and `value.converter`, and connectors cannot declare config providers of their own.
+- `${env:CPLN_...}` never resolves in a Connect worker, and a `config.providers.*.param.allowlist.pattern` of your own is refused.
 - Set `sha256` on every Kafka Connect plugin artifact: the plugin downloader does not verify TLS certificates.
 
 ## External References
