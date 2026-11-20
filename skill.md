@@ -579,6 +579,7 @@ cpln logs '{gvc="GVC", workload="WL"}' --org ORG --tail
 - **`--gvc` is NOT a flag here** — GVC goes inside the LogQL query.
 - Range flags: `--since "1h"`, `--from`, `--to` (ISO 8601, duration, or `now-<duration>`); `--limit N` (default 30, `0` = unlimited).
 - **Cron logs**: each run is a separate replica. Enumerate runs via `cpln workload get-deployments NAME --gvc GVC -o json` → `status.jobExecutions[]`, then scope logs by the `replica` label and run's time window.
+- **Retention**: logs, metrics, and traces default to 30 days each, set independently on the org via `spec.observability.logsRetentionDays` / `metricsRetentionDays` / `tracesRetentionDays`. **Maximum is 730 days (2 years) for each.** For longer log retention, use external logging.
 
 ## Operational notes
 
