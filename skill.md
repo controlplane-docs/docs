@@ -512,6 +512,8 @@ Dedicated LB on the GVC (`spec.loadBalancer.dedicated: true`) unlocks: domain po
 
 Direct and dedicated load balancers are billed at the dedicated load balancer rate on controlplane.com/pricing, on top of CPU, memory, and egress. A GVC is charged for only one load balancer per location: that one charge covers every direct load balancer on its workloads in that location, and the GVC's dedicated load balancer if it is enabled. Only Direct carries UDP.
 
+**IP Sets are ingress only.** Outbound traffic leaves through the NAT gateway IPs of the workload's location (`status.ipRanges`: `cpln location get LOCATION -o yaml`), shared by all workloads there and very stable. Allowlist those; pin the GVC to one location to shorten the list. A single fixed egress IP requires a BYOK or mk8s cluster with a static NAT IP (extra cost).
+
 ## Policies
 
 Bind principals to permissions on resources. Wrong target kind, link format, or permission name all silently fail.
