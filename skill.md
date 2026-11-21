@@ -512,6 +512,8 @@ Dedicated LB on the GVC (`spec.loadBalancer.dedicated: true`) unlocks: domain po
 
 Direct and dedicated load balancers are billed at the dedicated load balancer rate on controlplane.com/pricing, on top of CPU, memory, and egress. A GVC is charged for only one load balancer per location: that one charge covers every direct load balancer on its workloads in that location, and the GVC's dedicated load balancer if it is enabled. Only Direct carries UDP.
 
+**IP Sets are ingress only.** Outbound traffic leaves through the NAT gateway IPs of the workload's location (`status.ipRanges`: `cpln location get LOCATION -o yaml`), shared by all workloads there and very stable. Allowlist those; pin the GVC to one location to shorten the list. A single fixed egress IP requires a BYOK or mk8s cluster with a static NAT IP (extra cost).
+
 ## Policies
 
 Bind principals to permissions on resources. Wrong target kind, link format, or permission name all silently fail.
@@ -579,6 +581,7 @@ cpln logs '{gvc="GVC", workload="WL"}' --org ORG --tail
 - **`--gvc` is NOT a flag here** — GVC goes inside the LogQL query.
 - Range flags: `--since "1h"`, `--from`, `--to` (ISO 8601, duration, or `now-<duration>`); `--limit N` (default 30, `0` = unlimited).
 - **Cron logs**: each run is a separate replica. Enumerate runs via `cpln workload get-deployments NAME --gvc GVC -o json` → `status.jobExecutions[]`, then scope logs by the `replica` label and run's time window.
+- **Retention**: logs, metrics, and traces default to 30 days each, set independently on the org via `spec.observability.logsRetentionDays` / `metricsRetentionDays` / `tracesRetentionDays`. **Maximum is 730 days (2 years) for each.** For longer log retention, use external logging.
 
 ## Operational notes
 
