@@ -261,6 +261,8 @@ Reference syntax in env vars / volumes:
 | `aws`        | `cpln://secret/NAME.accessKey` / `.secretKey` / `.roleArn`              |
 | `gcp`        | `cpln://secret/NAME` (typically a volume mount — JSON file)             |
 
+**Whole dictionary as env vars**: `envFrom: [{secretRef: {name: DICT_SECRET}}]` on a container injects every key as an env var (dictionary secrets only; `env` entries win over `envFrom` keys). Needs the same identity + `reveal` policy.
+
 **Injection methods**: env var (`cpln://secret/NAME...`), volume mount (large/multi-file/GCP JSON), or **pull secret at GVC level** (`spec.pullSecretLinks` — `docker`, `ecr`, `gcp` types only).
 
 **Updating a secret value**: only a `dictionary` secret mounted as a directory (`uri: cpln://secret/NAME`, no `.KEY`) refreshes in the running container (within about 10 minutes, and the app must re-read the files). Everything else needs `cpln workload force-redeployment`.
