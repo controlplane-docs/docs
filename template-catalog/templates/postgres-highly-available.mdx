@@ -1,13 +1,13 @@
 ---
 title: PostgreSQL Highly Available
 icon: /template-catalog/templates/icons/postgresql.png
-description: Patroni-managed PostgreSQL 17 cluster with etcd consensus, automatic failover and an HAProxy leader endpoint in one location, plus optional PgBouncer pooling and logical or WAL-G backups to S3, GCS or MinIO. Deploys into an existing GVC and needs a dictionary credentials secret created first.
+description: Patroni-managed PostgreSQL 18 cluster with etcd consensus, automatic failover, optional synchronous replication and an HAProxy leader endpoint in one location, plus optional PgBouncer and logical or WAL-G backups. Deploys into an existing GVC and needs a dictionary credentials secret created first.
 keywords: ['pg ha', 'postgres ha', 'postgres cluster', 'streaming replication', 'leader election', 'rds alternative', 'aurora alternative', 'connection pooler', 'point-in-time recovery', 'patronictl', 'pg_dumpall', 'primary replica', 'database template']
 ---
 
 ## Overview
 
-PostgreSQL Highly Available deploys a multi-member PostgreSQL 17 cluster in one location. [Patroni](https://patroni.readthedocs.io/) manages the members, elects a leader and fails over automatically when the leader is lost; a dedicated [etcd](/template-catalog/templates/etcd) cluster holds the consensus state. An HAProxy workload gives applications one stable address that always routes to the current leader, and an optional PgBouncer in front of it pools connections. Backups are optional, in two modes: scheduled `pg_dumpall` dumps, or continuous WAL archiving with [WAL-G](https://github.com/wal-g/wal-g).
+PostgreSQL Highly Available deploys a multi-member PostgreSQL 18 cluster in one location. Clusters created by an earlier version keep the PostgreSQL major they were created with; see [Upgrading From 2.x](#upgrading-from-2-x). [Patroni](https://patroni.readthedocs.io/) manages the members, elects a leader and fails over automatically when the leader is lost; a dedicated [etcd](/template-catalog/templates/etcd) cluster holds the consensus state. An HAProxy workload gives applications one stable address that always routes to the current leader, and an optional PgBouncer in front of it pools connections. Backups are optional, in two modes: scheduled `pg_dumpall` dumps, or continuous WAL archiving with [WAL-G](https://github.com/wal-g/wal-g).
 
 Database credentials are **not** template values. The cluster reads its username, password and database name from a [dictionary secret](/guides/create-secret/dictionary) you create before installing, so no password passes through Helm or lands in the release. The template creates no credential secret of its own.
 
@@ -19,7 +19,7 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 
 | Resource | Name | Purpose | Optional |
 |---|---|---|---|
-| Workload | `RELEASE_NAME-postgres-ha` | Patroni-managed PostgreSQL 17 members (stateful, `replicas` replicas, TCP `5432`, Patroni REST API `8008`); container `patroni-postgres` | — |
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni-managed PostgreSQL members (18 for new clusters) (stateful, `replicas` replicas, TCP `5432`, Patroni REST API `8008`); container `patroni-postgres` | — |
 | Workload | `RELEASE_NAME-etcd` | Consensus store for leader election (stateful, `etcd.replicas` replicas, TCP `2379`/`2380`); container `etcd` | — |
 | Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy routing TCP `5432` to the current leader; health on `8404`, stats on `8405`; container `haproxy` | `proxy.enabled: true` (default), forced on by `pgbouncer.enabled: true` |
 | Workload | `RELEASE_NAME-pgbouncer` | PgBouncer connection pooler in front of HAProxy (TCP `5432`); container `pgbouncer` | `pgbouncer.enabled: true` |
@@ -78,7 +78,7 @@ Install the chart from the marketplace registry, pointing it at the secret you c
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/postgres-highly-available \
-  --version 2.8.1 --gvc GVC_NAME \
+  --version 3.0.0 --gvc GVC_NAME \
   --set config.credentialsSecretName=CREDENTIALS_SECRET_NAME
 ```
 
@@ -123,17 +123,71 @@ resources:
 
 # Patroni's Prometheus metrics are scraped by the platform automatically on the
 # REST API port — no knob, no exporter. See "Cluster metrics" in the README.
-image: controlplanecorporation/patroni-postgres:0.8 # pgvector 0.8.7; tags 0.1-0.7 are refused
+image: controlplanecorporation/patroni-postgres:0.9 # PostgreSQL 18 for new clusters (bundles 14-18); tags 0.1-0.7 are refused (CVE-2026-103484)
 
 multiZone: false
 ```
 
 - `replicas` — Number of PostgreSQL members. Keep at least 3 for a cluster that survives the loss of one member; one member is the leader and accepts writes, the others stream from it.
+- `image` — Bundles PostgreSQL 14 to 18. Each member runs the PostgreSQL major of its own data directory, so a new cluster starts on 18 and an existing one stays on the major it was created with. A custom `image` must include that major.
 - `multiZone` — Spread the members across availability zones within the location, when the location supports it.
 
 <Note>
 On a stateful workload the ratio of `maxCpu` to `minCpu` may not exceed 4:1. Raising `maxCpu` without raising `minCpu` can cross that limit and is rejected when the workload is applied.
 </Note>
+
+### Synchronous Replication
+
+By default replication is asynchronous: the leader acknowledges a commit as soon as it has written it, so if it fails at that moment the replica that takes over may be missing the last few acknowledged transactions. Synchronous replication closes that gap.
+
+```yaml
+synchronous: # see Synchronous Replication
+  enabled: false
+  nodeCount: 1 # replicas each commit waits for; must be lower than replicas
+  strict: false # true: when no replica is in sync, writes wait instead of continuing without one (needs enabled)
+```
+
+With `enabled: true`, Patroni names `nodeCount` replicas as synchronous standbys and the leader acknowledges a commit only after they have written it. Patroni fails over or switches over only to a synchronous standby, so a failover loses no acknowledged transaction. Each commit takes one network round trip to the standby longer. `nodeCount` must be at least 1 and lower than `replicas`, because the leader is not one of them; with 3 members, `nodeCount: 2` makes every commit wait for both replicas. `strict` requires `enabled: true`.
+
+When a synchronous standby stops answering, commits wait until Patroni replaces it:
+
+- **`strict: false` (default):** Patroni names another replica or, when none is left, turns synchronous replication off until one catches up. Writes continue, but while no replica is synchronous a failover can lose acknowledged transactions.
+- **`strict: true`:** the leader never acknowledges a commit alone. When no replica is in sync, writes wait until one is back. Choose it when losing a transaction is worse than stopping writes.
+
+A client that gives up on a commit waiting for a standby does not undo it: the transaction is already written on the leader and becomes visible once the wait ends.
+
+The setting applies to a running cluster: change it in your values and upgrade, and the members restart one at a time. The chart's value replaces a synchronous setting changed with `patronictl edit-config`. `patronictl list` shows the synchronous standbys as `Sync Standby`; see [Checking Cluster State](#checking-cluster-state).
+
+### WAL Level and Logical Replication
+
+```yaml
+# replica, or logical for logical replication / CDC (Debezium). Applied when the cluster is created.
+walLevel: replica
+```
+
+`replica` is all that streaming replication between the members needs. `logical` additionally lets a client such as Debezium read row changes through a logical replication slot; any other value is refused at render. With `logical`, the cluster leaves logical slots alone (`ignore_slots`), so Patroni does not drop an inactive slot after a restart, and the replicas synchronize failover slots.
+
+`wal_level` is shared cluster configuration that is written once, when the cluster is created. **Changing `walLevel` on an existing release does not change `wal_level`.** To change a running cluster, patch the shared configuration, wait until every member shows `*` in the Pending restart column, then restart them. PostgreSQL restarts in place on each member, so expect a short write outage while the leader restarts:
+
+```bash
+cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --container patroni-postgres \
+  -- curl -s -XPATCH -d '{"postgresql":{"parameters":{"wal_level":"logical"}},"ignore_slots":[{"type":"logical"}]}' localhost:8008/config
+cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --container patroni-postgres \
+  -- patronictl -c /tmp/patroni_config.yml list
+cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --container patroni-postgres \
+  -- patronictl -c /tmp/patroni_config.yml restart RELEASE_NAME --pending --force
+```
+
+Then set `walLevel` to the same value in your values and upgrade the release, which turns slot synchronization on and restarts the members one at a time. Keep this order: upgrading with `walLevel: logical` before the cluster runs `wal_level = logical` crash-loops the first replica that restarts until you patch.
+
+A logical slot retains WAL like the members' own slots, under the same cap: a consumer that stays away past `max_slot_wal_keep_size` has its slot invalidated and must start over. The cluster allows 10 replication slots and 10 WAL senders.
+
+**Logical slots across a leader change.** A client that creates its slot as a PostgreSQL 17+ failover slot (Debezium's `slot.failover`) keeps its position across a switchover: every replica holds a synchronized copy (`synced = true` in `pg_replication_slots`), so the client resumes without missing changes, though changes can be delivered twice. A slot created without failover exists only on the leader, and the client must create a new one after a leader change. A member that stops being the leader drops its non-synchronized logical slots shortly after it runs as a replica, so do not create logical slots on a replica. Check a member:
+
+```bash
+cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --container patroni-postgres \
+  -- psql -h 127.0.0.1 -d postgres -c 'SELECT slot_name, failover, synced, active FROM pg_replication_slots'
+```
 
 ### Credentials
 
@@ -282,6 +336,8 @@ PgBouncer autoscales on requests per second between `minReplicas` and `maxReplic
 
 Two modes share the same provider settings. `logical` runs a cron workload that dumps every database and role with `pg_dumpall` through HAProxy; `wal-g` adds a sidecar to each member that archives WAL continuously and takes a base backup from the leader every `backup.walg.intervalSeconds`. Each provider's bucket, cloud account and policy steps are under [Backing Up](#backing-up).
 
+The logical backup image runs `pg_dumpall`, which refuses a server newer than itself: the default `18.2.0` tag backs up PostgreSQL 17 and 18 clusters, while a `17.x.x` tag cannot back up a PostgreSQL 18 cluster.
+
 ```yaml
 backup:
   enabled: false
@@ -291,11 +347,18 @@ backup:
     memory: 512Mi # 128Mi OOMKills wal-g mid-backup (exitCode 137) and silently produces no base backup
 
   logical: # logical backup settings
-    image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0 # tag 17.1.0 = Postgres 17, 18.1.0 = Postgres 18
-    schedule: "0 2 * * *" # cron schedule, default isdaily at 2am UTC
+    image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.2.0 # backs up PostgreSQL 17 and 18 clusters
+    schedule: "0 2 * * *" # cron schedule, default is daily at 2am UTC
 
   walg: # wal-g backup settings
     intervalSeconds: 21600 # interval in seconds between backups, default is every 6 hours
+    # Create this cluster from another release's WAL-G backups instead of an empty database
+    # (see Restoring Backup). Applies only when the cluster is first created.
+    restore:
+      enabled: false
+      fromPrefix: "" # the backed-up release's prefix in the same bucket; must differ from this release's prefix
+      backupName: LATEST # a base backup name from `wal-g backup-list`, or LATEST
+      targetTime: "" # optional point in time to stop at, e.g. "2026-11-23 15:30:00+00"; empty replays all WAL
 
   # storage settings are applied to whichever mode is enabled
   provider: aws # Options: aws, gcp, or minio
@@ -323,8 +386,8 @@ backup:
 
 | Mode | What is written | Restores to |
 |------|-------------|---|
-| `logical` | One `postgres-TIMESTAMP.sql.gz` object per run of `backup.logical.schedule` | Any PostgreSQL 17 server, by replaying the SQL |
-| `wal-g` | Continuous WAL segments (`archive_timeout` 60 s, zstd) plus a base backup every `backup.walg.intervalSeconds` | An empty data directory, to the latest base backup or a point in time |
+| `logical` | One `postgres-TIMESTAMP.sql.gz` object per run of `backup.logical.schedule` | A PostgreSQL 17 or 18 server, by replaying the SQL |
+| `wal-g` | Continuous WAL segments (`archive_timeout` 60 s, zstd) plus a base backup every `backup.walg.intervalSeconds` | A new release, to a base backup or a point in time; see [Restoring Backup](#restoring-backup) |
 
 ## Connecting
 
@@ -453,7 +516,7 @@ Complete the steps for your provider before enabling backups.
 }
 ```
 
-4. Set `backup.aws.policyName` to that policy's name. The template attaches it to the workload identity together with `cpln-connector` and nothing else — the bucket in your policy is the only storage the backup containers can reach. Upgrading from `2.5.0` or earlier narrows this further; see [Upgrading From 2.5.0](#upgrading-from-2-5-0).
+4. Set `backup.aws.policyName` to that policy's name. The template attaches only this policy to the workload identity, so the bucket in your policy is the only storage the backup containers can reach. See [Upgrading From 2.5.0](#upgrading-from-2-5-0) if you upgrade from that version.
 
 #### GCS
 
@@ -520,15 +583,11 @@ mc ilm rule ls ALIAS/BUCKET_NAME
 
 Lifecycle rules run in the background; objects are removed within about a day of reaching the age. The `Noncurrent` parts matter only on a versioned bucket, where expiry otherwise just adds a delete marker.
 
-### Restoring a Backup
-
-<Note>
-Neither restore path has been rehearsed against this template. The `logical` commands are the standard way to replay a `pg_dumpall` script and match what the backup job writes; the `wal-g` outline follows the chart's configuration and WAL-G's documentation. Rehearse whichever you depend on against a scratch release before you need it.
-</Note>
+### Restoring Backup
 
 #### Logical
 
-Each backup is a gzip-compressed `pg_dumpall` script, so it is restored by connecting **through HAProxy** to the `postgres` maintenance database as the superuser from your credentials secret; the script recreates the roles and databases it contains, and HAProxy guarantees the writes land on the leader. Run the commands from a client that can reach both the bucket and the cluster — a workload inside the GVC, or your own machine with `cpln port-forward RELEASE_NAME-postgres-ha-proxy 5432:5432 --gvc GVC_NAME` open and `--host=127.0.0.1` in place of the internal hostname.
+Each backup is a gzip-compressed `pg_dumpall` script that restores into a PostgreSQL 17 or 18 cluster. Use `psql` 18, or 17.6 or later: dumps contain `\restrict` lines that older `psql` releases reject (the `patroni-postgres:0.9` image's `psql` qualifies). It is restored by connecting **through HAProxy** to the `postgres` maintenance database as the superuser from your credentials secret; the script recreates the roles and databases it contains, and HAProxy guarantees the writes land on the leader. Run the commands from a client that can reach both the bucket and the cluster — a workload inside the GVC, or your own machine with `cpln port-forward RELEASE_NAME-postgres-ha-proxy 5432:5432 --gvc GVC_NAME` open and `--host=127.0.0.1` in place of the internal hostname.
 
 <Tabs>
   <Tab title="AWS S3">
@@ -585,31 +644,52 @@ Each backup is a gzip-compressed `pg_dumpall` script, so it is restored by conne
 
 #### WAL-G
 
-WAL-G restores into an **empty** data directory, which this template has no automation for: a running member already has a data directory, and Patroni refuses to adopt a data directory whose system identifier does not match the cluster recorded in etcd. The procedure below is the shape of a manual restore. It is **unverified** on this template — treat it as an outline to rehearse, not a runbook.
+A WAL-G restore creates a new cluster from the backups: you install a second release that fetches a base backup from the old release's prefix, replays the WAL archived after it and promotes. The old release keeps running until you remove it.
 
-1. List the base backups and pick one (`LATEST` is also accepted by `backup-fetch`):
+1. List the base backups from any member of the backed-up release:
 
    ```bash
    cpln workload exec RELEASE_NAME-postgres-ha --gvc GVC_NAME --container wal-g-backup -- wal-g backup-list
    ```
 
-2. Install a **new** release of this template into the GVC with `backup.enabled: false`, and stop it before Patroni initializes — or run a one-off workload of your own using the same `image`, with a fresh volume set mounted at `/var/lib/postgresql/data` and the same `WALG_*`/`AWS_*` environment the sidecar has (compare `cpln workload get RELEASE_NAME-postgres-ha --gvc GVC_NAME -o yaml`).
+2. Install a new release with the same backup settings and the same `config.credentialsSecretName`, a **different** `prefix` for its own backups, and `backup.walg.restore` pointing at the old prefix:
 
-3. In that container, fetch the base backup into the empty `PGDATA` and configure recovery. The chart already sets `restore_command: wal-g wal-fetch %f %p`; for a point in time add `recovery_target_time`:
-
-   ```bash
-   wal-g backup-fetch /var/lib/postgresql/data/pgdata BACKUP_NAME
+   ```yaml
+   backup:
+     enabled: true
+     mode: wal-g
+     provider: aws
+     aws:
+       # bucket, region, cloudAccountName and policyName as on the old release
+       prefix: postgres/backups-restored # new backups go here
+     walg:
+       restore:
+         enabled: true
+         fromPrefix: postgres/backups # the old release's prefix
+         backupName: LATEST # or a name from step 1
+         targetTime: "" # optional, e.g. "2026-11-23 15:30:00+00"; empty replays all archived WAL
    ```
 
-4. Start PostgreSQL once on that data directory so it replays WAL to the target and finishes recovery, then point the new release's members at the recovered volume and let Patroni initialize a new cluster from it.
+   ```bash
+   cpln helm install NEW_RELEASE oci://ghcr.io/controlplane-com/templates/postgres-highly-available \
+     --version 3.0.0 --gvc GVC_NAME -f restore-values.yaml
+   ```
 
-5. **Change `backup.aws.prefix` (or the GCS / MinIO prefix) before re-enabling `wal-g` backups** on the restored cluster — it has a new system identifier and must not archive into the old cluster's prefix.
+   The first member restores and promotes, on the PostgreSQL major the backup was taken on; the others copy it from that member. The restore setting is used only when the cluster is created, so later upgrades of the new release ignore it.
 
-If you cannot rehearse this, rely on `logical` backups for recovery and treat `wal-g` as an archive.
+3. Wait for one leader and the other members streaming:
+
+   ```bash
+   cpln workload exec NEW_RELEASE-postgres-ha --gvc GVC_NAME --container patroni-postgres -- patronictl -c /tmp/patroni_config.yml list
+   ```
+
+4. Check the data, point applications at `NEW_RELEASE-postgres-ha-proxy.GVC_NAME.cpln.local`, and uninstall the old release when you no longer need it.
+
+Transactions committed after `targetTime`, or not yet archived when the backup stopped (WAL is archived at least every 60 seconds), are not in the restored cluster. Logical replication slots are not restored.
 
 ### Rotating the Password
 
-Patroni writes its configuration from the secret each time a member starts and applies the password to the database only when the cluster is first initialized. After that the stored passwords live in PostgreSQL, so a rotation touches three places, and the order matters. **This procedure has not been rehearsed on this template — practise it on a scratch release first.**
+Patroni writes its configuration from the secret each time a member starts and applies the password to the database only when the cluster is first initialized. After that the stored passwords live in PostgreSQL, so a rotation touches three places, and the order matters. Practise it on a scratch release first.
 
 1. Update the `password` key in your credentials secret to the new value — for example with `cpln apply -f` of the full secret manifest — so any member that restarts from now on reads the new one. Nothing running changes yet: workloads resolve a secret only when a replica starts.
 
@@ -675,7 +755,7 @@ postgres-highly-available: the `postgres` block was REMOVED in 2.5.0. `postgres.
 
 ### Upgrading From 2.5.0
 
-Template version `2.5.1` removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to every bucket in your AWS account and contains no write actions, so it never carried the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit. **Update your IAM policy to the full action list in [AWS S3](#aws-s3) before upgrading**; if it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only.
+Template version `2.5.1` removes `aws::ReadOnlyAccess` from the backup identity. That AWS managed policy granted read access to every bucket in your AWS account and contains no write actions, so it never carried the backup itself — but it *was* silently supplying any read action your own bucket-scoped policy happened to omit. **Update your IAM policy to the full action list in [AWS S3](#aws-s3) before upgrading**; if it already matches, no action is needed. The identity carries your bucket-scoped policy only.
 
 ### Upgrading From a Version Before 2.6.0
 
@@ -695,13 +775,59 @@ Also note that `failsafe_mode` is on for clusters created from `2.6.0`: when the
 
 ### Upgrading From 2.8.0 or Earlier
 
-Version 2.8.1 moves to `controlplanecorporation/patroni-postgres:0.8`, which carries pgvector 0.8.7. The fix is in the server library and takes effect when the upgrade restarts the members; existing data and indexes need nothing. If you pinned `image` in your values, set it to the `0.8` tag: tags `0.1` to `0.7` are refused at render.
+Version 2.8.1 moved to a `patroni-postgres` image that carries pgvector 0.8.7. The fix is in the server library and takes effect when the upgrade restarts the members; existing data and indexes need nothing. If you pinned `image` in your values, set it to the `0.9` tag (or `0.8`, which bundles PostgreSQL 13 to 17 and starts new clusters on 17): tags `0.1` to `0.7` are refused at render.
 
 In each database where you created the `vector` extension, `\dx` keeps reporting the old version until you run the following, which only updates that record:
 
 ```sql
 ALTER EXTENSION vector UPDATE;
 ```
+
+### Upgrading From 2.x
+
+New clusters run PostgreSQL 18, but an existing cluster keeps the PostgreSQL major it was created with (17). The `0.9` image bundles PostgreSQL 14 to 18 and each member runs the major of its data directory; a member with an empty volume that joins an existing cluster takes the major the running members report. The upgrade moves 17 clusters to the latest 17 minor release and changes the default logical backup image to the `18.2.0` tag, which backs up 17 clusters too. The upgrade also removes the `cpln-connector` policy from the backup identity, which a backup does not need; no action is required.
+
+To move an existing cluster to PostgreSQL 18, see [Upgrading an Existing Cluster to PostgreSQL 18](#upgrading-an-existing-cluster-to-postgresql-18).
+
+### Upgrading an Existing Cluster to PostgreSQL 18
+
+PostgreSQL cannot change major version in place inside a running Patroni cluster, so the move to 18 is a copy into a new release. Applications cannot write while the copy runs; plan a maintenance window about as long as a `pg_dumpall` of your data takes.
+
+<Steps>
+  <Step title="Install a second release">
+    Install a second release of this template (3.0.0 or later) in the same GVC with the same values as the old one and the same `config.credentialsSecretName`, but without a pinned `image` (or with the `0.9` tag): a new release on that image starts on PostgreSQL 18. If the old release has WAL-G backups, give the new one a different `backup.PROVIDER.prefix`.
+  </Step>
+  <Step title="Wait until the new release is ready">
+    One member is the leader and the others are streaming:
+
+    ```bash
+    cpln workload exec NEW_RELEASE-postgres-ha --gvc GVC_NAME --container patroni-postgres \
+      -- patronictl -c /tmp/patroni_config.yml list
+    ```
+  </Step>
+  <Step title="Stop the applications that write to the old cluster">
+    Suspend their workloads so nothing changes during the copy.
+  </Step>
+  <Step title="Copy everything with pg_dumpall">
+    Run it from inside the new release:
+
+    ```bash
+    cpln workload exec NEW_RELEASE-postgres-ha --gvc GVC_NAME --container patroni-postgres -- bash -c '
+      pg_dumpall -h OLD_RELEASE-postgres-ha-proxy.GVC_NAME.cpln.local -U "$PGUSER" \
+        | psql -h NEW_RELEASE-postgres-ha-proxy.GVC_NAME.cpln.local -U "$PGUSER" -d postgres -q'
+    ```
+
+    `psql` reports that the roles and the application database already exist, because the new release created them; those lines are expected and the data still loads.
+  </Step>
+  <Step title="Check the copy">
+    Compare the row counts of your main tables on both releases.
+  </Step>
+  <Step title="Switch applications and remove the old release">
+    Point applications at `NEW_RELEASE-postgres-ha-proxy.GVC_NAME.cpln.local` (or the new PgBouncer endpoint) and resume them. Uninstalling the old release deletes its volumes, so take a backup of it first if you want one to fall back on.
+  </Step>
+</Steps>
+
+`pg_dumpall` copies roles, databases and data, not replication slots. With `walLevel: logical`, a change data capture client such as Debezium creates its slot again on the new release and takes a new snapshot.
 
 ### Scaling and Availability
 
@@ -802,7 +928,9 @@ ALTER EXTENSION vector UPDATE;
 - **Do not change `etcd.tuning` to disable compaction** — an uncompacted etcd takes the whole cluster read-only months later.
 - **With `workload-list` access, list the release's own workloads** as well as your applications, or HAProxy cannot reach the members.
 - **Confirm a `wal-g` base backup exists** with `wal-g backup-list` before relying on that mode; WAL alone cannot be restored.
-- **Restore procedures are unverified on this template** — rehearse the one you depend on against a scratch release.
+- **A restore creates a new release**, for both modes: see [Restoring Backup](#restoring-backup).
+- **`walLevel` sets `wal_level` only when the cluster is created** — on an existing release follow [WAL Level and Logical Replication](#wal-level-and-logical-replication).
+- **An existing cluster stays on the PostgreSQL major it was created with**; moving to 18 is a copy into a new release, see [Upgrading an Existing Cluster to PostgreSQL 18](#upgrading-an-existing-cluster-to-postgresql-18).
 - **`cpln helm uninstall` deletes both volume sets** and the data with them. Your credentials secrets are yours and are left alone.
 - **Upgrading from 2.4.x is a breaking change** — the removed keys stop the upgrade rather than resetting a password. See [Upgrading From 2.4.x](#upgrading-from-2-4-x).
 
@@ -812,8 +940,8 @@ ALTER EXTENSION vector UPDATE;
     <Card title="Patroni Documentation" icon="book" href="https://patroni.readthedocs.io/">
     Patroni configuration, REST API and `patronictl` reference
     </Card>
-    <Card title="PostgreSQL Documentation" icon="database" href="https://www.postgresql.org/docs/17/">
-    Official PostgreSQL 17 documentation
+    <Card title="PostgreSQL Documentation" icon="database" href="https://www.postgresql.org/docs/18/">
+    Official PostgreSQL 18 documentation
     </Card>
     <Card title="WAL-G for PostgreSQL" icon="github" href="https://github.com/wal-g/wal-g/blob/master/docs/PostgreSQL.md">
     WAL-G commands, storage variables and restore guidance
