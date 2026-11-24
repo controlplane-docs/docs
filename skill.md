@@ -241,7 +241,7 @@ Stateful provisioning, large image pushes, mk8s creation, GVC location adds — 
 | `metric`/`multi`/`target` | `metric` and `multi` are mutually exclusive; `target` is mutually exclusive with `multi` |
 | `replicaDirect` LB        | Stateful only                                                                            |
 
-**Defaults**: `type=serverless`, `cpu=50m`, `memory=128Mi`, `autoscaling.target=95`, `minScale=1`, `maxScale=5`, `scaleToZeroDelay=300s`, `terminationGracePeriodSeconds=90`, `firewallConfig.internal.inboundAllowType=none`.
+**Defaults**: `type=serverless`, `cpu=50m`, `memory=128Mi`, `autoscaling.target=95`, `minScale=1`, `maxScale=5`, `scaleToZeroDelay=300s`, `terminationGracePeriodSeconds=90`, `firewallConfig.internal.inboundAllowType=none`. With no `autoscaling.metric` or `autoscaling.multi` set, the default metric is `concurrency` for Serverless, `cpu` for Stateful, `cpu` for Standard (`disabled` when Capacity AI is enabled), `disabled` for VM, and not applicable for Cron.
 
 For full validation (Stateful min/max ratios, GPU constraints — nvidia t4/a10g, container name reservations, probe XOR rules, health-check timing ranges), fetch [/reference/workload/general](https://docs.controlplane.com/reference/workload/general).
 
