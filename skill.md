@@ -261,6 +261,8 @@ Reference syntax in env vars / volumes:
 | `aws`        | `cpln://secret/NAME.accessKey` / `.secretKey` / `.roleArn`              |
 | `gcp`        | `cpln://secret/NAME` (typically a volume mount — JSON file)             |
 
+**Whole dictionary as env vars**: `envFrom: [{secretRef: {name: DICT_SECRET}}]` on a container injects every key as an env var (dictionary secrets only; `env` entries win over `envFrom` keys). Needs the same identity + `reveal` policy.
+
 **Injection methods**: env var (`cpln://secret/NAME...`), volume mount (large/multi-file/GCP JSON), or **pull secret at GVC level** (`spec.pullSecretLinks` — `docker`, `ecr`, `gcp` types only).
 
 **Updating a secret value**: only a `dictionary` secret mounted as a directory (`uri: cpln://secret/NAME`, no `.KEY`) refreshes in the running container (within about 10 minutes, and the app must re-read the files). Everything else needs `cpln workload force-redeployment`.
@@ -329,7 +331,7 @@ Resource commands: `cpln <resource> <action> [REF] [--flags]`. Standalone comman
 | **location**       | org   | Partial                   | `install`, `uninstall`                                                                                                                        |
 | **auditctx**       | org   | Full (no delete)          | —                                                                                                                                             |
 | **quota**          | org   | get, edit, patch          | —                                                                                                                                             |
-| **sandbox** | org (finds the org's sandbox GVC itself; do not pass `--gvc`) | `create [--type dev\|worker] [--image //sandboximage/NAME]`, `get` (no args = list; `--type dev\|worker` filters), `delete`, `edit`, `update --set`, `patch`, `tag` (no `list`, no `clone`) | `connect [--ide vscode\|cursor\|ssh\|browser\|terminal] [--local-port N] [--print-url]`, `stop` / `start` (suspend / resume), `eventlog`, `audit`, `access-report`, `permissions`, `session` (create/get/exec/connect/preview/logs/metrics/processes/signal/delete; the session ID is positional, the sandbox is `--sandbox REF`, omit it for the GVC route). Files: `cpln cp SRC DEST --session ID`. Needs a current CLI: check `cpln sandbox --help` |
+| **sandbox** | org (finds the org's sandbox GVC itself; do not pass `--gvc`) | `create [--type dev\|worker] [--image //sandboximage/NAME]`, `get` (no args = list; `--type dev\|worker` filters), `delete`, `edit`, `update --set`, `patch`, `tag` (no `list`, no `clone`) | `connect [--ide vscode\|cursor\|ssh\|browser\|terminal] [--local-port N] [--print-url]`, `stop` / `start` (suspend / resume), `eventlog`, `audit`, `access-report`, `permissions`, `session` (create/get/exec/connect/preview/logs/metrics/processes/signal/delete; the session ID is positional, the sandbox is `--sandbox REF`, omit it for the GVC route; `session create --image //sandboximage/NAME` takes a ready agent sandbox image). Files: `cpln cp SRC DEST --session ID`. Needs a current CLI: check `cpln sandbox --help` |
 | **sandboximage** | org (finds the org's sandbox GVC itself; do not pass `--gvc`) | `create --name NAME [--base-image //image/NAME:TAG] [--image-tag TAG] [--type dev\|agent]`, `get`, `delete`, `edit`, `update --set`, `patch`, `tag`, `clone`, `query` | `rebuild REF...`, `buildlog REF [--follow] [--offset N]`, `eventlog`, `audit`, `access-report`, `permissions` |
 
 ### Standard CRUD verbs
@@ -512,6 +514,8 @@ Dedicated LB on the GVC (`spec.loadBalancer.dedicated: true`) unlocks: domain po
 
 Direct and dedicated load balancers are billed at the dedicated load balancer rate on controlplane.com/pricing, on top of CPU, memory, and egress. A GVC is charged for only one load balancer per location: that one charge covers every direct load balancer on its workloads in that location, and the GVC's dedicated load balancer if it is enabled. Only Direct carries UDP.
 
+**IP Sets are ingress only.** Outbound traffic leaves through the NAT gateway IPs of the workload's location (`status.ipRanges`: `cpln location get LOCATION -o yaml`), shared by all workloads there and very stable. Allowlist those; pin the GVC to one location to shorten the list. A single fixed egress IP requires a BYOK or mk8s cluster with a static NAT IP (extra cost).
+
 ## Policies
 
 Bind principals to permissions on resources. Wrong target kind, link format, or permission name all silently fail.
@@ -579,6 +583,7 @@ cpln logs '{gvc="GVC", workload="WL"}' --org ORG --tail
 - **`--gvc` is NOT a flag here** — GVC goes inside the LogQL query.
 - Range flags: `--since "1h"`, `--from`, `--to` (ISO 8601, duration, or `now-<duration>`); `--limit N` (default 30, `0` = unlimited).
 - **Cron logs**: each run is a separate replica. Enumerate runs via `cpln workload get-deployments NAME --gvc GVC -o json` → `status.jobExecutions[]`, then scope logs by the `replica` label and run's time window.
+- **Retention**: logs, metrics, and traces default to 30 days each, set independently on the org via `spec.observability.logsRetentionDays` / `metricsRetentionDays` / `tracesRetentionDays`. **Maximum is 730 days (2 years) for each.** For longer log retention, use external logging.
 
 ## Operational notes
 

@@ -1,13 +1,13 @@
 ---
 title: 'Cassandra'
 icon: /template-catalog/templates/icons/cassandra.png
-description: 'Deploy a multi-node Apache Cassandra 5.0 cluster on Control Plane in a single location, with authentication, scheduled anti-entropy repair, optional multi-zone placement and logical or physical backups to S3 or GCS. A dictionary secret holding the cluster credentials must exist before you install.'
+description: 'Deploy a multi-node Apache Cassandra 5.0.9 cluster on Control Plane in a single location, with authentication, scheduled anti-entropy repair, optional multi-zone placement and logical or physical backups to S3 or GCS. A dictionary secret holding the cluster credentials must exist before you install.'
 keywords: ['nosql', 'cql', 'cqlsh', 'nodetool', 'sstable', 'token ring', 'keyspace', 'replication factor', 'quorum', 'stateful workload', 'wide column', 'distributed database', 'dictionary secret', 'scylladb alternative', 'dynamodb alternative']
 ---
 
 ## Overview
 
-Apache Cassandra is a distributed wide-column NoSQL database built for write-heavy workloads, linear scaling and no single point of failure. This template deploys a Cassandra 5.0 cluster (`cassandra:5.0`) of `replicas` nodes in one location, each node on its own persistent volume, with password authentication enabled, a weekly `nodetool repair` cron job, and optional scheduled backups to AWS S3 or GCS.
+Apache Cassandra is a distributed wide-column NoSQL database built for write-heavy workloads, linear scaling and no single point of failure. This template deploys a Cassandra 5.0 cluster (`cassandra:5.0.9`) of `replicas` nodes in one location, each node on its own persistent volume, with password authentication enabled, a weekly `nodetool repair` cron job, and optional scheduled backups to AWS S3 or GCS.
 
 Cluster credentials are **not** template values. Cassandra reads its superuser password, application role and keyspace from a dictionary secret you create before installing, so no password passes through Helm or lands in the release.
 
@@ -82,7 +82,7 @@ Create the [prerequisite secret](#prerequisites), then install with the name of 
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/cassandra \
-  --version 1.1.1 --gvc GVC_NAME \
+  --version 1.1.2 --gvc GVC_NAME \
   --set credentialsSecretName=SECRET_NAME
 ```
 
@@ -152,7 +152,7 @@ The credentials are applied once, by node `0` on the cluster's first boot, and a
 ### Image and Resources
 
 ```yaml
-image: cassandra:5.0
+image: cassandra:5.0.9
 cpu: 1
 memory: 4Gi
 # JVM heap: leave ~50% of container memory for off-heap (bloom filters, page cache, etc.)
@@ -225,7 +225,7 @@ Cassandra is eventually consistent: a node that misses writes while it is down d
 backup:
   enabled: false
   type: logical   # options: logical, physical
-  image: ghcr.io/controlplane-com/backup-images/cassandra-backup:5.0
+  image: ghcr.io/controlplane-com/backup-images/cassandra-backup:5.0.9
   schedule: "0 2 * * *"   # daily at 2am UTC
 
   resources:
@@ -247,7 +247,7 @@ backup:
     prefix: cassandra/backups
 ```
 
-The bucket and Cloud Account must exist first — see [Backing Up](#backing-up) for the two modes, the per-provider steps and the IAM policy.
+The bucket and Cloud Account must exist first — see [Backing Up](#backing-up) for the two modes, the per-provider steps and the IAM policy. The backup image is `ghcr.io/controlplane-com/backup-images/cassandra-backup:5.0.9`; leave `backup.image` at its default unless you mirror the image.
 
 ## Connecting
 
@@ -284,7 +284,7 @@ cqlsh 127.0.0.1 9042 -u USERNAME -p PASSWORD -k KEYSPACE
 
 ### Backing Up
 
-Two modes are available; `backup.type` selects one. Neither mode saves the schema — keep your `CREATE KEYSPACE` and `CREATE TABLE` statements in version control, because both restore paths load data into tables that already exist. Backups keep no retention of their own; expire old folders with a bucket lifecycle rule.
+Two modes are available; `backup.type` selects one. Neither mode saves the schema — keep your `CREATE KEYSPACE` and `CREATE TABLE` statements in version control, because both restore paths load data into tables that already exist. Backups keep no retention of their own; see [Backup retention](#backup-retention).
 
 | Mode | What runs | What is written to the bucket |
 |---|---|---|
@@ -344,22 +344,72 @@ cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cassandra-backup"}' --limit 5
 cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cassandra"} |= "backup complete"' --limit 50 --since 24h
 ```
 
+#### Backup retention
+
+The backup job only uploads; it never deletes old backups. To keep a fixed window, add a lifecycle rule on the bucket that expires objects under the backup prefix. Each backup is a complete, standalone copy, so expiring old ones never affects restoring a newer one. Set the window to at least your retention plus one backup interval, and note that an age rule keeps no minimum: if backups stop running, the last ones expire too. Each run writes its own timestamped folder (logical: one `TABLE.csv.gz` per table under `TIMESTAMP/KEYSPACE/`; physical: each node's SSTable snapshot under `TIMESTAMP/HOSTNAME/`), and all of them sit under the prefix and expire together.
+
+The rules below use the default prefix `cassandra/backups/`; change it if you changed `backup.aws.prefix` or `backup.gcp.prefix`.
+
+**AWS S3.** `put-bucket-lifecycle-configuration` **replaces every existing rule on the bucket**, so check for existing rules first and add them to the file:
+
+```bash
+aws s3api get-bucket-lifecycle-configuration --bucket BUCKET_NAME
+cat > lifecycle.json <<'EOF'
+{"Rules":[{"ID":"expire-db-backups","Filter":{"Prefix":"cassandra/backups/"},"Status":"Enabled",
+  "Expiration":{"Days":30},"NoncurrentVersionExpiration":{"NoncurrentDays":1}}]}
+EOF
+aws s3api put-bucket-lifecycle-configuration --bucket BUCKET_NAME --lifecycle-configuration file://lifecycle.json
+```
+
+**Google Cloud Storage.** `--lifecycle-file` also **replaces the bucket's existing rules**; check with `gcloud storage buckets describe gs://BUCKET_NAME --format='json(lifecycle_config)'` first:
+
+```bash
+cat > lifecycle.json <<'EOF'
+{"rule":[
+  {"action":{"type":"Delete"},"condition":{"age":30,"matchesPrefix":["cassandra/backups/"]}},
+  {"action":{"type":"Delete"},"condition":{"daysSinceNoncurrentTime":1,"isLive":false,"matchesPrefix":["cassandra/backups/"]}}]}
+EOF
+gcloud storage buckets update gs://BUCKET_NAME --lifecycle-file=lifecycle.json
+```
+
+Lifecycle rules run in the background; objects are removed within about a day of reaching the age. The `Noncurrent` parts matter only on a versioned bucket, where expiry otherwise just adds a delete marker.
+
 ### Restoring a Backup
 
-Both restore paths are `/usr/local/bin/restore.sh` in the backup image, driven by `RESTORE_TIMESTAMP` — the `YYYY-MM-DDTHH-MM-SSZ` folder name under your prefix. The keyspace and tables must already exist; the script loads data, it does not recreate schema.
+Both restore paths run `/usr/local/bin/restore.sh` from the backup image. It takes `RESTORE_TIMESTAMP` (a timestamp folder under your prefix, for example `2026-05-15T02-00-00Z`) and reads the same `BACKUP_*` settings the backup uses. The keyspace and tables must already exist; the script loads data, it does not recreate schema. Rehearse a restore on a scratch install before you rely on one.
 
-<Note>
-These procedures match the chart's configuration and the backup image's `restore.sh`, but they have not been rehearsed against a live install of this template. Rehearse on a throwaway release before you depend on them.
-</Note>
+#### Logical restore
 
-**Physical restore.** Backups are per node, and the script restores the folder named after the node it runs on, so it must run in the `backup` sidecar of **every** node in turn. It downloads that node's SSTables onto the node's data volume, loads them into the live tables with `nodetool import` — no restart — and deletes the download. Repeat for `-1`, `-2` and so on; because each node owns a different token range, restoring only one node leaves the cluster with incomplete data:
+The backup is one gzip-compressed CSV per table at `PREFIX/TIMESTAMP/KEYSPACE/TABLE.csv.gz`. `restore.sh` downloads them and replays each with `cqlsh COPY FROM`: rows with matching primary keys are overwritten, and rows not in the backup are left in place.
+
+The logical backup workload is a cron job with no running replica to exec into, so run the restore as a one-off job on the backup image, under the release's identity so it can read the bucket. Use the bucket, region and prefix from your `backup.aws` (or `backup.gcp`) values.
+
+```bash
+cpln workload cron run --gvc GVC_NAME \
+  --image ghcr.io/controlplane-com/backup-images/cassandra-backup:5.0.9 \
+  --identity RELEASE_NAME-cassandra-identity --timeout 900 \
+  --env BACKUP_TYPE=logical --env BACKUP_PROVIDER=aws \
+  --env BACKUP_BUCKET=BUCKET_NAME --env AWS_REGION=BUCKET_REGION --env BACKUP_PREFIX=cassandra/backups \
+  --env CASSANDRA_HOST=RELEASE_NAME-cassandra.GVC_NAME.cpln.local --env CASSANDRA_USER=cassandra \
+  --env CASSANDRA_PASSWORD=cpln://secret/SECRET_NAME.superuserPassword \
+  --env CASSANDRA_KEYSPACE=cpln://secret/SECRET_NAME.keyspace \
+  --env RESTORE_TIMESTAMP=2026-05-15T02-00-00Z -- /usr/local/bin/restore.sh
+```
+
+On GCS, use `--env BACKUP_PROVIDER=gcp` and drop `AWS_REGION`. The restore's log ends with `Logical restore complete.` (`cpln logs` on the runner workload). The command leaves a `cpln-run-…` runner workload in the GVC; delete it with `cpln workload delete` when you are done.
+
+#### Physical restore
+
+Each replica uploads its own SSTable snapshot to `PREFIX/TIMESTAMP/HOSTNAME/`, where `HOSTNAME` is the replica name (`RELEASE_NAME-cassandra-0`, `-1`, and so on). The replicas' timestamps usually match, but each one is set when that replica's run starts, so list the bucket and pick, for every replica, its own folder from the same run.
+
+The `backup` sidecar on each replica stays running and has `nodetool`, so the restore runs there. `restore.sh` downloads that replica's snapshot and loads each application table into the live node with `nodetool import`, without a restart. System keyspaces (schema, roles and passwords, node state) are skipped, so the tables must exist:
 
 ```bash
 cpln workload exec RELEASE_NAME-cassandra --gvc GVC_NAME --replica RELEASE_NAME-cassandra-0 --container backup -- sh -c \
   'RESTORE_TIMESTAMP=2026-05-15T02-00-00Z /usr/local/bin/restore.sh'
 ```
 
-**Logical restore — unverified path.** The script downloads `PREFIX/TIMESTAMP/KEYSPACE/*.csv.gz` and replays each file into its table with `cqlsh COPY FROM`; rows whose primary key is in the backup are overwritten, rows that are not are left in place. It needs the environment the `RELEASE_NAME-cassandra-backup` job runs with — `BACKUP_PROVIDER`, `BACKUP_BUCKET`, `BACKUP_PREFIX`, `AWS_REGION` for S3, and `CASSANDRA_HOST`, `CASSANDRA_PORT`, `CASSANDRA_USER`, `CASSANDRA_PASSWORD`, `CASSANDRA_KEYSPACE` — but that job is a cron workload with no long-running container to exec into. Running it means starting the backup image with that environment, bucket access and network access to the cluster, with `RESTORE_TIMESTAMP` set and `/usr/local/bin/restore.sh` as the command. This has not been exercised with the template.
+**Repeat this on every replica**, changing `--replica`. Each node owns a different token range, so restoring only one replica leaves the cluster with incomplete data. The output ends with `Physical restore complete.`.
 
 ### Rotating Credentials
 
@@ -423,13 +473,21 @@ named by credentialsSecretName, holding the keys `superuserPassword`, `username`
 
 ### Upgrading From 1.1.0
 
-Version 1.1.1 removes `aws::ReadOnlyAccess` from the backup identity; it only affects releases with `backup.provider: aws`. That AWS managed policy granted read access to **every bucket in your AWS account** and contained no write actions, so it never carried the backup itself — but it was silently supplying any read action your bucket-scoped policy happened to omit. Before upgrading, make sure your IAM policy contains the full action list under [Backing Up](#backing-up); if it already matches, no action is needed. The identity now carries `cpln-connector` and your bucket-scoped policy only. Nothing else changes.
+Version 1.1.1 removes `aws::ReadOnlyAccess` from the backup identity; it only affects releases with `backup.provider: aws`. That AWS managed policy granted read access to **every bucket in your AWS account** and contained no write actions, so it never carried the backup itself — but it was silently supplying any read action your bucket-scoped policy happened to omit. Before upgrading, make sure your IAM policy contains the full action list under [Backing Up](#backing-up); if it already matches, no action is needed. Nothing else changes.
+
+### Upgrading From 1.1.1
+
+Three things change when you move from 1.1.1 to 1.1.2:
+
+- **Backup image.** The `cassandra-backup:5.0` image writes no backups to the bucket, so don't rely on objects from a 1.1.1 release. The default `backup.image` is now `ghcr.io/controlplane-com/backup-images/cassandra-backup:5.0.9`; if you set `backup.image` yourself, change it to this tag. After the upgrade, confirm the first scheduled run wrote objects under your prefix.
+- **Cassandra image.** Nodes move to the pinned `cassandra:5.0.9`. The upgrade restarts them one at a time and keeps their data.
+- **AWS backup identity.** The `cpln-connector` policy is removed from the backup identity, which now carries only your bucket-scoped policy. No action is needed.
 
 ### Scaling and Availability
 
 **Vertical.** Raise `cpu` and `memory` together with `jvmHeapSize` (about half of `memory`); the data volumes grow on their own within `volumes.data.autoscaling`.
 
-**Adding nodes.** Raise `replicas` and upgrade; the new nodes join the ring and the repair job and seed list follow the new count. New nodes do **not** stream existing data when they join — every node in this template is a seed, and Cassandra seed nodes do not auto-bootstrap. Once each new node shows `UN` in `nodetool status`, stream its share of the data onto it with `nodetool rebuild`, naming the cluster's datacenter (the template sets it to the GVC location, for example `aws-us-east-1`), then run `nodetool cleanup` on every pre-existing node to drop the ranges they no longer own. This procedure follows the upstream [topology changes](https://cassandra.apache.org/doc/latest/cassandra/managing/operating/topo_changes.html) guidance and has not been exercised against a live install of this template:
+**Adding nodes.** Raise `replicas` and upgrade; the new nodes join the ring and the repair job and seed list follow the new count. New nodes do **not** stream existing data when they join — every node in this template is a seed, and Cassandra seed nodes do not auto-bootstrap. Once each new node shows `UN` in `nodetool status`, stream its share of the data onto it with `nodetool rebuild`, naming the cluster's datacenter (the template sets it to the GVC location, for example `aws-us-east-1`), then run `nodetool cleanup` on every pre-existing node to drop the ranges they no longer own. This procedure follows the upstream [topology changes](https://cassandra.apache.org/doc/latest/cassandra/managing/operating/topo_changes.html) guidance:
 
 ```bash
 cpln workload exec RELEASE_NAME-cassandra --gvc GVC_NAME --replica RELEASE_NAME-cassandra-3 --container cassandra -- sh -c \
@@ -441,7 +499,7 @@ cpln workload exec RELEASE_NAME-cassandra --gvc GVC_NAME --replica RELEASE_NAME-
   'nodetool -u cassandra -pw "$CASS_SUPERUSER_PASSWORD" cleanup'
 ```
 
-**Removing nodes** is not covered by this template. Cassandra requires a node to be decommissioned (`nodetool decommission`) before it leaves the ring; lowering `replicas` without that is unverified and may lose data.
+**Removing nodes.** Lowering `replicas` without decommissioning each node first can lose data; the template does not decommission for you.
 
 **Node loss.** Each node's data lives on its own volume and comes back with it after a restart, and each node runs `nodetool drain` before it stops. While a node is down, the partitions for which it holds the only copy are unavailable — with the default `replicationFactor: 1` that is every partition it owns. With `replicationFactor: 3` and `QUORUM`, the cluster keeps serving reads and writes with one node down. Surviving a full zone outage is unverified; see [Multi-Zone](#multi-zone).
 
@@ -461,11 +519,11 @@ cpln workload exec RELEASE_NAME-cassandra --gvc GVC_NAME --replica RELEASE_NAME-
     **Fix:** Create the secret as shown in [Prerequisites](#prerequisites), then run `cpln workload force-redeployment RELEASE_NAME-cassandra --gvc GVC_NAME` or wait several minutes for the deployment to recover on its own.
   </Accordion>
   <Accordion title="First install sits at Waiting for all 3 replicas to join before bootstrapping">
-    **Symptom:** The cluster is slow to accept the application credentials and node `0`'s logs show `Waiting for all 3 replicas to join before bootstrapping...`, possibly followed by `WARN: Timed out waiting for all replicas — proceeding with available nodes`.
+    **Symptom:** The application user cannot log in yet and node `0`'s logs show `Waiting for all 3 replicas to join before bootstrapping...`. If the ring is still incomplete after 10 minutes, the log shows an `ERROR` every 5 minutes with the `nodetool status` table.
 
-    **Cause:** Node `0` creates the roles and keyspace only after every node has joined the ring, so that token ranges are final first. It waits up to ten minutes before proceeding with whatever has joined.
+    **Cause:** Node `0` creates the roles and keyspace only after every node has joined the ring, so that token ranges are final first. It never proceeds on a partial ring; it keeps waiting.
 
-    **Fix:** Wait. If the warning appears, check the other nodes' logs with `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cassandra"}' --limit 50 --since 10m` for why they did not join, and run `nodetool status` as shown under [Connecting](#connecting) until every node reports `UN`.
+    **Fix:** Check whether bootstrap has finished with `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cassandra"} |= "Bootstrap complete"' --limit 50 --since 1h`. If not, check why the other nodes have not joined in the workload's logs, and run `nodetool status` as shown under [Connecting](#connecting) until every node reports `UN`. Bootstrap completes on its own once they do.
   </Accordion>
   <Accordion title="Install fails with replicationFactor cannot exceed replicas">
     **Symptom:** `cpln helm install` or `upgrade` exits with:
@@ -502,7 +560,7 @@ cpln workload exec RELEASE_NAME-cassandra --gvc GVC_NAME --replica RELEASE_NAME-
   <Accordion title="Backup run fails with AccessDenied on the S3 upload">
     **Symptom:** The backup logs show the export or snapshot finishing, then `An error occurred (AccessDenied) when calling the PutObject operation`.
 
-    **Cause:** The IAM policy named in `backup.aws.policyName` is missing an action, or its `Resource` does not match `backup.aws.bucket`. From 1.1.1 nothing else on the identity fills the gap.
+    **Cause:** The IAM policy named in `backup.aws.policyName` is missing an action, or its `Resource` does not match `backup.aws.bucket`.
 
     **Fix:** Update the policy to the full action list under [Backing Up](#backing-up) with both the bucket ARN and `BUCKET/*`, then wait for the next scheduled run and check its logs.
   </Accordion>
@@ -512,6 +570,7 @@ cpln workload exec RELEASE_NAME-cassandra --gvc GVC_NAME --replica RELEASE_NAME-
 
 - **Never turn `multiZone.enabled` off once it has been on.** Each replica's volume stays in the zone it was created in, so with multi-zone off a replica whose volume is in another zone cannot be scheduled and the rollout stops at it. Turning it on later is safe. `cpln helm upgrade` does not reuse earlier values, so keep the setting in your values file on every upgrade. To recover, upgrade again with it on, then force a redeployment of the affected workload.
 - **Create the credentials secret before installing.** A missing secret wedges the deployment with no log output; the only diagnostic is `status.versions[].message` from `cpln workload get-deployments`.
+- **Clients cannot log in until every node has joined.** On first install the keyspace and application user are created only once all `replicas` are up; if that takes more than 10 minutes, see [Troubleshooting](#troubleshooting).
 - **Use a GVC with a single location.** The template has no per-location settings and forms a single-location cluster.
 - **The default replication factor is 1.** Set `replicationFactor: 3` with at least three `replicas` and use `QUORUM` before storing anything you cannot afford to lose.
 - **Credentials apply only on first boot.** Rotate inside Cassandra first, then update the secret and force a redeployment — in that order, together.
