@@ -19,7 +19,7 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 |---|---|---|---|
 | Workload | `RELEASE_NAME-plausible` | Plausible server: dashboard, `/js/*` tracker scripts and `POST /api/event` on port `8000` (standard, 1 replica, container `plausible`) | — |
 | Identity & Policy | `RELEASE_NAME-plausible-identity`, `RELEASE_NAME-plausible-policy`, `RELEASE_NAME-plausible-gvc-policy` | `reveal` on exactly the secrets Plausible reads, and `view` on its own GVC | — |
-| Workload | `RELEASE_NAME-postgres` | PostgreSQL from the bundled [postgres](/template-catalog/templates/postgres) subchart: users, teams, sites, goals (stateful) | — |
+| Workload | `RELEASE_NAME-postgres` | PostgreSQL 19 from the bundled [postgres](/template-catalog/templates/postgres) subchart: users, teams, sites, goals (stateful) | — |
 | Volume Set | `RELEASE_NAME-pg-vs` | PostgreSQL data | — |
 | Identity & Policy | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-pg-policy` | `reveal` on your PostgreSQL credentials secret | — |
 | Workload | `RELEASE_NAME-clickhouse-server` | ClickHouse from the bundled [clickhouse](/template-catalog/templates/clickhouse) subchart: every event and session (stateful, 1 replica, local storage) | — |
@@ -79,7 +79,7 @@ A default install needs the three secret names and the location of your GVC:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/plausible \
-  --version 1.0.0 --gvc GVC_NAME \
+  --version 2.0.0 --gvc GVC_NAME \
   --set app.secretKeyBaseSecretName=KEY_SECRET_NAME \
   --set postgres.config.credentialsSecretName=DB_SECRET_NAME \
   --set clickhouse.database.credentialsSecretName=CLICKHOUSE_SECRET_NAME \
@@ -171,7 +171,7 @@ internalAccess:
 
 ```yaml
 postgres:
-  image: postgres:18
+  image: postgres:19 # upgrading a 1.x release: postgres:18, see Upgrading from 1.x
   config:
     credentialsSecretName: my-plausible-db-credentials
   resources:
@@ -329,6 +329,37 @@ Plausible runs as one replica, and ClickHouse as one node in one location. Upgra
   </Accordion>
 </AccordionGroup>
 
+### Upgrading From 1.x
+
+New installs run PostgreSQL 19. The database of a 1.x release was created by PostgreSQL 18 (or the major of the image it ran), and a PostgreSQL data directory only opens with its own major. The chart never converts data in place: before PostgreSQL starts, a guard compares the data's major with the image's, and on a mismatch it does not start the server and changes nothing on the volume. Plausible then waits for the database and restarts until it comes up. ClickHouse and its events are not affected.
+
+A refused upgrade leaves `RELEASE_NAME-postgres` not ready, and the logs repeat `[pg-guard] REFUSING TO START` with the exact fix every 30 seconds:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres"} |= "pg-guard"' --since 15m
+```
+
+**Stay on PostgreSQL 18 with this chart.** Run the upgrade again with the image pinned, and keep `postgres.image: postgres:18` in your values file for every later upgrade (`cpln helm upgrade` does not reuse the installed values). The Console upgrade wizard keeps the installed image for you.
+
+```bash
+cpln helm upgrade RELEASE_NAME CHART --gvc GVC_NAME -f my-values.yaml --set postgres.image=postgres:18
+```
+
+**Move the PostgreSQL data to 19, side by side** (accounts, sites and goals only):
+
+1. Install this version as a NEW release in the same GVC with the **same three secrets**. The dump carries the old role's password hash, and the signing key keeps sessions and two-factor logins valid.
+2. Stop writes to the old release (turn its `publicAccess` off).
+3. Replace the new database with the old one, from inside the new PostgreSQL container (the PostgreSQL 19 `pg_dump` reads the old server; `--clean` drops the tables the new Plausible created at first boot):
+
+   ```bash
+   cpln workload exec NEW_RELEASE-postgres --gvc GVC_NAME --container postgresql -- bash -c \
+     'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h OLD_RELEASE-postgres.GVC_NAME.cpln.local -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists | psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q'
+   ```
+
+4. Restart the new app with `cpln workload force-redeployment NEW_RELEASE-plausible --gvc GVC_NAME`, log in, and check your sites and goals. Then point the tracker snippet at the new release's endpoint.
+
+These steps do not copy the analytics events, which live in the old release's ClickHouse: the new release starts with an empty event history. If you need the history, stay on PostgreSQL 18.
+
 ## Important Notes
 
 - **Register the owner before publishing.** Until the first account exists, anyone who can reach the URL can register as owner. See [First Run](#first-run).
@@ -336,6 +367,7 @@ Plausible runs as one replica, and ClickHouse as one node in one location. Upgra
 - **The GVC needs exactly one location,** and `clickhouse.locations[0].name` must be it. A GVC with more than one location makes Plausible refuse to start.
 - **Visitor locations are country-level**, from the DB-IP database bundled in the image.
 - **Analytics events have no scheduled backup or snapshot.** They live only on the ClickHouse volume. PostgreSQL is backed up only when `postgres.backup.enabled` is on.
+- **Upgrading a 1.x release needs `postgres.image: postgres:18`** in your values, on that upgrade and every later one; without it PostgreSQL refuses to start on the existing data. See [Upgrading From 1.x](#upgrading-from-1-x).
 - **Uninstalling deletes both volumes.** Each keeps one final snapshot for 7 days; after that the data is gone.
 - **Do not change the signing key.** A new one logs everyone out and breaks two-factor logins for every enrolled user.
 - **Community Edition** has no funnels, ecommerce revenue goals, SSO or Sites API; those are Plausible Cloud features. The Stats API and shared dashboard links are available.

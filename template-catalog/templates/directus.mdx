@@ -23,7 +23,7 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Volume Set | `RELEASE_NAME-directus-uploads` | Shared read-write volume at `/directus/uploads` that every replica mounts | — |
 | Identity & Policy | `RELEASE_NAME-directus-identity`, `RELEASE_NAME-directus-policy` | `reveal` on exactly the secrets Directus reads | — |
 | Policy | `RELEASE_NAME-directus-gvc-policy` | `view` on its own GVC, for a boot-time check that reports GVC locations Directus does not use | — |
-| Workload | `RELEASE_NAME-postgres` | Bundled PostgreSQL (stateful, 1 replica, container `postgresql`, port `5432`) from the [postgres](/template-catalog/templates/postgres) template | `postgres.enabled: true` (default) |
+| Workload | `RELEASE_NAME-postgres` | Bundled PostgreSQL 19 (stateful, 1 replica, container `postgresql`, port `5432`) from the [postgres](/template-catalog/templates/postgres) template | `postgres.enabled: true` (default) |
 | Volume Set | `RELEASE_NAME-pg-vs` | PostgreSQL data directory | `postgres.enabled: true` (default) |
 | Identity & Policy | `RELEASE_NAME-pg-identity`, `RELEASE_NAME-pg-policy` | `reveal` on the database credentials secret | `postgres.enabled: true` (default) |
 | Workload | `RELEASE_NAME-postgres-ha`, `RELEASE_NAME-etcd`, `RELEASE_NAME-postgres-ha-proxy` | Highly available PostgreSQL: Patroni replicas, etcd and an HAProxy leader endpoint, from the [postgres-highly-available](/template-catalog/templates/postgres-highly-available) template | `postgresHA.enabled: true` |
@@ -93,7 +93,7 @@ A default install needs only the names of the two secrets:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/directus \
-  --version 1.0.0 --gvc GVC_NAME \
+  --version 2.0.0 --gvc GVC_NAME \
   --set secrets.name=DIRECTUS_SECRET_NAME \
   --set postgres.config.credentialsSecretName=DB_SECRET_NAME
 ```
@@ -228,7 +228,7 @@ internalAccess:
 # set postgresHA.enabled: true (and postgres.enabled: false) for near-zero-downtime upgrades and failover
 postgres:
   enabled: true
-  image: postgres:18
+  image: postgres:19     # new installs; a release upgraded from 1.x keeps postgres:18, its data's major (Upgrading from 1.x)
   config:
     credentialsSecretName: my-directus-db-credentials
   resources:
@@ -240,6 +240,7 @@ postgres:
     capacity: 10         # GiB (minimum 10)
 
 # 3 Patroni replicas, 3 etcd and an HAProxy leader endpoint; enable exactly one of postgres / postgresHA.
+# New clusters run PostgreSQL 18; a cluster created by a 1.x release stays on 17 (Upgrading from 1.x).
 postgresHA:
   enabled: false
   config:
@@ -393,11 +394,50 @@ Directus runs in one location only. To change it, set `location` to another loca
   </Accordion>
 </AccordionGroup>
 
+### Upgrading From 1.x
+
+**Highly available database (`postgresHA.enabled: true`).** A plain upgrade works, and the cluster stays on PostgreSQL 17, the major it was created with; new HA releases start on PostgreSQL 18. Moving an existing cluster to 18 is a copy into a new release: see [Upgrading an existing cluster to PostgreSQL 18](https://github.com/controlplane-com/templates/blob/main/postgres-highly-available/versions/3.0.0/README.md#upgrading-an-existing-cluster-to-postgresql-18) in the postgres-highly-available template.
+
+**Single-instance database (`postgres.enabled: true`, the default).** New installs run PostgreSQL 19. A 1.x release's data directory was created by PostgreSQL 18 (or the major of the `postgres.image` it ran), and a data directory only opens with its own major. The chart never converts data in place: before PostgreSQL starts, a guard compares the two majors, and on a mismatch it does not start the server and changes nothing on the volume. `RELEASE_NAME-postgres` then stays not ready, Directus waits for its database, and the logs repeat `[pg-guard] REFUSING TO START` with the exact `--set postgres.image=...` to run.
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres"} |= "pg-guard"' --since 15m
+```
+
+**Stay on PostgreSQL 18.** Run the upgrade with the image pinned, and keep `postgres.image: postgres:18` in your values file for every later upgrade (`cpln helm upgrade` does not reuse the installed values). The Console upgrade wizard keeps the installed image for you.
+
+```bash
+cpln helm upgrade RELEASE_NAME CHART --gvc GVC_NAME -f my-values.yaml --set postgres.image=postgres:18
+```
+
+**Move to PostgreSQL 19, side by side** (Directus gets a new endpoint; writes pause during the copy):
+
+1. Install this version as a NEW release in the same GVC with the **same** `secrets.name` and `postgres.config.credentialsSecretName` (and the same `storage` settings with `storage.type: s3`). Directus initializes an empty project in it.
+2. With `storage.type: local`, copy the uploaded files through your machine while the old Directus is still running (do this in a quiet window: a file uploaded after this step is not copied):
+
+   ```bash
+   mkdir -p ./directus-uploads
+   cpln workload exec OLD_RELEASE-directus --gvc GVC_NAME --container directus -- \
+     sh -c 'cd /directus/uploads && tar czf - --exclude="./.*" . | base64' | base64 -d | tar xzf - -C ./directus-uploads
+   cpln cp ./directus-uploads/. NEW_RELEASE-directus:/directus/uploads --gvc GVC_NAME --container directus
+   ```
+
+3. Stop writes to the old release, for example by stopping its Directus workload (`cpln workload stop OLD_RELEASE-directus --gvc GVC_NAME`; the database keeps running).
+4. Replace the new project's database with the old one, from inside the new database container. The PostgreSQL 19 `pg_dump` reads the old server, and `--clean --if-exists` first drops what the new Directus created:
+
+   ```bash
+   cpln workload exec NEW_RELEASE-postgres --gvc GVC_NAME --container postgresql -- bash -c \
+     'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h OLD_RELEASE-postgres.GVC_NAME.cpln.local -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists | psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q'
+   ```
+
+5. Run `cpln workload force-redeployment NEW_RELEASE-directus --gvc GVC_NAME` so Directus reloads the copied schema, sign in to check your collections and files, point your front ends at the new endpoint (or move your custom domain), then uninstall the old release.
+
 ## Important Notes
 
 - **Never change `secret` after installing.** It signs every session and token, so all of them stop working. Rotating any other secret needs `cpln workload force-redeployment RELEASE_NAME-directus --gvc GVC_NAME`.
 - **Local files are deleted on uninstall and are not snapshotted.** Use `storage.type: s3` for files that must outlive the release; switching `storage.type` later does not move existing files.
 - **Install into a GVC with one location** and set `location` to it; the bundled PostgreSQL and Redis start in every GVC location.
+- **Upgrading a 1.x release with the single-instance database needs `postgres.image: postgres:18`** in your values on that and every later upgrade, or the database refuses to start (data untouched); moving the data to PostgreSQL 19 is a dump and restore into a new release. See [Upgrading From 1.x](#upgrading-from-1-x).
 - **The first `helm upgrade` can briefly restart the single-instance PostgreSQL**, and Directus with it; use `postgresHA` when that matters.
 - **A replica restart empties the shared data cache** in Redis; Directus rebuilds it on demand.
 - **Changing the public URL** (`directus.publicUrl`) changes where a license key is activated; recheck Settings, License.

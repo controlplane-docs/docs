@@ -22,10 +22,10 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Workload | `RELEASE_NAME-hindsight` | REST and MCP API on port `8888` (standard, 1 replica by default) | — |
 | Workload | `RELEASE_NAME-hindsight-ui` | Web UI on port `9999`, behind an access key (standard) | `ui.enabled: true` (default) |
 | Workload | `RELEASE_NAME-hindsight-worker` | Dedicated background task workers (stateful) | `worker.enabled: true` |
-| Workload | `RELEASE_NAME-pgvector` | PostgreSQL with pgvector holding every bank (stateful, TCP `5432`) | `pgvector.enabled: true` (default) |
+| Workload | `RELEASE_NAME-pgvector` | PostgreSQL 19 with pgvector holding every bank (stateful, TCP `5432`) | `pgvector.enabled: true` (default) |
 | Volume Set | `RELEASE_NAME-pgvector-vs` | Database volume | `pgvector.enabled: true` (default) |
 | Secret | `RELEASE_NAME-pgvector-init` | First-boot SQL that creates the `vector` extension; no credentials | `pgvector.enabled: true` (default) |
-| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL cluster (3 replicas) | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL cluster (3 replicas; PostgreSQL 18 for a new cluster) | `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy leader endpoint for the cluster | `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-etcd` | etcd consensus store for the cluster | `postgresHA.enabled: true` |
 | Volume Set | `RELEASE_NAME-postgres-ha-vs` | Volume per Patroni replica | `postgresHA.enabled: true` |
@@ -101,7 +101,7 @@ Install the chart from the marketplace registry, pointing it at the secrets you 
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/hindsight \
-  --version 1.0.0 --gvc GVC_NAME \
+  --version 2.0.0 --gvc GVC_NAME \
   --set auth.apiKeySecretName=API_KEY_SECRET_NAME \
   --set pgvector.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
   --set ui.accessKeySecretName=UI_KEY_SECRET_NAME \
@@ -248,7 +248,7 @@ ui:
 ### Database
 
 ```yaml
-pgvector:
+pgvector:                       # PostgreSQL 19; a release upgraded from 1.x keeps 18 (Upgrading from 1.x)
   enabled: true
   config:
     # REQUIRED PREREQUISITE SECRET — CREATE IT BEFORE YOU INSTALL, or the deployment WEDGES silently.
@@ -371,7 +371,7 @@ cpln workload exec RELEASE_NAME-hindsight --gvc GVC_NAME --container hindsight -
   HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL=NEW_MODEL HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=KEY_OR_unused \
   hindsight-admin reembed --all-schemas
 cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/hindsight \
-  --version 1.0.0 --gvc GVC_NAME -f values.yaml
+  --version 2.0.0 --gvc GVC_NAME -f values.yaml
 cpln workload exec RELEASE_NAME-hindsight --gvc GVC_NAME --container hindsight -- hindsight-admin reembed --all-schemas --finish
 ```
 
@@ -423,12 +423,52 @@ cpln workload exec RELEASE_NAME-hindsight --gvc GVC_NAME --container hindsight -
   </Accordion>
 </AccordionGroup>
 
+### Upgrading From 1.x
+
+**Highly available database (`postgresHA.enabled: true`).** The upgrade is in place: an existing cluster keeps the PostgreSQL major it was created with (17 for a 1.x release) on the new `patroni-postgres:0.9` image, and only a new cluster starts on PostgreSQL 18. To move an existing cluster to 18, follow [Upgrading an existing cluster to PostgreSQL 18](https://github.com/controlplane-com/templates/blob/main/postgres-highly-available/versions/3.0.0/README.md#upgrading-an-existing-cluster-to-postgresql-18) in the postgres-highly-available template. The second release there is a new Hindsight 2.0.0 release with `postgresHA.enabled: true` and the same secrets; this chart names its database workloads `RELEASE_NAME-postgres-ha` and `RELEASE_NAME-postgres-ha-proxy`, so the commands apply as written. Stop both releases' `-hindsight` workloads while the copy runs.
+
+**Single-instance database (`pgvector.enabled: true`, the default).** The single-instance database of 2.0.0 runs PostgreSQL 19. A 1.x release's data directory is PostgreSQL 18, and a data directory only starts under the major version that created it: on a PostgreSQL 19 image the database container does not start PostgreSQL and changes nothing on the volume. `RELEASE_NAME-pgvector` stays not ready, Hindsight waits for it, and the database logs repeat a `[pg-guard] REFUSING TO START` message naming the pin.
+
+**Stay on PostgreSQL 18.** Pin the image, and keep the pin in your values file for every later upgrade (`cpln helm upgrade` does not reuse the release's values):
+
+```yaml
+pgvector:
+  image: pgvector/pgvector:0.8.7-pg18
+```
+
+If an upgrade ran without the pin, run the same upgrade again with `--set pgvector.image=pgvector/pgvector:0.8.7-pg18`; the database comes back on its data. The Console wizard keeps the installed image on upgrade and warns before a change to another major version.
+
+**Move to PostgreSQL 19** (dump and restore into a new release in the same GVC):
+
+1. Install 2.0.0 as a **new release** with the **same database credentials secret** (and the same API key, LLM key and UI access key secrets). Wait until `NEW_RELEASE-hindsight` is ready: it creates an empty schema.
+2. Stop writes on both releases (add the `-worker` workloads if `worker.enabled`):
+
+   ```bash
+   cpln workload stop OLD_RELEASE-hindsight NEW_RELEASE-hindsight --gvc GVC_NAME
+   ```
+
+3. Stream the old database into the new one, inside the new database container (`--clean` replaces the empty schema; nothing binary crosses `cpln workload exec`):
+
+   ```bash
+   cpln workload exec NEW_RELEASE-pgvector --gvc GVC_NAME --container pgvector -- bash -c \
+     'export PGPASSWORD="$POSTGRES_PASSWORD"; pg_dump -h OLD_RELEASE-pgvector.GVC_NAME.cpln.local -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists | psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q'
+   ```
+
+4. Compare `SELECT count(*) FROM memory_units;` on both databases, then start the new API and point your agents at `NEW_RELEASE-hindsight`:
+
+   ```bash
+   cpln workload start NEW_RELEASE-hindsight --gvc GVC_NAME
+   ```
+
+5. Uninstall the old release.
+
 ## Important Notes
 
 - One API key opens every bank: anyone holding it, or the web UI access key, can read and change all banks. Give each agent its own bank id to keep memories separate, not for security. Per-user keys are not available.
 - Updating a secret restarts nothing: after rotating one, run `cpln workload force-redeployment` on the API, the workers and the web UI.
 - The database password is read only when PostgreSQL first initializes; run `ALTER ROLE` before updating its secret.
 - Database credentials must be letters and digits only.
+- A release upgraded from 1.x with the single-instance database needs `pgvector.image: pgvector/pgvector:0.8.7-pg18` in its values on every upgrade, or the database refuses to start (data untouched). See [Upgrading From 1.x](#upgrading-from-1-x).
 - Choose the embedding provider at install; changing it later needs a re-embed.
 - Use the `-slim` image only with `embeddings.provider: openai` and `reranker.provider: rrf`.
 - Install into a GVC with one location; uninstalling deletes every memory bank.
