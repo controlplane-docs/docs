@@ -1,13 +1,13 @@
 ---
 title: PostgreSQL
 icon: /template-catalog/templates/icons/postgresql.png
-description: Single-replica PostgreSQL 18 on a persistent volume, with optional PgBouncer connection pooling and scheduled S3, GCS or MinIO backups. Deploys into an existing GVC and needs a dictionary credentials secret created before install.
+description: Single-replica PostgreSQL 19 on a persistent volume, with optional PgBouncer connection pooling and scheduled S3, GCS or MinIO backups. Deploys into an existing GVC and needs a dictionary credentials secret created before install.
 keywords: ['pg', 'postgres', 'rdbms', 'oltp', 'sql database', 'connection pooler', 'pg_dump', 'pg_dumpall', 'psql', 'pgadmin', 'rds alternative', 'alter role', 'database template']
 ---
 
 ## Overview
 
-PostgreSQL is a widely used open-source relational database. This template deploys one PostgreSQL 18 server on a persistent volume, an optional [PgBouncer](https://www.pgbouncer.org/) connection pooler in front of it, and an optional cron job that writes compressed `pg_dumpall` backups to AWS S3, Google Cloud Storage or a MinIO (S3-compatible) bucket.
+PostgreSQL is a widely used open-source relational database. This template deploys one PostgreSQL 19 server on a persistent volume, an optional [PgBouncer](https://www.pgbouncer.org/) connection pooler in front of it, and an optional cron job that writes compressed `pg_dumpall` backups to AWS S3, Google Cloud Storage or a MinIO (S3-compatible) bucket.
 
 Database credentials are **not** template values. The server reads its username, password and database name from a [dictionary secret](/guides/create-secret/dictionary) you create before installing, so no password passes through Helm or lands in the release. The template creates no secret of its own.
 
@@ -23,7 +23,7 @@ This is a single server, not a cluster — there is no replication or failover. 
 
 | Resource | Name | Purpose | Optional |
 |---|---|---|---|
-| Workload | `RELEASE_NAME-postgres` | PostgreSQL 18 server (stateful, 1 replica, TCP `5432`) | — |
+| Workload | `RELEASE_NAME-postgres` | PostgreSQL 19 server (stateful, 1 replica, TCP `5432`) | — |
 | Volume Set | `RELEASE_NAME-pg-vs` | `PGDATA` on an `ext4` general-purpose SSD volume; a final snapshot is taken when the volume set is deleted and kept 7 days | — |
 | Identity | `RELEASE_NAME-pg-identity` | Shared by the database, pooler and backup workloads; carries the cloud account binding when backups use AWS or GCP | — |
 | Policy | `RELEASE_NAME-pg-policy` | Grants the identity `reveal` on exactly the credential secrets you created | — |
@@ -107,7 +107,7 @@ Each block below is the shipped default for that part of `values.yaml`.
 ### Server and Resources
 
 ```yaml
-image: postgres:18  # versions before postgres:17 are compatible but do not support backup feature
+image: postgres:19  # PostgreSQL 19 for new installs. Upgrading a 3.x release: set postgres:18, its data's major (README, "Upgrading from 3.x")
 
 resources:
   minCpu: 200m
@@ -115,6 +115,8 @@ resources:
   maxCpu: 500m
   maxMemory: 256Mi
 ```
+
+A boot guard runs before the server starts. It compares the major version of the data directory with the image's major and, on a mismatch, refuses to start the server and changes nothing on the volume. An image change therefore never converts data; see [Upgrading From 3.x](#upgrading-from-3-x).
 
 <Note>
 On a stateful workload the ratio of `maxCpu` to `minCpu` may not exceed 4:1. Raising `maxCpu` without raising `minCpu` can cross that limit and is rejected when the workload is applied.
@@ -196,7 +198,7 @@ A cron workload runs `pg_dumpall` on the schedule and uploads a gzip-compressed 
 ```yaml
 backup: # compatible with Postgres 17+
   enabled: false
-  image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0 # tag 18.1.0 = Postgres 18, 17.1.0 = Postgres 17
+  image: ghcr.io/controlplane-com/backup-images/postgres-backup:19.1.0 # PostgreSQL 19 client; also backs up a server pinned to 17 or 18
   schedule: "0 2 * * *"   # daily at 2am UTC
 
   resources:
@@ -227,7 +229,7 @@ backup: # compatible with Postgres 17+
 ```
 
 <Note>
-Backups require PostgreSQL 17 or later, and `backup.image` must match the server's major version: tag `18.1.0` for `postgres:18`, `17.1.0` for `postgres:17`.
+Backups require PostgreSQL 17 or later. The default `backup.image` (`19.1.0`) also dumps a server pinned to 17 or 18. A dump restores into the same PostgreSQL major or a newer one; replaying a dump into an older major can print `unrecognized configuration parameter` errors on `SET` lines, which `psql` skips. If you stay on 18 and restore into 18, set `backup.image` to `ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0`.
 </Note>
 
 ## Connecting
@@ -305,7 +307,7 @@ Complete the steps for your provider before enabling backups.
 }
 ```
 
-4. Set `backup.aws.policyName` to that policy's name. The template attaches it to the workload identity and nothing else — the bucket in your policy is the only storage the backup job can reach.
+4. Set `backup.aws.policyName` to that policy's name. The template attaches it to the workload identity and nothing else (no `cpln-connector` policy is attached) — the bucket in your policy is the only storage the backup job can reach.
 
 #### GCS
 
@@ -476,6 +478,48 @@ Template versions up to 3.3.0 took the database credentials as plain Helm values
 **The chart no longer creates `RELEASE_NAME-pg-config`.** Anything outside this release that referenced that secret by name — another workload's environment, a policy, or a parent chart that bundles PostgreSQL as a subchart — must be pointed at the secret you created instead. A reference to a secret that no longer exists does not fail loudly; it wedges the referring workload silently, exactly as described in [Prerequisites](#prerequisites).
 </Warning>
 
+### Upgrading From 3.x
+
+New installs run PostgreSQL 19. A 3.x release's data directory was created by PostgreSQL 18 (or the major of the image it ran), and a data directory only opens with its own major. The chart never converts data in place: before PostgreSQL starts, a guard compares the data's major with the image's, and on a mismatch it does not start the server and changes nothing on the volume.
+
+A refused upgrade leaves the server workload not ready, and its logs repeat `[pg-guard] REFUSING TO START` with the exact fix every 30 seconds:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres"} |= "pg-guard"' --since 15m
+```
+
+**Stay on PostgreSQL 18 with this chart.** Run the upgrade again with the image pinned, and keep `image: postgres:18` in your values file for every later upgrade — `cpln helm upgrade` does not reuse the installed values. The Console upgrade wizard keeps the installed image for you.
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/postgres \
+  --version 4.0.0 --gvc GVC_NAME \
+  -f my-values.yaml --set image=postgres:18
+```
+
+**Move to PostgreSQL 19 side by side.** Clients change host, and writes pause during the copy.
+
+<Steps>
+  <Step title="Install this version as a new release">
+    Install in the same GVC with the **same credentials secret**. The dump carries the old role's password hash, so a different secret would no longer match it.
+  </Step>
+  <Step title="Stop writes to the old release">
+    Stop your applications from writing to the old server.
+  </Step>
+  <Step title="Copy everything into the new server">
+    Run the copy from inside the new container: the PostgreSQL 19 `pg_dumpall` reads the old server and `psql` writes to the local server. `already exists` errors for the role and database the new server created at first boot are expected.
+
+    ```bash
+    cpln workload exec NEW_RELEASE-postgres --gvc GVC_NAME --container postgresql -- bash -c \
+      'PGPASSWORD="$POSTGRES_PASSWORD" pg_dumpall -h OLD_RELEASE-postgres.GVC_NAME.cpln.local -U "$POSTGRES_USER" | psql -U "$POSTGRES_USER" -d postgres -q'
+    ```
+  </Step>
+  <Step title="Verify and switch clients">
+    Compare row counts on both servers, point clients at `NEW_RELEASE-postgres` (or `NEW_RELEASE-pgbouncer`), then uninstall the old release.
+  </Step>
+</Steps>
+
+**Move to PostgreSQL 19 under the same release name.** Clients are unchanged and the database is down for the whole dump and restore. Enable the backup job on the 3.x release and take a backup, uninstall the release, install this version under the same name, and replay the backup as in [Restoring a Backup](#restoring-a-backup).
+
 ### Scaling and Availability
 
 - The server is pinned to one replica. Do not raise it — a single volume set backs a single server, and a second replica cannot mount it. Choose [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) or [Postgres Multi Location](/template-catalog/templates/postgres-multi-location) when you need failover.
@@ -548,6 +592,7 @@ Template versions up to 3.3.0 took the database credentials as plain Helm values
 - **Do not scale the server past one replica.** It is a single instance on a single volume, not a replicated cluster.
 - **`cpln helm uninstall` deletes the volume set** and the database with it. Your credentials secret is yours and is left alone.
 - **Every `cpln helm upgrade` restarts the server.** Treat each one as a short planned write outage.
+- **A 3.x release must pin `image: postgres:18` on upgrade, or the boot guard keeps the server not ready.** Keep the pin in your values on every later upgrade; moving to 19 is a dump and restore. See [Upgrading From 3.x](#upgrading-from-3-x).
 - **Upgrading from 3.3.0 or earlier is a breaking change** — the removed keys stop the upgrade rather than resetting a password. See [Upgrading From Earlier Versions](#upgrading-from-earlier-versions).
 
 ## External References
