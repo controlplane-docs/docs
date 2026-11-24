@@ -382,17 +382,17 @@ Both restore paths run `/usr/local/bin/restore.sh` from the backup image. It tak
 
 The backup is one gzip-compressed CSV per table at `PREFIX/TIMESTAMP/KEYSPACE/TABLE.csv.gz`. `restore.sh` downloads them and replays each with `cqlsh COPY FROM`: rows with matching primary keys are overwritten, and rows not in the backup are left in place.
 
-The logical backup workload is a cron job with no running replica to exec into, so run the restore as a one-off job on the backup image, under the release's identity so it can read the bucket. Replace `YOUR_CREDENTIALS_SECRET` with your credentials secret name:
+The logical backup workload is a cron job with no running replica to exec into, so run the restore as a one-off job on the backup image, under the release's identity so it can read the bucket. Use the bucket, region and prefix from your `backup.aws` (or `backup.gcp`) values.
 
 ```bash
 cpln workload cron run --gvc GVC_NAME \
   --image ghcr.io/controlplane-com/backup-images/cassandra-backup:5.0.9 \
   --identity RELEASE_NAME-cassandra-identity --timeout 900 \
   --env BACKUP_TYPE=logical --env BACKUP_PROVIDER=aws \
-  --env BACKUP_BUCKET=my-backup-bucket --env AWS_REGION=us-east-1 --env BACKUP_PREFIX=cassandra/backups \
+  --env BACKUP_BUCKET=BUCKET_NAME --env AWS_REGION=BUCKET_REGION --env BACKUP_PREFIX=cassandra/backups \
   --env CASSANDRA_HOST=RELEASE_NAME-cassandra.GVC_NAME.cpln.local --env CASSANDRA_USER=cassandra \
-  --env CASSANDRA_PASSWORD=cpln://secret/YOUR_CREDENTIALS_SECRET.superuserPassword \
-  --env CASSANDRA_KEYSPACE=cpln://secret/YOUR_CREDENTIALS_SECRET.keyspace \
+  --env CASSANDRA_PASSWORD=cpln://secret/SECRET_NAME.superuserPassword \
+  --env CASSANDRA_KEYSPACE=cpln://secret/SECRET_NAME.keyspace \
   --env RESTORE_TIMESTAMP=2026-05-15T02-00-00Z -- /usr/local/bin/restore.sh
 ```
 
@@ -479,7 +479,7 @@ Version 1.1.1 removes `aws::ReadOnlyAccess` from the backup identity; it only af
 
 Three things change when you move from 1.1.1 to 1.1.2:
 
-- **Backup image.** The default `backup.image` is now `ghcr.io/controlplane-com/backup-images/cassandra-backup:5.0.9`. If you set `backup.image` yourself, change it to this tag; a values file that still pins `cassandra-backup:5.0` keeps the old image. After the upgrade, confirm the first scheduled run wrote objects under your prefix.
+- **Backup image.** The `cassandra-backup:5.0` image writes no backups to the bucket, so don't rely on objects from a 1.1.1 release. The default `backup.image` is now `ghcr.io/controlplane-com/backup-images/cassandra-backup:5.0.9`; if you set `backup.image` yourself, change it to this tag. After the upgrade, confirm the first scheduled run wrote objects under your prefix.
 - **Cassandra image.** Nodes move to the pinned `cassandra:5.0.9`. The upgrade restarts them one at a time and keeps their data.
 - **AWS backup identity.** The `cpln-connector` policy is removed from the backup identity, which now carries only your bucket-scoped policy. No action is needed.
 
@@ -499,7 +499,7 @@ cpln workload exec RELEASE_NAME-cassandra --gvc GVC_NAME --replica RELEASE_NAME-
   'nodetool -u cassandra -pw "$CASS_SUPERUSER_PASSWORD" cleanup'
 ```
 
-**Removing nodes** is not covered by this template. Cassandra requires a node to be decommissioned (`nodetool decommission`) before it leaves the ring; lowering `replicas` without that is unverified and may lose data.
+Lowering `replicas` without decommissioning each node first can lose data; the template does not decommission for you.
 
 **Node loss.** Each node's data lives on its own volume and comes back with it after a restart, and each node runs `nodetool drain` before it stops. While a node is down, the partitions for which it holds the only copy are unavailable — with the default `replicationFactor: 1` that is every partition it owns. With `replicationFactor: 3` and `QUORUM`, the cluster keeps serving reads and writes with one node down. Surviving a full zone outage is unverified; see [Multi-Zone](#multi-zone).
 
@@ -523,7 +523,7 @@ cpln workload exec RELEASE_NAME-cassandra --gvc GVC_NAME --replica RELEASE_NAME-
 
     **Cause:** Node `0` creates the roles and keyspace only after every node has joined the ring, so that token ranges are final first. It never proceeds on a partial ring; it keeps waiting.
 
-    **Fix:** Check why the other nodes have not joined with `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cassandra"}' --limit 50 --since 10m`, and run `nodetool status` as shown under [Connecting](#connecting) until every node reports `UN`. Bootstrap completes on its own once they do.
+    **Fix:** Check whether bootstrap has finished with `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cassandra"} |= "Bootstrap complete"' --limit 50 --since 1h`. If not, check why the other nodes have not joined in the workload's logs, and run `nodetool status` as shown under [Connecting](#connecting) until every node reports `UN`. Bootstrap completes on its own once they do.
   </Accordion>
   <Accordion title="Install fails with replicationFactor cannot exceed replicas">
     **Symptom:** `cpln helm install` or `upgrade` exits with:
@@ -570,7 +570,7 @@ cpln workload exec RELEASE_NAME-cassandra --gvc GVC_NAME --replica RELEASE_NAME-
 
 - **Never turn `multiZone.enabled` off once it has been on.** Each replica's volume stays in the zone it was created in, so with multi-zone off a replica whose volume is in another zone cannot be scheduled and the rollout stops at it. Turning it on later is safe. `cpln helm upgrade` does not reuse earlier values, so keep the setting in your values file on every upgrade. To recover, upgrade again with it on, then force a redeployment of the affected workload.
 - **Create the credentials secret before installing.** A missing secret wedges the deployment with no log output; the only diagnostic is `status.versions[].message` from `cpln workload get-deployments`.
-- **The keyspace and application user are created once every node has joined.** Node `0` waits for the full ring before creating them, because every node is a seed and a seed takes over its share of the data without copying it when it joins. If the nodes have not all joined after 10 minutes, node `0` logs an `ERROR` every 5 minutes and keeps waiting; the application user cannot log in until it finishes. Check with `cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-cassandra"} |~ "ERROR|Bootstrap complete"' --since 1h`.
+- **Clients cannot log in until every node has joined.** On first install the keyspace and application user are created only once all `replicas` are up; if that takes more than 10 minutes, see [Troubleshooting](#troubleshooting).
 - **Use a GVC with a single location.** The template has no per-location settings and forms a single-location cluster.
 - **The default replication factor is 1.** Set `replicationFactor: 3` with at least three `replicas` and use `QUORUM` before storing anything you cannot afford to lose.
 - **Credentials apply only on first boot.** Rotate inside Cassandra first, then update the secret and force a redeployment — in that order, together.
