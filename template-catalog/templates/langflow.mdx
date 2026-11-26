@@ -21,12 +21,12 @@ This template does not create a GVC. It deploys into an existing GVC that you al
 | Volume set | `RELEASE_NAME-langflow-data` | Shared data volume mounted by every replica (uploads, knowledge bases) | — |
 | Identity | `RELEASE_NAME-langflow-identity` | Workload identity for Langflow | — |
 | Policy | `RELEASE_NAME-langflow-policy` | Grants the identity `reveal` on exactly the secrets you name | — |
-| Workload | `RELEASE_NAME-postgres` | PostgreSQL (stateful, 1 replica) | `postgres.enabled: true` (default) |
+| Workload | `RELEASE_NAME-postgres` | PostgreSQL 19 (stateful, 1 replica) | `postgres.enabled: true` (default) |
 | Volume set | `RELEASE_NAME-pg-vs` | PostgreSQL data volume | `postgres.enabled: true` (default) |
 | Identity | `RELEASE_NAME-pg-identity` | Workload identity for PostgreSQL | `postgres.enabled: true` (default) |
 | Policy | `RELEASE_NAME-pg-policy` | Grants the PostgreSQL identity `reveal` on the database credentials secret | `postgres.enabled: true` (default) |
 | Workload | `RELEASE_NAME-postgres-backup` | Scheduled backups of PostgreSQL to object storage | `postgres.backup.enabled: true` |
-| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL (stateful, 3 replicas by default) | `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL (stateful, 3 replicas by default; PostgreSQL 18 for a new cluster) | `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-etcd` | etcd cluster for Patroni | `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy endpoint that always points at the PostgreSQL leader | `postgresHA.enabled: true` |
 | Volume set | `RELEASE_NAME-postgres-ha-vs` | PostgreSQL data volume, one per replica | `postgresHA.enabled: true` |
@@ -101,7 +101,7 @@ The required values are the names of the three secrets from [Prerequisites](#pre
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/langflow \
-  --version 1.0.0 --gvc GVC_NAME \
+  --version 2.0.0 --gvc GVC_NAME \
   --set postgres.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
   --set admin.secretName=ADMIN_SECRET_NAME \
   --set secretKey.secretName=FERNET_KEY_SECRET_NAME
@@ -180,7 +180,7 @@ internalAccess:
 ```yaml
 postgres:                       # every knob of the postgres template
   enabled: true
-  image: postgres:18
+  image: postgres:19            # new installs; a release upgraded from 1.x keeps postgres:18, its data's major (README, "Upgrading from 1.x")
   config:
     credentialsSecretName: my-langflow-db-credentials   # REQUIRED, create before install
   resources:
@@ -193,6 +193,7 @@ postgres:                       # every knob of the postgres template
   backup:
     enabled: false              # scheduled backups to object storage; provider aws, gcp or minio (postgres template)
 
+# New clusters run PostgreSQL 18; a cluster created by a 1.x release stays on 17 (Upgrading from 1.x).
 postgresHA:                     # every knob of the postgres-highly-available template
   enabled: false                # enable exactly one of postgres / postgresHA
   config:
@@ -319,6 +320,46 @@ mc ilm rule ls ALIAS/BUCKET_NAME
 
 Lifecycle rules run in the background; objects are removed within about a day of reaching the age. The `Noncurrent` parts matter only on a versioned bucket, where expiry otherwise just adds a delete marker.
 
+### Upgrading from 1.x
+
+**Highly available database (`postgresHA.enabled: true`):** a plain upgrade works, and the cluster stays on PostgreSQL 17, the major it was created with; new HA releases start on PostgreSQL 18. Moving an existing cluster to 18 is a copy into a new release: see [Upgrading an existing cluster to PostgreSQL 18](https://github.com/controlplane-com/templates/blob/main/postgres-highly-available/versions/3.0.0/README.md#upgrading-an-existing-cluster-to-postgresql-18) in the postgres-highly-available template. With AWS backups, the backup identity no longer carries `aws::ReadOnlyAccess`: **update your IAM policy to the action list on the [postgres-highly-available](/template-catalog/templates/postgres-highly-available) page before upgrading.**
+
+**Single-instance database (`postgres.enabled: true`, the default):** new installs run PostgreSQL 19. A 1.x release's data directory was created by PostgreSQL 18 (or the major of the `postgres.image` it ran), and a data directory only opens with its own major. The chart never converts data in place: before PostgreSQL starts, a guard compares the two majors, and on a mismatch it does not start the server and changes nothing on the volume. `RELEASE_NAME-postgres` then stays not ready, Langflow cannot reach its database, and the logs repeat `[pg-guard] REFUSING TO START` with the exact `--set postgres.image=...` to run.
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres"} |= "pg-guard"' --since 15m
+```
+
+**Stay on PostgreSQL 18:** run the upgrade with the image pinned, and keep `postgres.image: postgres:18` in your values file for every later upgrade (`cpln helm upgrade` does not reuse the installed values). The Console upgrade wizard keeps the installed image for you.
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/langflow --version 2.0.0 --gvc GVC_NAME -f my-values.yaml --set postgres.image=postgres:18
+```
+
+**Move to PostgreSQL 19, side by side** (Langflow gets a new endpoint; writes pause during the copy):
+
+1. Install this version as a NEW release in the same GVC with the **same** `admin.secretName`, `secretKey.secretName` and `postgres.config.credentialsSecretName` (and the same `variableSecrets` and `cplnMcp` settings). The encryption key must be the same one, or the API keys stored in the copied database cannot be decrypted. Langflow initializes an empty database in it.
+2. Copy the data volume (uploaded files and knowledge bases) through your machine while the old Langflow is still running (do this in a quiet window: a file uploaded after this step is not copied):
+
+   ```bash
+   mkdir -p ./langflow-data
+   cpln workload exec OLD_RELEASE-langflow --gvc GVC_NAME --container langflow -- \
+     sh -c 'cd /app/langflow && tar czf - --exclude="./.*" . | base64' | base64 -d | tar xzf - -C ./langflow-data
+   cpln cp ./langflow-data/. NEW_RELEASE-langflow:/app/langflow --gvc GVC_NAME --container langflow
+   ```
+
+   `cpln cp` may end with `Cannot change mode ... Operation not permitted` and exit 2: the volume's root directory belongs to root, so its mode cannot be copied. The files themselves arrive; check with `cpln workload exec NEW_RELEASE-langflow --gvc GVC_NAME --container langflow -- ls -la /app/langflow`.
+
+3. Stop writes to the old release by stopping its Langflow workload (`cpln workload stop OLD_RELEASE-langflow --gvc GVC_NAME`; the database keeps running).
+4. Replace the new release's database with the old one, from inside the new database container. The PostgreSQL 19 `pg_dump` reads the old server, and `--clean --if-exists` first drops what the new Langflow created:
+
+   ```bash
+   cpln workload exec NEW_RELEASE-postgres --gvc GVC_NAME --container postgresql -- bash -c \
+     'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -h OLD_RELEASE-postgres.GVC_NAME.cpln.local -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists | psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q'
+   ```
+
+5. Run `cpln workload force-redeployment NEW_RELEASE-langflow --gvc GVC_NAME` so Langflow reloads the copied data, log in to check your flows and files, point your clients at the new endpoint (or move your custom domain), then uninstall the old release.
+
 ### Scaling and Availability
 
 Set `langflow.replicas` from 1 to 4. Replicas share PostgreSQL, the data volume and Redis, so they are interchangeable, and more than one requires `redis.enabled: true`. Redis stays a single node, because Langflow takes one Redis URL and cannot follow Sentinel.
@@ -381,6 +422,7 @@ cpln workload force-redeployment RELEASE_NAME-langflow --gvc GVC_NAME
 - The first `helm upgrade` after an install can restart the bundled database, which briefly interrupts the editor and the API.
 - Use a single-location GVC: the database, the data volume and Redis run in one location.
 - Uninstalling deletes the database and the data volume, and with them every flow, user and uploaded file.
+- **Upgrading a 1.x release with the single-instance database needs `postgres.image: postgres:18`** in your values on that and every later upgrade, or the database refuses to start (data untouched); moving the data to PostgreSQL 19 is a dump and restore into a new release. The data volume (uploaded files and knowledge bases) is copied separately from the database. See [Upgrading from 1.x](#upgrading-from-1-x).
 
 ## External References
 
