@@ -24,11 +24,11 @@ This template deploys into a GVC **you already have** — it does not create, pr
 | Resource | Name | Purpose | Optional |
 |---|---|---|---|
 | Workload | `RELEASE_NAME-grafana` | Grafana UI and HTTP API (standard, `replicas` instances, HTTP port `3000`, public by default) | — |
-| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL app database (stateful, 3 replicas) | Default; `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL app database (stateful, 3 replicas; PostgreSQL 18 for a new cluster) | Default; `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy leader-routing endpoint Grafana connects through (standard, 2 replicas, port `5432`) | Default; `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-etcd` | Consensus store for the highly available database (stateful, 3 replicas) | Default; `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-postgres-ha-backup` | Scheduled logical dump of the highly available database (cron) | `postgresHA.backup.enabled: true` with `mode: logical` |
-| Workload | `RELEASE_NAME-postgres` | Single-instance PostgreSQL app database (stateful, 1 replica, port `5432`) | `postgres.enabled: true` with `postgresHA.enabled: false` |
+| Workload | `RELEASE_NAME-postgres` | Single-instance PostgreSQL 19 app database (stateful, 1 replica, port `5432`) | `postgres.enabled: true` with `postgresHA.enabled: false` |
 | Workload | `RELEASE_NAME-postgres-backup` | Scheduled logical dump of the single-instance database (cron) | `postgres.backup.enabled: true` |
 | Workload | `RELEASE_NAME-redis`, `RELEASE_NAME-sentinel` | Alerting-HA coordination tier (stateful, 3 replicas each) | `redis.enabled: true` |
 | Volume set | `RELEASE_NAME-postgres-ha-vs`, `RELEASE_NAME-etcd-vs` | Highly available database and consensus-store data (10 GiB per replica by default) | Default; `postgresHA.enabled: true` |
@@ -107,7 +107,7 @@ Once the three secrets exist, install the template into your GVC, naming the sec
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/grafana \
-  --version 1.5.0 --gvc GVC_NAME \
+  --version 2.0.0 --gvc GVC_NAME \
   --set postgresHA.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME \
   --set admin.passwordSecretName=ADMIN_PASSWORD_SECRET_NAME \
   --set admin.secretKeySecretName=SECRET_KEY_SECRET_NAME
@@ -352,9 +352,10 @@ Exactly one of the two database modes must be enabled — the chart enforces thi
 | Best for | Production | Development and lightweight installs |
 
 ```yaml
+# New clusters run PostgreSQL 18; a cluster created by a 1.x release stays on 17 (Upgrading from 1.x).
 postgresHA: # default: highly available PostgreSQL app database
   enabled: true
-  image: controlplanecorporation/patroni-postgres:0.8 # pgvector 0.8.7 (CVE-2026-103484); tags 0.1-0.7 are refused
+  image: controlplanecorporation/patroni-postgres:0.9 # PostgreSQL 18 for new clusters (bundles 14-18); tags 0.1-0.7 are refused (CVE-2026-103484)
   config:
     credentialsSecretName: my-grafana-db-credentials # PREREQUISITE dictionary secret (username, password, database), must exist BEFORE install
   replicas: 3
@@ -367,6 +368,7 @@ postgresHA:
   enabled: false # set postgresHA.enabled: true (the default) for automatic database failover
 postgres: # dev/lightweight: single-instance PostgreSQL
   enabled: true
+  image: postgres:19 # new installs; a release upgraded from 1.x keeps postgres:18, its data's major (Upgrading from 1.x)
   config:
     credentialsSecretName: my-grafana-db-credentials # PREREQUISITE dictionary secret (username, password, database), must exist BEFORE install
   volumeset:
@@ -468,9 +470,9 @@ postgresHA:
     mode: logical # logical or wal-g
     resources:
       cpu: 100m
-      memory: 128Mi
+      memory: 512Mi # 128Mi OOMKills wal-g mid-backup
     logical:
-      image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
+      image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.2.0 # backs up PostgreSQL 17 and 18 clusters
       schedule: "0 2 * * *"
     walg:
       intervalSeconds: 21600
@@ -496,7 +498,7 @@ postgresHA:
 postgres:
   backup: # optional database backups — see README storage setup
     enabled: false
-    image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0
+    image: ghcr.io/controlplane-com/backup-images/postgres-backup:19.1.0 # PostgreSQL 19 client; also backs up a server pinned to 18
     schedule: "0 2 * * *"
     resources:
       cpu: 100m
@@ -546,7 +548,9 @@ In HA mode `postgresHA.backup.mode` selects `logical` (a scheduled `pg_dump` run
               "s3:PutObject",
               "s3:DeleteObject",
               "s3:DeleteObjectVersion",
-              "s3:AbortMultipartUpload"
+              "s3:AbortMultipartUpload",
+              "s3:ListBucketMultipartUploads",
+              "s3:ListMultipartUploadParts"
             ],
             "Resource": [
               "arn:aws:s3:::YOUR_BUCKET",
@@ -779,6 +783,47 @@ The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), s
 
 1.5.1 moves the HA database (`postgresHA`) to `controlplanecorporation/patroni-postgres:0.8`, which carries pgvector 0.8.7 (CVE-2026-103484). The fix takes effect when the upgrade restarts the Patroni members; existing data needs nothing. Nothing limits that rollout, so expect a brief interruption of writes while the leader changes. Grafana itself restarts without a gap (the new replica serves before the old one stops); while the leader changes, Grafana can briefly answer valid users with 401. Upgrade in a quiet window. If you pinned `postgresHA.image` in your values, set it to the `0.8` tag: tags `0.1` to `0.7` are refused at render. Grafana does not use the `vector` extension; if you created it yourself in a database, `\dx` keeps reporting the old version until you run `ALTER EXTENSION vector UPDATE;` there, which only updates that record. Single-instance mode (`postgres`) is unchanged.
 
+### Upgrading from 1.x
+
+**HA mode (the default)** moves to the `postgres-highly-available` 3.0.0 template. New clusters run PostgreSQL 18; an existing cluster keeps PostgreSQL 17 in place, because the new image (`controlplanecorporation/patroni-postgres:0.9`) bundles PostgreSQL 14 to 18 and each member runs the version of its data directory. The upgrade needs no pin. What changes:
+
+- The database members restart one after another onto the new image (and the latest 17 minor release), so writes pause briefly while the leader changes; Grafana can briefly answer valid users with 401 meanwhile. Upgrade in a quiet window.
+- If your values set `postgresHA.image`, use the `0.9` tag (`0.8` also keeps a 17 cluster running); tags `0.1` to `0.7` are refused at render.
+- The default logical backup image moves to `postgres-backup:18.2.0`, which backs up 17 and 18 clusters, and the backup job gets 512Mi of memory.
+- The backup identity no longer carries `cpln-connector` or `aws::ReadOnlyAccess`. With AWS backups, **update your IAM policy to the action list in [Backing Up](#backing-up) before upgrading.**
+
+To move an existing HA cluster to PostgreSQL 18, copy it into a new release: follow [Upgrading an existing cluster to PostgreSQL 18](https://github.com/controlplane-com/templates/blob/main/postgres-highly-available/versions/3.0.0/README.md#upgrading-an-existing-cluster-to-postgresql-18) in the `postgres-highly-available` README, with a new Grafana release (same three prerequisite secrets) in place of the second database release, and both Grafana workloads stopped during the copy.
+
+**Single-instance mode** (`postgres.enabled: true`) now installs PostgreSQL 19, while a 1.x release's database is PostgreSQL 18. A data directory only opens with its own major, and the chart never converts it in place: before PostgreSQL starts, a guard compares the two, and on a mismatch it does not start the server and changes nothing on the volume. `cpln workload get-deployments RELEASE_NAME-postgres --gvc GVC_NAME` then stays not ready, and the logs repeat `[pg-guard] REFUSING TO START` every 30 seconds:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres"} |= "pg-guard"' --since 15m
+```
+
+**Stay on PostgreSQL 18:** upgrade with the image pinned, and keep `postgres.image: postgres:18` in your values file for every later upgrade (`cpln helm upgrade` does not reuse the installed values). The Console upgrade wizard keeps the installed image for you.
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/grafana --version 2.0.0 --gvc GVC_NAME -f my-values.yaml --set postgres.image=postgres:18
+```
+
+**Move to PostgreSQL 19, side by side** (Grafana gets a new endpoint and is down during the copy; it keeps no files of its own, so the database is all there is to move):
+
+1. Stop the old Grafana, so nothing writes to its database: `cpln workload stop OLD_RELEASE-grafana --gvc GVC_NAME`.
+2. Install this version as a NEW release in single-instance mode with the **same three prerequisite secrets**. The encryption key (`admin.secretKeySecretName`) must be the same, or the copied datasource credentials cannot be decrypted, and the copied database role keeps the old password.
+3. Once `NEW_RELEASE-grafana` is ready, stop it (`cpln workload stop NEW_RELEASE-grafana --gvc GVC_NAME`), then replace its empty database with a copy of the old one, from inside the new PostgreSQL container:
+
+   ```bash
+   cpln workload exec NEW_RELEASE-postgres --gvc GVC_NAME --container postgresql -- bash -c \
+     'export PGPASSWORD="$POSTGRES_PASSWORD"
+      psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -q \
+        -c "DROP DATABASE \"$POSTGRES_DB\" WITH (FORCE)" -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\"" &&
+      pg_dump -h OLD_RELEASE-postgres.GVC_NAME.cpln.local -U "$POSTGRES_USER" -d "$POSTGRES_DB" |
+        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -q'
+   ```
+
+4. Start the new Grafana (`cpln workload start NEW_RELEASE-grafana --gvc GVC_NAME`), log in, and check your dashboards, alert rules and datasources.
+5. Point your users and any API clients at the new endpoint, then uninstall the old release (this deletes its volumes).
+
 ### Scaling and Availability
 
 - **`replicas`** scales the Grafana tier; `2` or more requires `redis.enabled: true` — see [Alerting High Availability](#alerting-high-availability). Database replicas are set separately with `postgresHA.replicas`; the single-instance database must stay at one replica.
@@ -860,6 +905,7 @@ The upgrade restarts the bundled PostgreSQL too (it now reads the new secret), s
 - **Prerequisite secrets you create are not owned by the release** — they survive `helm uninstall` and must be deleted manually if you no longer need them.
 - **Keep `publicAccess.enabled: true` if you rely on links in alert emails** — an internal-only instance has no derived `root_url` and links point at localhost.
 - **This template ships Grafana OSS only** — Enterprise features such as fine-grained RBAC, reporting and query caching are not available.
+- **Upgrading a 1.x release with the single-instance database needs `postgres.image: postgres:18`** in your values on that and every later upgrade, or the database refuses to start (data untouched); moving the data to PostgreSQL 19 is a dump and restore into a new release. See [Upgrading from 1.x](#upgrading-from-1-x).
 
 ## External References
 
