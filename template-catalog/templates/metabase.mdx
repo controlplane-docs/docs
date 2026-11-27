@@ -18,11 +18,11 @@ This template deploys into an existing [GVC](/reference/gvc) that you already ha
 | Resource | Name | Purpose | Optional |
 |---|---|---|---|
 | Workload | `RELEASE_NAME-metabase` | Metabase UI and API (standard, 1 replica, HTTP port `3000`, public by default) | — |
-| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL app database (stateful, 3 replicas) | Default; `postgresHA.enabled: true` |
+| Workload | `RELEASE_NAME-postgres-ha` | Patroni PostgreSQL app database (stateful, 3 replicas; PostgreSQL 18 for a new cluster) | Default; `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy leader-routing endpoint Metabase connects through (standard, 2 replicas, port `5432`) | Default; `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-etcd` | Consensus store for the highly available database (stateful, 3 replicas) | Default; `postgresHA.enabled: true` |
 | Workload | `RELEASE_NAME-postgres-ha-backup` | Scheduled logical dump of the highly available database (cron) | `postgresHA.backup.enabled: true` with `mode: logical` |
-| Workload | `RELEASE_NAME-postgres` | Single-instance PostgreSQL app database (stateful, 1 replica, port `5432`) | `postgres.enabled: true` with `postgresHA.enabled: false` |
+| Workload | `RELEASE_NAME-postgres` | Single-instance PostgreSQL 19 app database (stateful, 1 replica, port `5432`) | `postgres.enabled: true` with `postgresHA.enabled: false` |
 | Workload | `RELEASE_NAME-postgres-backup` | Scheduled logical dump of the single-instance database (cron) | `postgres.backup.enabled: true` |
 | Volume set | `RELEASE_NAME-postgres-ha-vs`, `RELEASE_NAME-etcd-vs` | Highly available database and consensus-store data (10 GiB per replica by default; takes no scheduled snapshots; a final snapshot is taken when the volume set is deleted and kept 7 days) | Default; `postgresHA.enabled: true` |
 | Volume set | `RELEASE_NAME-pg-vs` | Single-instance database data (10 GiB by default; takes no scheduled snapshots; a final snapshot is taken when the volume set is deleted and kept 7 days) | `postgres.enabled: true` |
@@ -98,7 +98,7 @@ Once all three secrets exist, install the template into your GVC, naming the sec
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/metabase \
-  --version 1.5.0 --gvc GVC_NAME \
+  --version 2.0.0 --gvc GVC_NAME \
   --set admin.secretName=ADMIN_SECRET_NAME \
   --set encryptionKey.secretName=ENCRYPTION_KEY_SECRET_NAME \
   --set postgresHA.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME
@@ -211,9 +211,10 @@ Exactly one of the two database modes must be enabled — the chart enforces thi
 | Best for | Production | Development and lightweight installs |
 
 ```yaml
+# New clusters run PostgreSQL 18; a cluster created by a 1.x release stays on 17 (Upgrading from 1.x).
 postgresHA: # default: highly available PostgreSQL app database
   enabled: true
-  image: controlplanecorporation/patroni-postgres:0.8 # pgvector 0.8.7 (CVE-2026-103484); tags 0.1-0.7 are refused
+  image: controlplanecorporation/patroni-postgres:0.9 # PostgreSQL 18 for new clusters (bundles 14-18); tags 0.1-0.7 are refused (CVE-2026-103484)
   config:
     credentialsSecretName: my-metabase-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   replicas: 3
@@ -226,6 +227,7 @@ postgresHA:
   enabled: false # set postgresHA.enabled: true (the default) for automatic database failover
 postgres: # dev/lightweight: single-instance PostgreSQL
   enabled: true
+  image: postgres:19 # new installs; a release upgraded from 1.x keeps postgres:18, its data's major (Upgrading from 1.x)
   config:
     credentialsSecretName: my-metabase-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   volumeset:
@@ -305,9 +307,9 @@ postgresHA:
     mode: logical # logical or wal-g
     resources:
       cpu: 100m
-      memory: 128Mi
+      memory: 512Mi # 128Mi OOMKills wal-g mid-backup
     logical:
-      image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
+      image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.2.0 # backs up PostgreSQL 17 and 18 clusters
       schedule: "0 2 * * *"
     walg:
       intervalSeconds: 21600
@@ -333,7 +335,7 @@ postgresHA:
 postgres:
   backup: # optional database backups (Postgres 17+) — see README storage setup
     enabled: false
-    image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0
+    image: ghcr.io/controlplane-com/backup-images/postgres-backup:19.1.0 # PostgreSQL 19 client; also backs up a server pinned to 18
     schedule: "0 2 * * *"
     resources:
       cpu: 100m
@@ -622,6 +624,47 @@ Then force-redeploy `RELEASE_NAME-metabase`, which keeps the old password until 
 pgx N curl -s -XPOST -d '{"force": true}' localhost:8008/reinitialize
 ```
 
+### Upgrading from 1.x
+
+**HA mode (the default)** moves to the `postgres-highly-available` 3.0.0 template. New clusters run PostgreSQL 18; an existing cluster keeps PostgreSQL 17 in place, because the new image (`controlplanecorporation/patroni-postgres:0.9`) bundles PostgreSQL 14 to 18 and each member runs the version of its data directory. The upgrade needs no pin. What changes:
+
+- The database members restart one after another onto the new image (and the latest 17 minor release), so writes pause briefly while the leader changes.
+- If your values set `postgresHA.image`, use the `0.9` tag (`0.8` also keeps a 17 cluster running); tags `0.1` to `0.7` are refused at render.
+- The default logical backup image moves to `postgres-backup:18.2.0`, which backs up 17 and 18 clusters, and the backup job gets 512Mi of memory.
+- The backup identity no longer carries `cpln-connector` or `aws::ReadOnlyAccess`. With AWS backups, **update your IAM policy to the action list in [Backing Up](#backing-up) before upgrading.**
+
+To move an existing HA cluster to PostgreSQL 18, copy it into a new release: follow [Upgrading an existing cluster to PostgreSQL 18](https://github.com/controlplane-com/templates/blob/main/postgres-highly-available/versions/3.0.0/README.md#upgrading-an-existing-cluster-to-postgresql-18) in the `postgres-highly-available` README, with a new Metabase release (same three prerequisite secrets) in place of the second database release, and both Metabase workloads stopped during the copy.
+
+**Single-instance mode** (`postgres.enabled: true`) now installs PostgreSQL 19, while a 1.x release's database is PostgreSQL 18. A data directory only opens with its own major, and the chart never converts it in place: before PostgreSQL starts, a guard compares the two, and on a mismatch it does not start the server and changes nothing on the volume. `cpln workload get-deployments RELEASE_NAME-postgres --gvc GVC_NAME` then stays not ready, and the logs repeat `[pg-guard] REFUSING TO START` every 30 seconds:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres"} |= "pg-guard"' --since 15m
+```
+
+**Stay on PostgreSQL 18:** upgrade with the image pinned, and keep `postgres.image: postgres:18` in your values file for every later upgrade (`cpln helm upgrade` does not reuse the installed values). The Console upgrade wizard keeps the installed image for you.
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/metabase --version 2.0.0 --gvc GVC_NAME -f my-values.yaml --set postgres.image=postgres:18
+```
+
+**Move to PostgreSQL 19, side by side** (Metabase gets a new endpoint and is down during the copy):
+
+1. Stop the old Metabase, so nothing writes to its database: `cpln workload stop OLD_RELEASE-metabase --gvc GVC_NAME`.
+2. Install this version as a NEW release in single-instance mode with the **same three prerequisite secrets**. The encryption key must be the same, or the copied database connections cannot be decrypted, and the copied database role keeps the old password.
+3. Once `NEW_RELEASE-metabase` is ready, stop it (`cpln workload stop NEW_RELEASE-metabase --gvc GVC_NAME`), then replace its empty database with a copy of the old one, from inside the new PostgreSQL container:
+
+   ```bash
+   cpln workload exec NEW_RELEASE-postgres --gvc GVC_NAME --container postgresql -- bash -c \
+     'export PGPASSWORD="$POSTGRES_PASSWORD"
+      psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -q \
+        -c "DROP DATABASE \"$POSTGRES_DB\" WITH (FORCE)" -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\"" &&
+      pg_dump -h OLD_RELEASE-postgres.GVC_NAME.cpln.local -U "$POSTGRES_USER" -d "$POSTGRES_DB" |
+        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -q'
+   ```
+
+4. Start the new Metabase (`cpln workload start NEW_RELEASE-metabase --gvc GVC_NAME`) and sign in with the old admin login; your questions, dashboards and saved connections are there. The first-boot setup is skipped, because the copied database already has its admin.
+5. Point users and embeds at the new endpoint, then uninstall the old release (this deletes its database volume).
+
 ### Scaling and Availability
 
 - **Metabase runs as a single replica in this template**, and no `replicas` knob is exposed. It holds no state of its own, so a replaced replica comes back with everything intact; the highly available default database removes the database as a failure point.
@@ -701,6 +744,7 @@ pgx N curl -s -XPOST -d '{"force": true}' localhost:8008/reinitialize
 - **Metabase is single-replica in this template** — every upgrade restarts it; the highly available default database keeps running and no data is lost.
 - **Prerequisite secrets you create are not owned by the release** — they survive `helm uninstall` and must be deleted manually if you no longer need them.
 - **This template ships the open-source image only** — Pro/Enterprise features (SSO, sandboxing, config-file initialisation) are not available.
+- **Upgrading a 1.x release with the single-instance database needs `postgres.image: postgres:18`** in your values on that and every later upgrade, or the database refuses to start (data untouched); moving the data to PostgreSQL 19 is a dump and restore into a new release. See [Upgrading from 1.x](#upgrading-from-1-x).
 
 ## External References
 

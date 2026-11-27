@@ -20,12 +20,12 @@ All durable state — realms, users, and active sessions — lives in PostgreSQL
 | Resource | Name | Purpose | Optional |
 |---|---|---|---|
 | Workload | `RELEASE_NAME-keycloak` | Keycloak 26 server (stateful, 2 replicas, clustered over the shared database) | — |
-| Workload | `RELEASE_NAME-postgres-ha` | PostgreSQL cluster managed by Patroni (stateful, 3 replicas) | default store (`postgresHA.enabled: true`) |
+| Workload | `RELEASE_NAME-postgres-ha` | PostgreSQL cluster managed by Patroni (stateful, 3 replicas; PostgreSQL 18 for a new cluster) | default store (`postgresHA.enabled: true`) |
 | Workload | `RELEASE_NAME-postgres-ha-proxy` | HAProxy leader-routing endpoint that Keycloak connects through | default store |
 | Workload | `RELEASE_NAME-etcd` | Consensus store for Patroni (stateful, 3 replicas) | default store |
 | Workload | `RELEASE_NAME-pgbouncer` | Connection pooler in front of the HA store | `postgresHA.pgbouncer.enabled: true` |
 | Workload | `RELEASE_NAME-postgres-ha-backup` | Scheduled logical backups of the HA store | `postgresHA.backup.enabled: true` with `mode: logical` |
-| Workload | `RELEASE_NAME-postgres` | Single-instance PostgreSQL (stateful, 1 replica) | `postgres.enabled: true` |
+| Workload | `RELEASE_NAME-postgres` | Single-instance PostgreSQL 19 (stateful, 1 replica) | `postgres.enabled: true` |
 | Workload | `RELEASE_NAME-postgres-backup` | Scheduled backups of the single-instance store | `postgres.backup.enabled: true` |
 | Volume set | `RELEASE_NAME-postgres-ha-vs`, `RELEASE_NAME-etcd-vs` | Persistent data for the Patroni and etcd replicas | default store |
 | Volume set | `RELEASE_NAME-pg-vs` | Persistent data for the single-instance store | `postgres.enabled: true` |
@@ -109,7 +109,7 @@ Install from the marketplace registry, naming your two secrets:
 
 ```bash
 cpln helm install RELEASE_NAME oci://ghcr.io/controlplane-com/templates/keycloak \
-  --version 1.5.0 --gvc GVC_NAME \
+  --version 2.0.0 --gvc GVC_NAME \
   --set admin.secretName=ADMIN_SECRET_NAME \
   --set postgresHA.config.credentialsSecretName=DB_CREDENTIALS_SECRET_NAME
 ```
@@ -187,12 +187,13 @@ Exactly one of the two stores must be enabled; the chart refuses both-on and bot
 **Highly available PostgreSQL (default).** Three Patroni-managed PostgreSQL replicas, three etcd replicas and an HAProxy endpoint that routes Keycloak's connections to the current leader, from the [PostgreSQL Highly Available](/template-catalog/templates/postgres-highly-available) template:
 
 ```yaml
+# New clusters run PostgreSQL 18; a cluster created by a 1.x release stays on 17 (Upgrading from 1.x).
 postgresHA:
   enabled: true # set postgres.enabled: true (and this to false) for a lighter single-instance dev/test store
   config:
     credentialsSecretName: my-keycloak-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   replicas: 3
-  image: controlplanecorporation/patroni-postgres:0.8 # pgvector 0.8.7 (CVE-2026-103484); tags 0.1-0.7 are refused
+  image: controlplanecorporation/patroni-postgres:0.9 # PostgreSQL 18 for new clusters (bundles 14-18); tags 0.1-0.7 are refused (CVE-2026-103484)
   volumeset:
     capacity: 10 # initial capacity in GiB per replica (minimum is 10)
 
@@ -208,6 +209,7 @@ postgresHA:
 
 postgres:
   enabled: true
+  image: postgres:19 # new installs; a release upgraded from 1.x keeps postgres:18, its data's major (Upgrading from 1.x)
   config:
     credentialsSecretName: my-keycloak-db-credentials # PREREQUISITE dictionary secret (username, password, database) — must exist BEFORE install
   volumeset:
@@ -289,9 +291,9 @@ postgresHA:
     mode: logical # logical or wal-g
     resources:
       cpu: 100m
-      memory: 128Mi
+      memory: 512Mi # 128Mi OOMKills wal-g mid-backup
     logical:
-      image: ghcr.io/controlplane-com/backup-images/postgres-backup:17.1.0
+      image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.2.0 # backs up PostgreSQL 17 and 18 clusters
       schedule: "0 2 * * *" # daily at 2am UTC
     walg:
       intervalSeconds: 21600 # every 6 hours
@@ -317,7 +319,7 @@ postgresHA:
 postgres:
   backup: # pass-through to the postgres template's backup feature (Postgres 17+)
     enabled: false
-    image: ghcr.io/controlplane-com/backup-images/postgres-backup:18.1.0
+    image: ghcr.io/controlplane-com/backup-images/postgres-backup:19.1.0 # PostgreSQL 19 client; also backs up a server pinned to 18
     schedule: "0 2 * * *" # daily at 2am UTC
     resources:
       cpu: 100m
@@ -530,6 +532,47 @@ With 2 or more replicas Keycloak keeps serving throughout the upgrade, apart fro
 
 In HA mode, `1.5.1` also moves the database to `controlplanecorporation/patroni-postgres:0.8`, which carries pgvector 0.8.7 (CVE-2026-103484). The database members restart, so expect a brief interruption of writes while the leader changes, even with 2 or more Keycloak replicas. Upgrade in a quiet window. Keycloak does not use the `vector` extension; if you created it yourself in a database, run `ALTER EXTENSION vector UPDATE;` there after the upgrade. If your values set `postgresHA.image`, set it to the `0.8` tag: tags `0.1` to `0.7` are refused at render.
 
+### Upgrading from 1.x
+
+**HA mode (the default)** moves to the `postgres-highly-available` 3.0.0 template. New clusters run PostgreSQL 18; an existing cluster keeps PostgreSQL 17 in place, because the new image (`controlplanecorporation/patroni-postgres:0.9`) bundles PostgreSQL 14 to 18 and each member runs the version of its data directory. The upgrade needs no pin. What changes:
+
+- The database members restart one after another onto the new image (and the latest 17 minor release), so writes pause briefly while the leader changes, even with 2 or more Keycloak replicas.
+- If your values set `postgresHA.image`, use the `0.9` tag (`0.8` also keeps a 17 cluster running); tags `0.1` to `0.7` are refused at render.
+- The default logical backup image moves to `postgres-backup:18.2.0`, which backs up 17 and 18 clusters, and the backup job gets 512Mi of memory.
+- The backup identity no longer carries `cpln-connector` or `aws::ReadOnlyAccess`. With AWS backups, **update your bucket's IAM policy to the action list in the [postgres-highly-available](/template-catalog/templates/postgres-highly-available) page before upgrading.**
+
+To move an existing HA cluster to PostgreSQL 18, copy it into a new release: follow [Upgrading an existing cluster to PostgreSQL 18](https://github.com/controlplane-com/templates/blob/main/postgres-highly-available/versions/3.0.0/README.md#upgrading-an-existing-cluster-to-postgresql-18) in the `postgres-highly-available` README, with a new Keycloak release (same two prerequisite secrets) in place of the second database release, and both Keycloak workloads stopped during the copy.
+
+**Single-instance mode** (`postgres.enabled: true`) now installs PostgreSQL 19, while a 1.x release's database is PostgreSQL 18. A data directory only opens with its own major, and the chart never converts it in place: before PostgreSQL starts, a guard compares the two, and on a mismatch it does not start the server and changes nothing on the volume. `cpln workload get-deployments RELEASE_NAME-postgres --gvc GVC_NAME` then stays not ready, Keycloak waits for its database, and the logs repeat `[pg-guard] REFUSING TO START` every 30 seconds:
+
+```bash
+cpln logs '{gvc="GVC_NAME", workload="RELEASE_NAME-postgres"} |= "pg-guard"' --since 15m
+```
+
+**Stay on PostgreSQL 18:** upgrade with the image pinned, and keep `postgres.image: postgres:18` in your values file for every later upgrade (`cpln helm upgrade` does not reuse the installed values). The Console upgrade wizard keeps the installed image for you.
+
+```bash
+cpln helm upgrade RELEASE_NAME oci://ghcr.io/controlplane-com/templates/keycloak --version 2.0.0 --gvc GVC_NAME -f my-values.yaml --set postgres.image=postgres:18
+```
+
+**Move to PostgreSQL 19, side by side** (Keycloak gets a new endpoint, so every application must move to the new issuer URL; logins are down during the copy):
+
+1. Stop the old Keycloak, so nothing writes to its database: `cpln workload stop OLD_RELEASE-keycloak --gvc GVC_NAME`.
+2. Install this version as a NEW release in single-instance mode with the **same two prerequisite secrets** (`admin.secretName` and `postgres.config.credentialsSecretName`), so the copied tables belong to the role Keycloak connects as.
+3. Once `NEW_RELEASE-keycloak` is ready, stop it (`cpln workload stop NEW_RELEASE-keycloak --gvc GVC_NAME`), then replace its new database with a copy of the old one, from inside the new PostgreSQL container:
+
+   ```bash
+   cpln workload exec NEW_RELEASE-postgres --gvc GVC_NAME --container postgresql -- bash -c \
+     'export PGPASSWORD="$POSTGRES_PASSWORD"
+      psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -q \
+        -c "DROP DATABASE \"$POSTGRES_DB\" WITH (FORCE)" -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\"" &&
+      pg_dump -h OLD_RELEASE-postgres.GVC_NAME.cpln.local -U "$POSTGRES_USER" -d "$POSTGRES_DB" |
+        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -q'
+   ```
+
+4. Start the new Keycloak (`cpln workload start NEW_RELEASE-keycloak --gvc GVC_NAME`), log in to the admin console with your permanent admin, and check your realms, clients and users.
+5. Point your applications at the new issuer (`https://{new-canonical-endpoint}/realms/{realm}`, or move your custom domain), then uninstall the old release (this deletes its database volume).
+
 ### Scaling and Availability
 
 - **Keycloak replicas.** Change `replicas` and upgrade the release; there is deliberately no autoscaling, so cluster membership only changes when you change it. Clustered replicas (`2` or more) share realm, user and session state through the database, so one replica restarting does not interrupt sign-ins. With `replicas: 1` a restart is a short outage.
@@ -617,6 +660,7 @@ In HA mode, `1.5.1` also moves the database to `controlplanecorporation/patroni-
 - **`replicas` above `1` needs internal access** — set `internalAccess.type` to anything but `none`, or the install is refused.
 - **Scaling is operator-driven** — change `replicas` via a template upgrade; there is deliberately no autoscaling.
 - **Uninstalling deletes the database volume sets** — the database (and, in HA mode, etcd) volume sets go with the release, so data does not survive a reinstall. Enable backups.
+- **Upgrading a 1.x release with the single-instance database needs `postgres.image: postgres:18`** in your values on that and every later upgrade, or the database refuses to start (data untouched); moving the data to PostgreSQL 19 is a dump and restore into a new release. A new release has a new issuer URL, so applications must be pointed at it. See [Upgrading from 1.x](#upgrading-from-1-x).
 
 ## External References
 
